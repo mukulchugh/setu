@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# setu — one-line install
-# curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash
+# setu — install
+# bun install -g 'git+ssh://git@github.com/quivly/setu.git' && setu setup
 set -e
 
 if ! command -v bun &>/dev/null; then
@@ -9,8 +9,6 @@ if ! command -v bun &>/dev/null; then
   export PATH="$HOME/.bun/bin:$PATH"
 fi
 
-echo "Installing setu..."
-bun install -g github:quivly/setu
-
+bun install -g 'git+ssh://git@github.com/quivly/setu.git'
 echo ""
 echo "✓ setu installed — run: setu setup"

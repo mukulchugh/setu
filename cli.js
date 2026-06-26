@@ -543,7 +543,7 @@ async function cmdPath([repo, name]) {
 
 async function cmdUpdate() {
   console.log('Updating setu...');
-  execSync('bun install -g github:quivly/setu', { stdio: 'inherit' });
+  execSync("bun install -g 'git+ssh://git@github.com/quivly/setu.git'", { stdio: 'inherit' });
   ok('setu updated');
 }
 
