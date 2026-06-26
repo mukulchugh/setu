@@ -543,13 +543,7 @@ async function cmdPath([repo, name]) {
 
 async function cmdUpdate() {
   console.log('Updating setu...');
-  const tmp = execSync('mktemp -d', { encoding: 'utf8' }).trim();
-  try {
-    execSync(`git clone git@github.com:quivly/setu.git ${tmp}/setu --quiet`, { stdio: 'inherit' });
-    execSync(`bun install -g ${tmp}/setu`, { stdio: 'inherit' });
-  } finally {
-    execSync(`rm -rf ${tmp}`, { stdio: 'ignore' });
-  }
+  execSync('bun install -g git@github.com:quivly/setu.git', { stdio: 'inherit' });
   ok('setu updated');
 }
 
