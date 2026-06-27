@@ -9,19 +9,26 @@ if ! command -v bun &>/dev/null; then
   export PATH="$HOME/.bun/bin:$PATH"
 fi
 
-if ! command -v gh &>/dev/null; then
-  echo "gh CLI required — install from https://cli.github.com then run: gh auth login"
-  exit 1
-fi
+SETU_DIR="$HOME/.setu"
 
-if [ -d "$HOME/.setu" ]; then
-  echo "Updating setu..."
-  git -C "$HOME/.setu" pull --quiet
-else
-  echo "Installing setu..."
-  gh repo clone quivly/setu "$HOME/.setu" -- --quiet
-fi
+clone_or_update() {
+  if [ -d "$SETU_DIR" ]; then
+    echo "Updating setu..."
+    git -C "$SETU_DIR" pull --quiet
+    return 0
+  fi
 
-cd "$HOME/.setu" && bun link
+  # Try gh first (HTTPS auth), fall back to SSH
+  if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    echo "Installing setu via gh..."
+    gh repo clone quivly/setu "$SETU_DIR" -- --quiet
+  else
+    echo "Installing setu via SSH..."
+    git clone git@github.com:quivly/setu.git "$SETU_DIR" --quiet
+  fi
+}
+
+clone_or_update
+cd "$SETU_DIR" && bun link
 echo ""
 echo "✓ setu ready — run: setu setup"
