@@ -385,7 +385,11 @@ async function cmdNew([repo, name, ...flags]) {
   writeCaddy(workspace, repo, name, port, withTunnel, c);
   caddyReload(workspace);
 
-  spawnSync('bun', ['install'], { cwd: wtDir, stdio: 'inherit' });
+  if (existsSync(join(wtDir, 'package.json'))) {
+    spawnSync('bun', ['install'], { cwd: wtDir, stdio: 'inherit' });
+  } else if (existsSync(join(wtDir, 'pyproject.toml')) || existsSync(join(wtDir, 'requirements.txt'))) {
+    spawnSync('uv', ['sync'], { cwd: wtDir, stdio: 'inherit' });
+  }
 
   console.log(`\n  ${G}✓${R} worktree  ${wtDir}`);
   console.log(`  ${G}✓${R} port      :${port}`);
