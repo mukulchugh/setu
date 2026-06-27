@@ -447,7 +447,12 @@ async function cmdInit([slug, label]) {
 
   if (!existsSync(repoDir)) {
     console.log(`  Cloning ${slug}...`);
-    execSync(`git clone --bare git@github.com:${slug}.git ${repoDir}`, { stdio: 'inherit' });
+    const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
+    if (useGh) {
+      execSync(`gh repo clone ${slug} ${repoDir} -- --bare`, { stdio: 'inherit' });
+    } else {
+      execSync(`git clone --bare git@github.com:${slug}.git ${repoDir}`, { stdio: 'inherit' });
+    }
     execSync(`git -C ${repoDir} config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'`);
     execSync(`git -C ${repoDir} fetch --all --prune`, { stdio: 'ignore' });
   }
