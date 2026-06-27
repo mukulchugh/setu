@@ -9,14 +9,19 @@ if ! command -v bun &>/dev/null; then
   export PATH="$HOME/.bun/bin:$PATH"
 fi
 
+if ! command -v gh &>/dev/null; then
+  echo "gh CLI required — install from https://cli.github.com then run: gh auth login"
+  exit 1
+fi
+
 if [ -d "$HOME/.setu" ]; then
   echo "Updating setu..."
   git -C "$HOME/.setu" pull --quiet
 else
   echo "Installing setu..."
-  git clone git@github.com:quivly/setu.git "$HOME/.setu" --quiet
+  gh repo clone quivly/setu "$HOME/.setu" -- --quiet
 fi
 
-cd "$HOME/.setu" && bun link --silent 2>/dev/null || bun link
+cd "$HOME/.setu" && bun link
 echo ""
 echo "✓ setu ready — run: setu setup"

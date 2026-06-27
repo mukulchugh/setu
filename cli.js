@@ -547,7 +547,7 @@ async function cmdUpdate() {
   if (existsSync(setuDir)) {
     execSync('git pull --quiet', { cwd: setuDir, stdio: 'inherit' });
   } else {
-    execSync(`git clone git@github.com:quivly/setu.git ${setuDir} --quiet`, { stdio: 'inherit' });
+    execSync(`gh repo clone quivly/setu ${setuDir} -- --quiet`, { stdio: 'inherit' });
   }
   execSync('bun link', { cwd: setuDir, stdio: 'inherit' });
   ok('setu updated');
