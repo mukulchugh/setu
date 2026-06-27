@@ -1,6 +1,6 @@
 # setu
 
-![setu](./banner.png)
+![setu](./banner.webp)
 
 Workspace bridge for Quivly engineers — git worktrees, local `.quivly.local` domains, and Cloudflare tunnels.
 
