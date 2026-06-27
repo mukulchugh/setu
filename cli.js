@@ -543,7 +543,13 @@ async function cmdPath([repo, name]) {
 
 async function cmdUpdate() {
   console.log('Updating setu...');
-  execSync('bun install -g git@github.com:quivly/setu.git', { stdio: 'inherit' });
+  const setuDir = join(HOME, '.setu');
+  if (existsSync(setuDir)) {
+    execSync('git pull --quiet', { cwd: setuDir, stdio: 'inherit' });
+  } else {
+    execSync(`git clone git@github.com:quivly/setu.git ${setuDir} --quiet`, { stdio: 'inherit' });
+  }
+  execSync('bun link', { cwd: setuDir, stdio: 'inherit' });
   ok('setu updated');
 }
 

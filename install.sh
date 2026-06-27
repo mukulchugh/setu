@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # setu — install
-# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh)
-# Or just: bun install -g git@github.com:quivly/setu.git && setu setup
+# curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash
 set -e
 
 if ! command -v bun &>/dev/null; then
@@ -10,6 +9,14 @@ if ! command -v bun &>/dev/null; then
   export PATH="$HOME/.bun/bin:$PATH"
 fi
 
-bun install -g git@github.com:quivly/setu.git
+if [ -d "$HOME/.setu" ]; then
+  echo "Updating setu..."
+  git -C "$HOME/.setu" pull --quiet
+else
+  echo "Installing setu..."
+  git clone git@github.com:quivly/setu.git "$HOME/.setu" --quiet
+fi
+
+cd "$HOME/.setu" && bun link --silent 2>/dev/null || bun link
 echo ""
-echo "✓ setu installed — run: setu setup"
+echo "✓ setu ready — run: setu setup"
