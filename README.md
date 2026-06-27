@@ -1,5 +1,7 @@
 # setu
 
+![setu](./banner.png)
+
 Workspace bridge for Quivly engineers — git worktrees, local `.quivly.local` domains, and Cloudflare tunnels.
 
 ## Install
