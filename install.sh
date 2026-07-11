@@ -14,7 +14,14 @@ SETU_DIR="$HOME/.setu"
 clone_or_update() {
   if [ -d "$SETU_DIR" ]; then
     echo "Updating setu..."
-    git -C "$SETU_DIR" pull --quiet
+    if [ -n "$(git -C "$SETU_DIR" status --porcelain)" ]; then
+      echo "  local edits found — stashing"
+      git -C "$SETU_DIR" stash push -m "setu-install $(date -u +%FT%TZ)"
+      git -C "$SETU_DIR" pull --rebase --quiet origin main
+      git -C "$SETU_DIR" stash pop || echo "  ⚠ stash pop conflicted — recover with: git -C ~/.setu stash pop"
+    else
+      git -C "$SETU_DIR" pull --rebase --quiet origin main
+    fi
     return 0
   fi
 
@@ -31,4 +38,4 @@ clone_or_update() {
 clone_or_update
 cd "$SETU_DIR" && bun link
 echo ""
-echo "✓ setu ready — run: setu setup"
+echo "✓ setu ready — run: setu setup   (or: setu setup --name <you> --yes for non-interactive)"

@@ -3,28 +3,27 @@
 // quivly internal tool — https://github.com/quivly/setu
 
 import readline from 'readline';
-import { execSync, execFileSync, spawnSync, spawn } from 'child_process';
+import { execFileSync, spawnSync, spawn } from 'child_process';
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
   mkdirSync, readdirSync, statSync, openSync, unlinkSync,
 } from 'fs';
-import { homedir } from 'os';
 import { join, resolve } from 'path';
+import {
+  HOME, CFG_PATH, SETU_DIR, PORTAL_PORT, HOSTS_TMP,
+  BREW_PREFIX, CADDY_BIN, CLOUDFLARED_BIN,
+  loadConfig, saveConfig, requireConfig,
+  localDomain, publicDomain, envLocalPath, parseEnvFile, tunnelEnabled,
+  writeCaddy, reloadCaddy, syncHosts,
+  portEntries, getPort, activePid, loadProjects, registerProject,
+  git, createWorktree, removeWorktree,
+  portalPid, portalRequest,
+} from './lib.js';
 
-// ── config ────────────────────────────────────────────────────────────────────
-
-const HOME     = homedir();
-const CFG_PATH = join(HOME, '.setu.json');
-const PKG_DIR  = new URL('.', import.meta.url).pathname; // setu package dir
-
-function loadConfig() {
-  try { return JSON.parse(readFileSync(CFG_PATH, 'utf8')); } catch { return {}; }
-}
+const PKG_DIR = new URL('.', import.meta.url).pathname;
 
 function cfg() {
-  const c = loadConfig();
-  if (!c.workspace) { die('Run `setu setup` first.'); }
-  return c;
+  try { return requireConfig(); } catch (e) { die(e.message); }
 }
 
 // ── ANSI ──────────────────────────────────────────────────────────────────────
@@ -54,24 +53,48 @@ function step(n, total, label) {
   console.log(`${B}[${n}/${total}] ${label}${R}`);
 }
 
+// ── args ──────────────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const args = [], flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++; }
+      else flags[key] = true;
+    } else args.push(a);
+  }
+  return { args, flags };
+}
+
 // ── router ────────────────────────────────────────────────────────────────────
 
-const [,, cmd, ...argv] = process.argv;
+const [,, cmdRaw, ...rest] = process.argv;
+const cmd = { '--version': 'version', '-v': 'version' }[cmdRaw] ?? cmdRaw;
+const { args, flags } = parseArgs(rest);
+const asJson = !!flags.json;
+
+// Passive staleness nudge — never on `path` (wt() consumes its stdout) or meta commands.
+if (!['path', 'update', 'setup', 'version', 'help', undefined].includes(cmd)) updateNudge();
 
 switch (cmd) {
-  case 'setup':  await cmdSetup(); break;
-  case 'new':    await cmdNew(argv); break;
-  case 'rm':     await cmdRm(argv); break;
-  case 'ls':     await cmdLs(argv); break;
-  case 'init':   await cmdInit(argv); break;
-  case 'status': await cmdStatus(); break;
-  case 'portal': await cmdPortal(argv); break;
-  case 'tunnel': await cmdTunnel(argv); break;
-  case 'trigger': await cmdTrigger(argv); break;
-  case 'fetch':  await cmdFetch(argv); break;
-  case 'path':   await cmdPath(argv); break;
-  case 'update': await cmdUpdate(); break;
-  default:       cmdHelp(); break;
+  case 'setup':   await cmdSetup(); break;
+  case 'new':     await cmdNew(); break;
+  case 'rm':      await cmdRm(); break;
+  case 'ls':      await cmdLs(); break;
+  case 'init':    await cmdInit(); break;
+  case 'status':  await cmdLs(); break;
+  case 'portal':  await cmdPortal(); break;
+  case 'tunnel':  await cmdTunnel(); break;
+  case 'trigger': await cmdTrigger(); break;
+  case 'fetch':   await cmdFetch(); break;
+  case 'path':    await cmdPath(); break;
+  case 'update':  await cmdUpdate(); break;
+  case 'doctor':  await cmdDoctor(); break;
+  case 'version': cmdVersion(); break;
+  default:        cmdHelp(); break;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -90,7 +113,7 @@ function brewInstall(pkg) {
   spin(pkg);
   if (brewInstalled(pkg)) { done(); return; }
   process.stdout.write('installing...  ');
-  try { execSync(`brew install ${pkg}`, { stdio: ['ignore', 'pipe', 'pipe'] }); done(); }
+  try { execFileSync('brew', ['install', pkg], { stdio: ['ignore', 'pipe', 'pipe'] }); done(); }
   catch { fail(`failed — run: brew install ${pkg}`); process.exit(1); }
 }
 
@@ -103,92 +126,35 @@ function ask(rl, question, defaultVal) {
   });
 }
 
-// worktree helpers
-function workspacePath(c, repo, name) {
-  return join(c.workspace, repo, name);
+function sudoTee(content, dest, mode) {
+  execFileSync('sudo', ['tee', dest], { input: content, stdio: ['pipe', 'ignore', 'inherit'] });
+  if (mode) execFileSync('sudo', ['chmod', mode, dest], { stdio: 'ignore' });
 }
 
-function envLocalPath(repo, wtDir) {
-  return repo === 'quivly-app'
-    ? join(wtDir, 'apps', 'quivly-app', '.env.local')
-    : join(wtDir, '.env.local');
-}
-
-function getPort(workspace, repo, name) {
-  const portsFile = join(workspace, '.ports');
-  if (!existsSync(portsFile)) return null;
-  const line = readFileSync(portsFile, 'utf8')
-    .split('\n').find(l => l.startsWith(`${repo}/${name}:`));
-  return line ? parseInt(line.split(':')[1]) : null;
-}
-
-function assignPort(workspace, repo, name) {
-  const portsFile  = join(workspace, '.ports');
-  const projectsFile = join(workspace, '.projects');
-
-  let existing = getPort(workspace, repo, name);
-  if (existing) return existing;
-
-  // base port from .projects
-  let base = 3200;
-  if (existsSync(projectsFile)) {
-    const line = readFileSync(projectsFile, 'utf8')
-      .split('\n').find(l => l.startsWith(`${repo}:`));
-    if (line) base = parseInt(line.split(':')[1]);
+async function ensurePortal(c) {
+  if (portalPid()) return;
+  const portalJs = join(PKG_DIR, 'portal.js');
+  if (!existsSync(portalJs)) die(`portal.js not found at ${portalJs}`);
+  const child = spawn('bun', ['run', portalJs], {
+    detached: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env, HOME },
+  });
+  child.unref();
+  for (let i = 0; i < 40; i++) {
+    try { await portalRequest('/api/worktrees'); return; } catch {}
+    await new Promise(r => setTimeout(r, 200));
   }
-
-  // find next free port
-  const usedPorts = existsSync(portsFile)
-    ? readFileSync(portsFile, 'utf8').split('\n')
-        .filter(Boolean).map(l => parseInt(l.split(':')[1]))
-    : [];
-
-  let port = base;
-  while (usedPorts.includes(port)) port++;
-
-  appendFileSync(portsFile, `${repo}/${name}:${port}\n`);
-  return port;
+  die('portal did not come up on :' + PORTAL_PORT);
 }
 
-function localDomain(repo, name) {
-  const slug = name.replace(/\//g, '-');
-  return name === 'main' ? `${repo}.quivly.local` : `${slug}.quivly.local`;
-}
-
-function publicDomain(c, repo, name) {
-  const slug = name.replace(/\//g, '-');
-  if (name === 'main') {
-    return repo === 'quivly-app' ? c.domain : `${repo}.${c.domain}`;
-  }
-  return repo === 'quivly-app'
-    ? `${slug}.${c.domain}`
-    : `${slug}--${repo}.${c.domain}`;
-}
-
-function writeEnvrc(wtDir, port, appUrl, redirectUri) {
-  writeFileSync(join(wtDir, '.envrc'),
-    `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`);
-  spawnSync('direnv', ['allow', wtDir], { stdio: 'ignore' });
-}
-
-function writeCaddy(workspace, repo, name, port, withTunnel, c) {
-  const ld = localDomain(repo, name);
-  const slug = name.replace(/\//g, '-');
-  const snippet = withTunnel
-    ? `http://${ld},\nhttp://${publicDomain(c, repo, name)} {\n  reverse_proxy localhost:${port}\n}\n`
-    : `http://${ld} {\n  reverse_proxy localhost:${port}\n}\n`;
-  writeFileSync(join(workspace, 'caddy.d', `${repo}-${slug}.caddy`), snippet);
-}
-
-function caddyReload(workspace) {
-  try {
-    execSync(`sudo caddy reload --config ${workspace}/Caddyfile 2>/dev/null`, { stdio: 'ignore' });
-  } catch {
-    console.warn(`  ${Y}⚠${R}  caddy reload failed — run manually`);
+function autoInstall(wtDir) {
+  if (existsSync(join(wtDir, 'package.json'))) {
+    spawnSync('bun', ['install'], { cwd: wtDir, stdio: 'inherit' });
+  } else if (existsSync(join(wtDir, 'pyproject.toml')) || existsSync(join(wtDir, 'requirements.txt'))) {
+    spawnSync('uv', ['sync'], { cwd: wtDir, stdio: 'inherit' });
   }
 }
 
-// ── setu setup ────────────────────────────────────────────────────────────────
+// ── setu setup [--name x] [--workspace p] [--zone z] [--yes] ─────────────────
 
 async function cmdSetup() {
   box('setu setup');
@@ -202,40 +168,41 @@ async function cmdSetup() {
   for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv']) brewInstall(pkg);
   console.log();
 
-  // 2. configure
+  // 2. configure — flags first, prompts only for what's missing (agents pass flags)
   step(2, 7, 'Configuration');
   const existing = loadConfig();
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  let input;
-  try {
-    const nameDefault = existing.tunnel ? existing.tunnel.replace(/^dev-/, '') : '';
-    const name = await ask(rl, 'Your name (e.g. "alice" → tunnel dev-alice)', nameDefault);
-    if (!name) die('Name is required.');
+  let name      = flags.name ?? (existing.tunnel ? existing.tunnel.replace(/^dev-/, '') : '');
+  let workspace = resolvePath(flags.workspace ?? existing.workspace ?? join(HOME, 'workspace'));
+  let zone      = flags.zone ?? existing.domain?.split('.').slice(1).join('.') ?? 'getquivly.ai';
 
-    const wsRaw = await ask(rl, 'Workspace path', existing.workspace?.replace(HOME, '~') ?? '~/workspace');
-    const workspace = resolvePath(wsRaw);
-
-    const zoneDefault = existing.domain?.split('.').slice(1).join('.') ?? 'getquivly.ai';
-    const zone = await ask(rl, 'Zone domain', zoneDefault);
-
-    input = { name, workspace, zone, tunnel: `dev-${name}`, domain: `dev-${name}.${zone}` };
-  } finally { rl.close(); }
+  const interactive = process.stdin.isTTY && !flags.yes;
+  if (interactive) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      name      = await ask(rl, 'Your name (e.g. "alice" → tunnel dev-alice)', name);
+      workspace = resolvePath(await ask(rl, 'Workspace path', workspace.replace(HOME, '~')));
+      zone      = await ask(rl, 'Zone domain', zone);
+    } finally { rl.close(); }
+  }
+  if (!name) die('Name is required — pass --name <you> (non-interactive) or run in a terminal.');
+  const input = { name, workspace, zone, tunnel: `dev-${name}`, domain: `dev-${name}.${zone}` };
+  ok(`${input.tunnel} → ${input.domain}, workspace ${workspace}`);
   console.log();
 
   // 3. Cloudflare
   step(3, 7, 'Cloudflare tunnel');
   if (!existsSync(join(HOME, '.cloudflared', 'cert.pem'))) {
     process.stdout.write(`  ${GR}○${R} Logging in to Cloudflare...  `);
-    execSync('cloudflared tunnel login', { stdio: 'inherit' });
+    execFileSync(CLOUDFLARED_BIN, ['tunnel', 'login'], { stdio: 'inherit' });
     done();
   } else {
     ok('already authenticated');
   }
 
   spin(`tunnel ${input.tunnel}`);
-  const listOut = execSync('cloudflared tunnel list', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const listOut = execFileSync(CLOUDFLARED_BIN, ['tunnel', 'list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   if (!listOut.split('\n').some(l => l.includes(` ${input.tunnel} `))) {
-    execSync(`cloudflared tunnel create ${input.tunnel}`, { stdio: 'ignore' });
+    execFileSync(CLOUDFLARED_BIN, ['tunnel', 'create', input.tunnel], { stdio: 'ignore' });
     done();
   } else {
     process.stdout.write(`${G}✓${R} already exists\n`);
@@ -250,8 +217,8 @@ async function cmdSetup() {
 
   spin(`DNS *.${input.domain}`);
   try {
-    execSync(`cloudflared tunnel route dns ${input.tunnel} '${input.domain}'`, { stdio: 'ignore' });
-    execSync(`cloudflared tunnel route dns ${input.tunnel} '*.${input.domain}'`, { stdio: 'ignore' });
+    execFileSync(CLOUDFLARED_BIN, ['tunnel', 'route', 'dns', input.tunnel, input.domain], { stdio: 'ignore' });
+    execFileSync(CLOUDFLARED_BIN, ['tunnel', 'route', 'dns', input.tunnel, `*.${input.domain}`], { stdio: 'ignore' });
     done();
   } catch {
     process.stdout.write(`${G}✓${R} already configured\n`);
@@ -261,16 +228,19 @@ async function cmdSetup() {
   // 4. DNS & proxy
   step(4, 7, 'DNS & proxy');
   spin('dnsmasq');
-  const dnsConf = '/opt/homebrew/etc/dnsmasq.conf';
+  const dnsConf = join(BREW_PREFIX, 'etc', 'dnsmasq.conf');
   const dnsText = existsSync(dnsConf) ? readFileSync(dnsConf, 'utf8') : '';
   if (!dnsText.includes('address=/.quivly.local/127.0.0.1'))
     appendFileSync(dnsConf, '\naddress=/.quivly.local/127.0.0.1\n');
-  execSync('brew services restart dnsmasq', { stdio: 'ignore' });
-  done();
+  // port 53 needs root — a user-level dnsmasq service silently fails to bind
+  try {
+    execFileSync('sudo', ['brew', 'services', 'restart', 'dnsmasq'], { stdio: ['inherit', 'ignore', 'ignore'] });
+    done();
+  } catch { fail('failed — run: sudo brew services restart dnsmasq'); }
 
   spin('/etc/resolver/quivly.local');
-  execSync('sudo mkdir -p /etc/resolver', { stdio: 'ignore' });
-  execSync('echo "nameserver 127.0.0.1" | sudo tee /etc/resolver/quivly.local > /dev/null');
+  execFileSync('sudo', ['mkdir', '-p', '/etc/resolver'], { stdio: 'ignore' });
+  sudoTee('nameserver 127.0.0.1\n', '/etc/resolver/quivly.local');
   done();
 
   spin('Caddyfile');
@@ -280,42 +250,37 @@ async function cmdSetup() {
   if (!existsSync(caddyfile))
     writeFileSync(caddyfile, `{ auto_https off }\nimport ${input.workspace}/caddy.d/*.caddy\n`);
   done();
+
+  spin('caddy service');
+  const services = execFileSync('brew', ['services', 'list'], { encoding: 'utf8' });
+  if (!/^caddy\s+started/m.test(services)) {
+    try { execFileSync('brew', ['services', 'restart', 'caddy'], { stdio: 'ignore' }); done(); }
+    catch { fail('failed — run: brew services restart caddy'); }
+  } else {
+    process.stdout.write(`${G}✓${R} already running\n`);
+  }
   console.log();
 
-  // 5. /etc/hosts
-  step(5, 7, '/etc/hosts');
-  spin('127.0.0.1 quivly.local');
-  const hosts = readFileSync('/etc/hosts', 'utf8');
-  if (!hosts.includes('quivly.local'))
-    execSync('echo "127.0.0.1  quivly.local" | sudo tee -a /etc/hosts > /dev/null');
-  done();
-  console.log();
-
-  // 6. Passwordless sudo
-  step(6, 7, 'Passwordless sudo');
-  const user    = execSync('whoami', { encoding: 'utf8' }).trim();
-  const caddyBin = '/opt/homebrew/bin/caddy';
+  // 5. Passwordless sudo — rules must match EXACTLY what lib.js runs
+  step(5, 7, 'Passwordless sudo');
+  const user = execFileSync('whoami', { encoding: 'utf8' }).trim();
   spin('caddy reload');
-  const caddyRule = `${user} ALL=(ALL) NOPASSWD: ${caddyBin} reload --config ${input.workspace}/Caddyfile`;
-  execSync(`echo "${caddyRule}" | sudo tee /etc/sudoers.d/caddy-setu-${user} > /dev/null`);
-  execSync(`sudo chmod 440 /etc/sudoers.d/caddy-setu-${user}`, { stdio: 'ignore' });
+  const caddyRule = `${user} ALL=(ALL) NOPASSWD: ${CADDY_BIN} reload --config ${input.workspace}/Caddyfile`;
+  sudoTee(caddyRule + '\n', `/etc/sudoers.d/caddy-setu-${user}`, '440');
   done();
 
   spin('/etc/hosts sync');
-  const hostsRule = `${user} ALL=(ALL) NOPASSWD: /bin/cp /tmp/setu-hosts /etc/hosts`;
-  execSync(`echo "${hostsRule}" | sudo tee /etc/sudoers.d/setu-hosts-${user} > /dev/null`);
-  execSync(`sudo chmod 440 /etc/sudoers.d/setu-hosts-${user}`, { stdio: 'ignore' });
+  const hostsRule = `${user} ALL=(ALL) NOPASSWD: /bin/cp ${HOSTS_TMP} /etc/hosts`;
+  sudoTee(hostsRule + '\n', `/etc/sudoers.d/setu-hosts-${user}`, '440');
   done();
   console.log();
 
-  // 7. config + shell
-  step(7, 7, 'Shell & config');
-  const finalCfg = { workspace: input.workspace, tunnel: input.tunnel, domain: input.domain, cfCredentials };
+  // 6. config + shell
+  step(6, 7, 'Shell & config');
   spin('~/.setu.json');
-  writeFileSync(CFG_PATH, JSON.stringify(finalCfg, null, 2) + '\n');
+  saveConfig({ workspace: input.workspace, tunnel: input.tunnel, domain: input.domain, cfCredentials });
   done();
 
-  // Minimal shell injection — just the cd shortcut
   spin('~/.zshrc');
   const zshrc = join(HOME, '.zshrc');
   const START = '# setu start';
@@ -332,138 +297,86 @@ async function cmdSetup() {
   done();
   console.log();
 
+  // 7. first hosts sync
+  step(7, 7, 'Verify');
+  syncHosts(input.workspace) ? ok('/etc/hosts synced') : fail('/etc/hosts sync');
+  console.log();
+
   box('All done!');
   console.log(`  ${G}1.${R} source ~/.zshrc`);
   console.log(`  ${G}2.${R} setu portal`);
   console.log(`  ${G}3.${R} open http://quivly.local`);
   console.log(`  ${G}4.${R} setu init quivly/quivly-app`);
   console.log();
-  console.log(`  ${GR}run \`setu help\` for all commands${R}\n`);
+  console.log(`  ${GR}run \`setu doctor\` if anything misbehaves${R}\n`);
 }
 
-// ── setu new <repo> <branch> [--tunnel] ──────────────────────────────────────
+// ── setu new <repo> <branch> [--tunnel] [--json] ─────────────────────────────
 
-function findWorktreeForBranch(porcelain, branchName) {
-  for (const entry of porcelain.trim().split('\n\n')) {
-    const path   = entry.match(/^worktree (.+)$/m)?.[1];
-    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
-    if (branch === branchName) return path;
-  }
-  return null;
-}
-
-async function cmdNew([repo, name, ...flags]) {
-  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel]');
+async function cmdNew() {
+  const [repo, name] = args;
+  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel] [--json]');
   const c = cfg();
-  const withTunnel = flags.includes('--tunnel');
-  const workspace = c.workspace;
-  const repoDir = join(workspace, `${repo}.git`);
-  const wtDir   = join(workspace, repo, name);
+  const withTunnel = !!flags.tunnel;
 
-  if (!existsSync(repoDir)) die(`Bare repo not found: ${repoDir}\nRun: setu init <gh-slug>`);
+  let res;
+  try { res = createWorktree(c, repo, name, { tunnel: withTunnel }); }
+  catch (e) { die(e.message); }
 
-  execSync(`git -C ${repoDir} fetch --all --prune`, { stdio: 'ignore' });
-  execSync(`git -C ${repoDir} worktree prune`, { stdio: 'ignore' });
+  if (withTunnel) await ensureTunnel(c, repo, name);
+  autoInstall(res.wtDir);
 
-  if (!existsSync(wtDir)) {
-    const porcelain = execSync(`git -C ${repoDir} worktree list --porcelain`, { encoding: 'utf8' });
-    const existingPath = findWorktreeForBranch(porcelain, name);
-    if (existingPath && resolve(existingPath) !== resolve(wtDir)) {
-      const existingRepo = existingPath.split('/').slice(-2)[0];
-      const existingName  = existingPath.split('/').pop();
-      die(`Branch '${name}' is already checked out at ${existingPath}\n  → wt ${existingRepo} ${existingName}`);
-    }
-
-    const hasBranch =
-      spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`]).status === 0 ||
-      spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', `refs/remotes/origin/${name}`]).status === 0;
-
-    if (hasBranch) {
-      execSync(`git -C ${repoDir} worktree add ${wtDir} ${name}`);
-    } else {
-      execSync(`git -C ${repoDir} worktree add ${wtDir} -b ${name} origin/staging`);
-    }
-  }
-
-  const port = assignPort(workspace, repo, name);
-  const ld   = localDomain(repo, name);
-  const pd   = publicDomain(c, repo, name);
-
-  if (withTunnel) {
-    writeEnvrc(wtDir, port, `https://${pd}`, `https://${pd}/authentication/callback`);
-  } else {
-    writeEnvrc(wtDir, port, `http://${ld}`, `http://localhost:${port}/authentication/callback`);
-  }
-
-  // Symlink shared .env.local from main
-  const mainEnv = envLocalPath(repo, join(workspace, repo, 'main'));
-  const wtEnv   = envLocalPath(repo, wtDir);
-  if (existsSync(mainEnv) && !existsSync(wtEnv)) {
-    spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
-  }
-
-  writeCaddy(workspace, repo, name, port, withTunnel, c);
-  caddyReload(workspace);
-
-  if (existsSync(join(wtDir, 'package.json'))) {
-    spawnSync('bun', ['install'], { cwd: wtDir, stdio: 'inherit' });
-  } else if (existsSync(join(wtDir, 'pyproject.toml')) || existsSync(join(wtDir, 'requirements.txt'))) {
-    spawnSync('uv', ['sync'], { cwd: wtDir, stdio: 'inherit' });
-  }
-
-  console.log(`\n  ${G}✓${R} worktree  ${wtDir}`);
-  console.log(`  ${G}✓${R} port      :${port}`);
-  console.log(`  ${G}✓${R} local     http://${ld}`);
-  if (withTunnel) console.log(`  ${G}✓${R} public    https://${pd}`);
+  if (asJson) { console.log(JSON.stringify(res)); return; }
+  console.log(`\n  ${G}✓${R} worktree  ${res.wtDir}`);
+  console.log(`  ${G}✓${R} port      :${res.port}`);
+  console.log(`  ${G}✓${R} local     http://${res.localDom}`);
+  if (withTunnel) console.log(`  ${G}✓${R} public    https://${res.pubDom}`);
   console.log();
 }
 
 // ── setu rm <repo> <branch> ───────────────────────────────────────────────────
 
-async function cmdRm([repo, name]) {
+async function cmdRm() {
+  const [repo, name] = args;
   if (!repo || !name) die('Usage: setu rm <repo> <branch>');
   const c = cfg();
-  const repoDir = join(c.workspace, `${repo}.git`);
-  const wtDir   = join(c.workspace, repo, name);
-  const slug    = name.replace(/\//g, '-');
-
-  execSync(`git -C ${repoDir} worktree remove ${wtDir} --force`, { stdio: 'inherit' });
-
-  const portsFile = join(c.workspace, '.ports');
-  if (existsSync(portsFile)) {
-    const lines = readFileSync(portsFile, 'utf8').split('\n')
-      .filter(l => !l.startsWith(`${repo}/${name}:`));
-    writeFileSync(portsFile, lines.join('\n'));
+  // Portal owns dev-server/tunnel processes — let it stop them + clean up
+  if (portalPid()) {
+    const res = await portalRequest('/api/remove', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+    if (!res.ok) die(res.error ?? 'remove failed');
+  } else {
+    try { removeWorktree(c, repo, name); } catch (e) { die(e.message); }
   }
-
-  const caddy = join(c.workspace, 'caddy.d', `${repo}-${slug}.caddy`);
-  if (existsSync(caddy)) { (await import('fs')).unlinkSync(caddy); }
-
-  caddyReload(c.workspace);
   ok(`removed ${repo}/${name}`);
 }
 
-// ── setu ls [repo] ────────────────────────────────────────────────────────────
+// ── setu ls [repo] [--json] ───────────────────────────────────────────────────
 
-async function cmdLs([repo]) {
+async function cmdLs() {
+  const [repo] = args;
   const c = cfg();
-  const portsFile = join(c.workspace, '.ports');
-  if (!existsSync(portsFile)) { console.log('No worktrees yet.'); return; }
+  const entries = portEntries(c.workspace).filter(e => !repo || e.repo === repo);
+  if (!entries.length) { asJson ? console.log('[]') : console.log('No worktrees yet.'); return; }
 
-  const ports = readFileSync(portsFile, 'utf8').split('\n').filter(Boolean);
-  for (const line of ports) {
-    if (repo && !line.startsWith(`${repo}/`)) continue;
-    const [key, port] = line.split(':');
-    const pid = spawnSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'], { stdio: ['ignore', 'pipe', 'ignore'] })
-      .stdout?.toString().trim();
-    const state = pid ? `${G}●${R} running` : `${GR}○${R} stopped`;
-    console.log(`  ${state}  ${key}  :${port}`);
+  const rows = entries.map(e => ({
+    ...e,
+    running: !!activePid(e.port),
+    wtDir: join(c.workspace, e.repo, e.name),
+    localDomain: localDomain(e.repo, e.name),
+    tunnel: tunnelEnabled(join(c.workspace, e.repo, e.name), c),
+  }));
+
+  if (asJson) { console.log(JSON.stringify(rows, null, 2)); return; }
+  for (const r of rows) {
+    const state = r.running ? `${G}●${R} running` : `${GR}○${R} stopped`;
+    console.log(`  ${state}  ${r.key}  :${r.port}${r.tunnel ? `  ${C}⇄ ${publicDomain(c)}${R}` : ''}`);
   }
 }
 
-// ── setu init <gh-slug> ───────────────────────────────────────────────────────
+// ── setu init <gh-slug> [label] ───────────────────────────────────────────────
 
-async function cmdInit([slug, label]) {
+async function cmdInit() {
+  const [slug, label] = args;
   if (!slug) die('Usage: setu init quivly/quivly-app [label]');
   const c = cfg();
   const repo    = slug.split('/').pop();
@@ -473,43 +386,28 @@ async function cmdInit([slug, label]) {
     console.log(`  Cloning ${slug}...`);
     const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
     if (useGh) {
-      execSync(`gh repo clone ${slug} ${repoDir} -- --bare`, { stdio: 'inherit' });
+      execFileSync('gh', ['repo', 'clone', slug, repoDir, '--', '--bare'], { stdio: 'inherit' });
     } else {
-      execSync(`git clone --bare git@github.com:${slug}.git ${repoDir}`, { stdio: 'inherit' });
+      execFileSync('git', ['clone', '--bare', `git@github.com:${slug}.git`, repoDir], { stdio: 'inherit' });
     }
-    execSync(`git -C ${repoDir} config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'`);
-    execSync(`git -C ${repoDir} fetch --all --prune`, { stdio: 'ignore' });
+    git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
+    git(repoDir, ['fetch', '--all', '--prune']);
   }
 
-  // Register in .projects
-  const projectsFile = join(c.workspace, '.projects');
-  const projectsText = existsSync(projectsFile) ? readFileSync(projectsFile, 'utf8') : '';
-  if (!projectsText.includes(`${repo}:`)) {
-    let base = 3000;
-    const taken = projectsText.split('\n').filter(Boolean)
-      .map(l => parseInt(l.split(':')[1])).filter(n => !isNaN(n));
-    while (taken.includes(base)) base += 100;
-    appendFileSync(projectsFile, `${repo}:${base}:${slug}:${label ?? repo}\n`);
-  }
-
-  await cmdNew([repo, 'main']);
-}
-
-// ── setu status ───────────────────────────────────────────────────────────────
-
-async function cmdStatus() {
-  await cmdLs([]);
+  registerProject(c.workspace, { name: repo, slug, label });
+  args.length = 0; args.push(repo, 'main');
+  await cmdNew();
 }
 
 // ── setu portal [stop] ────────────────────────────────────────────────────────
 
-async function cmdPortal([action]) {
+async function cmdPortal() {
+  const [action] = args;
   const c = cfg();
-  const pid = spawnSync('lsof', ['-i', ':2999', '-sTCP:LISTEN', '-t'],
-    { stdio: ['ignore', 'pipe', 'ignore'] }).stdout?.toString().trim();
+  const pid = portalPid();
 
   if (action === 'stop') {
-    if (pid) { execSync(`kill ${pid}`); ok('Portal stopped'); }
+    if (pid) { execFileSync('kill', [pid]); ok('Portal stopped'); }
     else console.log('Portal not running.');
     return;
   }
@@ -519,36 +417,38 @@ async function cmdPortal([action]) {
     return;
   }
 
-  const portalJs = join(PKG_DIR, 'portal.js');
-  if (!existsSync(portalJs)) die(`portal.js not found at ${portalJs}`);
-
-  const child = spawn('bun', ['run', portalJs], {
-    detached: true,
-    stdio: ['ignore', 'ignore', 'ignore'],
-    env: { ...process.env, HOME },
-  });
-  child.unref();
-
-  caddyReload(c.workspace);
+  await ensurePortal(c);
+  reloadCaddy(c.workspace);
   ok('Portal → http://quivly.local');
 }
 
-// ── setu tunnel <repo> <branch> ───────────────────────────────────────────────
+// ── setu tunnel <repo> <branch> [stop] ────────────────────────────────────────
+// The portal owns the cloudflared process — the CLI just asks it.
 
-async function cmdTunnel([repo, name]) {
-  if (!repo || !name) die('Usage: setu tunnel <repo> <branch>');
-  const c    = cfg();
-  const port = getPort(c.workspace, repo, name);
-  if (!port) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
+async function ensureTunnel(c, repo, name) {
+  await ensurePortal(c);
+  const res = await portalRequest('/api/tunnel/enable', { repo, name })
+    .catch(e => ({ ok: false, error: String(e) }));
+  if (!res.ok) die(res.error ?? 'tunnel enable failed');
+}
 
-  const ld = localDomain(repo, name);
-  const pd = publicDomain(c, repo, name);
+async function cmdTunnel() {
+  const [repo, name, action] = args;
+  if (!repo || !name) die('Usage: setu tunnel <repo> <branch> [stop]');
+  const c = cfg();
+  if (!getPort(c.workspace, repo, name)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
 
-  writeEnvrc(join(c.workspace, repo, name), port,
-    `https://${pd}`, `https://${pd}/authentication/callback`);
-  writeCaddy(c.workspace, repo, name, port, true, c);
-  caddyReload(c.workspace);
-  ok(`Public → https://${pd}`);
+  if (action === 'stop') {
+    if (!portalPid()) { console.log('Portal not running — tunnel already down.'); return; }
+    const res = await portalRequest('/api/tunnel/disable', { repo, name })
+      .catch(e => ({ ok: false, error: String(e) }));
+    if (!res.ok) die(res.error ?? 'tunnel disable failed');
+    ok(`tunnel disabled for ${repo}/${name}`);
+    return;
+  }
+
+  await ensureTunnel(c, repo, name);
+  ok(`Public → https://${publicDomain(c)}  (now pointing at ${repo}/${name})`);
 }
 
 // ── setu trigger <repo> <branch> [stop] ──────────────────────────────────────
@@ -582,24 +482,11 @@ function pinnedTriggerVersion(wtDir) {
   } catch { return 'latest'; }
 }
 
-// `trigger dev` runs from the repo root, but the shared .env.local (Supabase
-// keys etc. that trigger tasks import at load time) lives at envLocalPath() —
-// a plain spawn() won't pick that up the way `next dev`/direnv would.
-function readEnvFile(path) {
-  if (!existsSync(path)) return {};
-  const out = {};
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
-    if (!line.trim() || line.trim().startsWith('#')) continue;
-    const m = line.match(/^\s*([\w.-]+)\s*=\s*(.*?)\s*$/);
-    if (m) out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
-  }
-  return out;
-}
-
-async function cmdTrigger([repo, name, action]) {
+async function cmdTrigger() {
+  const [repo, name, action] = args;
   if (!repo || !name) die('Usage: setu trigger <repo> <branch> [stop]');
   const c = cfg();
-  const wtDir = workspacePath(c, repo, name);
+  const wtDir = join(c.workspace, repo, name);
   if (!existsSync(wtDir)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
 
   const { pidFile, logFile } = triggerLogPaths(c.workspace, repo, name);
@@ -621,7 +508,9 @@ async function cmdTrigger([repo, name, action]) {
   mkdirSync(join(c.workspace, 'logs'), { recursive: true });
   const out = openSync(logFile, 'a');
   const version = pinnedTriggerVersion(wtDir);
-  const env = { ...process.env, ...readEnvFile(envLocalPath(repo, wtDir)) };
+  // trigger tasks import Supabase keys etc. from the shared .env.local at load
+  // time — a plain spawn() won't pick that up the way `next dev`/direnv would.
+  const env = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
   const child = spawn('bunx', [`trigger.dev@${version}`, 'dev'], {
     cwd: wtDir,
     detached: true,
@@ -637,38 +526,190 @@ async function cmdTrigger([repo, name, action]) {
 
 // ── setu fetch <repo> ─────────────────────────────────────────────────────────
 
-async function cmdFetch([repo]) {
+async function cmdFetch() {
+  const [repo] = args;
   if (!repo) die('Usage: setu fetch <repo>');
   const c = cfg();
-  execSync(`git -C ${join(c.workspace, `${repo}.git`)} fetch --all --prune`, { stdio: 'inherit' });
+  execFileSync('git', ['-C', join(c.workspace, `${repo}.git`), 'fetch', '--all', '--prune'], { stdio: 'inherit' });
 }
 
 // ── setu path <repo> <branch> ────────────────────────────────────────────────
-// Used by the `wt()` shell function to cd into a worktree
+// Used by the `wt()` shell function to cd into a worktree — stdout must stay clean.
 
-async function cmdPath([repo, name]) {
+async function cmdPath() {
+  const [repo, name] = args;
   if (!repo || !name) die('Usage: setu path <repo> <branch>');
   const c = cfg();
-  process.stdout.write(join(c.workspace, repo, name) + '\n');
+  const p = join(c.workspace, repo, name);
+  if (!existsSync(p)) die(`No worktree at ${p} — run: setu new ${repo} ${name}`);
+  process.stdout.write(p + '\n');
 }
 
 // ── setu update ───────────────────────────────────────────────────────────────
 
+function setuGit(argv, opts = {}) {
+  return execFileSync('git', ['-C', SETU_DIR, ...argv], { encoding: 'utf8', ...opts });
+}
+
 async function cmdUpdate() {
   console.log('Updating setu...');
-  const setuDir = join(HOME, '.setu');
-  if (existsSync(setuDir)) {
-    execSync('git pull --quiet', { cwd: setuDir, stdio: 'inherit' });
-  } else {
+  if (!existsSync(join(SETU_DIR, '.git'))) {
     const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
-    if (useGh) {
-      execSync(`gh repo clone quivly/setu ${setuDir} -- --quiet`, { stdio: 'inherit' });
+    if (useGh) execFileSync('gh', ['repo', 'clone', 'quivly/setu', SETU_DIR, '--', '--quiet'], { stdio: 'inherit' });
+    else execFileSync('git', ['clone', 'git@github.com:quivly/setu.git', SETU_DIR, '--quiet'], { stdio: 'inherit' });
+  } else {
+    setuGit(['fetch', 'origin', '--quiet']);
+    const behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10);
+    const before = setuGit(['rev-parse', 'HEAD']).trim();
+
+    const dirty = setuGit(['status', '--porcelain']).trim() !== '';
+    if (dirty) {
+      console.log(`  ${Y}⚠${R}  local edits in ~/.setu — stashing before update`);
+      setuGit(['stash', 'push', '-m', `setu-update ${new Date().toISOString()}`]);
+    }
+    try {
+      setuGit(['pull', '--rebase', '--quiet', 'origin', 'main'], { stdio: ['ignore', 'inherit', 'inherit'] });
+    } catch {
+      if (dirty) setuGit(['stash', 'pop']);
+      die('pull failed — fix ~/.setu manually (git -C ~/.setu status)');
+    }
+    if (dirty) {
+      try { setuGit(['stash', 'pop']); ok('local edits restored'); }
+      catch {
+        console.error(`  ${Y}⚠${R}  your local edits conflict with the update — they are saved in the stash.`);
+        console.error(`     recover with: git -C ~/.setu stash show -p && git -C ~/.setu stash pop`);
+      }
+    }
+
+    if (behind > 0) {
+      console.log(`\n  ${B}What's new:${R}`);
+      for (const l of setuGit(['log', '--oneline', `${before}..HEAD`]).trim().split('\n').filter(Boolean))
+        console.log(`  ${GR}·${R} ${l}`);
+      console.log();
     } else {
-      execSync(`git clone git@github.com:quivly/setu.git ${setuDir} --quiet`, { stdio: 'inherit' });
+      ok('already up to date');
     }
   }
-  execSync('bun link', { cwd: setuDir, stdio: 'inherit' });
+
+  execFileSync('bun', ['link'], { cwd: SETU_DIR, stdio: 'ignore' });
+
+  // A running portal keeps serving old code — restart it
+  const pid = portalPid();
+  if (pid) {
+    execFileSync('kill', [pid]);
+    await new Promise(r => setTimeout(r, 500));
+    const c = loadConfig();
+    if (c.workspace) { await ensurePortal(c); ok('portal restarted'); }
+  }
+  const cNudge = loadConfig();
+  saveConfig({ ...cNudge, lastUpdateCheck: Date.now() });
   ok('setu updated');
+}
+
+// Once a day: report staleness from the last fetch, then refresh refs in the
+// background so tomorrow's check is current. Never blocks, never prompts.
+function updateNudge() {
+  try {
+    const c = loadConfig();
+    if (!existsSync(join(SETU_DIR, '.git'))) return;
+    if (Date.now() - (c.lastUpdateCheck ?? 0) < 24 * 60 * 60 * 1000) return;
+    saveConfig({ ...c, lastUpdateCheck: Date.now() });
+    const behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10);
+    if (behind > 0)
+      console.error(`${GR}setu is ${behind} commit${behind > 1 ? 's' : ''} behind — run \`setu update\`${R}`);
+    const child = spawn('git', ['-C', SETU_DIR, 'fetch', 'origin', '--quiet'],
+      { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {}
+}
+
+// ── setu version ──────────────────────────────────────────────────────────────
+
+function cmdVersion() {
+  const pkg = JSON.parse(readFileSync(join(PKG_DIR, 'package.json'), 'utf8'));
+  let sha = '';
+  try { sha = setuGit(['rev-parse', '--short', 'HEAD']).trim(); } catch {}
+  console.log(`setu ${pkg.version}${sha ? ` (${sha})` : ''}`);
+}
+
+// ── setu doctor [--json] ──────────────────────────────────────────────────────
+
+async function cmdDoctor() {
+  const checks = [];
+  const check = (name, okVal, fix) => checks.push({ name, ok: !!okVal, fix: okVal ? undefined : fix });
+
+  // deps
+  for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv'])
+    check(`brew: ${pkg}`, brewInstalled(pkg), `brew install ${pkg}`);
+
+  // config
+  const c = loadConfig();
+  check('config ~/.setu.json', c.workspace && c.domain && c.tunnel, 'setu setup');
+  const workspace = c.workspace ?? '';
+
+  // dnsmasq service healthy + actually resolving
+  const services = (() => { try { return execFileSync('brew', ['services', 'list'], { encoding: 'utf8' }); } catch { return ''; } })();
+  const dnsmasqLine = services.split('\n').find(l => l.startsWith('dnsmasq')) ?? '';
+  check('dnsmasq service', /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
+    'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq');
+  const digOut = spawnSync('dig', ['+short', '+time=1', '+tries=1', 'test.quivly.local', '@127.0.0.1'],
+    { encoding: 'utf8' });
+  check('dnsmasq resolves *.quivly.local', digOut.stdout?.includes('127.0.0.1'),
+    'sudo brew services restart dnsmasq (then re-check)');
+  check('/etc/resolver/quivly.local', existsSync('/etc/resolver/quivly.local'), 'setu setup');
+
+  // caddy
+  check('caddy service', /^caddy\s+started/m.test(services), 'brew services restart caddy');
+  const caddyAdmin = await fetch('http://localhost:2019/config/', { signal: AbortSignal.timeout(1500) })
+    .then(r => r.ok).catch(() => false);
+  check('caddy admin API (:2019)', caddyAdmin, 'brew services restart caddy');
+
+  // sudoers rules match what lib.js actually runs (sudo -l checks without executing)
+  const sudoOk = (argv) => spawnSync('sudo', ['-n', '-l', ...argv], { stdio: 'ignore' }).status === 0;
+  check('sudoers: caddy reload', workspace && sudoOk([CADDY_BIN, 'reload', '--config', join(workspace, 'Caddyfile')]),
+    'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)');
+  check('sudoers: hosts sync', sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']),
+    'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)');
+
+  // /etc/hosts actually has our block
+  check('/etc/hosts quivly block', readFileSync('/etc/hosts', 'utf8').includes('# quivly-start'),
+    'setu new <repo> <branch> (or any command that syncs hosts)');
+
+  // cloudflared
+  check('cloudflared cert', existsSync(join(HOME, '.cloudflared', 'cert.pem')), 'cloudflared tunnel login');
+  if (c.tunnel) {
+    const tl = spawnSync(CLOUDFLARED_BIN, ['tunnel', 'list'], { encoding: 'utf8' });
+    check(`tunnel ${c.tunnel} exists`, tl.stdout?.split('\n').some(l => l.includes(` ${c.tunnel} `)),
+      `cloudflared tunnel create ${c.tunnel}`);
+  }
+
+  // setu repo hygiene
+  if (existsSync(join(SETU_DIR, '.git'))) {
+    check('~/.setu clean', setuGit(['status', '--porcelain']).trim() === '',
+      'git -C ~/.setu status — commit or stash local edits');
+    let behind = 0;
+    try { behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10); } catch {}
+    check('setu up to date', behind === 0, 'setu update');
+  }
+
+  // portal
+  const portalUp = await portalRequest('/api/worktrees').then(() => true).catch(() => false);
+  check('portal (:2999)', portalUp, 'setu portal');
+
+  if (asJson) {
+    console.log(JSON.stringify(checks, null, 2));
+    process.exit(checks.every(x => x.ok) ? 0 : 1);
+  }
+
+  console.log();
+  for (const x of checks) {
+    if (x.ok) ok(x.name);
+    else console.log(`  ${Y}✗${R} ${x.name}  ${GR}→ ${x.fix}${R}`);
+  }
+  const bad = checks.filter(x => !x.ok).length;
+  console.log();
+  console.log(bad === 0 ? `  ${G}all checks passed${R}\n` : `  ${Y}${bad} problem${bad > 1 ? 's' : ''} found${R}\n`);
+  process.exit(bad === 0 ? 0 : 1);
 }
 
 // ── setu help ─────────────────────────────────────────────────────────────────
@@ -678,20 +719,23 @@ function cmdHelp() {
   ${B}setu${R} — workspace bridge for quivly developers
 
   ${C}Setup${R}
-    setu setup                       First-time onboarding
+    setu setup                       First-time onboarding (interactive)
+    setu setup --name x [--yes]      Non-interactive (agents / scripts)
+    setu doctor [--json]             Check every layer, print fixes
 
   ${C}Repos${R}
     setu init  <gh-slug>             Clone repo + create main worktree
     setu new   <repo> <branch>       Create worktree (auto port + domain)
-    setu new   <repo> <branch> --tunnel   ...with Cloudflare tunnel
+    setu new   <repo> <branch> --tunnel   ...and take the public URL
     setu rm    <repo> <branch>       Remove worktree
 
   ${C}Day-to-day${R}
     wt         <repo> <branch>       cd into worktree  ${GR}(shell alias)${R}
-    setu ls    [repo]                List worktrees + status
+    setu ls    [repo] [--json]       List worktrees + status
     setu status                      Same as ls
     setu fetch <repo>                git fetch --all
-    setu tunnel <repo> <branch>      Enable public tunnel on existing worktree
+    setu tunnel <repo> <branch>      Point the public URL at this worktree
+    setu tunnel <repo> <branch> stop      Release it
     setu trigger <repo> <branch>     Run trigger.dev dev (background, per worktree)
     setu trigger <repo> <branch> stop     Stop it
 
@@ -700,7 +744,8 @@ function cmdHelp() {
     setu portal stop                 Stop portal
 
   ${C}Meta${R}
-    setu update                      Update setu to latest
+    setu update                      Update setu (stash-safe, shows changelog)
+    setu version                     Show version + commit
     setu help                        Show this
 `);
 }

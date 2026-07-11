@@ -1,20 +1,28 @@
 #!/usr/bin/env bun
 // Dev portal — http://quivly.local
 
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, statSync, renameSync, openSync } from 'fs';
-import { execFileSync, execSync } from 'child_process';
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
 import { tmpdir } from 'os';
+import { join } from 'path';
+import {
+  PORTAL_PORT, CLOUDFLARED_BIN,
+  requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
+  readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
+  portEntries, getPort, activePid, loadProjects, registerProject,
+  git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
+} from './lib.js';
 
-const _cfg = (() => {
-  try { return JSON.parse(readFileSync(`${process.env.HOME}/.setu.json`, 'utf8')); } catch { return {}; }
-})();
-const WORKSPACE      = _cfg.workspace    ?? (process.env.HOME + '/workspace');
-const TUNNEL_NAME    = _cfg.tunnel       ?? 'dev-mukul';
-const CF_CREDENTIALS_CFG = _cfg.cfCredentials ?? `${process.env.HOME}/.cloudflared/c11a5c20-51a0-4002-936d-0469636209c1.json`;
+let _cfg;
+try { _cfg = requireConfig(); }
+catch (e) { console.error(`setu portal: ${e.message}`); process.exit(1); }
+
+const WORKSPACE      = _cfg.workspace;
+const TUNNEL_NAME    = _cfg.tunnel;
+const CF_CREDENTIALS_CFG = _cfg.cfCredentials;
+const PKG_DIR     = new URL('.', import.meta.url).pathname;
 const LOGS        = `${WORKSPACE}/logs`;
-const CADDYFILE   = `${WORKSPACE}/Caddyfile`;
-const PORT        = 2999;
-const CLOUDFLARED = '/opt/homebrew/bin/cloudflared';
+const PORT        = PORTAL_PORT;
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
 
 const procs        = new Map();
@@ -73,20 +81,7 @@ function tailLog(repo, name, type = 'dev', lines = 150) {
 
 // ── repo metadata ─────────────────────────────────────────────────────────────
 
-function loadProjects() {
-  try {
-    return Object.fromEntries(
-      readFileSync(`${WORKSPACE}/.projects`, 'utf8').split('\n')
-        .filter(l => l.trim() && !l.startsWith('#'))
-        .map(l => {
-          const [name, base, slug, label] = l.split(':');
-          return [name, { label: label?.trim() ?? name, github: `https://github.com/${slug}`, base: +base }];
-        })
-    );
-  } catch { return {}; }
-}
-
-const REPO_META = loadProjects();
+let REPO_META = loadProjects(WORKSPACE);
 
 // ── PR cache ──────────────────────────────────────────────────────────────────
 
@@ -100,7 +95,7 @@ async function fetchPR(repo, name) {
   try {
     // ponytail: Bun.spawn keeps event loop unblocked; execFileSync froze it with 10+ parallel calls
     const proc = Bun.spawn(['gh', 'pr', 'list', '--head', name,
-      '--repo', REPO_META[repo]?.github.replace('https://github.com/', '') ?? repo,
+      '--repo', REPO_META[repo]?.slug ?? repo,
       '--json', 'number,title,url', '--limit', '1',
     ], { stdout: 'pipe', stderr: 'ignore' });
     const raw  = await new Response(proc.stdout).text();
@@ -118,10 +113,6 @@ async function fetchPR(repo, name) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function portsRaw() {
-  try { return readFileSync(`${WORKSPACE}/.ports`, 'utf8').trim(); } catch { return ''; }
-}
-
 function listActivePorts() {
   try {
     const out = execFileSync('lsof', ['-i', 'TCP:3000-3999', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
@@ -137,58 +128,25 @@ function listActivePorts() {
 }
 
 function killPort(port) {
-  try {
-    const pid = execFileSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'],
-      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-    if (!pid) return { ok: false, error: 'nothing on that port' };
-    process.kill(parseInt(pid), 'SIGTERM');
-    return { ok: true };
-  } catch (e) { return { ok: false, error: String(e) }; }
-}
-
-function activePid(port) {
-  try {
-    return execFileSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'],
-      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-  } catch { return ''; }
-}
-
-function readEnvrc(wtDir) {
-  try { return readFileSync(`${wtDir}/.envrc`, 'utf8'); } catch { return ''; }
-}
-
-function localDomain(repo, name)  {
-  const slug = name.replace(/\//g, '-');
-  return name === 'main' ? `${repo}.quivly.local` : `${slug}.quivly.local`;
-}
-function publicDomain() {
-  return _cfg.domain ?? 'dev-mukul.getquivly.ai';
-}
-function hasTunnel(wtDir, repo, name) {
-  const slug = name.replace(/\//g, '-');
-  return readEnvrc(wtDir).includes(publicDomain(repo, name, slug));
+  const pid = activePid(port);
+  if (!pid) return { ok: false, error: 'nothing on that port' };
+  try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
+  catch (e) { return { ok: false, error: String(e) }; }
 }
 
 async function getWorktrees() {
   return Promise.all(
-    portsRaw().split('\n').filter(Boolean).map(async line => {
-      const colonIdx = line.lastIndexOf(':');
-      const key      = line.slice(0, colonIdx);
-      const port     = parseInt(line.slice(colonIdx + 1), 10);
-      const slashIdx = key.indexOf('/');
-      const repo     = key.slice(0, slashIdx);
-      const name     = key.slice(slashIdx + 1);
+    portEntries(WORKSPACE).map(async ({ key, repo, name, port }) => {
       const slug     = name.replace(/\//g, '-');
       const domain   = localDomain(repo, name);
       const wtDir    = `${WORKSPACE}/${repo}/${name}`;
-      const tunnelOn = hasTunnel(wtDir, repo, name);
-      const pubDomain = publicDomain(repo, name, slug);
+      const tunnelOn = tunnelEnabled(wtDir, _cfg);
       const meta     = REPO_META[repo] ?? { label: repo, github: null };
       const branchUrl = meta.github ? `${meta.github}/tree/${name}` : null;
       const pr        = name !== 'main' ? await fetchPR(repo, name) : null;
       const iPort = inngestPort(port);
       return {
-        key, repo, name, slug, port, domain, pubDomain, tunnelOn,
+        key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
         active:        !!activePid(port),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
         label:         meta.label,
@@ -277,11 +235,14 @@ function openTunnelLog() {
 
 function restartTunnel() {
   if (tunnelProc) { tunnelProc.kill(); tunnelProc = null; }
+  // reap orphaned cloudflared from a previous portal — two replicas of the same
+  // tunnel serve divergent ingress maps and randomly 404 (see comment above)
+  spawnSync('pkill', ['-f', `cloudflared --config ${MERGED_CONF}`]);
   if (activeTunnelMap.size === 0) return;
   writeMergedConf();
   const fd = openTunnelLog();
   tunnelProc = Bun.spawn(
-    [CLOUDFLARED, '--config', MERGED_CONF, 'tunnel', 'run', TUNNEL_NAME],
+    [CLOUDFLARED_BIN, '--config', MERGED_CONF, 'tunnel', 'run', TUNNEL_NAME],
     { stdout: fd, stderr: fd }
   );
   tunnelProc.exited.then(() => { tunnelProc = null; });
@@ -301,44 +262,6 @@ function removeTunnelRoute(repo, name) {
 
 // ── per-worktree tunnel toggle ────────────────────────────────────────────────
 
-function reloadCaddy() {
-  try {
-    // stdio: 'inherit' so sudo password prompt (if any) works against the real TTY
-    // even when the portal server itself was started with output redirected.
-    execSync(`sudo caddy reload --config ${CADDYFILE}`, { stdio: 'inherit' });
-  } catch {
-    console.error(`⚠️  Caddy reload failed. You may need to run:\n    sudo caddy reload --config ${CADDYFILE}`);
-  }
-}
-
-function syncHosts() {
-  const raw = readFileSync('/etc/hosts', 'utf8');
-  const cleaned = raw.replace(/\n?# quivly-start[\s\S]*?# quivly-end\n?/, '');
-  const entries = portsRaw().split('\n').filter(Boolean).map(line => {
-    const colonIdx = line.lastIndexOf(':');
-    const key = line.slice(0, colonIdx);
-    const slashIdx = key.indexOf('/');
-    return `127.0.0.1\t${localDomain(key.slice(0, slashIdx), key.slice(slashIdx + 1))}`;
-  });
-  const newContent = cleaned.trimEnd() + '\n# quivly-start\n' + entries.join('\n') + '\n# quivly-end\n';
-  writeFileSync('/tmp/quivly-hosts', newContent);
-  try { execSync('sudo -n cp /tmp/quivly-hosts /etc/hosts', { stdio: 'ignore' }); } catch {}
-}
-
-function writeEnvrc(wtDir, port, appUrl, redirectUri) {
-  writeFileSync(`${wtDir}/.envrc`,
-    `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`);
-  execSync(`direnv allow "${wtDir}"`);
-}
-
-function writeCaddy(repo, slug, localDom, port, pubDom) {
-  const body = pubDom
-    ? `http://${localDom},\nhttp://${pubDom} {\n  reverse_proxy localhost:${port}\n}\n`
-    : `http://${localDom} {\n  reverse_proxy localhost:${port}\n}\n`;
-  writeFileSync(`${WORKSPACE}/caddy.d/${repo}-${slug}.caddy`, body);
-  reloadCaddy();
-}
-
 function enableTunnel(repo, name, port) {
   // Only one worktree can use the shared tunnel URL — evict any currently active one
   for (const [key, { port: p }] of activeTunnelMap.entries()) {
@@ -346,123 +269,48 @@ function enableTunnel(repo, name, port) {
     const si = key.indexOf('/');
     disableTunnel(key.slice(0, si), key.slice(si + 1), p);
   }
-  const slug     = name.replace(/\//g, '-');
-  const wtDir    = `${WORKSPACE}/${repo}/${name}`;
-  const localDom = localDomain(repo, name);
-  const pubDom   = publicDomain();
+  const pubDom = publicDomain(_cfg);
   const wasRunning = !!activePid(port);
   if (wasRunning) stopWorktree(repo, name, port);
-  writeEnvrc(wtDir, port, `https://${pubDom}`, `https://${pubDom}/authentication/callback`);
-  writeCaddy(repo, slug, localDom, port, pubDom);
+  configureWorktreeEnv(_cfg, repo, name, port, true);
+  reloadCaddy(WORKSPACE);
   addTunnelRoute(repo, name, pubDom, port);
   if (wasRunning) startWorktree(repo, name, port);
   return { ok: true };
 }
 
 function disableTunnel(repo, name, port) {
-  const slug     = name.replace(/\//g, '-');
-  const wtDir    = `${WORKSPACE}/${repo}/${name}`;
-  const localDom = localDomain(repo, name);
   const wasRunning = !!activePid(port);
   if (wasRunning) stopWorktree(repo, name, port);
   removeTunnelRoute(repo, name);
-  writeEnvrc(wtDir, port, `http://${localDom}`, `http://localhost:${port}/authentication/callback`);
-  writeCaddy(repo, slug, localDom, port, null);
+  configureWorktreeEnv(_cfg, repo, name, port, false);
+  reloadCaddy(WORKSPACE);
   if (wasRunning) startWorktree(repo, name, port);
   return { ok: true };
 }
 
 // ── create / remove worktree ──────────────────────────────────────────────────
 
-function nextPort(repo) {
-  const base = REPO_META[repo]?.base ?? 3200;
-  const existing = portsRaw();
-  let port = base;
-  while (existing.includes(`:${port}`) || activePid(port)) port++;
-  return port;
-}
-
-function branchExists(repoDir, name) {
-  for (const ref of [`refs/heads/${name}`, `refs/remotes/origin/${name}`]) {
-    try { execFileSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', ref]); return true; }
-    catch {}
-  }
-  return false;
-}
-
 function createWorktree(repo, name, tunnel) {
-  const slug    = name.replace(/\//g, '-');
-  const repoDir = `${WORKSPACE}/${repo}.git`;
-  const wtDir   = `${WORKSPACE}/${repo}/${name}`;
-
-  const port = nextPort(repo);
-
-  execFileSync('git', ['-C', repoDir, 'fetch', '--all', '--prune']);
-  execFileSync('git', ['-C', repoDir, 'worktree', 'prune']);
-  if (branchExists(repoDir, name)) {
-    execFileSync('git', ['-C', repoDir, 'worktree', 'add', wtDir, name]);
-  } else {
-    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', name, wtDir, 'origin/staging']);
-  }
-
-  appendFileSync(`${WORKSPACE}/.ports`, `${repo}/${name}:${port}\n`);
-
-  const localDom = localDomain(repo, name);
-  const pubDom   = publicDomain(repo, name, slug);
-
-  if (tunnel) {
-    writeEnvrc(wtDir, port, `https://${pubDom}`, `https://${pubDom}/authentication/callback`);
-    writeCaddy(repo, slug, localDom, port, pubDom);
-    addTunnelRoute(repo, name, pubDom, port);
-  } else {
-    writeEnvrc(wtDir, port, `http://${localDom}`, `http://localhost:${port}/authentication/callback`);
-    writeCaddy(repo, slug, localDom, port, null);
-  }
-  syncHosts();
-
-  // symlink shared .env.local
-  const envSrc = repo === 'quivly-app'
-    ? `${WORKSPACE}/${repo}/main/apps/quivly-app/.env.local`
-    : `${WORKSPACE}/${repo}/main/.env.local`;
-  const envDst = repo === 'quivly-app'
-    ? `${wtDir}/apps/quivly-app/.env.local`
-    : `${wtDir}/.env.local`;
-  try { unlinkSync(envDst); } catch {}
-  execSync(`ln -sf "${envSrc}" "${envDst}"`);
+  const res = libCreateWorktree(_cfg, repo, name, { tunnel });
+  if (tunnel) addTunnelRoute(repo, name, publicDomain(_cfg), res.port);
 
   // mise trust + bun install (background — takes a while)
   const setupFd = openLogFd(repo, name, 'setup');
-  Bun.spawn(['zsh', '-c', `mise trust "${wtDir}" 2>/dev/null; cd "${wtDir}" && bun install`],
+  Bun.spawn(['zsh', '-c', `mise trust "${res.wtDir}" 2>/dev/null; cd "${res.wtDir}" && bun install`],
     { stdout: setupFd, stderr: setupFd });
 
-  return { ok: true, port, domain: localDom };
+  return { ok: true, port: res.port, domain: res.localDom };
 }
 
 function removeWorktree(repo, name) {
-  const slug    = name.replace(/\//g, '-');
-  const repoDir = `${WORKSPACE}/${repo}.git`;
-  const wtDir   = `${WORKSPACE}/${repo}/${name}`;
-
   // stop dev server and tunnel route first
-  const line = portsRaw().split('\n').find(l => l.startsWith(`${repo}/${name}:`));
-  if (line) {
-    const port = parseInt(line.split(':').at(-1), 10);
-    stopWorktree(repo, name, port);
-  }
+  const port = getPort(WORKSPACE, repo, name);
+  if (port) stopWorktree(repo, name, port);
   if (activeTunnelMap.has(`${repo}/${name}`)) removeTunnelRoute(repo, name);
 
-  try {
-    execFileSync('git', ['-C', repoDir, 'worktree', 'remove', '--force', wtDir]);
-  } catch (e) { return { ok: false, error: String(e) }; }
-
-  // remove from .ports
-  const newPorts = portsRaw().split('\n').filter(l => !l.startsWith(`${repo}/${name}:`)).filter(Boolean).join('\n');
-  writeFileSync(`${WORKSPACE}/.ports`, newPorts ? newPorts + '\n' : '');
-
-  // remove caddy snippet
-  try { unlinkSync(`${WORKSPACE}/caddy.d/${repo}-${slug}.caddy`); } catch {}
-  reloadCaddy();
-  syncHosts();
+  try { libRemoveWorktree(_cfg, repo, name); }
+  catch (e) { return { ok: false, error: String(e) }; }
 
   prCache.delete(`${repo}/${name}`);
   return { ok: true };
@@ -483,34 +331,25 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
   const label_ = label.trim() || name;
   const repoDir = `${WORKSPACE}/${name}.git`;
 
-  // Already registered?
-  const projects = readFileSync(`${WORKSPACE}/.projects`, 'utf8').catch?.() ??
-    (() => { try { return readFileSync(`${WORKSPACE}/.projects`, 'utf8'); } catch { return ''; } })();
-  if (projects.split('\n').some(l => l.startsWith(`${name}:`))) {
+  if (loadProjects(WORKSPACE)[name]) {
     return { ok: false, error: `${name} is already registered` };
   }
 
-  // Assign next free 100-port band
-  const usedBases = projects.split('\n')
-    .filter(l => l.trim() && !l.startsWith('#'))
-    .map(l => parseInt(l.split(':')[1], 10))
-    .filter(Boolean);
-  let base = 3000;
-  while (usedBases.includes(base)) base += 100;
-
   // Bare clone (existing) or bare init (new)
   mkdirSync(WORKSPACE, { recursive: true });
-  if (slug) {
-    execFileSync('git', ['clone', '--bare', `git@github.com:${slug}.git`, repoDir]);
-    execFileSync('git', ['-C', repoDir, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
-    execFileSync('git', ['-C', repoDir, 'fetch', '--all', '--prune']);
-  } else {
+  if (slug && !existsSync(repoDir)) {
+    const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
+    if (useGh) execFileSync('gh', ['repo', 'clone', slug, repoDir, '--', '--bare']);
+    else execFileSync('git', ['clone', '--bare', `git@github.com:${slug}.git`, repoDir]);
+    git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
+    git(repoDir, ['fetch', '--all', '--prune']);
+  } else if (!slug) {
     mkdirSync(repoDir, { recursive: true });
     execFileSync('git', ['-C', repoDir, 'init', '--bare']);
   }
 
-  // Register in .projects
-  appendFileSync(`${WORKSPACE}/.projects`, `${name}:${base}:${slug}:${label_}\n`);
+  const base = registerProject(WORKSPACE, { name, slug, label: label_ });
+  REPO_META = loadProjects(WORKSPACE);
 
   return { ok: true, name, base, slug: slug || null, label: label_ };
 }
@@ -523,8 +362,7 @@ function openInGhostty(wtDir, tool) {
   const cmd = TOOL_CMD[tool];
   if (!cmd) return { ok: false, error: 'unknown tool' };
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
-  writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`);
-  execSync(`chmod +x "${script}"`);
+  writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
   Bun.spawn(['ghostty', `--working-directory=${wtDir}`, `--command=${script}`],
     { detached: true, stdio: ['ignore', 'ignore', 'ignore'] });
   return { ok: true };
@@ -539,7 +377,7 @@ async function handle(req) {
   if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
 
   if (pathname === '/api/projects') return Response.json(
-    Object.entries(loadProjects()).map(([name, m]) => ({ name, label: m.label }))
+    Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label }))
   );
 
   if (method === 'POST' && pathname === '/api/project/add') {
@@ -557,8 +395,7 @@ async function handle(req) {
   if (method === 'POST') {
     const body = await req.json().catch(() => ({}));
     const { repo, name, tool, tunnel } = body;
-    const portLine = () => portsRaw().split('\n').find(l => l.startsWith(`${repo}/${name}:`));
-    const getPort  = () => { const l = portLine(); return l ? parseInt(l.split(':').at(-1), 10) : null; };
+    const wtPort = () => getPort(WORKSPACE, repo, name);
 
     if (pathname === '/api/create') {
       try { return Response.json(createWorktree(repo, name, !!tunnel)); }
@@ -568,23 +405,23 @@ async function handle(req) {
       return Response.json(removeWorktree(repo, name));
     }
     if (pathname === '/api/start') {
-      const port = getPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       return Response.json(startWorktree(repo, name, port));
     }
     if (pathname === '/api/stop') {
-      const port = getPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       stopWorktree(repo, name, port); return Response.json({ ok: true });
     }
     if (pathname === '/api/tunnel/enable') {
-      const port = getPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       return Response.json(enableTunnel(repo, name, port));
     }
     if (pathname === '/api/tunnel/disable') {
-      const port = getPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       return Response.json(disableTunnel(repo, name, port));
     }
     if (pathname === '/api/inngest/start') {
-      const port = getPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       return Response.json(startInngest(repo, name, port));
     }
     if (pathname === '/api/inngest/stop') {
@@ -601,12 +438,12 @@ async function handle(req) {
 
   if (pathname === '/api/ports') {
     const ports = listActivePorts();
-    const registry = Object.fromEntries(
-      portsRaw().split('\n').filter(Boolean).map(l => { const ci = l.lastIndexOf(':'); return [+l.slice(ci+1), l.slice(0,ci)]; })
-    );
+    const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
     return Response.json(ports.map(p => ({ ...p, worktree: registry[p.port] ?? null })));
   }
 
+  if (pathname === '/tailwind.js')
+    return new Response(Bun.file(join(PKG_DIR, 'tailwind.js')), { headers: { 'content-type': 'text/javascript' } });
   if (pathname === '/') return new Response(HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
   return new Response('Not found', { status: 404 });
 }
@@ -619,7 +456,7 @@ const HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>setu</title>
-<script async src="https://cdn.tailwindcss.com"></script>
+<script src="/tailwind.js"></script>
 <style>
 .icon-btn { display:inline-flex; align-items:center; justify-content:center; width:2rem; height:2rem; border-radius:9999px; background:rgba(255,255,255,0.55); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,0.75); box-shadow:0 1px 3px rgba(0,0,0,0.07); transition:background 0.15s,color 0.15s,box-shadow 0.15s; flex-shrink:0; }
 .icon-btn:hover { background:rgba(255,255,255,0.85); box-shadow:0 2px 8px rgba(0,0,0,0.12); }
@@ -681,6 +518,9 @@ const HTML = `<!DOCTYPE html>
   </div>
 
 </div>
+
+<!-- error toast -->
+<div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 bg-zinc-900 text-white text-xs px-4 py-2.5 rounded-lg shadow-lg z-[60] hidden max-w-md"></div>
 
 <!-- log viewer modal -->
 <div id="log-modal" class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 hidden items-end justify-stretch" onclick="if(event.target===this) closeLogModal()">
@@ -932,7 +772,17 @@ document.addEventListener('click', () => { if (activeMenu) { activeMenu.classLis
 
 async function post(url, body) {
   return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    .then(r => r.json());
+    .then(r => r.json())
+    .catch(e => ({ ok: false, error: String(e) }));
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 5000);
 }
 
 async function createWorktree() {
@@ -963,12 +813,14 @@ async function createWorktree() {
 
 async function removeWorktree(repo, name) {
   if (!confirm(\`Remove worktree "\${name}"? The branch will not be deleted.\`)) return;
-  await post('/api/remove', { repo, name });
+  const res = await post('/api/remove', { repo, name });
+  if (!res.ok) toast('✗ remove failed: ' + (res.error ?? 'unknown error'));
   refreshWorktrees();
 }
 
 async function act(url, repo, name) {
-  await post(url, { repo, name });
+  const res = await post(url, { repo, name });
+  if (res && res.ok === false) toast('✗ ' + url.replace('/api/', '') + ' failed: ' + (res.error ?? 'unknown error'));
   await refreshWorktrees();
 }
 
@@ -1101,26 +953,22 @@ function renderWorktrees(wts) {
 
         <!-- claude -->
         <button onclick="openTool('\${w.repo}','\${w.name}','claude')" data-tip="Open in Claude" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <img src="https://www.google.com/s2/favicons?domain=claude.ai&sz=64" class="w-4 h-4 rounded-sm" alt="Claude"
-            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'C'}))">
+          <span class="text-[10px] font-bold">C</span>
         </button>
 
         <!-- codex -->
         <button onclick="openTool('\${w.repo}','\${w.name}','codex')" data-tip="Open in Codex" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" class="w-4 h-4 rounded-sm" alt="Codex"
-            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'O'}))">
+          <span class="text-[10px] font-bold">O</span>
         </button>
 
         <!-- antigravity -->
         <button onclick="openTool('\${w.repo}','\${w.name}','antigravity')" data-tip="Open in Antigravity" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <img src="https://www.google.com/s2/favicons?domain=antigravity.google&sz=64" class="w-4 h-4 rounded-sm" alt="Antigravity"
-            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'AG'}))">
+          <span class="text-[10px] font-bold">AG</span>
         </button>
 
         <!-- grok -->
         <button onclick="openTool('\${w.repo}','\${w.name}','grok')" data-tip="Open in Grok" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=64" class="w-4 h-4 rounded-sm" alt="Grok"
-            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'GK'}))">
+          <span class="text-[10px] font-bold">GK</span>
         </button>
 
         <!-- copy cd -->
@@ -1143,8 +991,7 @@ function renderWorktrees(wts) {
         <button onclick="act('\${w.inngestActive ? '/api/inngest/stop' : '/api/inngest/start'}','\${w.repo}','\${w.name}')"
           data-tip="\${w.inngestActive ? 'Stop Inngest' : 'Start Inngest'}"
           class="tip icon-btn \${w.inngestActive ? 'text-orange-500 hover:bg-orange-50' : 'text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100'}">
-          <img src="https://www.google.com/s2/favicons?domain=inngest.com&sz=64" class="w-4 h-4 rounded-sm" alt="Inngest"
-            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'IN'}))">
+          <span class="text-[10px] font-bold">IN</span>
         </button>
 
         <!-- kebab menu -->
@@ -1176,7 +1023,8 @@ async function actStart(repo, name) {
   const key = \`\${repo}/\${name}\`;
   pendingStart.add(key);
   renderWorktrees(allWorktrees);
-  await post('/api/start', { repo, name });
+  const res = await post('/api/start', { repo, name });
+  if (res && res.ok === false) { toast('✗ start failed: ' + (res.error ?? 'unknown error')); pendingStart.delete(key); }
   if (!fastPollTimer) {
     fastPollTimer = setInterval(async () => {
       await refreshWorktrees();
@@ -1233,7 +1081,7 @@ setInterval(refresh, 3000);
 
 // Rebuild merged ingress and restart the single tunnel process for all enabled worktrees
 ;(async () => {
-  syncHosts();
+  syncHosts(WORKSPACE);
   const wts = await getWorktrees().catch(() => []);
   for (const w of wts) {
     if (w.tunnelOn) activeTunnelMap.set(w.key, { pubDom: w.pubDomain, port: w.port });

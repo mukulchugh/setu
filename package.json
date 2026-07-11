@@ -1,6 +1,6 @@
 {
   "name": "@quivly/setu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Workspace bridge — git worktrees, local domains, Cloudflare tunnels",
   "type": "module",
   "bin": {
@@ -8,8 +8,10 @@
   },
   "files": [
     "cli.js",
-    "install.sh",
-    "portal.js"
+    "lib.js",
+    "portal.js",
+    "tailwind.js",
+    "install.sh"
   ],
   "engines": {
     "bun": ">=1.0.0"
