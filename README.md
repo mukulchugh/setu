@@ -40,7 +40,7 @@ setu new   <repo> <branch>        Create worktree (auto port + local domain)
 setu new   <repo> <branch> --tunnel   ...and take the public URL
 setu rm    <repo> <branch>        Remove worktree
 
-wt         <repo> <branch>        cd into worktree
+setu cd    <repo> <branch>        cd into worktree
 setu ls    [repo] [--json]        List worktrees + running state
 setu fetch <repo>                 git fetch --all
 setu tunnel <repo> <branch>       Point the public URL at this worktree

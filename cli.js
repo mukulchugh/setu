@@ -13,7 +13,7 @@ import {
   HOME, CFG_PATH, SETU_DIR, PORTAL_PORT, HOSTS_TMP,
   BREW_PREFIX, CADDY_BIN, CLOUDFLARED_BIN,
   loadConfig, saveConfig, requireConfig,
-  localDomain, publicDomain, envLocalPath, parseEnvFile, tunnelEnabled,
+  localDomain, publicDomain, envLocalPath, parseEnvFile, tunnelEnabled, pinnedTriggerVersion,
   writeCaddy, reloadCaddy, syncHosts,
   portEntries, getPort, activePid, loadProjects, registerProject,
   git, createWorktree, removeWorktree,
@@ -76,8 +76,8 @@ const cmd = { '--version': 'version', '-v': 'version' }[cmdRaw] ?? cmdRaw;
 const { args, flags } = parseArgs(rest);
 const asJson = !!flags.json;
 
-// Passive staleness nudge — never on `path` (wt() consumes its stdout) or meta commands.
-if (!['path', 'update', 'setup', 'version', 'help', undefined].includes(cmd)) updateNudge();
+// Passive staleness nudge — never on `path`/`cd` (the shell wrapper consumes stdout) or meta commands.
+if (!['path', 'cd', 'update', 'setup', 'version', 'help', undefined].includes(cmd)) updateNudge();
 
 switch (cmd) {
   case 'setup':   await cmdSetup(); break;
@@ -91,6 +91,7 @@ switch (cmd) {
   case 'trigger': await cmdTrigger(); break;
   case 'fetch':   await cmdFetch(); break;
   case 'path':    await cmdPath(); break;
+  case 'cd':      await cmdCd(); break;
   case 'update':  await cmdUpdate(); break;
   case 'doctor':  await cmdDoctor(); break;
   case 'version': cmdVersion(); break;
@@ -285,7 +286,8 @@ async function cmdSetup() {
   const zshrc = join(HOME, '.zshrc');
   const START = '# setu start';
   const END   = '# setu end';
-  const block = `${START}\nwt() { cd "$(setu path "$1" "$2")"; }\n${END}`;
+  // a child process can't cd the parent shell — `setu cd` needs this wrapper
+  const block = `${START}\nsetu() { if [ "$1" = "cd" ]; then cd "$(command setu path "$2" "$3")" || return; else command setu "$@"; fi; }\n${END}`;
   let current = '';
   try { current = readFileSync(zshrc, 'utf8'); } catch {}
   if (current.includes(START)) {
@@ -472,16 +474,6 @@ function runningPid(pidFile) {
   catch (err) { return err.code === 'EPERM' ? pid : null; }
 }
 
-// The trigger.dev CLI aborts if its own version doesn't match the pinned
-// @trigger.dev/sdk in package.json — resolve the same version instead of `@latest`.
-function pinnedTriggerVersion(wtDir) {
-  try {
-    const pkg = JSON.parse(readFileSync(join(wtDir, 'package.json'), 'utf8'));
-    const v = pkg.dependencies?.['@trigger.dev/sdk'] ?? pkg.devDependencies?.['@trigger.dev/sdk'];
-    return v ? v.replace(/^[\^~]/, '') : 'latest';
-  } catch { return 'latest'; }
-}
-
 async function cmdTrigger() {
   const [repo, name, action] = args;
   if (!repo || !name) die('Usage: setu trigger <repo> <branch> [stop]');
@@ -543,6 +535,17 @@ async function cmdPath() {
   const p = join(c.workspace, repo, name);
   if (!existsSync(p)) die(`No worktree at ${p} — run: setu new ${repo} ${name}`);
   process.stdout.write(p + '\n');
+}
+
+// ── setu cd <repo> <branch> ──────────────────────────────────────────────────
+// Normally intercepted by the setu() shell function before reaching the binary.
+// Reaching here means shell integration isn't loaded — still print the path so
+// `cd "$(setu cd r b)"` works, and hint on stderr.
+
+async function cmdCd() {
+  await cmdPath();
+  if (process.stdout.isTTY)
+    console.error(`${GR}shell integration not loaded — run: source ~/.zshrc${R}`);
 }
 
 // ── setu update ───────────────────────────────────────────────────────────────
@@ -730,7 +733,7 @@ function cmdHelp() {
     setu rm    <repo> <branch>       Remove worktree
 
   ${C}Day-to-day${R}
-    wt         <repo> <branch>       cd into worktree  ${GR}(shell alias)${R}
+    setu cd    <repo> <branch>       cd into worktree
     setu ls    [repo] [--json]       List worktrees + status
     setu status                      Same as ls
     setu fetch <repo>                git fetch --all

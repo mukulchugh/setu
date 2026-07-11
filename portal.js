@@ -8,6 +8,7 @@ import { join } from 'path';
 import {
   PORTAL_PORT, CLOUDFLARED_BIN,
   requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
+  parseEnvFile, pinnedTriggerVersion,
   readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
   portEntries, getPort, activePid, loadProjects, registerProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
@@ -27,6 +28,7 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
 
 const procs        = new Map();
 const inngestProcs = new Map();
+const triggerProcs = new Map();
 
 const INNGEST_CLI    = 'inngest-cli';
 const INNGEST_OFFSET = 5288; // app port 3000 → inngest 8288, 3001 → 8289, …
@@ -154,6 +156,7 @@ async function getWorktrees() {
         pr:            pr?.url ? { url: pr.url, number: pr.number, title: pr.title } : null,
         inngestActive: inngestProcs.has(key),
         inngestPort:   iPort,
+        triggerActive: triggerProcs.has(key),
       };
     })
   );
@@ -181,6 +184,7 @@ function stopWorktree(repo, name, port) {
   const pid = activePid(port);
   if (pid) { try { execFileSync('kill', [pid]); } catch {} }
   stopInngest(repo, name);
+  stopTrigger(repo, name);
 }
 
 // ── inngest dev server ────────────────────────────────────────────────────────
@@ -205,6 +209,31 @@ function stopInngest(repo, name) {
   if (!proc) return { ok: false, error: 'not running' };
   proc.kill();
   inngestProcs.delete(key);
+  return { ok: true };
+}
+
+// ── trigger.dev dev server (per worktree, like inngest) ──────────────────────
+
+function startTrigger(repo, name) {
+  const key = `${repo}/${name}`;
+  if (triggerProcs.has(key)) return { ok: false, error: 'already running' };
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const fd    = openLogFd(repo, name, 'trigger');
+  // trigger tasks import Supabase keys etc. from the shared .env.local at load time
+  const env   = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
+  const proc  = Bun.spawn(['bunx', `trigger.dev@${pinnedTriggerVersion(wtDir)}`, 'dev'],
+    { cwd: wtDir, env, stdout: fd, stderr: fd });
+  triggerProcs.set(key, proc);
+  proc.exited.then(() => triggerProcs.delete(key));
+  return { ok: true };
+}
+
+function stopTrigger(repo, name) {
+  const key  = `${repo}/${name}`;
+  const proc = triggerProcs.get(key);
+  if (!proc) return { ok: false, error: 'not running' };
+  proc.kill();
+  triggerProcs.delete(key);
   return { ok: true };
 }
 
@@ -427,6 +456,12 @@ async function handle(req) {
     if (pathname === '/api/inngest/stop') {
       return Response.json(stopInngest(repo, name));
     }
+    if (pathname === '/api/trigger/start') {
+      return Response.json(startTrigger(repo, name));
+    }
+    if (pathname === '/api/trigger/stop') {
+      return Response.json(stopTrigger(repo, name));
+    }
     if (pathname === '/api/open') {
       return Response.json(openInGhostty(`${WORKSPACE}/${repo}/${name}`, tool));
     }
@@ -530,6 +565,7 @@ const HTML = `<!DOCTYPE html>
         <button onclick="switchLogTab('dev')" id="log-tab-dev" class="log-tab active text-xs font-medium px-3 py-1 rounded-md transition-colors">Dev server</button>
         <button onclick="switchLogTab('tunnel')" id="log-tab-tunnel" class="log-tab text-xs font-medium px-3 py-1 rounded-md transition-colors">Tunnel</button>
         <button onclick="switchLogTab('inngest')" id="log-tab-inngest" class="log-tab text-xs font-medium px-3 py-1 rounded-md transition-colors">Inngest</button>
+        <button onclick="switchLogTab('trigger')" id="log-tab-trigger" class="log-tab text-xs font-medium px-3 py-1 rounded-md transition-colors">Trigger</button>
         <button onclick="switchLogTab('setup')" id="log-tab-setup" class="log-tab text-xs font-medium px-3 py-1 rounded-md transition-colors">Setup</button>
       </div>
       <span id="log-title" class="text-xs text-zinc-400 flex-1"></span>
@@ -845,7 +881,7 @@ const LOG_TAB_CLS     = { active: 'bg-white text-zinc-900 shadow-sm', inactive: 
 
 function switchLogTab(type) {
   logState.type = type;
-  ['dev','tunnel','inngest','setup'].forEach(t => {
+  ['dev','tunnel','inngest','trigger','setup'].forEach(t => {
     const el = document.getElementById('log-tab-' + t);
     el.className = 'log-tab text-xs font-medium px-3 py-1 rounded-md transition-colors ' +
       (t === type ? LOG_TAB_CLS.active : LOG_TAB_CLS.inactive);
@@ -918,6 +954,9 @@ function renderWorktrees(wts) {
           \${w.inngestActive ? \`<a href="http://localhost:\${w.inngestPort}" target="_blank" class="flex items-center gap-1 text-xs text-orange-500 hover:text-orange-600 transition-colors shrink-0" title="Inngest dashboard">
             <span class="w-1.5 h-1.5 rounded-full bg-orange-400"></span>inngest:\${w.inngestPort}
           </a>\` : ''}
+          \${w.triggerActive ? \`<button onclick="openLogModal('\${w.repo}','\${w.name}');switchLogTab('trigger')" class="flex items-center gap-1 text-xs text-emerald-600 hover:text-emerald-700 transition-colors shrink-0" title="trigger.dev logs">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>trigger
+          </button>\` : ''}
           \${w.branchUrl ? \`<a href="\${w.branchUrl}" target="_blank" class="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-700 transition-colors shrink-0">
             <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm3-8.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z"/></svg>branch
           </a>\` : ''}
@@ -953,22 +992,26 @@ function renderWorktrees(wts) {
 
         <!-- claude -->
         <button onclick="openTool('\${w.repo}','\${w.name}','claude')" data-tip="Open in Claude" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <span class="text-[10px] font-bold">C</span>
+          <img src="https://www.google.com/s2/favicons?domain=claude.ai&sz=64" class="w-4 h-4 rounded-sm" alt="Claude"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'C'}))">
         </button>
 
         <!-- codex -->
         <button onclick="openTool('\${w.repo}','\${w.name}','codex')" data-tip="Open in Codex" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <span class="text-[10px] font-bold">O</span>
+          <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" class="w-4 h-4 rounded-sm" alt="Codex"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'O'}))">
         </button>
 
         <!-- antigravity -->
         <button onclick="openTool('\${w.repo}','\${w.name}','antigravity')" data-tip="Open in Antigravity" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <span class="text-[10px] font-bold">AG</span>
+          <img src="https://www.google.com/s2/favicons?domain=antigravity.google&sz=64" class="w-4 h-4 rounded-sm" alt="Antigravity"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'AG'}))">
         </button>
 
         <!-- grok -->
         <button onclick="openTool('\${w.repo}','\${w.name}','grok')" data-tip="Open in Grok" class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
-          <span class="text-[10px] font-bold">GK</span>
+          <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=64" class="w-4 h-4 rounded-sm" alt="Grok"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'GK'}))">
         </button>
 
         <!-- copy cd -->
@@ -991,7 +1034,16 @@ function renderWorktrees(wts) {
         <button onclick="act('\${w.inngestActive ? '/api/inngest/stop' : '/api/inngest/start'}','\${w.repo}','\${w.name}')"
           data-tip="\${w.inngestActive ? 'Stop Inngest' : 'Start Inngest'}"
           class="tip icon-btn \${w.inngestActive ? 'text-orange-500 hover:bg-orange-50' : 'text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100'}">
-          <span class="text-[10px] font-bold">IN</span>
+          <img src="https://www.google.com/s2/favicons?domain=inngest.com&sz=64" class="w-4 h-4 rounded-sm" alt="Inngest"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'IN'}))">
+        </button>
+
+        <!-- trigger.dev toggle -->
+        <button onclick="act('\${w.triggerActive ? '/api/trigger/stop' : '/api/trigger/start'}','\${w.repo}','\${w.name}')"
+          data-tip="\${w.triggerActive ? 'Stop trigger.dev' : 'Start trigger.dev'}"
+          class="tip icon-btn \${w.triggerActive ? 'text-emerald-500 hover:bg-emerald-50' : 'text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100'}">
+          <img src="https://www.google.com/s2/favicons?domain=trigger.dev&sz=64" class="w-4 h-4 rounded-sm" alt="Trigger.dev"
+            onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'text-[10px] font-bold',textContent:'T'}))">
         </button>
 
         <!-- kebab menu -->

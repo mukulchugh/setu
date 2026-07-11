@@ -71,6 +71,16 @@ export function parseEnvFile(path) {
   return out;
 }
 
+// The trigger.dev CLI aborts if its own version doesn't match the pinned
+// @trigger.dev/sdk in package.json — resolve the same version instead of `@latest`.
+export function pinnedTriggerVersion(wtDir) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(wtDir, 'package.json'), 'utf8'));
+    const v = pkg.dependencies?.['@trigger.dev/sdk'] ?? pkg.devDependencies?.['@trigger.dev/sdk'];
+    return v ? v.replace(/^[\^~]/, '') : 'latest';
+  } catch { return 'latest'; }
+}
+
 export function readEnvrc(wtDir) {
   try { return readFileSync(join(wtDir, '.envrc'), 'utf8'); } catch { return ''; }
 }

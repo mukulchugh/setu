@@ -17,7 +17,8 @@ setu doctor --json                   # layer-by-layer health, exit 1 if any chec
 setu ls [repo] --json                # [{key, repo, name, port, running, wtDir, localDomain, tunnel}]
 setu new <repo> <branch> [--tunnel] --json   # {wtDir, port, localDom, pubDom} — creates branch from origin/staging if new
 setu rm <repo> <branch>              # stops servers (via portal) + removes worktree/port/domain
-setu path <repo> <branch>            # prints worktree path (used by the wt() shell alias)
+setu path <repo> <branch>            # prints worktree path
+setu cd <repo> <branch>              # cd into worktree (shell wrapper; from scripts use: cd "$(setu path r b)")
 setu init <gh-org>/<repo> [label]    # bare-clone + register + main worktree
 setu tunnel <repo> <branch> [stop]   # point the shared public URL at this worktree
 setu trigger <repo> <branch> [stop]  # detached trigger.dev dev server per worktree
@@ -38,12 +39,13 @@ Start it with `setu portal` if `GET /api/worktrees` refuses connection.
 | GET `/api/worktrees` | — | full worktree state incl. `active`, `tunnelOn`, `pr` |
 | GET `/api/projects` | — | registered repos |
 | GET `/api/ports` | — | processes listening on 3000–3999 |
-| GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|tunnel` | — | tail of that log |
+| GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|trigger\|tunnel` | — | tail of that log |
 | POST `/api/create` | `{repo, name, tunnel?}` | create worktree (bun install runs in background — poll the `setup` log) |
 | POST `/api/remove` | `{repo, name}` | stop + remove worktree |
 | POST `/api/start` / `/api/stop` | `{repo, name}` | dev server |
 | POST `/api/tunnel/enable` / `/api/tunnel/disable` | `{repo, name}` | move/release the shared public URL |
 | POST `/api/inngest/start` / `/api/inngest/stop` | `{repo, name}` | inngest dev server |
+| POST `/api/trigger/start` / `/api/trigger/stop` | `{repo, name}` | trigger.dev dev server (version pinned to the worktree's @trigger.dev/sdk) |
 | POST `/api/ports/kill` | `{port}` | SIGTERM whatever listens there |
 
 All POSTs return `{ok: boolean, error?: string}`.
