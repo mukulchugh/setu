@@ -36,6 +36,6 @@ clone_or_update() {
 }
 
 clone_or_update
-cd "$SETU_DIR" && bun link
+cd "$SETU_DIR" && bun install && bun link
 echo ""
 echo "✓ setu ready — run: setu setup   (or: setu setup --name <you> --yes for non-interactive)"

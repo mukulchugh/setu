@@ -136,8 +136,9 @@ async function ensurePortal(c) {
   if (portalPid()) return;
   const portalJs = join(PKG_DIR, 'portal.js');
   if (!existsSync(portalJs)) die(`portal.js not found at ${portalJs}`);
+  // cwd = package dir so bunfig.toml (tailwind plugin) and node_modules resolve
   const child = spawn('bun', ['run', portalJs], {
-    detached: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env, HOME },
+    cwd: PKG_DIR, detached: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env, HOME },
   });
   child.unref();
   for (let i = 0; i < 40; i++) {
@@ -594,6 +595,7 @@ async function cmdUpdate() {
     }
   }
 
+  execFileSync('bun', ['install'], { cwd: SETU_DIR, stdio: 'ignore' });
   execFileSync('bun', ['link'], { cwd: SETU_DIR, stdio: 'ignore' });
 
   // A running portal keeps serving old code — restart it
