@@ -6,7 +6,7 @@ import readline from 'readline';
 import { execSync, execFileSync, spawnSync, spawn } from 'child_process';
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
-  mkdirSync, readdirSync, statSync,
+  mkdirSync, readdirSync, statSync, openSync, unlinkSync,
 } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
@@ -67,6 +67,7 @@ switch (cmd) {
   case 'status': await cmdStatus(); break;
   case 'portal': await cmdPortal(argv); break;
   case 'tunnel': await cmdTunnel(argv); break;
+  case 'trigger': await cmdTrigger(argv); break;
   case 'fetch':  await cmdFetch(argv); break;
   case 'path':   await cmdPath(argv); break;
   case 'update': await cmdUpdate(); break;
@@ -105,6 +106,12 @@ function ask(rl, question, defaultVal) {
 // worktree helpers
 function workspacePath(c, repo, name) {
   return join(c.workspace, repo, name);
+}
+
+function envLocalPath(repo, wtDir) {
+  return repo === 'quivly-app'
+    ? join(wtDir, 'apps', 'quivly-app', '.env.local')
+    : join(wtDir, '.env.local');
 }
 
 function getPort(workspace, repo, name) {
@@ -336,6 +343,15 @@ async function cmdSetup() {
 
 // ── setu new <repo> <branch> [--tunnel] ──────────────────────────────────────
 
+function findWorktreeForBranch(porcelain, branchName) {
+  for (const entry of porcelain.trim().split('\n\n')) {
+    const path   = entry.match(/^worktree (.+)$/m)?.[1];
+    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
+    if (branch === branchName) return path;
+  }
+  return null;
+}
+
 async function cmdNew([repo, name, ...flags]) {
   if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel]');
   const c = cfg();
@@ -350,6 +366,14 @@ async function cmdNew([repo, name, ...flags]) {
   execSync(`git -C ${repoDir} worktree prune`, { stdio: 'ignore' });
 
   if (!existsSync(wtDir)) {
+    const porcelain = execSync(`git -C ${repoDir} worktree list --porcelain`, { encoding: 'utf8' });
+    const existingPath = findWorktreeForBranch(porcelain, name);
+    if (existingPath && resolve(existingPath) !== resolve(wtDir)) {
+      const existingRepo = existingPath.split('/').slice(-2)[0];
+      const existingName  = existingPath.split('/').pop();
+      die(`Branch '${name}' is already checked out at ${existingPath}\n  → wt ${existingRepo} ${existingName}`);
+    }
+
     const hasBranch =
       spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`]).status === 0 ||
       spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', `refs/remotes/origin/${name}`]).status === 0;
@@ -372,12 +396,8 @@ async function cmdNew([repo, name, ...flags]) {
   }
 
   // Symlink shared .env.local from main
-  const mainEnv = repo === 'quivly-app'
-    ? join(workspace, repo, 'main', 'apps', 'quivly-app', '.env.local')
-    : join(workspace, repo, 'main', '.env.local');
-  const wtEnv = repo === 'quivly-app'
-    ? join(wtDir, 'apps', 'quivly-app', '.env.local')
-    : join(wtDir, '.env.local');
+  const mainEnv = envLocalPath(repo, join(workspace, repo, 'main'));
+  const wtEnv   = envLocalPath(repo, wtDir);
   if (existsSync(mainEnv) && !existsSync(wtEnv)) {
     spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
   }
@@ -531,6 +551,90 @@ async function cmdTunnel([repo, name]) {
   ok(`Public → https://${pd}`);
 }
 
+// ── setu trigger <repo> <branch> [stop] ──────────────────────────────────────
+// Runs `trigger dev` for a worktree as a detached background process, so
+// multiple worktrees of the same repo can each run their own without
+// fighting over a terminal.
+
+function triggerLogPaths(workspace, repo, name) {
+  const slug = name.replace(/\//g, '-');
+  return {
+    pidFile: join(workspace, 'logs', `trigger-${repo}-${slug}.pid`),
+    logFile: join(workspace, 'logs', `trigger-${repo}-${slug}.log`),
+  };
+}
+
+function runningPid(pidFile) {
+  if (!existsSync(pidFile)) return null;
+  const pid = parseInt(readFileSync(pidFile, 'utf8'));
+  if (!pid) return null;
+  try { process.kill(pid, 0); return pid; }
+  catch (err) { return err.code === 'EPERM' ? pid : null; }
+}
+
+// The trigger.dev CLI aborts if its own version doesn't match the pinned
+// @trigger.dev/sdk in package.json — resolve the same version instead of `@latest`.
+function pinnedTriggerVersion(wtDir) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(wtDir, 'package.json'), 'utf8'));
+    const v = pkg.dependencies?.['@trigger.dev/sdk'] ?? pkg.devDependencies?.['@trigger.dev/sdk'];
+    return v ? v.replace(/^[\^~]/, '') : 'latest';
+  } catch { return 'latest'; }
+}
+
+// `trigger dev` runs from the repo root, but the shared .env.local (Supabase
+// keys etc. that trigger tasks import at load time) lives at envLocalPath() —
+// a plain spawn() won't pick that up the way `next dev`/direnv would.
+function readEnvFile(path) {
+  if (!existsSync(path)) return {};
+  const out = {};
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const m = line.match(/^\s*([\w.-]+)\s*=\s*(.*?)\s*$/);
+    if (m) out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
+  }
+  return out;
+}
+
+async function cmdTrigger([repo, name, action]) {
+  if (!repo || !name) die('Usage: setu trigger <repo> <branch> [stop]');
+  const c = cfg();
+  const wtDir = workspacePath(c, repo, name);
+  if (!existsSync(wtDir)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
+
+  const { pidFile, logFile } = triggerLogPaths(c.workspace, repo, name);
+  const pid = runningPid(pidFile);
+
+  if (action === 'stop') {
+    if (!pid) { console.log(`Trigger dev not running for ${repo}/${name}.`); return; }
+    try { process.kill(-pid, 'SIGTERM'); } catch { process.kill(pid, 'SIGTERM'); }
+    unlinkSync(pidFile);
+    ok(`stopped trigger dev for ${repo}/${name}`);
+    return;
+  }
+
+  if (pid) {
+    console.log(`Trigger dev already running (pid ${pid}) for ${repo}/${name} → ${logFile}`);
+    return;
+  }
+
+  mkdirSync(join(c.workspace, 'logs'), { recursive: true });
+  const out = openSync(logFile, 'a');
+  const version = pinnedTriggerVersion(wtDir);
+  const env = { ...process.env, ...readEnvFile(envLocalPath(repo, wtDir)) };
+  const child = spawn('bunx', [`trigger.dev@${version}`, 'dev'], {
+    cwd: wtDir,
+    detached: true,
+    stdio: ['ignore', out, out],
+    env,
+  });
+  writeFileSync(pidFile, String(child.pid));
+  child.unref();
+
+  ok(`Trigger dev started for ${repo}/${name} (pid ${child.pid})`);
+  console.log(`  ${GR}logs: ${logFile}${R}`);
+}
+
 // ── setu fetch <repo> ─────────────────────────────────────────────────────────
 
 async function cmdFetch([repo]) {
@@ -588,6 +692,8 @@ function cmdHelp() {
     setu status                      Same as ls
     setu fetch <repo>                git fetch --all
     setu tunnel <repo> <branch>      Enable public tunnel on existing worktree
+    setu trigger <repo> <branch>     Run trigger.dev dev (background, per worktree)
+    setu trigger <repo> <branch> stop     Stop it
 
   ${C}Portal${R}
     setu portal                      Start web UI at http://quivly.local
