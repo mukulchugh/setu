@@ -720,119 +720,141 @@ function cmdVersion() {
 
 // ── setu doctor [--json] ──────────────────────────────────────────────────────
 
+// Bun.spawn, not execFileSync/spawnSync — checks run concurrently (Promise.all
+// below) instead of one after another; a blocking exec call per check would
+// serialize them on the event loop regardless of the Promise.all wrapper.
+async function spawnText(cmd, args) {
+  try {
+    const proc = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'ignore' });
+    const text = await new Response(proc.stdout).text();
+    await proc.exited;
+    return { text, code: proc.exitCode };
+  } catch { return { text: '', code: 1 }; }
+}
+
 async function cmdDoctor() {
-  const checks = [];
-  const check = (name, okVal, fix) => checks.push({ name, ok: !!okVal, fix: okVal ? undefined : fix });
-
-  // deps
-  for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv'])
-    check(`brew: ${pkg}`, brewInstalled(pkg), `brew install ${pkg}`);
-
-  // config
   const c = loadConfig();
-  check('config ~/.setu.json', c.workspace && c.domain && c.tunnel, 'setu setup');
   const workspace = c.workspace ?? '';
 
-  // dnsmasq service healthy + actually resolving
-  const services = (() => { try { return execFileSync('brew', ['services', 'list'], { encoding: 'utf8' }); } catch { return ''; } })();
+  // Shared across multiple checks below — fetch once, not once per check.
+  const [servicesRes, digRes, caddyAdmin] = await Promise.all([
+    spawnText('brew', ['services', 'list']),
+    spawnText('dig', ['+short', '+time=1', '+tries=1', 'test.quivly.local', '@127.0.0.1']),
+    fetch('http://localhost:2019/config/', { signal: AbortSignal.timeout(1500) }).then(r => r.ok).catch(() => false),
+  ]);
+  const services    = servicesRes.text;
   const dnsmasqLine = services.split('\n').find(l => l.startsWith('dnsmasq')) ?? '';
-  check('dnsmasq service', /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
-    'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq');
-  const digOut = spawnSync('dig', ['+short', '+time=1', '+tries=1', 'test.quivly.local', '@127.0.0.1'],
-    { encoding: 'utf8' });
-  check('dnsmasq resolves *.quivly.local', digOut.stdout?.includes('127.0.0.1'),
-    'sudo brew services restart dnsmasq (then re-check)');
-  check('/etc/resolver/quivly.local', existsSync('/etc/resolver/quivly.local'), 'setu setup');
+  const sudoOk      = async (argv) => (await spawnText('sudo', ['-n', '-l', ...argv])).code === 0;
 
-  // caddy
-  check('caddy service', /^caddy\s+started/m.test(services), 'brew services restart caddy');
-  const caddyAdmin = await fetch('http://localhost:2019/config/', { signal: AbortSignal.timeout(1500) })
-    .then(r => r.ok).catch(() => false);
-  check('caddy admin API (:2019)', caddyAdmin, 'brew services restart caddy');
+  const checkThunks = [
+    ...['caddy', 'cloudflared', 'dnsmasq', 'direnv'].map(pkg => async () => (
+      { name: `brew: ${pkg}`, ok: brewInstalled(pkg), fix: `brew install ${pkg}` }
+    )),
+    async () => ({ name: 'config ~/.setu.json', ok: !!(c.workspace && c.domain && c.tunnel), fix: 'setu setup' }),
+    async () => ({
+      name: 'dnsmasq service',
+      ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
+      fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
+    }),
+    async () => ({ name: 'dnsmasq resolves *.quivly.local', ok: digRes.text.includes('127.0.0.1'), fix: 'sudo brew services restart dnsmasq (then re-check)' }),
+    async () => ({ name: '/etc/resolver/quivly.local', ok: existsSync('/etc/resolver/quivly.local'), fix: 'setu setup' }),
+    async () => ({ name: 'caddy service', ok: /^caddy\s+started/m.test(services), fix: 'brew services restart caddy' }),
+    async () => ({ name: 'caddy admin API (:2019)', ok: caddyAdmin, fix: 'brew services restart caddy' }),
+    async () => ({
+      name: 'sudoers: caddy reload',
+      ok: !!workspace && await sudoOk([CADDY_BIN, 'reload', '--config', join(workspace, 'Caddyfile')]),
+      fix: 'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)',
+    }),
+    async () => ({ name: 'sudoers: hosts sync', ok: await sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']), fix: 'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)' }),
+    async () => ({ name: '/etc/hosts quivly block', ok: readFileSync('/etc/hosts', 'utf8').includes('# quivly-start'), fix: 'setu new <repo> <branch> (or any command that syncs hosts)' }),
+    async () => ({ name: 'cloudflared cert', ok: existsSync(join(HOME, '.cloudflared', 'cert.pem')), fix: 'cloudflared tunnel login' }),
+  ];
 
-  // sudoers rules match what lib.js actually runs (sudo -l checks without executing)
-  const sudoOk = (argv) => spawnSync('sudo', ['-n', '-l', ...argv], { stdio: 'ignore' }).status === 0;
-  check('sudoers: caddy reload', workspace && sudoOk([CADDY_BIN, 'reload', '--config', join(workspace, 'Caddyfile')]),
-    'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)');
-  check('sudoers: hosts sync', sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']),
-    'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)');
-
-  // /etc/hosts actually has our block
-  check('/etc/hosts quivly block', readFileSync('/etc/hosts', 'utf8').includes('# quivly-start'),
-    'setu new <repo> <branch> (or any command that syncs hosts)');
-
-  // cloudflared
-  check('cloudflared cert', existsSync(join(HOME, '.cloudflared', 'cert.pem')), 'cloudflared tunnel login');
   if (c.tunnel) {
-    const tl = spawnSync(CLOUDFLARED_BIN, ['tunnel', 'list'], { encoding: 'utf8' });
-    check(`tunnel ${c.tunnel} exists`, tl.stdout?.split('\n').some(l => l.includes(` ${c.tunnel} `)),
-      `cloudflared tunnel create ${c.tunnel}`);
+    checkThunks.push(async () => {
+      const tl = await spawnText(CLOUDFLARED_BIN, ['tunnel', 'list']);
+      return { name: `tunnel ${c.tunnel} exists`, ok: tl.text.split('\n').some(l => l.includes(` ${c.tunnel} `)), fix: `cloudflared tunnel create ${c.tunnel}` };
+    });
   }
 
   // setu repo hygiene
   if (existsSync(join(SETU_DIR, '.git'))) {
-    check('~/.setu clean', setuGit(['status', '--porcelain']).trim() === '',
-      'git -C ~/.setu status — commit or stash local edits');
-    let behind = 0;
-    try { behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10); } catch {}
-    check('setu up to date', behind === 0, 'setu update');
+    checkThunks.push(async () => ({ name: '~/.setu clean', ok: setuGit(['status', '--porcelain']).trim() === '', fix: 'git -C ~/.setu status — commit or stash local edits' }));
+    checkThunks.push(async () => {
+      let behind = 0;
+      try { behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10); } catch {}
+      return { name: 'setu up to date', ok: behind === 0, fix: 'setu update' };
+    });
   }
 
   // worktree hygiene — the class of bug that let a worktree ("orb") run fully
   // invisibly to setu for over a day in production: unregistered-but-running
   // processes, a registered port whose actual listener belongs to a different
   // worktree, and worktree directories git knows about that setu's own registry
-  // (.ports/.projects) doesn't.
+  // (.ports/.projects) doesn't. entries/active computed once, shared by all
+  // four checks below instead of each re-scanning independently.
   if (workspace) {
     const entries = portEntries(workspace);
-    const known   = new Set(entries.map(e => e.port));
     const active  = listActivePorts();
 
-    const orphanProcs = active.filter(p => !known.has(p.port));
-    check('no unregistered dev-server processes', orphanProcs.length === 0,
-      orphanProcs.length ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map(p => `pid ${p.pid} :${p.port}`).join(', ')})` : undefined);
+    checkThunks.push(async () => {
+      const known = new Set(entries.map(e => e.port));
+      const orphanProcs = active.filter(p => !known.has(p.port));
+      return { name: 'no unregistered dev-server processes', ok: orphanProcs.length === 0,
+        fix: orphanProcs.length ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map(p => `pid ${p.pid} :${p.port}`).join(', ')})` : undefined };
+    });
 
-    const mismatches = [];
-    for (const e of entries) {
-      const p = active.find(a => a.port === e.port);
-      if (!p) continue;
-      const cwd = processCwd(p.pid);
-      const expected = resolve(join(workspace, e.repo, e.name));
-      // Nx/monorepo dev servers end up with cwd nested inside apps/<app> — only
-      // flag it if cwd isn't the worktree root or somewhere underneath it.
-      if (cwd && resolve(cwd) !== expected && !resolve(cwd).startsWith(expected + '/'))
-        mismatches.push(`${e.key} :${e.port} is actually serving ${cwd}`);
-    }
-    check('registered ports match their worktree', mismatches.length === 0, mismatches.join('; ') || undefined);
+    checkThunks.push(async () => {
+      const mismatches = [];
+      for (const e of entries) {
+        const p = active.find(a => a.port === e.port);
+        if (!p) continue;
+        const cwd = processCwd(p.pid);
+        const expected = resolve(join(workspace, e.repo, e.name));
+        // Nx/monorepo dev servers end up with cwd nested inside apps/<app> —
+        // only flag it if cwd isn't the worktree root or underneath it.
+        if (cwd && resolve(cwd) !== expected && !resolve(cwd).startsWith(expected + '/'))
+          mismatches.push(`${e.key} :${e.port} is actually serving ${cwd}`);
+      }
+      return { name: 'registered ports match their worktree', ok: mismatches.length === 0, fix: mismatches.join('; ') || undefined };
+    });
 
-    const registeredDirs = new Set(entries.map(e => join(workspace, e.repo, e.name)));
-    const gitWorktreeDirs = new Set();
-    for (const repo of Object.keys(loadProjects(workspace))) {
-      const repoDir = join(workspace, `${repo}.git`);
-      if (!existsSync(repoDir)) continue;
-      try {
-        const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
-        for (const wt of porcelain.trim().split('\n\n')) {
-          const p = wt.match(/^worktree (.+)$/m)?.[1];
-          if (p && p !== repoDir && !p.includes('/.claude/worktrees/')) gitWorktreeDirs.add(p);
-        }
-      } catch {}
-    }
-    const unregistered = [...gitWorktreeDirs].filter(d => !registeredDirs.has(d));
-    check('all git worktrees are registered with setu', unregistered.length === 0,
-      unregistered.length ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)` : undefined);
+    checkThunks.push(async () => {
+      const registeredDirs = new Set(entries.map(e => join(workspace, e.repo, e.name)));
+      const gitWorktreeDirs = new Set();
+      for (const repo of Object.keys(loadProjects(workspace))) {
+        const repoDir = join(workspace, `${repo}.git`);
+        if (!existsSync(repoDir)) continue;
+        try {
+          const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
+          for (const wt of porcelain.trim().split('\n\n')) {
+            const p = wt.match(/^worktree (.+)$/m)?.[1];
+            if (p && p !== repoDir && !p.includes('/.claude/worktrees/')) gitWorktreeDirs.add(p);
+          }
+        } catch {}
+      }
+      const unregistered = [...gitWorktreeDirs].filter(d => !registeredDirs.has(d));
+      return { name: 'all git worktrees are registered with setu', ok: unregistered.length === 0,
+        fix: unregistered.length ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)` : undefined };
+    });
 
     // mirror case: registry entries for worktrees removed via raw `git worktree
     // remove` instead of `setu rm` — the port/domain registration outlives the
     // directory it pointed at.
-    const stale = entries.filter(e => !existsSync(join(workspace, e.repo, e.name)));
-    check('no registry entries for missing worktrees', stale.length === 0,
-      stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined);
+    checkThunks.push(async () => {
+      const stale = entries.filter(e => !existsSync(join(workspace, e.repo, e.name)));
+      return { name: 'no registry entries for missing worktrees', ok: stale.length === 0,
+        fix: stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined };
+    });
   }
 
-  // portal
-  const portalUp = await portalRequest('/api/worktrees').then(() => true).catch(() => false);
-  check('portal (:2999)', portalUp, 'setu portal');
+  checkThunks.push(async () => ({
+    name: 'portal (:2999)',
+    ok: await portalRequest('/api/worktrees').then(() => true).catch(() => false),
+    fix: 'setu portal',
+  }));
+
+  const checks = (await Promise.all(checkThunks.map(fn => fn()))).map(r => ({ ...r, ok: !!r.ok }));
 
   if (asJson) {
     console.log(JSON.stringify(checks, null, 2));

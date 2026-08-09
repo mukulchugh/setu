@@ -174,6 +174,8 @@ async function getWorktrees() {
       return {
         key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
         active:        activePorts.has(port),
+        queued:        queuePosition(key) !== null,
+        queuePosition: queuePosition(key),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
         label:         meta.label,
         branchUrl,
@@ -187,30 +189,78 @@ async function getWorktrees() {
 }
 
 // ── dev server ────────────────────────────────────────────────────────────────
+// Each next-server can still be several hundred MB to low-GB even after the
+// Turbopack-eviction fix (Next.js ≥16.3.0) — unbounded concurrent starts is
+// exactly the failure mode this whole portal exists to prevent. Cap concurrent
+// dev servers; anything beyond the cap queues and starts automatically as a
+// slot frees up (a worktree stopping, or exiting on its own).
+const MAX_CONCURRENT_DEV = _cfg.maxConcurrentDevServers ?? 3;
+const startQueue = []; // [{ key, repo, name, port }], FIFO
 
-function startWorktree(repo, name, port) {
+function queuePosition(key) {
+  const i = startQueue.findIndex(q => q.key === key);
+  return i === -1 ? null : i + 1;
+}
+
+function drainQueue() {
+  while (startQueue.length && procs.size < MAX_CONCURRENT_DEV) {
+    const next = startQueue.shift();
+    if (procs.has(next.key)) continue; // started some other way already
+    spawnWorktree(next.repo, next.name, next.port);
+  }
+}
+
+function spawnWorktree(repo, name, port) {
   const key   = `${repo}/${name}`;
-  if (procs.has(key)) return { ok: false, error: 'already running' };
   const wtDir = `${WORKSPACE}/${repo}/${name}`;
   const env   = { ...process.env, PORT: String(port) };
   const envrc = readEnvrc(wtDir);
   for (const m of envrc.matchAll(/^export (\w+)=(.+)$/gm)) env[m[1]] = m[2].trim();
   const fd   = openLogFd(repo, name, 'dev');
   const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stdout: fd, stderr: fd });
-  procs.set(key, proc);
-  proc.exited.then(() => procs.delete(key));
+  const entry = wrapProc(proc);
+  procs.set(key, entry);
+  proc.exited.then(() => { if (procs.get(key) === entry) { procs.delete(key); drainQueue(); } });
   startSidecars(repo, name, port);
+}
+
+// Boot-time only: procs starts empty on every portal restart, same blind spot
+// reconcileTriggerSidecars() fixes for Trigger — without this, a dev server
+// that predates this portal instance (e.g. still running from before a
+// restart) doesn't count against MAX_CONCURRENT_DEV, so the cap silently
+// undercounts real concurrent servers. Unlike Trigger, dev servers do bind a
+// port, so this reuses the same batched scan getWorktrees() already does.
+function reconcileDevServers() {
+  const activePorts = new Map(listActivePorts().map(p => [p.port, p.pid]));
+  for (const { key, port } of portEntries(WORKSPACE)) {
+    if (procs.has(key)) continue;
+    const pid = activePorts.get(port);
+    if (pid) procs.set(key, wrapPid(+pid));
+  }
+}
+
+function startWorktree(repo, name, port) {
+  const key = `${repo}/${name}`;
+  if (procs.has(key)) return { ok: false, error: 'already running' };
+  if (queuePosition(key)) return { ok: true, queued: true, position: queuePosition(key) };
+  if (procs.size >= MAX_CONCURRENT_DEV) {
+    startQueue.push({ key, repo, name, port });
+    return { ok: true, queued: true, position: startQueue.length };
+  }
+  spawnWorktree(repo, name, port);
   return { ok: true };
 }
 
 function stopWorktree(repo, name, port) {
-  const proc = procs.get(`${repo}/${name}`);
-  if (proc) { proc.kill(); procs.delete(`${repo}/${name}`); }
+  const qi = startQueue.findIndex(q => q.key === `${repo}/${name}`);
+  if (qi !== -1) startQueue.splice(qi, 1);
+  procs.delete(`${repo}/${name}`);
   const pid = activePid(port);
   if (pid) { try { execFileSync('kill', [pid]); } catch {} }
   stopInngest(repo, name, port);
   stopTrigger(repo, name);
   stopSidecars(repo, name);
+  drainQueue(); // don't wait on the killed process's async .then() to free the slot
 }
 
 // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
@@ -403,7 +453,10 @@ function enableTunnel(repo, name, port) {
   configureWorktreeEnv(_cfg, repo, name, port, true);
   reloadCaddy(WORKSPACE);
   addTunnelRoute(repo, name, pubDom, port);
-  if (wasRunning) startWorktree(repo, name, port);
+  // spawnWorktree, not startWorktree — this is resuming something that was
+  // already running a moment ago, not a fresh admission decision, so it
+  // shouldn't get stuck behind the concurrency queue.
+  if (wasRunning) spawnWorktree(repo, name, port);
   return { ok: true };
 }
 
@@ -413,7 +466,7 @@ function disableTunnel(repo, name, port) {
   removeTunnelRoute(repo, name);
   configureWorktreeEnv(_cfg, repo, name, port, false);
   reloadCaddy(WORKSPACE);
-  if (wasRunning) startWorktree(repo, name, port);
+  if (wasRunning) spawnWorktree(repo, name, port);
   return { ok: true };
 }
 
@@ -610,7 +663,7 @@ function checkMemoryCeilings() {
       const port = getPort(WORKSPACE, repo, name);
       console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
       stopWorktree(repo, name, port);
-      if (port) startWorktree(repo, name, port);
+      if (port) spawnWorktree(repo, name, port);
     }
   }
 }
@@ -620,6 +673,7 @@ setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
 // Rebuild merged ingress and restart the single tunnel process for all enabled worktrees
 ;(async () => {
   syncHosts(WORKSPACE);
+  reconcileDevServers();
   reconcileTriggerSidecars();
   const wts = await getWorktrees().catch(() => []);
   for (const w of wts) {

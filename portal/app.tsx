@@ -265,9 +265,9 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
         <div class="flex items-center gap-2 mb-1">
           <span class={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${badge} shrink-0`}>{w.label}</span>
           <span class="text-zinc-900 font-semibold text-sm truncate">{w.name}</span>
-          <span class={`flex items-center gap-1 text-xs ${w.active ? 'text-emerald-600' : 'text-zinc-400'} shrink-0 ml-1`}>
-            <span class={`w-1.5 h-1.5 rounded-full ${w.active ? 'bg-emerald-500' : 'bg-zinc-300'}`} />
-            {w.active ? 'running' : 'stopped'}
+          <span class={`flex items-center gap-1 text-xs ${w.active ? 'text-emerald-600' : w.queued ? 'text-amber-600' : 'text-zinc-400'} shrink-0 ml-1`}>
+            <span class={`w-1.5 h-1.5 rounded-full ${w.active ? 'bg-emerald-500' : w.queued ? 'bg-amber-400' : 'bg-zinc-300'}`} />
+            {w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped'}
           </span>
         </div>
         <div class="flex items-center gap-2 flex-wrap">
@@ -307,6 +307,10 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
         {w.active ? (
           <button onClick={() => onAct('/api/stop', w)} data-tip="Stop server" class="tip icon-btn text-red-500 hover:bg-red-50">
             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+          </button>
+        ) : w.queued ? (
+          <button onClick={() => onAct('/api/stop', w)} data-tip={`Queued #${w.queuePosition} — click to cancel`} class="tip icon-btn text-amber-500 hover:bg-amber-50">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path stroke-linecap="round" d="M12 6v6l4 2" /></svg>
           </button>
         ) : pending ? (
           <button disabled data-tip="Starting…" class="tip icon-btn text-emerald-400 cursor-not-allowed opacity-70">
