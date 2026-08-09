@@ -149,13 +149,23 @@ function killPort(port) {
 // reconciled from before this portal started (see reconcileTriggerSidecars) keeps
 // whatever pgid it was originally given — look it up rather than guess, or the
 // kill silently targets a group that doesn't exist and nothing dies.
+// Only send -pgid when pid IS the group leader (pgid === pid) — same guard
+// kill-with-style uses. A freshly-spawned (detached:true) sidecar is always
+// its own leader, so this always fires for the normal case. A *reconciled*
+// pid (adopted from before this portal instance existed — see
+// reconcileTriggerSidecars/reconcileDevServers) might have inherited a pgid
+// from whatever spawned it originally; that group could contain processes
+// Setu never created and doesn't own. Without this guard, killing that group
+// could take out unrelated siblings — worst case, even Setu's own group, if
+// the pgid happens to collide. Fall back to a plain single-pid kill instead.
 function killGroup(pid, signal = 'TERM') {
   let pgid = pid;
   try {
     const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim();
     if (out) pgid = parseInt(out, 10);
   } catch {}
-  try { execFileSync('kill', [`-${signal}`, '--', `-${pgid}`], { stdio: 'ignore' }); return true; }
+  const target = pgid === pid ? `-${pgid}` : String(pid);
+  try { execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' }); return true; }
   catch { return false; }
 }
 
