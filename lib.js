@@ -101,7 +101,14 @@ export function configureWorktreeEnv(c, repo, name, port, withTunnel) {
     const pd = publicDomain(c);
     writeEnvrc(wtDir, port, `https://${pd}`, `https://${pd}/authentication/callback`);
   } else {
-    writeEnvrc(wtDir, port, `http://${localDomain(repo, name)}`, `http://localhost:${port}/authentication/callback`);
+    // Was http://localhost:${port}/... — inconsistent with APP_BASE_URL on the
+    // line above, and the actual root cause of "redirected to localhost" after
+    // login: WORKOS_REDIRECT_URI is read once from this env var at process
+    // startup by @workos-inc/authkit-nextjs and used verbatim as the OAuth
+    // redirect destination, so a mismatched value here sends the browser to
+    // localhost regardless of what domain the user actually visited through Caddy.
+    const ld = localDomain(repo, name);
+    writeEnvrc(wtDir, port, `http://${ld}`, `http://${ld}/authentication/callback`);
   }
   writeCaddy(c, repo, name, port, withTunnel);
 }
