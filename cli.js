@@ -18,6 +18,7 @@ import {
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, createWorktree, removeWorktree,
   portalPid, portalRequest, commandExists, killGroup, containerRuntimeAvailable,
+  engineCapacity, parseMemToMb,
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
@@ -316,11 +317,11 @@ async function cmdSetup() {
   console.log(`  ${GR}run \`setu doctor\` if anything misbehaves${R}\n`);
 }
 
-// ── setu new <repo> <branch> [--tunnel] [--start] [--bare] [--json] ─────────
+// ── setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json] ─
 
 async function cmdNew() {
   const [repo, name] = args;
-  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel] [--start] [--json]');
+  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json]');
   const c = cfg();
   const withTunnel = !!flags.tunnel;
 
@@ -334,7 +335,14 @@ async function cmdNew() {
   let started = false;
   if (flags.start) {
     await ensurePortal(c);
-    const startRes = await portalRequest('/api/start', { repo, name, container: !flags.bare }).catch(e => ({ ok: false, error: String(e) }));
+    const startBody = { repo, name };
+    if (flags.container) startBody.container = true;
+    else if (flags.bare) startBody.container = false;
+    // Neither flag: a brand-new worktree has no prior history either way, so
+    // the portal's sticky default naturally resolves to the intended global
+    // default (container) here — same call shape as `setu start`, not a
+    // special case.
+    const startRes = await portalRequest('/api/start', startBody).catch(e => ({ ok: false, error: String(e) }));
     started = !!startRes.ok;
     if (!started) fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
   }
@@ -373,18 +381,21 @@ async function cmdRm() {
 
 async function cmdStart() {
   const [repo, name] = args;
-  if (!repo || !name) die('Usage: setu start <repo> <branch> [--bare]');
+  if (!repo || !name) die('Usage: setu start <repo> <branch> [--container|--bare]');
   const c = cfg();
   if (!getPort(c.workspace, repo, name)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
   await ensurePortal(c);
-  // Container is the default — real cgroup-enforced memory/CPU cap instead of
-  // an uncapped bare process. --bare is the explicit opt-out, not the other
-  // way around; native stays for the tooling around it (portal/Caddy/git),
-  // this only governs how the dev server process itself runs.
-  const container = !flags.bare;
-  const res = await portalRequest('/api/start', { repo, name, container }).catch(e => ({ ok: false, error: String(e) }));
+  // --container/--bare force a mode explicitly. Neither flag omits `container`
+  // entirely so the portal applies its sticky per-worktree default instead of
+  // blindly forcing one — found live: a flat "container unless --bare" default
+  // silently switched an established, always-bare worktree into a container
+  // the moment it needed a restart with no explicit choice from anyone.
+  const body = { repo, name };
+  if (flags.container) body.container = true;
+  else if (flags.bare) body.container = false;
+  const res = await portalRequest('/api/start', body).catch(e => ({ ok: false, error: String(e) }));
   if (!res.ok) die(res.error ?? 'start failed');
-  ok(`started ${repo}/${name}${container ? ' (containerized)' : ' (bare)'}`);
+  ok(`started ${repo}/${name}${res.queued ? ' (queued)' : res.container ? ' (containerized)' : ' (bare)'}`);
 }
 
 async function cmdStop() {
@@ -779,6 +790,23 @@ async function cmdDoctor() {
       return { name: 'container runtime (setu start uses it by default)', ok: rt.available,
         fix: rt.available ? undefined : 'start OrbStack/Docker Desktop — or use `setu start --bare` until then' };
     },
+    // engineCapacity() clamps each INDIVIDUAL container's limit to what the
+    // engine has — that alone doesn't stop 3 containers, each individually
+    // valid, from jointly asking for more memory than the engine's VM
+    // actually has. Documented as an invariant to manage by hand in AGENTS.md;
+    // this is the check that actually verifies it instead of leaving it as
+    // homework. Memory only, not CPU — CPU is shares-based and softly
+    // time-shares under oversubscription, it doesn't fail the way memory can.
+    async () => {
+      const cap = engineCapacity();
+      if (!cap.memMb) return { name: 'container memory budget fits engine capacity', ok: true };
+      const memLimitMb = parseMemToMb(c.containerMemoryLimit ?? '4g') ?? 4096;
+      const maxDev = c.maxConcurrentDevServers ?? 3;
+      const totalMb = memLimitMb * maxDev;
+      const ok = totalMb <= cap.memMb;
+      return { name: 'container memory budget fits engine capacity', ok,
+        fix: ok ? undefined : `maxConcurrentDevServers(${maxDev}) × containerMemoryLimit(${memLimitMb}MB) = ${totalMb}MB exceeds the engine's ${cap.memMb}MB — lower one in ~/.setu.json` };
+    },
     async () => ({
       name: 'sudoers: caddy reload',
       ok: !!workspace && await sudoOk([CADDY_BIN, 'reload', '--config', join(workspace, 'Caddyfile')]),
@@ -906,16 +934,19 @@ function cmdHelp() {
     setu init  <gh-slug>             Clone repo + create main worktree
     setu new   <repo> <branch>       Create worktree (auto port + domain)
     setu new   <repo> <branch> --tunnel   ...and take the public URL
-    setu new   <repo> <branch> --start    ...and start its dev server (containerized by default)
-    setu new   <repo> <branch> --start --bare   ...as a bare process instead (no memory/CPU cap)
+    setu new   <repo> <branch> --start    ...and start its dev server (new worktree → containerized; see below)
+    setu new   <repo> <branch> --start --bare   ...force a bare process instead (no memory/CPU cap)
     setu rm    <repo> <branch>       Remove worktree
 
   ${C}Day-to-day${R}
     setu cd    <repo> <branch>       cd into worktree
     setu ls    [repo] [--json]       List worktrees + status
     setu status                      Same as ls
-    setu start <repo> <branch>       Start dev server — containerized by default (real memory/CPU cap; needs Docker/OrbStack running)
-    setu start <repo> <branch> --bare   ...as a bare process instead, no cap
+    setu start <repo> <branch>       Start dev server — sticky per-worktree default: a worktree that has
+                                      only ever run bare stays bare; one that's containerized before (or is
+                                      brand new) defaults to a container (real memory/CPU cap; needs Docker/OrbStack)
+    setu start <repo> <branch> --container   Force containerized, even on a worktree that's always been bare
+    setu start <repo> <branch> --bare        Force bare, even on a worktree that's containerized before
     setu stop  <repo> <branch>       Stop dev server (via portal)
     setu prune [--force]             Find/kill dev servers running outside the registry
     setu fetch <repo>                git fetch --all

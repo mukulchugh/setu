@@ -16,6 +16,7 @@ import {
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
   AGENT_CLIS, detectAgentClis, loadSidecars, killGroup,
   containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
+  defaultContainerMode,
 } from './lib.js';
 
 let _cfg;
@@ -135,6 +136,21 @@ function activePortsCached() {
 }
 
 function killPort(port) {
+  // A container-published port's host-side "process" is the engine's own
+  // port-forwarding helper, not the dev server itself — signaling it directly
+  // isn't scoped to one container (reconcileDevServers hits this exact hazard
+  // and already branches container-first for the same reason). Route through
+  // the real stop path whenever the port belongs to a known, container-backed
+  // worktree; the raw PID-kill fallback below stays for bare processes and for
+  // genuinely-unregistered ports (setu prune's orphan-killing case).
+  const owner = portEntries(WORKSPACE).find(e => e.port === port);
+  const entry = owner && procs.get(owner.key);
+  if (entry?.container) {
+    stopContainer(owner.repo, owner.name, entry.container);
+    if (procs.get(owner.key) === entry) procs.delete(owner.key);
+    drainQueue();
+    return { ok: true };
+  }
   const pid = activePid(port);
   if (!pid) return { ok: false, error: 'nothing on that port' };
   try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
@@ -280,13 +296,23 @@ function startWorktree(repo, name, port, container = true) {
   }
   if (procs.size >= MAX_CONCURRENT_DEV) {
     startQueue.push({ key, repo, name, port, container });
-    return { ok: true, queued: true, position: startQueue.length };
+    return { ok: true, queued: true, position: startQueue.length, container };
   }
   if (container) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
-  return { ok: true };
+  return { ok: true, container };
 }
 
-function stopWorktree(repo, name, port) {
+// drain=false is for callers that stop a worktree only to immediately respawn
+// the SAME one (a restart, not a real vacancy) — checkMemoryCeilings' restart
+// path and the tunnel toggle below. Defaulting drain=true here and letting
+// drainQueue() run unconditionally used to admit a queued worktree into the
+// slot in the moment between stop and respawn, and then the caller's respawn
+// added the original worktree back on top — procs.size silently exceeding
+// MAX_CONCURRENT_DEV, the exact thing the cap exists to prevent. If the
+// respawn itself later fails, spawnWorktree/spawnContainer's own `.then`
+// handlers already drain the queue — so skipping the drain here never leaves
+// a slot stuck, it only avoids double-counting during a same-worktree restart.
+function stopWorktree(repo, name, port, { drain = true } = {}) {
   const key = `${repo}/${name}`;
   const qi = startQueue.findIndex(q => q.key === key);
   if (qi !== -1) startQueue.splice(qi, 1);
@@ -301,7 +327,7 @@ function stopWorktree(repo, name, port) {
   stopInngest(repo, name, port);
   stopTrigger(repo, name);
   stopSidecars(repo, name);
-  drainQueue(); // don't wait on the killed process's async .then() to free the slot
+  if (drain) drainQueue();
 }
 
 // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
@@ -486,6 +512,14 @@ function removeTunnelRoute(repo, name) {
 
 // ── per-worktree tunnel toggle ────────────────────────────────────────────────
 
+// Resumes a worktree in whatever mode it was actually running before —
+// container or bare — instead of always spawnWorktree (bare). Always-bare
+// used to silently strip a containerized worktree's memory/CPU cap on every
+// tunnel toggle, with nothing telling the user it happened.
+function respawnAsBefore(repo, name, port, wasContainer) {
+  if (wasContainer) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
+}
+
 function enableTunnel(repo, name, port) {
   // Only one worktree can use the shared tunnel URL — evict any currently active one
   for (const [key, { port: p }] of activeTunnelMap.entries()) {
@@ -493,26 +527,33 @@ function enableTunnel(repo, name, port) {
     const si = key.indexOf('/');
     disableTunnel(key.slice(0, si), key.slice(si + 1), p);
   }
-  const pubDom = publicDomain(_cfg);
+  const key = `${repo}/${name}`;
+  const wasContainer = !!procs.get(key)?.container;
   const wasRunning = !!activePid(port);
-  if (wasRunning) stopWorktree(repo, name, port);
+  const pubDom = publicDomain(_cfg);
+  // drain: false — this is a same-worktree restart, not a real vacancy; see
+  // stopWorktree's comment. Captured wasContainer before stopping since
+  // stopWorktree deletes the procs entry.
+  if (wasRunning) stopWorktree(repo, name, port, { drain: false });
   configureWorktreeEnv(_cfg, repo, name, port, true);
   reloadCaddy(WORKSPACE);
   addTunnelRoute(repo, name, pubDom, port);
-  // spawnWorktree, not startWorktree — this is resuming something that was
-  // already running a moment ago, not a fresh admission decision, so it
-  // shouldn't get stuck behind the concurrency queue.
-  if (wasRunning) spawnWorktree(repo, name, port);
+  // spawnContainer/spawnWorktree directly, not startWorktree — this is
+  // resuming something that was already running a moment ago, not a fresh
+  // admission decision, so it shouldn't get stuck behind the concurrency queue.
+  if (wasRunning) respawnAsBefore(repo, name, port, wasContainer);
   return { ok: true };
 }
 
 function disableTunnel(repo, name, port) {
+  const key = `${repo}/${name}`;
+  const wasContainer = !!procs.get(key)?.container;
   const wasRunning = !!activePid(port);
-  if (wasRunning) stopWorktree(repo, name, port);
+  if (wasRunning) stopWorktree(repo, name, port, { drain: false });
   removeTunnelRoute(repo, name);
   configureWorktreeEnv(_cfg, repo, name, port, false);
   reloadCaddy(WORKSPACE);
-  if (wasRunning) spawnWorktree(repo, name, port);
+  if (wasRunning) respawnAsBefore(repo, name, port, wasContainer);
   return { ok: true };
 }
 
@@ -535,6 +576,22 @@ function removeWorktree(repo, name) {
   const port = getPort(WORKSPACE, repo, name);
   if (port) stopWorktree(repo, name, port);
   if (activeTunnelMap.has(`${repo}/${name}`)) removeTunnelRoute(repo, name);
+
+  // The worktree is being permanently removed, not just stopped — unlike a
+  // normal stop (stopContainer's `down` deliberately keeps the node_modules
+  // volume so a later start skips reinstalling), there's no later start
+  // coming. Without this, the volume leaks forever with nothing left
+  // pointing at it — the exact kind of disk bloat this tool exists to avoid.
+  // Must run before libRemoveWorktree deletes the directory (and the compose
+  // file with it) below.
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  if (existsSync(dockerComposePath(wtDir))) {
+    try {
+      execFileSync('docker',
+        ['compose', '-p', composeProjectName(repo, name), '-f', dockerComposePath(wtDir), 'down', '-v'],
+        { stdio: 'ignore' });
+    } catch {}
+  }
 
   try { libRemoveWorktree(_cfg, repo, name); }
   catch (e) { return { ok: false, error: String(e) }; }
@@ -636,11 +693,19 @@ async function handle(req) {
     }
     if (pathname === '/api/start') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      // Container is the default now, not opt-in — dev servers run in Docker
-      // unless a caller explicitly asks for bare (container === false). Native
-      // stays for the tooling around it (portal, Caddy, dnsmasq, git) — this
-      // default only governs how the dev server process itself runs.
-      return Response.json(startWorktree(repo, name, port, container !== false));
+      // Container is the default for dev servers, not opt-in — but ONLY when
+      // nobody expressed a preference. `container` explicitly true/false
+      // (a CLI --container/--bare flag) always wins. Omitted entirely (a
+      // plain `setu start`, or the portal UI's Start button, which never
+      // sends this field) falls back to defaultContainerMode's sticky,
+      // per-worktree default — found live: applying the flat global default
+      // unconditionally silently switched an established, always-bare
+      // worktree into a container the moment it needed a restart, with no
+      // one having asked for that. Native stays for the tooling around it
+      // (portal, Caddy, dnsmasq, git) regardless — this only governs how the
+      // dev server process itself runs.
+      const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
+      return Response.json(startWorktree(repo, name, port, useContainer));
     }
     if (pathname === '/api/stop') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -704,6 +769,8 @@ function processFootprintMb(pid) {
   } catch { return 0; }
 }
 
+const deadContainerStrikes = new Map(); // key -> consecutive "not alive" readings
+
 function checkMemoryCeilings() {
   for (const [key, entry] of procs.entries()) {
     if (entry.container) {
@@ -715,10 +782,24 @@ function checkMemoryCeilings() {
       // exhausting its retries — without this, its concurrency slot stays
       // occupied forever (verified live: a memory limit too small for the
       // app to ever boot left a dead entry in `procs` indefinitely).
-      if (!composeProjectAlive(entry.container)) {
-        console.warn(`⚠ ${key} container exited and is not restarting — freeing its slot`);
-        procs.delete(key);
-        drainQueue();
+      if (composeProjectAlive(entry.container)) {
+        deadContainerStrikes.delete(key);
+      } else {
+        // Require two consecutive misses, not one — a single "not alive"
+        // reading can be a transient window during a legitimate recreate
+        // (a tunnel toggle or manual restart respawning the same worktree),
+        // not just a container that's genuinely given up for good. Treating
+        // one miss as final risked freeing a slot — and losing container
+        // tracking — for a worktree that was actually fine a moment later.
+        const strikes = (deadContainerStrikes.get(key) ?? 0) + 1;
+        if (strikes >= 2) {
+          console.warn(`⚠ ${key} container exited and is not restarting — freeing its slot`);
+          procs.delete(key);
+          deadContainerStrikes.delete(key);
+          drainQueue();
+        } else {
+          deadContainerStrikes.set(key, strikes);
+        }
       }
       continue;
     }
@@ -728,7 +809,7 @@ function checkMemoryCeilings() {
       const repo = key.slice(0, si), name = key.slice(si + 1);
       const port = getPort(WORKSPACE, repo, name);
       console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
-      stopWorktree(repo, name, port);
+      stopWorktree(repo, name, port, { drain: false });
       if (port) spawnWorktree(repo, name, port);
     }
   }

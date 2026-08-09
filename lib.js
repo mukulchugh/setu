@@ -9,6 +9,7 @@ import {
 } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
+import { createHash } from 'crypto';
 
 export const HOME        = homedir();
 export const CFG_PATH    = join(HOME, '.setu.json');
@@ -342,15 +343,43 @@ export function containerRuntimeAvailable() {
   return { available: true, engine: engine || 'docker', version };
 }
 
+// A hash suffix, not just a sanitized slug — `slugify` maps `/` to `-`, so two
+// ordinary, independently-valid branch names (`feat/ab` and `feat-ab`) used to
+// collide on the exact same project name. Docker Compose then treats the
+// second `up` as a config change to the same project and recreates the first
+// worktree's container out from under it — found via live review, not a
+// hypothetical. The hash is of the exact registry key, so it's collision-safe
+// regardless of how lossy the human-readable prefix is.
 export function composeProjectName(repo, name) {
-  return `setu-${repo}-${slugify(name)}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const hash = createHash('sha1').update(`${repo}/${name}`).digest('hex').slice(0, 8);
+  const readable = `${repo}-${slugify(name)}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  return `setu-${readable}-${hash}`;
 }
 
 export function dockerComposePath(wtDir) {
   return join(wtDir, 'docker-compose.setu.yml');
 }
 
-function parseMemToMb(v) {
+// Sticky per-worktree default, used whenever a start call doesn't explicitly
+// say --container or --bare (a plain `setu start`, or the portal UI's Start
+// button, which never sends the field at all). Found live: an established
+// worktree that had only ever run bare got silently switched to a container
+// on a restart with no explicit choice made by anyone — container becoming
+// the global default doesn't mean every worktree's history should be
+// overridden by it. A worktree that has run in container mode before (has a
+// compose file on disk) stays sticky-container. A worktree with prior bare
+// history (a dev.log already exists) but has never containerized stays
+// sticky-bare — it has to be opted in explicitly with --container once. Only
+// a genuinely brand-new worktree (no history either way) gets the intended
+// global default.
+export function defaultContainerMode(workspace, repo, name) {
+  const wtDir = join(workspace, repo, name);
+  if (existsSync(dockerComposePath(wtDir))) return true;
+  if (existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) return false;
+  return true;
+}
+
+export function parseMemToMb(v) {
   const m = String(v).trim().match(/^(\d+(?:\.\d+)?)\s*(g|m)$/i);
   if (!m) return null;
   return m[2].toLowerCase() === 'g' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
