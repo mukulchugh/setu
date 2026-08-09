@@ -178,6 +178,61 @@ export function activePid(port) {
   } catch { return ''; }
 }
 
+// Covers app dev-server ports (3000-3999) and inngest sidecar ports (appPort+5288,
+// i.e. 8288-9287) in one lsof call. spawnSync, not execFileSync: with two -i
+// selectors lsof exits 1 even when it successfully printed matches (verified) —
+// execFileSync throws on that and discards output that was actually fine.
+export function listActivePorts() {
+  const res = spawnSync('lsof',
+    ['-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
+    { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
+  const out = res.stdout ?? '';
+  const results = []; let cur = {};
+  for (const line of out.split('\n')) {
+    if (line.startsWith('p')) cur = { pid: line.slice(1) };
+    else if (line.startsWith('c')) cur.cmd = line.slice(1);
+    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ port: +m[1], pid: cur.pid, cmd: cur.cmd }); }
+  }
+  return results;
+}
+
+// cwd of a live process, via lsof — used to verify a port's actual listener
+// belongs to the worktree the registry claims it does (setu doctor/prune).
+export function processCwd(pid) {
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
+    return out.split('\n').find(l => l.startsWith('n'))?.slice(1) ?? null;
+  } catch { return null; }
+}
+
+// ── AI coding CLI detection ──────────────────────────────────────────────────
+// No single "which agent CLIs are installed + launch one" package exists as an
+// importable primitive (checked: dmux/agentmanager/Codeman all bundle detection
+// into a much bigger opinionated tool). This registry + which-check is the
+// lazy version — a static tool-id -> binary map, not hardcoded to any one
+// project's preferred 4 tools. Detected live (not cached) so installing a new
+// CLI doesn't need a portal restart to be picked up.
+export const AGENT_CLIS = {
+  claude:      { bin: 'claude',          label: 'Claude' },
+  codex:       { bin: 'codex',           label: 'Codex' },
+  cursor:      { bin: 'cursor-agent',    label: 'Cursor' },
+  aider:       { bin: 'aider',           label: 'Aider' },
+  opencode:    { bin: 'opencode',        label: 'opencode' },
+  amp:         { bin: 'amp',             label: 'Amp' },
+  antigravity: { bin: 'antigravity-ide', label: 'Antigravity' },
+  grok:        { bin: 'grok',            label: 'Grok' },
+};
+
+export function commandExists(bin) {
+  return spawnSync('which', [bin], { stdio: 'ignore' }).status === 0;
+}
+
+export function detectAgentClis() {
+  return Object.entries(AGENT_CLIS)
+    .filter(([, t]) => commandExists(t.bin))
+    .map(([id, t]) => ({ id, label: t.label }));
+}
+
 export function assignPort(workspace, repo, name) {
   const existing = getPort(workspace, repo, name);
   if (existing) return existing;
@@ -213,6 +268,22 @@ export function loadProjects(workspace) {
         })
     );
   } catch { return {}; }
+}
+
+// ── project sidecars (workspace/sidecars.json: { [repo]: [{name, enabled, command, args, env}] }) ──
+// Procfile/docker-compose-profile shaped, per research: no existing process
+// orchestrator (pm2/overmind/process-compose/...) fits without Setu handing off
+// its own parent-process role, since it already spawns the dev server itself —
+// so this is a plain declarative list Setu loops over with the spawn path it
+// already has, not a new dependency. Not for Inngest/Trigger — those already
+// work as first-class endpoints; this is for anything else a project needs
+// (a plain cloudflared tunnel, a queue worker, whatever), so nothing about
+// starting a worktree stays hardcoded to one project's toolchain.
+export function loadSidecars(workspace, repo) {
+  try {
+    const all = JSON.parse(readFileSync(join(workspace, 'sidecars.json'), 'utf8'));
+    return (all[repo] ?? []).filter(s => s.enabled !== false && s.command);
+  } catch { return []; }
 }
 
 export function registerProject(workspace, { name, slug = '', label = '' }) {

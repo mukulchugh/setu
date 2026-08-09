@@ -15,9 +15,9 @@ import {
   loadConfig, saveConfig, requireConfig,
   localDomain, publicDomain, envLocalPath, parseEnvFile, tunnelEnabled, pinnedTriggerVersion,
   writeCaddy, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, loadProjects, registerProject,
+  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, createWorktree, removeWorktree,
-  portalPid, portalRequest,
+  portalPid, portalRequest, commandExists,
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
@@ -86,6 +86,9 @@ switch (cmd) {
   case 'ls':      await cmdLs(); break;
   case 'init':    await cmdInit(); break;
   case 'status':  await cmdLs(); break;
+  case 'start':   await cmdStart(); break;
+  case 'stop':    await cmdStop(); break;
+  case 'prune':   await cmdPrune(); break;
   case 'portal':  await cmdPortal(); break;
   case 'tunnel':  await cmdTunnel(); break;
   case 'trigger': await cmdTrigger(); break;
@@ -107,7 +110,6 @@ function resolvePath(p) {
   return resolve(p);
 }
 
-function cmdExists(c)    { return spawnSync('which', [c], { stdio: 'ignore' }).status === 0; }
 function brewInstalled(p){ return spawnSync('brew', ['list', p], { stdio: 'ignore' }).status === 0; }
 
 function brewInstall(pkg) {
@@ -163,9 +165,9 @@ async function cmdSetup() {
 
   // 1. deps
   step(1, 7, 'Dependencies');
-  if (!cmdExists('brew')) die('Homebrew not found — install from https://brew.sh');
+  if (!commandExists('brew')) die('Homebrew not found — install from https://brew.sh');
   ok('homebrew');
-  if (!cmdExists('bun')) die('bun not found');
+  if (!commandExists('bun')) die('bun not found');
   ok('bun');
   for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv']) brewInstall(pkg);
   console.log();
@@ -314,11 +316,11 @@ async function cmdSetup() {
   console.log(`  ${GR}run \`setu doctor\` if anything misbehaves${R}\n`);
 }
 
-// ── setu new <repo> <branch> [--tunnel] [--json] ─────────────────────────────
+// ── setu new <repo> <branch> [--tunnel] [--start] [--json] ──────────────────
 
 async function cmdNew() {
   const [repo, name] = args;
-  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel] [--json]');
+  if (!repo || !name) die('Usage: setu new <repo> <branch> [--tunnel] [--start] [--json]');
   const c = cfg();
   const withTunnel = !!flags.tunnel;
 
@@ -329,11 +331,20 @@ async function cmdNew() {
   if (withTunnel) await ensureTunnel(c, repo, name);
   autoInstall(res.wtDir);
 
-  if (asJson) { console.log(JSON.stringify(res)); return; }
+  let started = false;
+  if (flags.start) {
+    await ensurePortal(c);
+    const startRes = await portalRequest('/api/start', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+    started = !!startRes.ok;
+    if (!started) fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
+  }
+
+  if (asJson) { console.log(JSON.stringify({ ...res, started })); return; }
   console.log(`\n  ${G}✓${R} worktree  ${res.wtDir}`);
   console.log(`  ${G}✓${R} port      :${res.port}`);
   console.log(`  ${G}✓${R} local     http://${res.localDom}`);
   if (withTunnel) console.log(`  ${G}✓${R} public    https://${res.pubDom}`);
+  if (started) console.log(`  ${G}✓${R} dev server started`);
   console.log();
 }
 
@@ -351,6 +362,59 @@ async function cmdRm() {
     try { removeWorktree(c, repo, name); } catch (e) { die(e.message); }
   }
   ok(`removed ${repo}/${name}`);
+}
+
+// ── setu start / stop <repo> <branch> ─────────────────────────────────────────
+// The portal already exposes /api/start and /api/stop — this is the CLI verb
+// that was missing to reach them. Without it, `setu new` never started anything
+// and the only way to start a worktree's dev server was clicking a button in the
+// web UI, so real usage (agents included) bypassed the portal entirely by just
+// `cd`-ing in and running `bun dev` directly — untracked, unbounded, duplicable.
+
+async function cmdStart() {
+  const [repo, name] = args;
+  if (!repo || !name) die('Usage: setu start <repo> <branch>');
+  const c = cfg();
+  if (!getPort(c.workspace, repo, name)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
+  await ensurePortal(c);
+  const res = await portalRequest('/api/start', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+  if (!res.ok) die(res.error ?? 'start failed');
+  ok(`started ${repo}/${name}`);
+}
+
+async function cmdStop() {
+  const [repo, name] = args;
+  if (!repo || !name) die('Usage: setu stop <repo> <branch>');
+  if (!portalPid()) { console.log('Portal not running — nothing to stop.'); return; }
+  const res = await portalRequest('/api/stop', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+  if (!res.ok) die(res.error ?? 'stop failed');
+  ok(`stopped ${repo}/${name}`);
+}
+
+// ── setu prune [--force] ──────────────────────────────────────────────────────
+// Finds dev-server processes that are listening but not in setu's own registry —
+// the "orb" pattern found in production: a worktree fully running and consuming
+// memory, invisible to `setu ls`/the portal because portEntries() only knows
+// about what .ports already has. Dry-run by default; --force actually kills.
+
+async function cmdPrune() {
+  const c = cfg();
+  const known  = new Set(portEntries(c.workspace).map(e => e.port));
+  const active = listActivePorts();
+  const orphans = active.filter(p => !known.has(p.port));
+
+  if (!orphans.length) { ok('nothing to prune'); return; }
+
+  console.log(`\n  ${Y}${orphans.length} unregistered process${orphans.length > 1 ? 'es' : ''} found:${R}\n`);
+  for (const p of orphans) console.log(`  ${GR}pid ${p.pid}${R}  :${p.port}  ${p.cmd}`);
+  console.log();
+
+  if (!flags.force) { console.log(`  run with ${B}--force${R} to kill ${orphans.length > 1 ? 'them' : 'it'}\n`); return; }
+
+  for (const p of orphans) {
+    try { execFileSync('kill', [p.pid]); ok(`killed pid ${p.pid} (:${p.port})`); }
+    catch (e) { fail(`pid ${p.pid}: ${e.message}`); }
+  }
 }
 
 // ── setu ls [repo] [--json] ───────────────────────────────────────────────────
@@ -481,6 +545,23 @@ async function cmdTrigger() {
   const c = cfg();
   const wtDir = join(c.workspace, repo, name);
   if (!existsSync(wtDir)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
+
+  // Portal owns trigger.dev sidecars too (/api/trigger/start|stop) — delegate to
+  // it when running, same as cmdRm does for worktree removal. Without this, a
+  // CLI-started session and a portal-started session for the same worktree can't
+  // see each other and nothing stops both from running at once.
+  if (portalPid()) {
+    if (action === 'stop') {
+      const res = await portalRequest('/api/trigger/stop', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+      if (!res.ok) die(res.error ?? 'stop failed');
+      ok(`stopped trigger dev for ${repo}/${name}`);
+    } else {
+      const res = await portalRequest('/api/trigger/start', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
+      if (!res.ok) die(res.error ?? 'start failed');
+      ok(`Trigger dev started for ${repo}/${name} (via portal)`);
+    }
+    return;
+  }
 
   const { pidFile, logFile } = triggerLogPaths(c.workspace, repo, name);
   const pid = runningPid(pidFile);
@@ -697,6 +778,58 @@ async function cmdDoctor() {
     check('setu up to date', behind === 0, 'setu update');
   }
 
+  // worktree hygiene — the class of bug that let a worktree ("orb") run fully
+  // invisibly to setu for over a day in production: unregistered-but-running
+  // processes, a registered port whose actual listener belongs to a different
+  // worktree, and worktree directories git knows about that setu's own registry
+  // (.ports/.projects) doesn't.
+  if (workspace) {
+    const entries = portEntries(workspace);
+    const known   = new Set(entries.map(e => e.port));
+    const active  = listActivePorts();
+
+    const orphanProcs = active.filter(p => !known.has(p.port));
+    check('no unregistered dev-server processes', orphanProcs.length === 0,
+      orphanProcs.length ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map(p => `pid ${p.pid} :${p.port}`).join(', ')})` : undefined);
+
+    const mismatches = [];
+    for (const e of entries) {
+      const p = active.find(a => a.port === e.port);
+      if (!p) continue;
+      const cwd = processCwd(p.pid);
+      const expected = resolve(join(workspace, e.repo, e.name));
+      // Nx/monorepo dev servers end up with cwd nested inside apps/<app> — only
+      // flag it if cwd isn't the worktree root or somewhere underneath it.
+      if (cwd && resolve(cwd) !== expected && !resolve(cwd).startsWith(expected + '/'))
+        mismatches.push(`${e.key} :${e.port} is actually serving ${cwd}`);
+    }
+    check('registered ports match their worktree', mismatches.length === 0, mismatches.join('; ') || undefined);
+
+    const registeredDirs = new Set(entries.map(e => join(workspace, e.repo, e.name)));
+    const gitWorktreeDirs = new Set();
+    for (const repo of Object.keys(loadProjects(workspace))) {
+      const repoDir = join(workspace, `${repo}.git`);
+      if (!existsSync(repoDir)) continue;
+      try {
+        const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
+        for (const wt of porcelain.trim().split('\n\n')) {
+          const p = wt.match(/^worktree (.+)$/m)?.[1];
+          if (p && p !== repoDir && !p.includes('/.claude/worktrees/')) gitWorktreeDirs.add(p);
+        }
+      } catch {}
+    }
+    const unregistered = [...gitWorktreeDirs].filter(d => !registeredDirs.has(d));
+    check('all git worktrees are registered with setu', unregistered.length === 0,
+      unregistered.length ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)` : undefined);
+
+    // mirror case: registry entries for worktrees removed via raw `git worktree
+    // remove` instead of `setu rm` — the port/domain registration outlives the
+    // directory it pointed at.
+    const stale = entries.filter(e => !existsSync(join(workspace, e.repo, e.name)));
+    check('no registry entries for missing worktrees', stale.length === 0,
+      stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined);
+  }
+
   // portal
   const portalUp = await portalRequest('/api/worktrees').then(() => true).catch(() => false);
   check('portal (:2999)', portalUp, 'setu portal');
@@ -732,12 +865,16 @@ function cmdHelp() {
     setu init  <gh-slug>             Clone repo + create main worktree
     setu new   <repo> <branch>       Create worktree (auto port + domain)
     setu new   <repo> <branch> --tunnel   ...and take the public URL
+    setu new   <repo> <branch> --start    ...and start its dev server
     setu rm    <repo> <branch>       Remove worktree
 
   ${C}Day-to-day${R}
     setu cd    <repo> <branch>       cd into worktree
     setu ls    [repo] [--json]       List worktrees + status
     setu status                      Same as ls
+    setu start <repo> <branch>       Start dev server (via portal)
+    setu stop  <repo> <branch>       Stop dev server (via portal)
+    setu prune [--force]             Find/kill dev servers running outside the registry
     setu fetch <repo>                git fetch --all
     setu tunnel <repo> <branch>      Point the public URL at this worktree
     setu tunnel <repo> <branch> stop      Release it

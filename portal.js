@@ -12,8 +12,9 @@ import {
   requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
   parseEnvFile, pinnedTriggerVersion,
   readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, loadProjects, registerProject,
+  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
+  AGENT_CLIS, detectAgentClis, loadSidecars,
 } from './lib.js';
 
 let _cfg;
@@ -31,6 +32,7 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
 const procs        = new Map();
 const inngestProcs = new Map();
 const triggerProcs = new Map();
+const sidecarProcs = new Map(); // key: `${repo}/${name}/${sidecar.name}`
 
 const INNGEST_CLI    = 'inngest-cli';
 const INNGEST_OFFSET = 5288; // app port 3000 → inngest 8288, 3001 → 8289, …
@@ -117,18 +119,18 @@ async function fetchPR(repo, name) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function listActivePorts() {
-  try {
-    const out = execFileSync('lsof', ['-i', 'TCP:3000-3999', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
-      { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-    const results = []; let cur = {};
-    for (const line of out.split('\n')) {
-      if (line.startsWith('p')) cur = { pid: line.slice(1) };
-      else if (line.startsWith('c')) cur.cmd = line.slice(1);
-      else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ port: +m[1], pid: cur.pid, cmd: cur.cmd }); }
-    }
-    return results;
-  } catch { return []; }
+// ponytail: ports.js's activePid() call in getWorktrees() used to run once per
+// worktree, every poll (3s idle / 800ms mid-start) — same execFileSync-freezes-the-
+// event-loop bug fetchPR() already had. Batch + short TTL cache, shared with /api/ports.
+let _portsCache = null, _portsCacheAt = 0;
+const PORTS_TTL = 1500;
+
+function activePortsCached() {
+  const now = Date.now();
+  if (_portsCache && now - _portsCacheAt < PORTS_TTL) return _portsCache;
+  _portsCache = listActivePorts();
+  _portsCacheAt = now;
+  return _portsCache;
 }
 
 function killPort(port) {
@@ -138,7 +140,27 @@ function killPort(port) {
   catch (e) { return { ok: false, error: String(e) }; }
 }
 
+// Bun's Subprocess.kill() only signals the direct child PID, not its process group
+// (confirmed: not exposed to JS). Sidecars are spawned with detached:true (setsid),
+// making their pid the process-group id too — send the signal to the whole group so
+// children (e.g. trigger dev's esbuild watcher) die even if the parent's own exit
+// handler doesn't cascade to them (trigger.dev CLI v4.5.3 has exactly this bug).
+// Don't assume pid==pgid: that only holds for detached:true spawns. A sidecar
+// reconciled from before this portal started (see reconcileTriggerSidecars) keeps
+// whatever pgid it was originally given — look it up rather than guess, or the
+// kill silently targets a group that doesn't exist and nothing dies.
+function killGroup(pid, signal = 'TERM') {
+  let pgid = pid;
+  try {
+    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+    if (out) pgid = parseInt(out, 10);
+  } catch {}
+  try { execFileSync('kill', [`-${signal}`, '--', `-${pgid}`], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
 async function getWorktrees() {
+  const activePorts = new Set(activePortsCached().map(p => p.port));
   return Promise.all(
     portEntries(WORKSPACE).map(async ({ key, repo, name, port }) => {
       const slug     = name.replace(/\//g, '-');
@@ -151,12 +173,12 @@ async function getWorktrees() {
       const iPort = inngestPort(port);
       return {
         key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
-        active:        !!activePid(port),
+        active:        activePorts.has(port),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
         label:         meta.label,
         branchUrl,
         pr:            pr?.url ? { url: pr.url, number: pr.number, title: pr.title } : null,
-        inngestActive: inngestProcs.has(key),
+        inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
         inngestPort:   iPort,
         triggerActive: triggerProcs.has(key),
       };
@@ -177,6 +199,7 @@ function startWorktree(repo, name, port) {
   const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stdout: fd, stderr: fd });
   procs.set(key, proc);
   proc.exited.then(() => procs.delete(key));
+  startSidecars(repo, name, port);
   return { ok: true };
 }
 
@@ -185,9 +208,45 @@ function stopWorktree(repo, name, port) {
   if (proc) { proc.kill(); procs.delete(`${repo}/${name}`); }
   const pid = activePid(port);
   if (pid) { try { execFileSync('kill', [pid]); } catch {} }
-  stopInngest(repo, name);
+  stopInngest(repo, name, port);
   stopTrigger(repo, name);
+  stopSidecars(repo, name);
 }
+
+// ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
+// Generic version of what startInngest/startTrigger already do, for anything
+// project-specific that isn't Inngest or Trigger — a plain cloudflared tunnel,
+// a queue worker, whatever a future project needs. Not hardcoded to quivly-app.
+
+function startSidecars(repo, name, port) {
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  for (const s of loadSidecars(WORKSPACE, repo)) {
+    const key = `${repo}/${name}/${s.name}`;
+    if (sidecarProcs.has(key)) continue;
+    const fd  = openLogFd(repo, name, `sidecar-${s.name}`);
+    const env = { ...process.env, PORT: String(port), ...s.env };
+    const proc = Bun.spawn([s.command, ...(s.args ?? [])], { cwd: wtDir, env, stdout: fd, stderr: fd, detached: true });
+    const entry = wrapProc(proc);
+    sidecarProcs.set(key, entry);
+    proc.exited.then(() => { if (sidecarProcs.get(key) === entry) sidecarProcs.delete(key); });
+  }
+}
+
+function stopSidecars(repo, name) {
+  const prefix = `${repo}/${name}/`;
+  for (const [key, entry] of sidecarProcs.entries()) {
+    if (!key.startsWith(prefix)) continue;
+    killGroup(entry.pid);
+    sidecarProcs.delete(key);
+  }
+}
+
+// Uniform wrapper for both freshly-spawned (native Bun.Subprocess) and reconciled
+// (discovered-at-startup, PID only) sidecar entries — lets stop paths kill either
+// the same way, and lets a portal restart re-adopt a still-live sidecar instead of
+// losing track of it (inngestProcs/triggerProcs start as empty Maps every restart).
+function wrapProc(proc) { return { pid: proc.pid, native: proc }; }
+function wrapPid(pid)   { return { pid, native: null }; }
 
 // ── inngest dev server ────────────────────────────────────────────────────────
 
@@ -195,26 +254,39 @@ function startInngest(repo, name, port) {
   const key   = `${repo}/${name}`;
   if (inngestProcs.has(key)) return { ok: false, error: 'already running' };
   const iPort = inngestPort(port);
+  if (activePid(iPort)) return { ok: false, error: `port ${iPort} already in use (untracked process)` };
   const fd    = openLogFd(repo, name, 'inngest');
   const proc  = Bun.spawn(
-    [INNGEST_CLI, 'dev', '-p', String(iPort), '-u', `http://localhost:${port}/api/inngest`],
-    { stdout: fd, stderr: fd }
+    [INNGEST_CLI, 'dev', '-p', String(iPort), '-u', `http://localhost:${port}/api/inngest`, '--no-discovery'],
+    { stdout: fd, stderr: fd, detached: true }
   );
-  inngestProcs.set(key, proc);
-  proc.exited.then(() => inngestProcs.delete(key));
+  const entry = wrapProc(proc);
+  inngestProcs.set(key, entry);
+  proc.exited.then(() => { if (inngestProcs.get(key) === entry) inngestProcs.delete(key); });
   return { ok: true, port: iPort };
 }
 
-function stopInngest(repo, name) {
-  const key  = `${repo}/${name}`;
-  const proc = inngestProcs.get(key);
-  if (!proc) return { ok: false, error: 'not running' };
-  proc.kill();
+function stopInngest(repo, name, port) {
+  const key   = `${repo}/${name}`;
+  const entry = inngestProcs.get(key);
+  if (entry) killGroup(entry.pid);
   inngestProcs.delete(key);
+  // fall back to whatever's actually bound to the inngest port, same pattern as
+  // stopWorktree — the tracked entry can be stale after a portal restart
+  const iPort = port != null ? inngestPort(port) : null;
+  const pid   = iPort ? activePid(iPort) : null;
+  if (pid) killGroup(pid);
+  if (!entry && !pid) return { ok: false, error: 'not running' };
   return { ok: true };
 }
 
 // ── trigger.dev dev server (per worktree, like inngest) ──────────────────────
+
+// trigger.dev doesn't bind a local port (it's a websocket client to the cloud
+// backend), so unlike inngest its "is this actually running" state can't be
+// cross-checked against lsof — startup reconciliation (below) is what keeps this
+// accurate across a portal restart instead.
+const TRIGGER_MAX_CONCURRENT_RUNS = 2;
 
 function startTrigger(repo, name) {
   const key = `${repo}/${name}`;
@@ -223,20 +295,45 @@ function startTrigger(repo, name) {
   const fd    = openLogFd(repo, name, 'trigger');
   // trigger tasks import Supabase keys etc. from the shared .env.local at load time
   const env   = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
-  const proc  = Bun.spawn(['bunx', `trigger.dev@${pinnedTriggerVersion(wtDir)}`, 'dev'],
-    { cwd: wtDir, env, stdout: fd, stderr: fd });
-  triggerProcs.set(key, proc);
-  proc.exited.then(() => triggerProcs.delete(key));
+  const proc  = Bun.spawn(
+    ['bunx', `trigger.dev@${pinnedTriggerVersion(wtDir)}`, 'dev', '--max-concurrent-runs', String(TRIGGER_MAX_CONCURRENT_RUNS)],
+    { cwd: wtDir, env, stdout: fd, stderr: fd, detached: true });
+  const entry = wrapProc(proc);
+  triggerProcs.set(key, entry);
+  proc.exited.then(() => { if (triggerProcs.get(key) === entry) triggerProcs.delete(key); });
   return { ok: true };
 }
 
 function stopTrigger(repo, name) {
-  const key  = `${repo}/${name}`;
-  const proc = triggerProcs.get(key);
-  if (!proc) return { ok: false, error: 'not running' };
-  proc.kill();
+  const key   = `${repo}/${name}`;
+  const entry = triggerProcs.get(key);
+  if (!entry) return { ok: false, error: 'not running' };
+  // group-kill, not entry.native?.kill() — trigger.dev v4.5.3's own SIGTERM handler
+  // races ahead of and defeats the code path that would dispose its esbuild child
+  // (source-verified), so signal the whole process group directly instead
+  killGroup(entry.pid);
   triggerProcs.delete(key);
   return { ok: true };
+}
+
+// Startup-only: discover trigger dev processes already running (from before this
+// portal instance started) and adopt them into triggerProcs, keyed by matching
+// their cwd against a known worktree. Cheap because it only runs once at boot.
+function reconcileTriggerSidecars() {
+  let raw;
+  try { raw = execFileSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8' }); }
+  catch { return; }
+  const dirToKey = new Map(
+    portEntries(WORKSPACE).map(({ key, repo, name }) => [`${WORKSPACE}/${repo}/${name}`, key])
+  );
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+.*\.bin\/trigger dev\b/);
+    if (!m) continue;
+    const pid = +m[1];
+    const cwd = processCwd(pid);
+    const key = cwd && dirToKey.get(cwd);
+    if (key && !triggerProcs.has(key)) triggerProcs.set(key, wrapPid(pid));
+  }
 }
 
 // ── single cloudflared process with merged ingress ────────────────────────────
@@ -386,11 +483,12 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
 }
 
 // ── open in Ghostty ───────────────────────────────────────────────────────────
-
-const TOOL_CMD = { claude: 'claude', codex: 'codex', antigravity: 'antigravity-ide', grok: 'grok' };
+// Which coding CLIs to offer isn't hardcoded to one fixed list — AGENT_CLIS
+// (lib.js) is detected live via `which`, so this works for whatever's actually
+// installed on this machine, not just the tools one project happened to use.
 
 function openInGhostty(wtDir, tool) {
-  const cmd = TOOL_CMD[tool];
+  const cmd = AGENT_CLIS[tool]?.bin;
   if (!cmd) return { ok: false, error: 'unknown tool' };
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
   writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
@@ -406,6 +504,8 @@ async function handle(req) {
   const method = req.method;
 
   if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
+
+  if (pathname === '/api/agents') return Response.json(detectAgentClis());
 
   if (pathname === '/api/projects') return Response.json(
     Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label }))
@@ -456,7 +556,7 @@ async function handle(req) {
       return Response.json(startInngest(repo, name, port));
     }
     if (pathname === '/api/inngest/stop') {
-      return Response.json(stopInngest(repo, name));
+      return Response.json(stopInngest(repo, name, wtPort()));
     }
     if (pathname === '/api/trigger/start') {
       return Response.json(startTrigger(repo, name));
@@ -474,7 +574,7 @@ async function handle(req) {
   }
 
   if (pathname === '/api/ports') {
-    const ports = listActivePorts();
+    const ports = activePortsCached();
     const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
     return Response.json(ports.map(p => ({ ...p, worktree: registry[p.port] ?? null })));
   }
@@ -482,9 +582,45 @@ async function handle(req) {
   return new Response('Not found', { status: 404 });
 }
 
+// No upstream config (Next.js/Node/Turbopack) can cap Turbopack's native-side memory
+// growth — NODE_OPTIONS=--max-old-space-size only bounds the V8/JS heap, confirmed via
+// docs + vercel/next.js#92052. This is the backstop: restart any tracked dev server
+// whose *physical* footprint (not just RSS — this box compresses most of a Node/Bun
+// heap, so RSS alone hid a 17GB-footprint process behind a ~2.6GB RSS reading) crosses
+// a ceiling. Even on Next.js ≥16.3.0 (memory eviction default-on), eviction is
+// best-effort, not a hard cap.
+const DEV_MEM_CEILING_MB = _cfg.devMemCeilingMb ?? 8192;
+const MEM_CHECK_INTERVAL = 60_000;
+
+function processFootprintMb(pid) {
+  try {
+    const out = execFileSync('footprint', [String(pid)], { encoding: 'utf8' });
+    const m = out.match(/phys_footprint:\s*([\d.]+)\s*(MB|GB)/);
+    if (!m) return 0;
+    return m[2] === 'GB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
+  } catch { return 0; }
+}
+
+function checkMemoryCeilings() {
+  for (const [key, entry] of procs.entries()) {
+    const mb = processFootprintMb(entry.pid);
+    if (mb > DEV_MEM_CEILING_MB) {
+      const si = key.indexOf('/');
+      const repo = key.slice(0, si), name = key.slice(si + 1);
+      const port = getPort(WORKSPACE, repo, name);
+      console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
+      stopWorktree(repo, name, port);
+      if (port) startWorktree(repo, name, port);
+    }
+  }
+}
+
+setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
+
 // Rebuild merged ingress and restart the single tunnel process for all enabled worktrees
 ;(async () => {
   syncHosts(WORKSPACE);
+  reconcileTriggerSidecars();
   const wts = await getWorktrees().catch(() => []);
   for (const w of wts) {
     if (w.tunnelOn) activeTunnelMap.set(w.key, { pubDom: w.pubDomain, port: w.port });

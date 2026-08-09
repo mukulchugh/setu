@@ -24,9 +24,17 @@ const BADGE_COLORS: Record<string, string> = {
   Landing: 'bg-sky-50 text-sky-600 border border-sky-200',
 };
 
+// Best-effort favicon domain per known tool id — anything not listed here (a
+// future addition to lib.js's AGENT_CLIS) still renders fine via the label
+// fallback in ToolIcon, it just won't have a nice logo.
+const AGENT_ICON_DOMAIN: Record<string, string> = {
+  claude: 'claude.ai', codex: 'openai.com', cursor: 'cursor.com', aider: 'aider.chat',
+  opencode: 'opencode.ai', amp: 'ampcode.com', antigravity: 'antigravity.google', grok: 'x.ai',
+};
+
 function ToolIcon({ domain, fallback }: { domain: string; fallback: string }) {
   const [failed, setFailed] = useState(false);
-  if (failed) return <span class="text-[10px] font-bold">{fallback}</span>;
+  if (failed || !domain) return <span class="text-[10px] font-bold">{fallback}</span>;
   return <img src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
     class="w-4 h-4 rounded-sm" alt={fallback} onError={() => setFailed(true)} />;
 }
@@ -232,7 +240,7 @@ function LogModal({ repo, name, initialType, onClose }: any) {
   );
 }
 
-function WorktreeCard({ w, pending, onAct, onStart, onOpenLogs, onOpenTool, onRemove, toast }: any) {
+function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTool, onRemove, toast }: any) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -312,10 +320,11 @@ function WorktreeCard({ w, pending, onAct, onStart, onOpenLogs, onOpenTool, onRe
 
         <div class="w-px h-4 bg-zinc-200 mx-1" />
 
-        <button onClick={() => onOpenTool(w, 'claude')} data-tip="Open in Claude" class="tip icon-btn text-zinc-500 hover:bg-zinc-100"><ToolIcon domain="claude.ai" fallback="C" /></button>
-        <button onClick={() => onOpenTool(w, 'codex')} data-tip="Open in Codex" class="tip icon-btn text-zinc-500 hover:bg-zinc-100"><ToolIcon domain="openai.com" fallback="O" /></button>
-        <button onClick={() => onOpenTool(w, 'antigravity')} data-tip="Open in Antigravity" class="tip icon-btn text-zinc-500 hover:bg-zinc-100"><ToolIcon domain="antigravity.google" fallback="AG" /></button>
-        <button onClick={() => onOpenTool(w, 'grok')} data-tip="Open in Grok" class="tip icon-btn text-zinc-500 hover:bg-zinc-100"><ToolIcon domain="x.ai" fallback="GK" /></button>
+        {agents.map((a: { id: string; label: string }) => (
+          <button key={a.id} onClick={() => onOpenTool(w, a.id)} data-tip={`Open in ${a.label}`} class="tip icon-btn text-zinc-500 hover:bg-zinc-100">
+            <ToolIcon domain={AGENT_ICON_DOMAIN[a.id] ?? ''} fallback={a.label.slice(0, 2).toUpperCase()} />
+          </button>
+        ))}
 
         <button onClick={copyCD} data-tip="Copy cd command" class="tip icon-btn text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100">
           {copied
@@ -417,6 +426,7 @@ function PortsPanel() {
 function App() {
   const [worktrees, setWorktrees] = useState<Worktree[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [agents, setAgents] = useState<{ id: string; label: string }[]>([]);
   const [filter, setFilter] = useState('all');
   const [toastMsg, setToastMsg] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
@@ -441,9 +451,16 @@ function App() {
     setProjects(await fetch('/api/projects').then(r => r.json()).catch(() => []));
   }, []);
 
+  // Which "open in <tool>" buttons to show isn't fixed to one project's usual
+  // 4 tools — fetched once from whatever's actually installed on this machine.
+  const loadAgents = useCallback(async () => {
+    setAgents(await fetch('/api/agents').then(r => r.json()).catch(() => []));
+  }, []);
+
   // poll — fast while a start is pending
   useEffect(() => {
     loadProjects();
+    loadAgents();
     let alive = true;
     (async function loop() {
       while (alive) {
@@ -452,7 +469,7 @@ function App() {
       }
     })();
     return () => { alive = false; };
-  }, [refresh, loadProjects]);
+  }, [refresh, loadProjects, loadAgents]);
 
   async function act(url: string, w: Worktree) {
     const res = await post(url, { repo: w.repo, name: w.name });
@@ -507,7 +524,7 @@ function App() {
         {!filtered.length
           ? <p class="text-zinc-400 text-sm py-10 text-center">No worktrees{filter !== 'all' ? ' for this project' : ''} — click + Worktree to create one.</p>
           : filtered.map(w => (
-            <WorktreeCard key={w.key} w={w} pending={pendingStart.current.has(w.key)}
+            <WorktreeCard key={w.key} w={w} pending={pendingStart.current.has(w.key)} agents={agents}
               onAct={act} onStart={start} onRemove={remove} toast={toast}
               onOpenLogs={(repo: string, name: string, type: string) => setLogView({ repo, name, type })}
               onOpenTool={(w: Worktree, tool: string) => post('/api/open', { repo: w.repo, name: w.name, tool })} />
