@@ -5,6 +5,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 type Worktree = {
   key: string; repo: string; name: string; slug: string; port: number;
   domain: string; pubDomain: string; tunnelOn: boolean; active: boolean;
+  container: string | null;
   tunnelRunning: boolean; label: string; branchUrl: string | null;
   pr: { url: string; number: number; title: string } | null;
   inngestActive: boolean; inngestPort: number; triggerActive: boolean;
@@ -269,6 +270,11 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
             <span class={`w-1.5 h-1.5 rounded-full ${w.active ? 'bg-emerald-500' : w.queued ? 'bg-amber-400' : 'bg-zinc-300'}`} />
             {w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped'}
           </span>
+          {w.container && (
+            <span data-tip="Running in a container — real memory/CPU cap" class="tip text-[10px] font-medium px-1.5 py-0.5 rounded bg-sky-50 text-sky-600 shrink-0">
+              container
+            </span>
+          )}
         </div>
         <div class="flex items-center gap-2 flex-wrap">
           <span class="font-mono text-xs text-zinc-400">{w.domain}</span>

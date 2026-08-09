@@ -43,7 +43,8 @@ setu rm    <repo> <branch>        Remove worktree
 
 setu cd    <repo> <branch>        cd into worktree
 setu ls    [repo] [--json]        List worktrees + running state
-setu start <repo> <branch>        Start dev server (via the portal; queues past the concurrency cap)
+setu start <repo> <branch>        Start dev server — containerized by default (via the portal; queues past the concurrency cap)
+setu start <repo> <branch> --bare       ...as a bare process instead, no memory/CPU cap
 setu stop  <repo> <branch>        Stop dev server (or cancel it if still queued)
 setu prune [--force]              Find/kill dev servers running outside the registry
 setu fetch <repo>                 git fetch --all
@@ -63,6 +64,7 @@ setu version                      Version + commit
 - One shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) — `setu tunnel` moves it between worktrees
 - The portal (`http://quivly.local`) owns all long-running processes: dev servers, inngest, trigger.dev, cloudflared, and any configured sidecars — `setu start`/`setu stop` (or the portal UI) reach it directly, so nothing gets started outside its tracking
 - Concurrent dev servers are capped (`maxConcurrentDevServers` in `~/.setu.json`, default 3) — starting beyond the cap queues automatically and starts as a slot frees up, backed by a memory watchdog that restarts any single server that grows past a configured ceiling
+- `setu start` runs a worktree's dev server in a Docker-compatible container **by default** — real cgroup-enforced `containerMemoryLimit`/`containerCpuLimit` (`~/.setu.json`, defaults `4g`/`2`, auto-clamped to whatever the engine itself actually has available) instead of the polling watchdog. `--bare` is the explicit opt-out when you want the old uncapped native process (or the engine isn't running yet). Only the dev server itself is containerized — the portal, Caddy, dnsmasq, and git all stay native on the host, this default only governs how the dev server process runs. Works with any Docker-API-compatible engine (OrbStack, Docker Desktop, Colima, …), not hardcoded to OrbStack — Caddy always proxies to `localhost:<port>` exactly like the bare path, so nothing about routing changes between the two
 - Which "open in &lt;agent&gt;" buttons the portal shows isn't hardcoded — it detects installed AI coding CLIs live via `which` (see `AGENT_CLIS` in `lib.js`)
 - Sidecar processes beyond Inngest/Trigger (a plain tunnel, a queue worker, anything project-specific) are configurable per-project via `$WORKSPACE/sidecars.json` — not hardcoded to any one repo's toolchain
 - Config lives at `~/.setu.json`; shared logic in `lib.js` (used by both `cli.js` and `portal.js`)

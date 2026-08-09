@@ -5,7 +5,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
-  mkdirSync, unlinkSync,
+  mkdirSync, unlinkSync, realpathSync,
 } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
@@ -322,6 +322,128 @@ export function registerProject(workspace, { name, slug = '', label = '' }) {
   while (usedBases.includes(base)) base += 100;
   appendFileSync(join(workspace, '.projects'), `${name}:${base}:${slug}:${label || name}\n`);
   return base;
+}
+
+// ── containers (optional per-worktree, engine-agnostic) ──────────────────────
+// Opt-in alternative to the bare `bun dev` process: real cgroup-enforced memory/
+// CPU caps instead of the polling footprint watchdog above. Deliberately never
+// assumes OrbStack specifically — only the plain Docker Engine API surface
+// (`docker info`, `docker compose`, `-p`/`mem_limit`/named volumes), so it works
+// identically on Docker Desktop, Colima, or Podman's docker-compat, and keeps
+// working if OrbStack itself has an outage. A worktree with no
+// docker-compose.setu.yml is a plain bare process, same as always — this is
+// additive, not a replacement path.
+
+export function containerRuntimeAvailable() {
+  const res = spawnSync('docker', ['info', '--format', '{{.ServerVersion}}|{{.OperatingSystem}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (res.status !== 0 || !res.stdout?.trim()) return { available: false, engine: null };
+  const [version, engine] = res.stdout.trim().split('|');
+  return { available: true, engine: engine || 'docker', version };
+}
+
+export function composeProjectName(repo, name) {
+  return `setu-${repo}-${slugify(name)}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+}
+
+export function dockerComposePath(wtDir) {
+  return join(wtDir, 'docker-compose.setu.yml');
+}
+
+function parseMemToMb(v) {
+  const m = String(v).trim().match(/^(\d+(?:\.\d+)?)\s*(g|m)$/i);
+  if (!m) return null;
+  return m[2].toLowerCase() === 'g' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
+}
+
+// docker info's NCPU/MemTotal report what the engine itself has available (the
+// VM's own allocation on macOS) — a per-container limit above that isn't just
+// wasted, Docker rejects the container outright. Proven live: this machine's
+// OrbStack VM has 1 CPU allocated, and the original containerCpuLimit default
+// of 2 failed with "range of CPUs is from 0.01 to 1.00, as there are only 1
+// CPUs available" — .setu.json's configured value can't be trusted blindly.
+export function engineCapacity() {
+  const res = spawnSync('docker', ['info', '--format', '{{.NCPU}}|{{.MemTotal}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (res.status !== 0 || !res.stdout?.trim()) return { cpus: null, memMb: null };
+  const [cpus, memBytes] = res.stdout.trim().split('|');
+  return { cpus: parseInt(cpus, 10) || null, memMb: memBytes ? Math.floor(+memBytes / 1024 / 1024) : null };
+}
+
+// "running" or "restarting" both count as alive — mid-retry-backoff (the
+// `restart: on-failure:3` window between attempts) briefly reports neither
+// "running" nor present in a --status=running filter, and a caller polling on
+// a fixed interval (checkMemoryCeilings) could otherwise catch that gap and
+// prematurely free the worktree's concurrency slot while Docker is about to
+// bring it back up on its own. -a includes exited/dead containers so a
+// permanently-given-up retry cap (genuinely dead) is correctly reported false.
+export function composeProjectAlive(project) {
+  const res = spawnSync('docker', ['compose', '-p', project, 'ps', '-a', '--format', '{{.State}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (res.status !== 0) return false;
+  return res.stdout.trim().split('\n').some(s => s === 'running' || s === 'restarting');
+}
+
+// Caddy's reverse_proxy target never changes between bare and containerized —
+// always `localhost:<port>` (same port Setu's own registry already allocated).
+// The container publishes that port to the host with a plain `-p port:port`,
+// proven throughout the Phase 0 spike before any engine-specific networking
+// (`.orb.local`) was even tested. node_modules is a container-local named
+// volume, not a host bind-mount — the host installs macOS-native binaries
+// (@next/swc-darwin-arm64 etc.) that can't run in the Linux container; only the
+// source tree bind-mounts from the host. The resolved (symlink-followed)
+// .env.local is bind-mounted at the same in-container path the app expects it.
+export function writeDockerCompose(c, repo, name, port) {
+  const wtDir = join(c.workspace, repo, name);
+  const project = composeProjectName(repo, name);
+
+  // Map, not an array of pairs — .envrc already contains `export PORT=...`
+  // (writeEnvrc always writes it first), so a plain array would emit PORT
+  // twice and Docker's YAML parser rejects the resulting duplicate mapping
+  // key outright (`docker compose up` fails before anything starts).
+  const env = new Map([['PORT', String(port)]]);
+  for (const m of readEnvrc(wtDir).matchAll(/^export (\w+)=(.+)$/gm)) env.set(m[1], m[2].trim());
+  const envLines = [...env].map(([k, v]) => `      ${k}: ${JSON.stringify(v)}`).join('\n');
+
+  const volumes = [
+    `      - ${wtDir}:/workspace`,
+    `      - node_modules:/workspace/node_modules`,
+  ];
+  const hostEnvLocal = envLocalPath(repo, wtDir);
+  try {
+    const real = realpathSync(hostEnvLocal);
+    const inContainer = '/workspace' + hostEnvLocal.slice(wtDir.length);
+    volumes.push(`      - ${real}:${inContainer}`);
+  } catch { /* no .env.local yet (fresh worktree) — container still boots without it */ }
+
+  const cap = engineCapacity();
+  let memLimit = c.containerMemoryLimit ?? '4g';
+  let cpuLimit = c.containerCpuLimit ?? 2;
+  if (cap.cpus && Number(cpuLimit) > cap.cpus) cpuLimit = cap.cpus;
+  const memMb = parseMemToMb(memLimit);
+  if (cap.memMb && memMb && memMb > cap.memMb) memLimit = `${cap.memMb}m`;
+
+  const yaml = `# Generated by setu — regenerated on every \`setu start --container\`, do not edit by hand.
+name: ${project}
+services:
+  dev:
+    image: oven/bun:latest
+    working_dir: /workspace
+    command: sh -c "bun install && bun run dev"
+    restart: on-failure:3
+    mem_limit: "${memLimit}"
+    cpus: "${cpuLimit}"
+    ports:
+      - "${port}:${port}"
+    environment:
+${envLines}
+    volumes:
+${volumes.join('\n')}
+volumes:
+  node_modules:
+`;
+  writeFileSync(dockerComposePath(wtDir), yaml);
+  return dockerComposePath(wtDir);
 }
 
 // ── git worktrees ─────────────────────────────────────────────────────────────

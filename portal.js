@@ -15,6 +15,7 @@ import {
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
   AGENT_CLIS, detectAgentClis, loadSidecars, killGroup,
+  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
 } from './lib.js';
 
 let _cfg;
@@ -155,6 +156,7 @@ async function getWorktrees() {
       return {
         key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
         active:        activePorts.has(port),
+        container:     procs.get(key)?.container ?? null,
         queued:        queuePosition(key) !== null,
         queuePosition: queuePosition(key),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
@@ -187,7 +189,8 @@ function drainQueue() {
   while (startQueue.length && procs.size < MAX_CONCURRENT_DEV) {
     const next = startQueue.shift();
     if (procs.has(next.key)) continue; // started some other way already
-    spawnWorktree(next.repo, next.name, next.port);
+    if (next.container) spawnContainer(next.repo, next.name, next.port);
+    else spawnWorktree(next.repo, next.name, next.port);
   }
 }
 
@@ -205,39 +208,96 @@ function spawnWorktree(repo, name, port) {
   startSidecars(repo, name, port);
 }
 
+// Container path: `docker compose up -d --build` returns as soon as containers
+// are created and detached — the slow part (bun install && bun run dev) runs
+// INSIDE the container afterward, so this is not a blocking start any more than
+// the bare path is. Readiness is observed the same way as bare processes: once
+// the container's published port opens, getWorktrees()'s existing lsof-based
+// scan sees it — no container-specific polling needed there.
+function spawnContainer(repo, name, port) {
+  const key   = `${repo}/${name}`;
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  writeDockerCompose(_cfg, repo, name, port);
+  const project = composeProjectName(repo, name);
+  const fd = openLogFd(repo, name, 'dev');
+  const proc = Bun.spawn(
+    ['docker', 'compose', '-p', project, '-f', dockerComposePath(wtDir), 'up', '-d', '--build'],
+    { cwd: wtDir, stdout: fd, stderr: fd });
+  const entry = wrapContainer(project);
+  procs.set(key, entry);
+  proc.exited.then((code) => {
+    // Only `up -d` itself failing (bad compose file, daemon unreachable) lands
+    // here fast — the app's own boot happens after this exits, inside the
+    // container. A nonzero exit means no container is actually running, so
+    // don't leave a phantom "running" entry blocking the concurrency slot.
+    if (code !== 0 && procs.get(key) === entry) { procs.delete(key); drainQueue(); }
+  });
+  startSidecars(repo, name, port);
+}
+
+function stopContainer(repo, name, project) {
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  // No -v: the node_modules named volume survives, so the next `up` skips
+  // `bun install` unless the compose file's volume was ever pruned separately.
+  try { execFileSync('docker', ['compose', '-p', project, '-f', dockerComposePath(wtDir), 'down'], { stdio: 'ignore' }); }
+  catch {}
+}
+
 // Boot-time only: procs starts empty on every portal restart, same blind spot
 // reconcileTriggerSidecars() fixes for Trigger — without this, a dev server
 // that predates this portal instance (e.g. still running from before a
 // restart) doesn't count against MAX_CONCURRENT_DEV, so the cap silently
-// undercounts real concurrent servers. Unlike Trigger, dev servers do bind a
-// port, so this reuses the same batched scan getWorktrees() already does.
+// undercounts real concurrent servers. Container-backed worktrees are checked
+// FIRST via `docker compose ps` — falling through to the generic port scan for
+// them would misidentify the engine's own port-forwarding helper process as
+// "the dev server pid" and a later stop would try to kill it directly, which
+// isn't safe (that helper isn't scoped to one container).
 function reconcileDevServers() {
   const activePorts = new Map(listActivePorts().map(p => [p.port, p.pid]));
-  for (const { key, port } of portEntries(WORKSPACE)) {
+  for (const { key, repo, name, port } of portEntries(WORKSPACE)) {
     if (procs.has(key)) continue;
+    const wtDir = `${WORKSPACE}/${repo}/${name}`;
+    if (existsSync(dockerComposePath(wtDir))) {
+      const project = composeProjectName(repo, name);
+      if (composeProjectAlive(project)) { procs.set(key, wrapContainer(project)); continue; }
+    }
     const pid = activePorts.get(port);
     if (pid) procs.set(key, wrapPid(+pid));
   }
 }
 
-function startWorktree(repo, name, port) {
+function startWorktree(repo, name, port, container = true) {
   const key = `${repo}/${name}`;
   if (procs.has(key)) return { ok: false, error: 'already running' };
   if (queuePosition(key)) return { ok: true, queued: true, position: queuePosition(key) };
+  if (container) {
+    const rt = containerRuntimeAvailable();
+    // Fail loud, not silently downgrade to bare — a caller expecting a hard
+    // memory/CPU cap getting a silently-uncapped process instead would defeat
+    // the entire point. Explicit --bare is the escape hatch, not a fallback
+    // this function reaches for on its own.
+    if (!rt.available) return { ok: false, error: 'no Docker-compatible daemon reachable (docker info failed) — start OrbStack/Docker Desktop, or pass --bare to run natively instead' };
+  }
   if (procs.size >= MAX_CONCURRENT_DEV) {
-    startQueue.push({ key, repo, name, port });
+    startQueue.push({ key, repo, name, port, container });
     return { ok: true, queued: true, position: startQueue.length };
   }
-  spawnWorktree(repo, name, port);
+  if (container) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
   return { ok: true };
 }
 
 function stopWorktree(repo, name, port) {
-  const qi = startQueue.findIndex(q => q.key === `${repo}/${name}`);
+  const key = `${repo}/${name}`;
+  const qi = startQueue.findIndex(q => q.key === key);
   if (qi !== -1) startQueue.splice(qi, 1);
-  procs.delete(`${repo}/${name}`);
-  const pid = activePid(port);
-  if (pid) { try { execFileSync('kill', [pid]); } catch {} }
+  const entry = procs.get(key);
+  procs.delete(key);
+  if (entry?.container) {
+    stopContainer(repo, name, entry.container);
+  } else {
+    const pid = activePid(port);
+    if (pid) { try { execFileSync('kill', [pid]); } catch {} }
+  }
   stopInngest(repo, name, port);
   stopTrigger(repo, name);
   stopSidecars(repo, name);
@@ -278,6 +338,11 @@ function stopSidecars(repo, name) {
 // losing track of it (inngestProcs/triggerProcs start as empty Maps every restart).
 function wrapProc(proc) { return { pid: proc.pid, native: proc }; }
 function wrapPid(pid)   { return { pid, native: null }; }
+// Container-backed entries have no OS pid Setu owns directly (the tracked
+// process is `docker compose up -d`, which exits once containers are
+// created) — `container` holds the compose project name instead, and
+// stop/reconcile paths branch on its presence.
+function wrapContainer(project) { return { pid: null, native: null, container: project }; }
 
 // ── inngest dev server ────────────────────────────────────────────────────────
 
@@ -559,7 +624,7 @@ async function handle(req) {
 
   if (method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    const { repo, name, tool, tunnel } = body;
+    const { repo, name, tool, tunnel, container } = body;
     const wtPort = () => getPort(WORKSPACE, repo, name);
 
     if (pathname === '/api/create') {
@@ -571,7 +636,11 @@ async function handle(req) {
     }
     if (pathname === '/api/start') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      return Response.json(startWorktree(repo, name, port));
+      // Container is the default now, not opt-in — dev servers run in Docker
+      // unless a caller explicitly asks for bare (container === false). Native
+      // stays for the tooling around it (portal, Caddy, dnsmasq, git) — this
+      // default only governs how the dev server process itself runs.
+      return Response.json(startWorktree(repo, name, port, container !== false));
     }
     if (pathname === '/api/stop') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -637,6 +706,22 @@ function processFootprintMb(pid) {
 
 function checkMemoryCeilings() {
   for (const [key, entry] of procs.entries()) {
+    if (entry.container) {
+      // Docker's own cgroup limit + `restart: on-failure:3` already enforce
+      // and retry the memory ceiling — nothing in Setu needs to restart a
+      // container itself. But `docker compose up -d` exits successfully the
+      // moment containers are created, long before a crash-loop plays out, so
+      // nothing else ever notices a container that permanently gave up after
+      // exhausting its retries — without this, its concurrency slot stays
+      // occupied forever (verified live: a memory limit too small for the
+      // app to ever boot left a dead entry in `procs` indefinitely).
+      if (!composeProjectAlive(entry.container)) {
+        console.warn(`⚠ ${key} container exited and is not restarting — freeing its slot`);
+        procs.delete(key);
+        drainQueue();
+      }
+      continue;
+    }
     const mb = processFootprintMb(entry.pid);
     if (mb > DEV_MEM_CEILING_MB) {
       const si = key.indexOf('/');
