@@ -234,6 +234,27 @@ export function commandExists(bin) {
   return spawnSync('which', [bin], { stdio: 'ignore' }).status === 0;
 }
 
+// Only send -pgid when pid IS the group leader (pgid === pid) — same guard
+// kill-with-style (a comparable npm package) uses. A freshly-spawned
+// detached:true process is always its own leader, so this always fires for
+// the normal case. It matters for a pid recovered from state written before
+// the current process's lifetime (e.g. setu's own trigger.dev PID file,
+// which can outlive a reboot, or the portal's reconciled sidecar entries) —
+// that pid's process might no longer be the one that wrote the record (PID
+// reuse) or might have inherited a pgid from something setu never spawned.
+// Blasting that group could kill unrelated processes it doesn't own.
+// Falls back to a plain single-pid kill when pgid !== pid.
+export function killGroup(pid, signal = 'TERM') {
+  let pgid = pid;
+  try {
+    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+    if (out) pgid = parseInt(out, 10);
+  } catch {}
+  const target = pgid === pid ? `-${pgid}` : String(pid);
+  try { execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
 export function detectAgentClis() {
   return Object.entries(AGENT_CLIS)
     .filter(([, t]) => commandExists(t.bin))

@@ -14,7 +14,7 @@ import {
   readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
-  AGENT_CLIS, detectAgentClis, loadSidecars,
+  AGENT_CLIS, detectAgentClis, loadSidecars, killGroup,
 } from './lib.js';
 
 let _cfg;
@@ -138,35 +138,6 @@ function killPort(port) {
   if (!pid) return { ok: false, error: 'nothing on that port' };
   try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
   catch (e) { return { ok: false, error: String(e) }; }
-}
-
-// Bun's Subprocess.kill() only signals the direct child PID, not its process group
-// (confirmed: not exposed to JS). Sidecars are spawned with detached:true (setsid),
-// making their pid the process-group id too — send the signal to the whole group so
-// children (e.g. trigger dev's esbuild watcher) die even if the parent's own exit
-// handler doesn't cascade to them (trigger.dev CLI v4.5.3 has exactly this bug).
-// Don't assume pid==pgid: that only holds for detached:true spawns. A sidecar
-// reconciled from before this portal started (see reconcileTriggerSidecars) keeps
-// whatever pgid it was originally given — look it up rather than guess, or the
-// kill silently targets a group that doesn't exist and nothing dies.
-// Only send -pgid when pid IS the group leader (pgid === pid) — same guard
-// kill-with-style uses. A freshly-spawned (detached:true) sidecar is always
-// its own leader, so this always fires for the normal case. A *reconciled*
-// pid (adopted from before this portal instance existed — see
-// reconcileTriggerSidecars/reconcileDevServers) might have inherited a pgid
-// from whatever spawned it originally; that group could contain processes
-// Setu never created and doesn't own. Without this guard, killing that group
-// could take out unrelated siblings — worst case, even Setu's own group, if
-// the pgid happens to collide. Fall back to a plain single-pid kill instead.
-function killGroup(pid, signal = 'TERM') {
-  let pgid = pid;
-  try {
-    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim();
-    if (out) pgid = parseInt(out, 10);
-  } catch {}
-  const target = pgid === pid ? `-${pgid}` : String(pid);
-  try { execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' }); return true; }
-  catch { return false; }
 }
 
 async function getWorktrees() {

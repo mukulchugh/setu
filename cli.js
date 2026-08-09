@@ -17,7 +17,7 @@ import {
   writeCaddy, reloadCaddy, syncHosts,
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
   git, createWorktree, removeWorktree,
-  portalPid, portalRequest, commandExists,
+  portalPid, portalRequest, commandExists, killGroup,
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
@@ -568,7 +568,11 @@ async function cmdTrigger() {
 
   if (action === 'stop') {
     if (!pid) { console.log(`Trigger dev not running for ${repo}/${name}.`); return; }
-    try { process.kill(-pid, 'SIGTERM'); } catch { process.kill(pid, 'SIGTERM'); }
+    // killGroup, not a bare `process.kill(-pid, ...)` — this pid came from a PID
+    // file that can outlive a reboot; blindly treating it as its own pgid risks
+    // signaling a process group this pid was reassigned to (PID reuse) rather
+    // than the one setu actually spawned. killGroup verifies pgid===pid first.
+    killGroup(pid);
     unlinkSync(pidFile);
     ok(`stopped trigger dev for ${repo}/${name}`);
     return;
