@@ -59,6 +59,18 @@ setu update                       Update setu
 setu version                      Version + commit
 ```
 
+## Raycast extension
+
+A third front door onto the same core the CLI and portal already use — lives in `raycast/`, talks to the portal's HTTP API (`localhost:2999`), nothing duplicated. Covers listing/starting/stopping/syncing worktrees and creating new ones, plus a Quick Open command that's the Raycast-native equivalent of the portal's ⌘K. Also ships as an [AI Extension](https://developers.raycast.com/ai/learn-core-concepts-of-ai-extensions) — Raycast's own AI can call `list-worktrees`/`start-worktree`/`stop-worktree`/`sync-worktree` directly from natural language.
+
+`setu setup` checks for Raycast and prints this step if it's installed (there's no headless way to register a local extension — it goes through Raycast's own Import/Develop flow):
+
+```
+cd raycast && npm install && npx ray develop
+```
+
+Requires `setu portal` to be running — the extension has an explicit "portal isn't running" state rather than failing silently.
+
 ## How it works
 
 - Each worktree gets an auto-assigned port and a `<branch>.quivly.local` domain via Caddy

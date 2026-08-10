@@ -39,3 +39,5 @@ clone_or_update
 cd "$SETU_DIR" && bun install && bun link
 echo ""
 echo "✓ setu ready — run: setu setup   (or: setu setup --name <you> --yes for non-interactive)"
+echo "  setu setup also checks for Raycast and, if it's installed, prints the one manual"
+echo "  step to load the Setu Raycast extension (cd raycast && npm install && npx ray develop)"

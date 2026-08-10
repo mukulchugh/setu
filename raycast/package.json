@@ -1,0 +1,89 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "setu",
+  "title": "Setu",
+  "description": "Manage git worktrees, dev servers, and ports across your projects",
+  "icon": "icon.png",
+  "author": "mukulchugh",
+  "categories": ["Developer Tools"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "list-worktrees",
+      "title": "List Worktrees",
+      "subtitle": "Setu",
+      "description": "See every registered worktree, its status, and act on it",
+      "mode": "view"
+    },
+    {
+      "name": "create-worktree",
+      "title": "Create Worktree",
+      "subtitle": "Setu",
+      "description": "Check out a new branch as a worktree",
+      "mode": "view"
+    },
+    {
+      "name": "quick-open",
+      "title": "Quick Open Worktree",
+      "subtitle": "Setu",
+      "description": "Jump straight to a worktree's local domain",
+      "mode": "view",
+      "arguments": [
+        { "name": "query", "placeholder": "worktree name", "type": "text", "required": false }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "list-worktrees",
+      "title": "List Worktrees",
+      "description": "Lists every registered Setu worktree with its status (running/stopped/queued), dirty file count, and ahead/behind counts."
+    },
+    {
+      "name": "start-worktree",
+      "title": "Start Worktree",
+      "description": "Starts a worktree's dev server, in whichever mode (bare or container) it's currently sticky to."
+    },
+    {
+      "name": "stop-worktree",
+      "title": "Stop Worktree",
+      "description": "Stops a worktree's running dev server."
+    },
+    {
+      "name": "sync-worktree",
+      "title": "Sync Worktree with Staging",
+      "description": "Merges a worktree's resolved base branch (staging, or the project's default) into it. Only completes if the merge is clean; aborts automatically on conflict."
+    }
+  ],
+  "ai": {
+    "instructions": "Worktree names are unique per repo, not globally — if a name could belong to more than one registered project, ask which repo before acting."
+  },
+  "preferences": [
+    {
+      "name": "portalUrl",
+      "type": "textfield",
+      "title": "Setu portal URL",
+      "description": "Where the Setu portal is running — change this only if you've moved PORTAL_PORT in lib.js.",
+      "default": "http://localhost:2999",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.24",
+    "@raycast/utils": "^2.3.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^2.2.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "eslint": "^10.8.1",
+    "prettier": "^3.9.6",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "ray lint",
+    "format": "prettier 'src/**' '!**/.DS_Store' --write"
+  }
+}

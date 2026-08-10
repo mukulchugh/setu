@@ -165,7 +165,7 @@ async function cmdSetup() {
   box('setu setup');
 
   // 1. deps
-  step(1, 7, 'Dependencies');
+  step(1, 8, 'Dependencies');
   if (!commandExists('brew')) die('Homebrew not found — install from https://brew.sh');
   ok('homebrew');
   if (!commandExists('bun')) die('bun not found');
@@ -174,7 +174,7 @@ async function cmdSetup() {
   console.log();
 
   // 2. configure — flags first, prompts only for what's missing (agents pass flags)
-  step(2, 7, 'Configuration');
+  step(2, 8, 'Configuration');
   const existing = loadConfig();
   let name      = flags.name ?? (existing.tunnel ? existing.tunnel.replace(/^dev-/, '') : '');
   let workspace = resolvePath(flags.workspace ?? existing.workspace ?? join(HOME, 'workspace'));
@@ -195,7 +195,7 @@ async function cmdSetup() {
   console.log();
 
   // 3. Cloudflare
-  step(3, 7, 'Cloudflare tunnel');
+  step(3, 8, 'Cloudflare tunnel');
   if (!existsSync(join(HOME, '.cloudflared', 'cert.pem'))) {
     process.stdout.write(`  ${GR}○${R} Logging in to Cloudflare...  `);
     execFileSync(CLOUDFLARED_BIN, ['tunnel', 'login'], { stdio: 'inherit' });
@@ -231,7 +231,7 @@ async function cmdSetup() {
   console.log();
 
   // 4. DNS & proxy
-  step(4, 7, 'DNS & proxy');
+  step(4, 8, 'DNS & proxy');
   spin('dnsmasq');
   const dnsConf = join(BREW_PREFIX, 'etc', 'dnsmasq.conf');
   const dnsText = existsSync(dnsConf) ? readFileSync(dnsConf, 'utf8') : '';
@@ -267,7 +267,7 @@ async function cmdSetup() {
   console.log();
 
   // 5. Passwordless sudo — rules must match EXACTLY what lib.js runs
-  step(5, 7, 'Passwordless sudo');
+  step(5, 8, 'Passwordless sudo');
   const user = execFileSync('whoami', { encoding: 'utf8' }).trim();
   spin('caddy reload');
   const caddyRule = `${user} ALL=(ALL) NOPASSWD: ${CADDY_BIN} reload --config ${input.workspace}/Caddyfile`;
@@ -281,7 +281,7 @@ async function cmdSetup() {
   console.log();
 
   // 6. config + shell
-  step(6, 7, 'Shell & config');
+  step(6, 8, 'Shell & config');
   spin('~/.setu.json');
   saveConfig({ workspace: input.workspace, tunnel: input.tunnel, domain: input.domain, cfCredentials });
   done();
@@ -304,8 +304,21 @@ async function cmdSetup() {
   console.log();
 
   // 7. first hosts sync
-  step(7, 7, 'Verify');
+  step(7, 8, 'Verify');
   syncHosts(input.workspace) ? ok('/etc/hosts synced') : fail('/etc/hosts sync');
+  console.log();
+
+  // 8. Raycast extension — optional, skipped silently if Raycast isn't
+  // installed. There's no headless way to register a local extension with
+  // Raycast (it goes through the app's own Import/Develop flow), so this
+  // only ever prints the one manual step rather than pretending to automate it.
+  step(8, 8, 'Raycast extension');
+  if (existsSync('/Applications/Raycast.app')) {
+    ok('Raycast detected');
+    console.log(`  ${GR}run: cd ${SETU_DIR}/raycast && npm install && npx ray develop${R}`);
+  } else {
+    console.log(`  ${GR}○${R} Raycast not installed — skipping`);
+  }
   console.log();
 
   box('All done!');
