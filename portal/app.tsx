@@ -1165,7 +1165,6 @@ function App() {
   const [agents, setAgents] = useState<{ id: string; label: string }[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
   const [filter, setFilter] = useState(() => localStorage.getItem('setu-filter') || 'all');
-  const [search, setSearch] = useState('');
   const [view, setView] = useState<'list' | 'grid'>(() => (localStorage.getItem('setu-view') as any) || 'grid');
   const [dark, setDark] = useState(() => localStorage.getItem('setu-theme') === 'dark');
 
@@ -1189,7 +1188,6 @@ function App() {
   useEffect(() => { localStorage.setItem('setu-filter-dirty', onlyDirty ? '1' : '0'); setPage(0); }, [onlyDirty]);
   useEffect(() => { localStorage.setItem('setu-filter-ahead', onlyAhead ? '1' : '0'); setPage(0); }, [onlyAhead]);
   useEffect(() => { localStorage.setItem('setu-filter', filter); setPage(0); }, [filter]);
-  useEffect(() => { setPage(0); }, [search]);
   useEffect(() => { localStorage.setItem('setu-view', view); }, [view]);
   const [toastMsg, setToastMsg] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
@@ -1198,6 +1196,20 @@ function App() {
   const [commandOpen, setCommandOpen] = useState(false);
   const pendingStart = useRef(new Set<string>());
   const toastTimer = useRef<any>(null);
+
+  // Lightweight — just a status dot for the sidebar's quick-access entry
+  // point. The actual controls (start/stop, live log) live in Settings'
+  // RaycastSection; duplicating that whole surface into a w-52 sidebar
+  // isn't proportionate, a status-aware link to it is.
+  const [raycastRunning, setRaycastRunning] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const check = () => fetch('/api/raycast/status').then(r => r.json())
+      .then(s => { if (alive) setRaycastRunning(!!s?.running); }).catch(() => {});
+    check();
+    const t = setInterval(check, 10000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -1289,11 +1301,9 @@ function App() {
   // Running (and queued) worktrees float to the top regardless of sort key or
   // view — with 45+ worktrees registered, the 1-2 that are actually live are
   // otherwise buried wherever the chosen sort happens to put them.
-  const searchNeedle = search.trim().toLowerCase();
   const sorted = (filter === 'all' ? worktrees : worktrees.filter(w => w.repo === filter))
     .filter(w => !onlyDirty || w.dirty > 0)
     .filter(w => !onlyAhead || w.ahead > 0)
-    .filter(w => !searchNeedle || `${w.name} ${w.repo} ${w.label} ${w.domain}`.toLowerCase().includes(searchNeedle))
     .slice()
     .sort((a, b) => Number(b.active) - Number(a.active) || Number(b.queued) - Number(a.queued) || SORTERS[sortKey](a, b));
 
@@ -1344,6 +1354,10 @@ function App() {
             <span class="wordmark">setu</span>
             <StatusStrip status={status} />
           </span>
+        } subtitle={
+          <p class="text-xs text-zinc-400 dark:text-zinc-500 max-w-xl">
+            Parallel branches, dedicated dev servers, sidecars, and synced environments — one bridge for every feature an agent is building at once.
+          </p>
         } actions={<>
           <SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>
           <PrimaryButton onClick={() => setCreateOpen(true)}>+ Worktree</PrimaryButton>
@@ -1377,17 +1391,11 @@ function App() {
       {running.length > 0 && rest.length > 0 && (
         <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">All worktrees</h2>
       )}
-      <div class="relative mb-4">
-        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-300 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
-        <input value={search} onInput={(e: any) => setSearch(e.target.value)}
-          placeholder="Search by name, repo, or branch…"
-          class="w-full h-10 pl-9 pr-3 backdrop-blur-md bg-white/70 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-sm text-zinc-700 dark:text-zinc-300 rounded-none focus:outline-none focus:border-zinc-400 transition-colors duration-150" />
-      </div>
       <div class={view === 'grid' ? 'grid grid-cols-1 lg:grid-cols-2 gap-3 items-start' : 'flex flex-col gap-3'}>
         {!filtered.length
           ? <p class="text-zinc-400 text-sm py-10 text-center">
               {rest.length ? 'No worktrees on this page.' :
-               (onlyDirty || onlyAhead || searchNeedle) ? 'No worktrees match the active filters.' :
+               (onlyDirty || onlyAhead) ? 'No worktrees match the active filters.' :
                running.length ? '' :
                `No worktrees${filter !== 'all' ? ' for this project' : ''} — click + Worktree to create one.`}
             </p>
@@ -1478,6 +1486,12 @@ function App() {
           class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
           <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" /></svg>
           <span class="text-xs text-left">Settings</span>
+        </button>
+        <button onClick={() => navigate('/settings')} data-tip={raycastRunning ? 'Raycast dev mode is running' : 'Set up the Raycast extension'}
+          class="tip flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
+          <StatusDot tone={raycastRunning ? 'emerald' : 'zinc'} />
+          <span class="text-xs text-left flex-1">Raycast</span>
+          <span class="text-[10px] text-zinc-400">{raycastRunning ? 'running' : 'set up'}</span>
         </button>
       </div>
 
