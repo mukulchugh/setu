@@ -499,6 +499,61 @@ export function worktreeForBranch(repoDir, name) {
   return null;
 }
 
+// Full path->branch map in one pass — same porcelain parse worktreeForBranch
+// already does, just returning everything instead of searching for one name.
+// Needed because a worktree's directory name is not reliably its branch name
+// (confirmed live: a worktree directory can be on a branch with a completely
+// different name than the directory itself), so joining git ref data back to
+// a specific worktree has to go through the actual path, not an assumption.
+export function worktreeBranchMap(repoDir) {
+  const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
+  const map = new Map();
+  for (const entry of porcelain.trim().split('\n\n')) {
+    const path   = entry.match(/^worktree (.+)$/m)?.[1];
+    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
+    if (path && branch) map.set(resolve(path), branch);
+  }
+  return map;
+}
+
+// The same base-branch choice createWorktree() already makes for new
+// branches (fork point) — reused here for ahead/behind comparisons so
+// neither place hardcodes 'origin/staging', which doesn't exist for most
+// registered repos (confirmed live: only 2 of 5 have it; using it
+// unconditionally fails with "unknown revision" on the rest).
+export function baseBranchRef(repoDir) {
+  return branchExists(repoDir, 'staging') ? 'origin/staging'
+    : `origin/${git(repoDir, ['symbolic-ref', '--short', 'HEAD']).trim()}`;
+}
+
+// One call per repo, not one per worktree — %(ahead-behind:) and
+// %(committerdate:unix) are ref-level properties, so every branch's data
+// comes back in a single `for-each-ref` (measured live: 77ms for 300+
+// branches in one real repo). The alternative — per-worktree `git log`/
+// `rev-list` via the synchronous git() above — is the same class of bug this
+// codebase has already hit and fixed twice elsewhere (fetchPR, activePid):
+// O(n) synchronous subprocess spawns blocking Bun's single event loop during
+// exactly the poll window (as low as 800ms mid-start) that most needs to stay
+// responsive. Returns Map<branchName, {lastCommitAt, ahead, behind}>;
+// ahead/behind are 0 if the repo has no reachable base (rare, but
+// for-each-ref degrades to blank fields rather than erroring per-branch).
+export function branchMetadata(repoDir) {
+  const base = baseBranchRef(repoDir);
+  let raw;
+  try {
+    raw = git(repoDir, ['for-each-ref',
+      `--format=%(refname:short)\t%(committerdate:unix)\t%(ahead-behind:${base})`, 'refs/heads/']);
+  } catch { return new Map(); }
+  const map = new Map();
+  for (const line of raw.trim().split('\n')) {
+    if (!line) continue;
+    const [branch, at, ab] = line.split('\t');
+    const [ahead, behind] = (ab ?? '').trim().split(/\s+/).map(n => parseInt(n, 10) || 0);
+    map.set(branch, { lastCommitAt: parseInt(at, 10) || null, ahead: ahead ?? 0, behind: behind ?? 0 });
+  }
+  return map;
+}
+
 // Creates worktree + port + envrc + caddy + env symlink + hosts. Dependency
 // install is the caller's job (CLI runs it inline, portal in the background).
 export function createWorktree(c, repo, name, { tunnel = false } = {}) {

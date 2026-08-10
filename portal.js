@@ -4,7 +4,7 @@
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 // Bun bundles + transpiles the Preact UI referenced by this page at serve time
 import indexPage from './portal/index.html';
 import {
@@ -16,7 +16,7 @@ import {
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
   AGENT_CLIS, detectAgentClis, loadSidecars, killGroup,
   containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
-  defaultContainerMode,
+  defaultContainerMode, worktreeBranchMap, branchMetadata,
 } from './lib.js';
 
 let _cfg;
@@ -91,6 +91,56 @@ function tailLog(repo, name, type = 'dev', lines = 150) {
 
 let REPO_META = loadProjects(WORKSPACE);
 
+// ── git metadata cache (last-commit / ahead-behind, batched per repo) ────────
+// branchMetadata()+worktreeBranchMap() are each one call per REPO, not per
+// worktree (see lib.js) — still worth a short TTL so a full /api/worktrees
+// poll (every 800ms while a start is pending) doesn't re-run them needlessly.
+// Nothing in the poll path fetches, so this is inherently as stale as the
+// last `git fetch` regardless of TTL — the TTL bounds re-parse cost, not staleness.
+
+const gitMetaCache = new Map(); // repo -> { branchMeta, pathToBranch, fetchedAt }
+const GIT_META_TTL = 10_000;
+
+function repoGitMeta(repo) {
+  const cached = gitMetaCache.get(repo);
+  if (cached && Date.now() - cached.fetchedAt < GIT_META_TTL) return cached;
+  const repoDir = `${WORKSPACE}/${repo}.git`;
+  let branchMeta = new Map(), pathToBranch = new Map();
+  try {
+    branchMeta = branchMetadata(repoDir);
+    pathToBranch = worktreeBranchMap(repoDir);
+  } catch {}
+  const entry = { branchMeta, pathToBranch, fetchedAt: Date.now() };
+  gitMetaCache.set(repo, entry);
+  return entry;
+}
+
+// Uncommitted-changes count — genuinely per-worktree (live working-tree
+// state, can't be batched from the bare repo like the ref data above).
+// Same shape as fetchPR: Bun.spawn (not execFileSync — see fetchPR's own
+// comment on why), short TTL cache.
+const dirtyCache = new Map();
+const DIRTY_TTL  = 5_000;
+
+async function fetchDirty(repo, name) {
+  const key    = `${repo}/${name}`;
+  const cached = dirtyCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < DIRTY_TTL) return cached.count;
+  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  try {
+    const proc = Bun.spawn(['git', '-C', wtDir, '--no-optional-locks', 'status', '--porcelain'],
+      { stdout: 'pipe', stderr: 'ignore' });
+    const raw  = await new Response(proc.stdout).text();
+    await proc.exited;
+    const count = raw.trim() ? raw.trim().split('\n').length : 0;
+    dirtyCache.set(key, { count, fetchedAt: Date.now() });
+    return count;
+  } catch {
+    dirtyCache.set(key, { count: 0, fetchedAt: Date.now() });
+    return 0;
+  }
+}
+
 // ── PR cache ──────────────────────────────────────────────────────────────────
 
 const prCache = new Map();
@@ -157,6 +207,30 @@ function killPort(port) {
   catch (e) { return { ok: false, error: String(e) }; }
 }
 
+// Resource usage — only ever called for `active` worktrees (no point
+// measuring what isn't running), so this never scales with the full 45+
+// worktree registry, only with maxConcurrentDevServers (default 3).
+async function activeMemMb(entry) {
+  if (!entry) return null;
+  if (entry.container) {
+    try {
+      const idProc = Bun.spawn(['docker', 'compose', '-p', entry.container, 'ps', '-q'], { stdout: 'pipe', stderr: 'ignore' });
+      const id = (await new Response(idProc.stdout).text()).trim().split('\n')[0];
+      await idProc.exited;
+      if (!id) return null;
+      const statsProc = Bun.spawn(['docker', 'stats', '--no-stream', '--format', '{{.MemUsage}}', id], { stdout: 'pipe', stderr: 'ignore' });
+      const raw = (await new Response(statsProc.stdout).text()).trim();
+      await statsProc.exited;
+      // "123.4MiB / 4GiB" — only the used side matters here
+      const m = raw.match(/^([\d.]+)\s*(MiB|GiB)/);
+      if (!m) return null;
+      return m[2] === 'GiB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
+    } catch { return null; }
+  }
+  if (entry.pid) return processFootprintMb(entry.pid);
+  return null;
+}
+
 async function getWorktrees() {
   const activePorts = new Set(activePortsCached().map(p => p.port));
   return Promise.all(
@@ -169,10 +243,30 @@ async function getWorktrees() {
       const branchUrl = meta.github ? `${meta.github}/tree/${name}` : null;
       const pr        = name !== 'main' ? await fetchPR(repo, name) : null;
       const iPort = inngestPort(port);
+      const active = activePorts.has(port);
+      const procEntry = procs.get(key);
+
+      // Worktree directory name isn't reliably the branch name — join
+      // through the real path->branch map, not an assumption (see
+      // worktreeBranchMap's comment in lib.js for the confirmed live case
+      // where this bit us).
+      const { branchMeta, pathToBranch } = repoGitMeta(repo);
+      const branch = pathToBranch.get(resolve(wtDir)) ?? name;
+      const gm = branchMeta.get(branch) ?? { lastCommitAt: null, ahead: 0, behind: 0 };
+      const [dirty, memMb] = await Promise.all([
+        fetchDirty(repo, name),
+        active ? activeMemMb(procEntry) : Promise.resolve(null),
+      ]);
+
       return {
         key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
-        active:        activePorts.has(port),
-        container:     procs.get(key)?.container ?? null,
+        active,
+        container:     procEntry?.container ?? null,
+        // What a plain Start (no explicit --container/--bare) would resolve
+        // to right now — lets the UI show this *before* the click instead of
+        // the user finding out after, which is the exact blind spot that let
+        // an established worktree get silently switched to a container.
+        nextStartMode: defaultContainerMode(WORKSPACE, repo, name) ? 'container' : 'bare',
         queued:        queuePosition(key) !== null,
         queuePosition: queuePosition(key),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
@@ -182,6 +276,16 @@ async function getWorktrees() {
         inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
         inngestPort:   iPort,
         triggerActive: triggerProcs.has(key),
+        lastCommitAt:  gm.lastCommitAt,
+        ahead:         gm.ahead,
+        behind:        gm.behind,
+        dirty,
+        memMb,
+        // Directory birthtime, not a subprocess — statSync is essentially
+        // free (no spawn) and APFS supports real birthtime. This is
+        // creation time, not last-activity — don't conflate the two in the
+        // UI (lastCommitAt is the "worked on" signal).
+        createdAt: (() => { try { return Math.floor(statSync(wtDir).birthtimeMs / 1000); } catch { return null; } })(),
       };
     })
   );
@@ -648,7 +752,13 @@ function openInGhostty(wtDir, tool) {
   if (!cmd) return { ok: false, error: 'unknown tool' };
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
   writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
-  Bun.spawn(['ghostty', `--working-directory=${wtDir}`, `--command=${script}`],
+  // Not a raw `ghostty` spawn — Ghostty's own --help is explicit that launching
+  // the terminal from the CLI isn't supported on macOS ("use open -na
+  // Ghostty.app"). The raw binary silently spawns a process with zero children
+  // and never runs the script; /api/open still returned {ok:true} throughout
+  // since Bun.spawn not throwing synchronously was the only check — confirmed
+  // live via a marker-file test that only the `open -na` form actually executes.
+  Bun.spawn(['open', '-na', 'Ghostty', '--args', `--working-directory=${wtDir}`, `--command=${script}`],
     { detached: true, stdio: ['ignore', 'ignore', 'ignore'] });
   return { ok: true };
 }
@@ -660,6 +770,18 @@ async function handle(req) {
   const method = req.method;
 
   if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
+
+  if (pathname === '/api/status') {
+    const rt = containerRuntimeAvailable();
+    return Response.json({
+      concurrency: { active: procs.size, max: MAX_CONCURRENT_DEV, queued: startQueue.length },
+      container: {
+        engineAvailable: rt.available, engine: rt.engine,
+        memoryLimit: _cfg.containerMemoryLimit ?? '4g',
+        cpuLimit: _cfg.containerCpuLimit ?? 2,
+      },
+    });
+  }
 
   if (pathname === '/api/agents') return Response.json(detectAgentClis());
 
@@ -831,7 +953,11 @@ setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
 
 Bun.serve({
   port: PORT,
-  routes: { '/': indexPage },
+  // Both routes serve the identical SPA shell — the client-side router (app.tsx)
+  // reads location.pathname itself. Needed so a hard refresh or a direct link
+  // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
+  // handles in-app navigation, not a fresh page load hitting the server).
+  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage },
   fetch: handle,
   development: false,
 });
