@@ -12,11 +12,12 @@ import {
   requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
   parseEnvFile, pinnedTriggerVersion,
   readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
+  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject, removeProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
-  AGENT_CLIS, detectAgentClis, loadSidecars, killGroup,
+  AGENT_CLIS, detectAgentClis, loadSidecars, loadAllSidecars, saveSidecars, killGroup,
   containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
-  defaultContainerMode, worktreeBranchMap, branchMetadata,
+  defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
+  worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
 } from './lib.js';
 
 let _cfg;
@@ -267,6 +268,7 @@ async function getWorktrees() {
         // the user finding out after, which is the exact blind spot that let
         // an established worktree get silently switched to a container.
         nextStartMode: defaultContainerMode(WORKSPACE, repo, name) ? 'container' : 'bare',
+        needsMigrationPrompt: needsMigrationPrompt(WORKSPACE, repo, name),
         queued:        queuePosition(key) !== null,
         queuePosition: queuePosition(key),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
@@ -297,7 +299,11 @@ async function getWorktrees() {
 // exactly the failure mode this whole portal exists to prevent. Cap concurrent
 // dev servers; anything beyond the cap queues and starts automatically as a
 // slot frees up (a worktree stopping, or exiting on its own).
-const MAX_CONCURRENT_DEV = _cfg.maxConcurrentDevServers ?? 3;
+// `let`, not `const` — the settings page (POST /api/settings) updates this
+// in-memory so a concurrency-cap change takes effect immediately, not only
+// after the portal process restarts. Persisted to ~/.setu.json via
+// saveConfig() at the same time so it survives a real restart too.
+let MAX_CONCURRENT_DEV = _cfg.maxConcurrentDevServers ?? 3;
 const startQueue = []; // [{ key, repo, name, port }], FIFO
 
 function queuePosition(key) {
@@ -786,13 +792,61 @@ async function handle(req) {
   if (pathname === '/api/agents') return Response.json(detectAgentClis());
 
   if (pathname === '/api/projects') return Response.json(
-    Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label }))
+    Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }))
   );
 
   if (method === 'POST' && pathname === '/api/project/add') {
     const body = await req.json().catch(() => ({}));
     try { return Response.json(addProject(body)); }
     catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+  }
+
+  if (method === 'POST' && pathname === '/api/project/remove') {
+    const body = await req.json().catch(() => ({}));
+    try { removeProject(WORKSPACE, body.name); return Response.json({ ok: true }); }
+    catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+  }
+
+  // Both GET (read current values + real hardware/Docker capacity for the
+  // settings UI's ranges) and POST (persist a change) live on one path —
+  // handled here, before the generic POST body-parsing block below, so a
+  // POST to this path returns from here and never falls through to it.
+  if (pathname === '/api/settings') {
+    if (method === 'GET') {
+      return Response.json({
+        maxConcurrentDevServers: MAX_CONCURRENT_DEV,
+        containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
+        containerCpuLimit: _cfg.containerCpuLimit ?? 2,
+        mac: macCapacity(),
+        docker: engineCapacity(),
+      });
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      if (body.maxConcurrentDevServers != null) {
+        MAX_CONCURRENT_DEV = Math.max(1, Number(body.maxConcurrentDevServers) || 1);
+        _cfg.maxConcurrentDevServers = MAX_CONCURRENT_DEV;
+        drainQueue(); // a raised cap should immediately start anything already queued
+      }
+      if (body.containerMemoryLimit != null) _cfg.containerMemoryLimit = String(body.containerMemoryLimit);
+      if (body.containerCpuLimit != null) _cfg.containerCpuLimit = Number(body.containerCpuLimit) || 1;
+      saveConfig(_cfg);
+      return Response.json({ ok: true });
+    }
+  }
+
+  // Sidecars: GET returns every entry (including disabled) for the settings
+  // UI to edit; POST replaces the whole per-repo list — the caller always
+  // sends the full array back (add/remove/toggle are all client-side edits
+  // to that array), matching saveSidecars()'s per-repo-overwrite shape.
+  if (pathname === '/api/sidecars') {
+    const p = new URL(req.url).searchParams;
+    if (method === 'GET') return Response.json(loadAllSidecars(WORKSPACE, p.get('repo') ?? ''));
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      try { saveSidecars(WORKSPACE, body.repo, body.sidecars ?? []); return Response.json({ ok: true }); }
+      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+    }
   }
 
   if (pathname === '/api/logs') {
@@ -827,11 +881,22 @@ async function handle(req) {
       // (portal, Caddy, dnsmasq, git) regardless — this only governs how the
       // dev server process itself runs.
       const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
+      // An explicit mode choice (from either the Force bare/container menu
+      // or the one-time migration prompt) settles needsMigrationPrompt for
+      // good, regardless of which mode was actually picked — the point was
+      // never "must containerize," it was "must not decide silently."
+      if (container !== undefined && needsMigrationPrompt(WORKSPACE, repo, name)) markMigrationPrompted(WORKSPACE, repo, name);
       return Response.json(startWorktree(repo, name, port, useContainer));
     }
     if (pathname === '/api/stop') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       stopWorktree(repo, name, port); return Response.json({ ok: true });
+    }
+    if (pathname === '/api/sync') {
+      const wtDir = `${WORKSPACE}/${repo}/${name}`;
+      const repoDir = `${WORKSPACE}/${repo}.git`;
+      try { return Response.json(syncWithBase(wtDir, repoDir)); }
+      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
     }
     if (pathname === '/api/tunnel/enable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -957,7 +1022,7 @@ Bun.serve({
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage },
+  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage },
   fetch: handle,
   development: false,
 });

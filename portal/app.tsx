@@ -10,7 +10,7 @@ import { siClaude, siCursor, siOpencode, siAmp, siGoogle, siX } from 'simple-ico
 type Worktree = {
   key: string; repo: string; name: string; slug: string; port: number;
   domain: string; pubDomain: string; tunnelOn: boolean; active: boolean;
-  container: string | null; nextStartMode: 'container' | 'bare';
+  container: string | null; nextStartMode: 'container' | 'bare'; needsMigrationPrompt: boolean;
   tunnelRunning: boolean; label: string; branchUrl: string | null;
   pr: { url: string; number: number; title: string } | null;
   inngestActive: boolean; inngestPort: number; triggerActive: boolean;
@@ -18,7 +18,12 @@ type Worktree = {
   lastCommitAt: number | null; ahead: number; behind: number; dirty: number; memMb: number | null;
   createdAt: number | null;
 };
-type Project = { name: string; label: string };
+type Project = { name: string; label: string; github?: string | null };
+type Sidecar = { name: string; enabled?: boolean; command: string; args?: string[]; env?: Record<string, string> };
+type SettingsData = {
+  maxConcurrentDevServers: number; containerMemoryLimit: string; containerCpuLimit: number;
+  mac: { cpus: number | null; memMb: number | null }; docker: { cpus: number | null; memMb: number | null };
+};
 type PortInfo = { port: number; pid: string; cmd: string; worktree: string | null };
 type Status = {
   concurrency: { active: number; max: number; queued: number };
@@ -28,9 +33,12 @@ type Status = {
 // Minimal router — one detail view alongside the existing list/grid doesn't
 // justify a router dependency; history.pushState + popstate is the native
 // platform feature that already does exactly this.
-type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string };
+type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' };
 
 function parseRoute(pathname: string): Route {
+  if (pathname === '/settings') return { page: 'settings' };
+  if (pathname === '/help') return { page: 'help' };
+  if (pathname === '/ports') return { page: 'ports' };
   const m = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
   return m ? { page: 'detail', repo: decodeURIComponent(m[1]), name: decodeURIComponent(m[2]) } : { page: 'list' };
 }
@@ -112,6 +120,19 @@ function ToolIcon({ id, label }: { id?: string; label: string }) {
   return <span class="text-[9px] font-bold tracking-tight">{label.slice(0, 2).toUpperCase()}</span>;
 }
 
+// Neither Trigger.dev nor Inngest is a vector mark anywhere (not in
+// simple-icons, not in lobehub/lobe-icons) — their real favicons are small
+// raster PNGs, sourced once (trigger.dev/favicon.ico, inngest.com/favicon.ico)
+// and inlined as data URIs so they're bundled the same as every other icon
+// here: no runtime request, no failure mode to reproduce.
+const TRIGGER_ICON_URI = 'data:image/png;base64,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';
+const INNGEST_ICON_URI = 'data:image/png;base64,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';
+function SidecarIcon({ tool }: { tool: 'trigger' | 'inngest' }) {
+  return <img src={tool === 'trigger' ? TRIGGER_ICON_URI : INNGEST_ICON_URI} class="w-3.5 h-3.5 rounded-none" alt="" />;
+}
+
+const MUKUL_LOGO_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAFM0lEQVRoBd1ZSUtsRxQ+2s7THzDoi0F9KGpQQReujJsQJRFEXAny3LkV4vADEhcS4kIi4oCCuMnGlYqggggiJuHxVDRq8GmMGsF5Hjrnq3CLe693qO42dncOnL41n++rOnXqVl+iMJcIB/xRXPeGtZD1M9Y41teUKzb2O+uvrB9ZH1mVJY9b9rCi4z2rN0h6x3a3WH9kzWJ1lUhuUcu6wRos0HZ2PzCmryJY+GkrAP83q90gwS7/k7F9aYcebgOfCzZIN/u/MUbsSYN4OPcTq1vnUKn/3oCeM9gg22FEYIWxprISNi3kc1ZRIHKh//MpQ8wFTI1ABqfhRuEiOJPSAFYj4HpIZWZmUlqa6BMqJBP0BFxBFRUVUUtLC8XGxrq2fYkGsOMS8sXkayvgajM5OZnq6+uppqbGtW2gDTIyMqipqYni4lwdQ7qQq83ExESCtra2UnZ2tmt7fxsAfE9PD1VWVioN4dMKYMTc3Fxqa2ujhAThgkpGVBtlZWVRb28vVVRU0NPTE3m9OHacRZlAUlKSHKm2tpbq6upk/iUSOTk51NfXR+Xl5WI4FfBoqEwgJSVF4oRvYkPn5eHtI3ApKCig/v5+Kisr83kwJQKIBvoVgBWE1fb29mflviIoLi4W4EtKSgxdsQIqq6BEwOPxWAKtqqqi0tJSg2FfMgANtyksxJ3JKCrg0QO3LleJioqy3LSRkZEEhcTExFBDQwOlp6fT2dkZXV5eSr26uqLr62vCc3V1lY6Pj0WfxsZGys/PF2l/f5QJmF0IBu/u7uj09FTYRhqz1tzcTNHR0RIPosnj46OIKltbW1RdXS0J3N/jsmct6KciSi4EQFZh8+bmhi4uLqSd0dFRGh8fl3kksELoj5N1bGyM1tfXZf3JyYlMmxOqLqREAMatTkW4BVxFE7hOZ2cnHR0daUXyidkfGBgwbEwnArKjSyIgAgAPv9bL3NwcDQ0N6YtEGmVra2uGcicCWAGVVVAigNmPj483GEfm/Pycbm9vDeXw9+7ublpZwZ3jX8HGHR4e1rLyif1j5+sq4DGQEgGA129MDYEVAdRtbm5SV1cXYZMCyODgIMGFzAKXc9rI5vZWeSUCeIlDmDQLZtAOADb09PQ0LS8v08jIiLmryDsRUF0BpTCKCISzwCzwYbiMlYBcR0cHpaam0u7urlUTEcEQfq0EBFRIPEdlMRpWwI6ARXNZNDMzIw86WahLaAecrsjnpBIBHGLaiau3oJ2o+jJ9GhvUbpOinRMBldnHGEp7ALcxfwjAgJOYzxF92xclYPUagZl1iuN6MHZp+D8iWSCivAJmIw8PD/8pAUyQyir4TQDhE2EwEEEEsxtDBTxsKxGwciG8yAW6/CBg54Yuf6nIeXONQti8dgT0b6JyRB8T2uu41g2uube3R0tLS44RTGvvSgDxXyOAGTs8PBSn68TEBO3v72vj+P0EAYDe2Nig+fl5mpqaooWFBdrZ2XkZAlhKvMfg747Z2VkxM9vb2+KG5TdqXcfJyUkxIYuLi3RwcGB7suu6aEnDjedbLrX8758JePllzsuuZFlv1+8Vyt+BieZCm5x+0OVRJwTRAAdOiAkA4XuGjEL4lLmDgjARTPgysGph9A9Oj6EgTORnxvmXGetbLsA1KtR83YxnkTHafqj4hisRG82dQiUPv/+C1VYiuOZr1lBciV8YV4UtclMFvlr+wIrvxri1B2sFbtj2Kut3rG9Ynwlm3E48XIEvl/jv7xNW/N0GIq8hwIW75kfW96zYsIaDi/P/D/kHGNOpOz6fLmoAAAAASUVORK5CYII=';
+
 function CreateModal({ projects, onClose, onCreated }: any) {
   const [repo, setRepo] = useState(projects[0]?.name ?? '');
   const [name, setName] = useState('');
@@ -160,8 +181,8 @@ function CreateModal({ projects, onClose, onCreated }: any) {
           </div>
           {status && <p class="text-xs text-zinc-500">{status}</p>}
           <div class="flex gap-3 pt-1">
-            <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
-            <PrimaryButton onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create'}</PrimaryButton>
+            <SecondaryButton class="flex-1" onClick={onClose}>Cancel</SecondaryButton>
+            <PrimaryButton class="flex-1" onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create'}</PrimaryButton>
           </div>
         </div>
       </div>
@@ -235,8 +256,8 @@ function AddProjectModal({ onClose, onAdded }: any) {
           {status && <p class="text-xs text-zinc-500">{status}</p>}
 
           <div class="flex gap-3 pt-1">
-            <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
-            <PrimaryButton onClick={submit} disabled={busy}>{busy ? 'Adding…' : 'Add'}</PrimaryButton>
+            <SecondaryButton class="flex-1" onClick={onClose}>Cancel</SecondaryButton>
+            <PrimaryButton class="flex-1" onClick={submit} disabled={busy}>{busy ? 'Adding…' : 'Add'}</PrimaryButton>
           </div>
         </div>
       </div>
@@ -304,6 +325,23 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
       </IconButton>
     );
   }
+  // First Start for a worktree that's only ever run bare and has never been
+  // asked — same silent-switch concern as above, but for the one-time
+  // migration to container rather than a single start's mode. Asked once
+  // (lib.js marks it answered on either choice via markMigrationPrompted),
+  // never nagged again — see task/memory on why this isn't fully automatic.
+  if (w.needsMigrationPrompt) {
+    return (
+      <Menu trigger={toggle => (
+        <IconButton tone="emerald" tip="This worktree has always run bare — migrate to a container?" onClick={toggle}>
+          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+        </IconButton>
+      )}>
+        <MenuItem onClick={() => onStart(w, 'container')}>Migrate to container</MenuItem>
+        <MenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</MenuItem>
+      </Menu>
+    );
+  }
   return (
     <div class="flex items-center">
       <IconButton tone="emerald" tip={`Start — will run ${w.nextStartMode}`} onClick={() => onStart(w)}>
@@ -342,7 +380,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
       <div class="flex-1 min-w-0">
         <div class={`flex items-baseline gap-2.5 mb-1 ${gridMode ? 'flex-wrap' : ''}`}>
           <button onClick={() => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)}
-            class="text-zinc-900 font-medium text-[15px] truncate hover:text-accent transition-colors duration-150 text-left">
+            class="text-zinc-900 dark:text-zinc-100 font-medium text-[15px] truncate hover:text-accent transition-colors duration-150 text-left">
             {w.name}
           </button>
           <span class="board-mono text-[10px] text-zinc-300 font-bold shrink-0">{w.label}</span>
@@ -380,14 +418,14 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
           )}
           {showInngestInline && (
             <a href={`http://localhost:${w.inngestPort}`} target="_blank" title="Inngest dashboard"
-              class="flex items-center gap-1 hover:text-zinc-600 transition-colors duration-150 shrink-0">
-              <StatusDot tone="amber" />inngest
+              class="flex items-center gap-1.5 hover:text-zinc-600 transition-colors duration-150 shrink-0">
+              <SidecarIcon tool="inngest" />inngest
             </a>
           )}
           {showTriggerInline && (
             <button onClick={() => onOpenLogs(w.repo, w.name, 'trigger')} title="trigger.dev logs"
-              class="flex items-center gap-1 hover:text-zinc-600 transition-colors duration-150 shrink-0">
-              <StatusDot tone="emerald" />trigger
+              class="flex items-center gap-1.5 hover:text-zinc-600 transition-colors duration-150 shrink-0">
+              <SidecarIcon tool="trigger" />trigger
             </button>
           )}
           {w.branchUrl && (
@@ -404,7 +442,12 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
       </div>
 
     <div class={gridMode ? 'flex items-center justify-between gap-2 pt-1 border-t border-zinc-100 dark:border-zinc-800' : 'contents'}>
-      <div class="flex items-center gap-0.5 shrink-0 flex-wrap">
+      {/* Hidden until hover — a clean card at rest, the tool-launch icons
+          only when you're actually looking at this specific card. The
+          Start/Stop/More row below stays always-visible; that's the one
+          thing you came here to do, not a secondary action to reveal. */}
+      <div class={`flex items-center gap-0.5 shrink-0 flex-wrap transition-opacity duration-150 ${
+        gridMode ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'}`}>
         <IconButton tone="zinc" tip="Open in browser" disabled={!w.active} href={`http://${w.domain}`} target="_blank">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
         </IconButton>
@@ -469,6 +512,11 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
             </MenuItem>
           )}
           <div class="my-1 border-t border-zinc-100" />
+          <MenuItem onClick={() => onAct('/api/sync', w)}
+            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}>
+            Sync with staging
+          </MenuItem>
+          <div class="my-1 border-t border-zinc-100" />
           <MenuItem tone="red" onClick={() => onRemove(w)}
             icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>}>
             Remove worktree
@@ -476,53 +524,6 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
         </Menu>
       </div>
     </div>
-    </div>
-  );
-}
-
-function PortsPanel() {
-  const [open, setOpen] = useState(false);
-  const [ports, setPorts] = useState<PortInfo[]>([]);
-
-  const load = useCallback(async () => {
-    setPorts(await fetch('/api/ports').then(r => r.json()).catch(() => []));
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    load();
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
-  }, [open, load]);
-
-  async function kill(port: number) {
-    await post('/api/ports/kill', { port });
-    load();
-  }
-
-  return (
-    <div class="mt-10">
-      <button onClick={() => setOpen(!open)} class="flex items-center gap-2 text-xs font-medium text-zinc-400 hover:text-zinc-600 transition-colors duration-150 mb-3">
-        <svg class="w-3.5 h-3.5 transition-transform duration-200" style={{ transform: open ? 'rotate(90deg)' : '' }}
-          fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" /></svg>
-        Active ports (3000–3999)
-      </button>
-      <div class={`grid transition-all duration-200 ease-out ${open ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}>
-        <div class="overflow-hidden">
-          <div class="bg-white border border-zinc-200 rounded-none overflow-hidden text-xs">
-            {!ports.length
-              ? <p class="text-zinc-400 px-4 py-3">No processes on ports 3000–3999</p>
-              : ports.map(p => (
-                <div key={p.port} class="flex items-center gap-3 px-4 py-2.5 border-b border-zinc-100 last:border-0">
-                  <span class="font-mono font-medium text-zinc-900 w-12">{p.port}</span>
-                  <span class="text-zinc-400 w-10">PID {p.pid}</span>
-                  <span class="text-zinc-500 flex-1 truncate">{p.cmd}{p.worktree && <span class="text-zinc-400"> · {p.worktree}</span>}</span>
-                  <button onClick={() => kill(p.port)} class="text-red-400 hover:text-red-600 transition-colors duration-150 px-2 py-0.5 rounded hover:bg-red-50 font-medium">kill</button>
-                </div>
-              ))}
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
@@ -613,13 +614,18 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
         actions={
           w.active ? (
             <PrimaryButton onClick={() => onAct('/api/stop', w)}>Stop</PrimaryButton>
+          ) : w.needsMigrationPrompt ? (
+            <Menu align="right" trigger={toggle => <PrimaryButton onClick={toggle}>Start — choose mode</PrimaryButton>}>
+              <MenuItem onClick={() => onStart(w, 'container')}>Migrate to container</MenuItem>
+              <MenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</MenuItem>
+            </Menu>
           ) : (
             <PrimaryButton onClick={() => onStart(w)}>Start ({w.nextStartMode})</PrimaryButton>
           )
         }
       />
 
-      <Section title="Overview">
+      <Section title="Overview" actions={<SecondaryButton onClick={() => onAct('/api/sync', w)}>Sync with staging</SecondaryButton>}>
         <div class="grid grid-cols-2 gap-4 text-sm">
           <div>
             <div class="text-zinc-400 text-xs mb-0.5">Local domain</div>
@@ -663,6 +669,7 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
       <Section title="Sidecars">
         <div class="flex items-center gap-6 text-sm">
           <div class="flex items-center gap-2">
+            <SidecarIcon tool="inngest" />
             <StatusDot tone={w.inngestActive ? 'emerald' : 'zinc'} />
             <span>Inngest</span>
             {w.inngestActive
@@ -673,6 +680,7 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
               : <button onClick={() => onAct('/api/inngest/start', w)} class="text-xs text-zinc-500 hover:underline">start</button>}
           </div>
           <div class="flex items-center gap-2">
+            <SidecarIcon tool="trigger" />
             <StatusDot tone={w.triggerActive ? 'emerald' : 'zinc'} />
             <span>trigger.dev</span>
             {w.triggerActive
@@ -711,6 +719,264 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
       <button onClick={() => onRemove(w)} class="text-xs text-red-500 hover:text-red-700 transition-colors duration-150">
         Remove worktree
       </button>
+    </div>
+  );
+}
+
+function fmtGb(mb: number | null) { return mb == null ? '?' : `${(mb / 1024).toFixed(mb % 1024 ? 1 : 0)}GB`; }
+
+// One sidecar row — name/command/args/enabled, edited in place. The parent
+// owns the array and re-saves the whole thing on "Save sidecars"; this is
+// purely a controlled row, no independent state or its own save action.
+function SidecarRow({ s, onChange, onRemove }: { s: Sidecar; onChange: (s: Sidecar) => void; onRemove: () => void }) {
+  return (
+    <div class="flex items-center gap-2 py-2 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
+      <input type="checkbox" checked={s.enabled !== false} onChange={(e: any) => onChange({ ...s, enabled: e.target.checked })}
+        class="accent-current" style={{ accentColor: 'var(--color-accent)' }} />
+      <input value={s.name} onInput={(e: any) => onChange({ ...s, name: e.target.value })} placeholder="name"
+        class={`${inputCls} w-28 text-xs py-1`} />
+      <input value={s.command} onInput={(e: any) => onChange({ ...s, command: e.target.value })} placeholder="command"
+        class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
+      <input value={(s.args ?? []).join(' ')} onInput={(e: any) => onChange({ ...s, args: e.target.value.split(' ').filter(Boolean) })}
+        placeholder="args (space-separated)" class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
+      <IconButton tone="red" tip="Remove sidecar" onClick={onRemove}>
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+      </IconButton>
+    </div>
+  );
+}
+
+function SettingsPage({ toast }: { toast: (msg: string) => void }) {
+  const [settings, setSettings] = useState<SettingsData | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [addProjectOpen, setAddProjectOpen] = useState(false);
+  const [sidecarRepo, setSidecarRepo] = useState('');
+  const [sidecars, setSidecars] = useState<Sidecar[]>([]);
+  const [sidecarsSaving, setSidecarsSaving] = useState(false);
+
+  const loadProjects = useCallback(async () => {
+    const ps = await fetch('/api/projects').then(r => r.json()).catch(() => []);
+    setProjects(ps);
+    if (!sidecarRepo && ps.length) setSidecarRepo(ps[0].name);
+  }, [sidecarRepo]);
+
+  useEffect(() => {
+    fetch('/api/settings').then(r => r.json()).then(setSettings).catch(() => {});
+    loadProjects();
+  }, []);
+
+  useEffect(() => {
+    if (!sidecarRepo) return;
+    fetch(`/api/sidecars?repo=${encodeURIComponent(sidecarRepo)}`).then(r => r.json()).then(setSidecars).catch(() => setSidecars([]));
+  }, [sidecarRepo]);
+
+  async function saveSettings(patch: Partial<SettingsData>) {
+    if (!settings) return;
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    setSaving(true);
+    const res = await post('/api/settings', patch);
+    setSaving(false);
+    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
+  }
+
+  async function removeProject(name: string) {
+    if (!confirm(`Remove project "${name}"? Existing worktrees keep working — this only drops it from the registry.`)) return;
+    const res = await post('/api/project/remove', { name });
+    if (res?.ok === false) toast(`✗ remove failed: ${res.error ?? 'unknown error'}`);
+    loadProjects();
+  }
+
+  async function saveSidecarsList(next: Sidecar[]) {
+    setSidecars(next);
+    setSidecarsSaving(true);
+    const res = await post('/api/sidecars', { repo: sidecarRepo, sidecars: next });
+    setSidecarsSaving(false);
+    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
+  }
+
+  return (
+    <div class="max-w-3xl mx-auto px-6 py-12">
+      <PageHeader back={{ label: 'All worktrees', onClick: () => navigate('/') }} title="Settings" />
+
+      <Section title="Concurrency & container limits">
+        {!settings ? <p class="text-sm text-zinc-400">Loading…</p> : (
+          <div class="flex flex-col gap-5 text-sm">
+            <div>
+              <label class="text-xs text-zinc-500 flex items-center justify-between mb-1">
+                <span>Max concurrent dev servers</span>
+                <span class="text-zinc-400">Mac: {settings.mac.cpus ?? '?'} cores, {fmtGb(settings.mac.memMb)} RAM</span>
+              </label>
+              <input type="number" min={1} max={Math.max(20, (settings.mac.cpus ?? 10) * 2)} value={settings.maxConcurrentDevServers}
+                onChange={(e: any) => saveSettings({ maxConcurrentDevServers: Number(e.target.value) || 1 })}
+                class={`${inputCls} w-24`} />
+            </div>
+            <div>
+              <label class="text-xs text-zinc-500 flex items-center justify-between mb-1">
+                <span>Container memory limit</span>
+                <span class="text-zinc-400">Docker engine: {settings.docker.cpus ?? '?'} cores, {fmtGb(settings.docker.memMb)} available</span>
+              </label>
+              <input value={settings.containerMemoryLimit} placeholder="4g"
+                onBlur={(e: any) => saveSettings({ containerMemoryLimit: e.target.value })}
+                onInput={(e: any) => setSettings(s => s && { ...s, containerMemoryLimit: e.target.value })}
+                class={`${inputCls} w-24`} />
+              <p class="text-[11px] text-zinc-400 mt-1">A limit above what Docker's engine actually has gets silently clamped when a container starts.</p>
+            </div>
+            <div>
+              <label class="text-xs text-zinc-500 mb-1 block">Container CPU limit</label>
+              <input type="number" min={1} max={settings.docker.cpus ?? 16} value={settings.containerCpuLimit}
+                onChange={(e: any) => saveSettings({ containerCpuLimit: Number(e.target.value) || 1 })}
+                class={`${inputCls} w-24`} />
+            </div>
+            {saving && <p class="text-xs text-zinc-400">Saving…</p>}
+          </div>
+        )}
+      </Section>
+
+      <Section title="Projects" actions={<SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>}>
+        {!projects.length ? <p class="text-sm text-zinc-400">No projects registered.</p> : (
+          <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
+            {projects.map(p => (
+              <div key={p.name} class="flex items-center gap-3 py-2 text-sm">
+                <span class="font-medium text-zinc-900 dark:text-zinc-100 flex-1">{p.label}</span>
+                {p.github && <a href={p.github} target="_blank" class="text-xs text-zinc-400 hover:text-accent truncate max-w-[240px]">{p.github}</a>}
+                <button onClick={() => removeProject(p.name)} class="text-xs text-red-500 hover:text-red-700 transition-colors duration-150">Remove</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <Section title="Sidecars" actions={
+        projects.length > 1 && (
+          <select value={sidecarRepo} onChange={(e: any) => setSidecarRepo(e.target.value)} class={`${inputCls} text-xs py-1`}>
+            {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
+          </select>
+        )
+      }>
+        {!projects.length ? <p class="text-sm text-zinc-400">Add a project first.</p> : (
+          <div class="flex flex-col gap-2">
+            {sidecars.map((s, i) => (
+              <SidecarRow key={i} s={s}
+                onChange={next => setSidecars(list => list.map((x, j) => j === i ? next : x))}
+                onRemove={() => saveSidecarsList(sidecars.filter((_, j) => j !== i))} />
+            ))}
+            <div class="flex items-center gap-3 pt-2">
+              <SecondaryButton onClick={() => setSidecars(list => [...list, { name: '', command: '', args: [], enabled: true }])}>+ Add sidecar</SecondaryButton>
+              <PrimaryButton onClick={() => saveSidecarsList(sidecars)} disabled={sidecarsSaving}>{sidecarsSaving ? 'Saving…' : 'Save sidecars'}</PrimaryButton>
+            </div>
+            <p class="text-[11px] text-zinc-400 mt-1">Runs alongside the dev server on Start — for anything that isn't Inngest/trigger.dev/tunnel, which already have first-class controls on each worktree's page.</p>
+          </div>
+        )}
+      </Section>
+
+      {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}
+    </div>
+  );
+}
+
+function HelpTopic({ title, children }: { title: string; children: any }) {
+  return (
+    <div class="mb-5 last:mb-0">
+      <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-1">{title}</h3>
+      <div class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed">{children}</div>
+    </div>
+  );
+}
+
+function HelpPage() {
+  return (
+    <div class="max-w-3xl mx-auto px-6 py-12">
+      <PageHeader back={{ label: 'All worktrees', onClick: () => navigate('/') }} title="Help & guide" />
+
+      <Section title="Worktrees">
+        <HelpTopic title="What's a worktree, here?">
+          A separate checkout of one branch from a shared bare repo — its own directory, own dev server, own port and local domain (<span class="font-mono text-xs">*.quivly.local</span>), so you can run several branches of the same project side by side without switching branches in one folder.
+        </HelpTopic>
+        <HelpTopic title="Bare vs container mode">
+          <strong>Bare</strong> runs the dev server as a plain process on your Mac — fast to start, no memory/CPU cap. <strong>Container</strong> runs it in Docker with a real memory/CPU ceiling, isolated from the host. A worktree's mode is <em>sticky</em>: whichever it last ran as, it keeps running as, until you explicitly force the other mode (the caret next to Start, or the migration prompt on a worktree's first Start after this feature shipped). This is deliberate — an earlier version silently switched an established worktree into a container on restart with nobody asking for it.
+        </HelpTopic>
+        <HelpTopic title="Sync with staging">
+          Merges the worktree's resolved base branch (staging if the repo has one, otherwise its default branch) into the worktree's own branch. Only proceeds if the merge is clean — if it would conflict, Setu aborts automatically and tells you which files, rather than leaving the worktree half-merged. Resolve conflicts yourself in your editor, then try again.
+        </HelpTopic>
+      </Section>
+
+      <Section title="Sidecars, ports & domains">
+        <HelpTopic title="Sidecars">
+          Anything a project needs alongside its dev server that isn't Inngest, trigger.dev, or a tunnel (which already have first-class controls) — a plain process Setu starts and stops with the worktree. Configure them per-project in Settings.
+        </HelpTopic>
+        <HelpTopic title="Ports & local domains">
+          Each registered project owns a 100-port band; each worktree gets one port from it plus a local domain that Caddy reverse-proxies to that port. See every process currently bound in 3000–3999 under Active ports.
+        </HelpTopic>
+      </Section>
+
+      <Section title="Performance">
+        <HelpTopic title="Concurrency cap">
+          The max number of dev servers running at once — starting one more queues it instead of over-committing your Mac. Adjust it in Settings; it's clamped to what's actually reasonable for your hardware, not an arbitrary number.
+        </HelpTopic>
+        <HelpTopic title="Container limits">
+          Memory/CPU ceiling for container-mode worktrees. A limit above what your Docker engine actually has allocated (visible in Settings) gets silently clamped when the container starts — Docker itself refuses higher.
+        </HelpTopic>
+      </Section>
+
+      <Section title="Keyboard shortcuts">
+        <div class="flex items-center gap-3 text-sm">
+          <span class="board-mono text-[10px] font-bold text-zinc-500 border border-zinc-300 dark:border-zinc-700 px-1.5 py-0.5">⌘K</span>
+          <span class="text-zinc-600 dark:text-zinc-400">Jump to any registered worktree by name, repo, or branch — bypasses filtering and pagination entirely.</span>
+        </div>
+      </Section>
+
+      <Section title="Contributing">
+        <p class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed mb-3">
+          Setu is open source. Issues, ideas, and pull requests are welcome.
+        </p>
+        <SecondaryButton onClick={() => window.open('https://github.com/quivly/setu', '_blank')}>Open github.com/quivly/setu</SecondaryButton>
+      </Section>
+    </div>
+  );
+}
+
+function PortsPage() {
+  const [ports, setPorts] = useState<PortInfo[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const load = useCallback(async () => {
+    setPorts(await fetch('/api/ports').then(r => r.json()).catch(() => []));
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function kill(port: number) {
+    await post('/api/ports/kill', { port });
+    load();
+  }
+
+  return (
+    <div class="max-w-3xl mx-auto px-6 py-12">
+      <PageHeader back={{ label: 'All worktrees', onClick: () => navigate('/') }} title="Active ports"
+        subtitle={<span class="text-xs text-zinc-400">Every process bound in 3000–3999, worktree-registered or not</span>} />
+
+      <div class="backdrop-blur-md bg-white/70 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm rounded-none overflow-hidden text-sm">
+        {!loaded
+          ? <p class="text-zinc-400 px-4 py-6 text-center">Loading…</p>
+          : !ports.length
+          ? <p class="text-zinc-400 px-4 py-6 text-center">No processes on ports 3000–3999</p>
+          : ports.map(p => (
+            <div key={p.port} class="flex items-center gap-4 px-4 py-3 border-b border-zinc-100 dark:border-white/5 last:border-0 hover:bg-white/50 dark:hover:bg-white/5 transition-colors duration-150">
+              <span class="font-mono font-medium text-zinc-900 dark:text-zinc-100 w-14">{p.port}</span>
+              <span class="text-zinc-400 w-20">PID {p.pid}</span>
+              <span class="text-zinc-500 dark:text-zinc-400 flex-1 truncate">{p.cmd}{p.worktree && <span class="text-zinc-400"> · {p.worktree}</span>}</span>
+              <button onClick={() => kill(p.port)}
+                class="text-red-500 hover:text-white hover:bg-red-500 transition-colors duration-150 px-3 py-1.5 rounded-none font-medium border border-red-200 dark:border-red-900">Kill</button>
+            </div>
+          ))}
+      </div>
     </div>
   );
 }
@@ -779,8 +1045,8 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<{ id: string; label: string }[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
-  const [filter, setFilter] = useState('all');
-  const [view, setView] = useState<'list' | 'grid'>('grid');
+  const [filter, setFilter] = useState(() => localStorage.getItem('setu-filter') || 'all');
+  const [view, setView] = useState<'list' | 'grid'>(() => (localStorage.getItem('setu-view') as any) || 'grid');
   const [dark, setDark] = useState(() => localStorage.getItem('setu-theme') === 'dark');
 
   // View preferences — localStorage, not a client-side database. The actual
@@ -802,7 +1068,8 @@ function App() {
   useEffect(() => { localStorage.setItem('setu-sort', sortKey); setPage(0); }, [sortKey]);
   useEffect(() => { localStorage.setItem('setu-filter-dirty', onlyDirty ? '1' : '0'); setPage(0); }, [onlyDirty]);
   useEffect(() => { localStorage.setItem('setu-filter-ahead', onlyAhead ? '1' : '0'); setPage(0); }, [onlyAhead]);
-  useEffect(() => { setPage(0); }, [filter]);
+  useEffect(() => { localStorage.setItem('setu-filter', filter); setPage(0); }, [filter]);
+  useEffect(() => { localStorage.setItem('setu-view', view); }, [view]);
   const [toastMsg, setToastMsg] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
@@ -925,58 +1192,44 @@ function App() {
     </>;
   }
 
+  if (route.page === 'settings') {
+    return <>
+      <SettingsPage toast={toast} />
+      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+    </>;
+  }
+
+  if (route.page === 'help') {
+    return <>
+      <HelpPage />
+      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+    </>;
+  }
+
+  if (route.page === 'ports') {
+    return <>
+      <PortsPage />
+      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+    </>;
+  }
+
   return (
-    <div class="max-w-5xl mx-auto px-6 py-12">
+    <div class="max-w-6xl mx-auto px-6 py-12 flex items-start gap-6">
+      <div class="flex-1 min-w-0">
       <PageHeader title={
           <span class="inline-flex items-center gap-3">
             <span class="wordmark">setu</span>
-            <button onClick={() => setCommandOpen(true)} data-tip="Jump to a worktree"
-              class="tip flex items-center gap-1.5 h-7 px-2.5 rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors duration-150">
-              <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
-              <span class="board-mono text-[9px] font-bold">⌘K</span>
-            </button>
+            <StatusStrip status={status} />
           </span>
-        } subtitle={<StatusStrip status={status} />} actions={<>
-          <select value={filter} onChange={(e: any) => setFilter(e.target.value)}
-            class="backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-700 dark:text-zinc-300 text-sm rounded-none px-3 py-1.5 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
-            <option value="all">All</option>
-            {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
-          </select>
-          <select value={sortKey} onChange={(e: any) => setSortKey(e.target.value)}
-            data-tip="Sort" class="tip backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-700 dark:text-zinc-300 text-sm rounded-none px-3 py-1.5 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
-            <option value="recent">Recently active</option>
-            <option value="name">Name</option>
-            <option value="created">Created</option>
-          </select>
-          <button onClick={() => setOnlyDirty(!onlyDirty)} data-tip="Only worktrees with uncommitted changes"
-            class={`tip w-9 h-9 flex items-center justify-center rounded-none backdrop-blur-md border shadow-sm transition-all duration-150 ${
-              onlyDirty ? 'bg-signal-amber border-signal-amber text-white' : 'bg-white/60 dark:bg-white/5 border-white/75 dark:border-white/10 text-zinc-400 hover:text-zinc-600'}`}>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /></svg>
-          </button>
-          <button onClick={() => setOnlyAhead(!onlyAhead)} data-tip="Only worktrees ahead of their base branch"
-            class={`tip w-9 h-9 flex items-center justify-center rounded-none backdrop-blur-md border shadow-sm transition-all duration-150 ${
-              onlyAhead ? 'bg-signal-green border-signal-green text-white' : 'bg-white/60 dark:bg-white/5 border-white/75 dark:border-white/10 text-zinc-400 hover:text-zinc-600'}`}>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m0 0l-6 6m6-6l6 6" /></svg>
-          </button>
-          <div class="flex backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm rounded-none p-0.5">
-            {(['list', 'grid'] as const).map(v => (
-              <button key={v} onClick={() => setView(v)} data-tip={v === 'list' ? 'List view' : 'Grid view'}
-                class={`tip w-7 h-7 flex items-center justify-center rounded-none transition-all duration-150 ${
-                  view === v ? 'bg-accent text-white' : 'text-zinc-400 hover:text-zinc-600'}`}>
-                {v === 'list'
-                  ? <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
-                  : <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg>}
-              </button>
-            ))}
-          </div>
-          <button onClick={() => setDark(!dark)} data-tip={dark ? 'Light mode' : 'Dark mode'}
-            class="tip w-9 h-9 flex items-center justify-center rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-all duration-150">
-            {dark
-              ? <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41" /></svg>
-              : <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" /></svg>}
-          </button>
+        } actions={<>
           <SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>
           <PrimaryButton onClick={() => setCreateOpen(true)}>+ Worktree</PrimaryButton>
+          <button onClick={() => setCommandOpen(true)} data-tip="Jump to a worktree"
+            class="tip flex items-center gap-1.5 h-9 w-32 px-2.5 rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors duration-150">
+            <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
+            <span class="text-xs flex-1 text-left">Search</span>
+            <span class="board-mono text-[9px] font-bold shrink-0">⌘K</span>
+          </button>
         </>} />
 
       <div class="rail-divider mb-8" />
@@ -1027,7 +1280,77 @@ function App() {
         </div>
       )}
 
-      <PortsPanel />
+      <div class="rail-divider mt-10 mb-4" />
+      <div class="flex items-center justify-between flex-wrap gap-3 text-xs text-zinc-400">
+        <a href="https://mukulchugh.com" target="_blank"
+          class="flex items-center gap-2 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors duration-150 w-fit">
+          <img src={MUKUL_LOGO_URI} class="w-4 h-4 rounded-none" alt="" />
+          Created by Mukul Chugh
+        </a>
+        <div class="flex items-center gap-4">
+          <a href="/help" onClick={(e: any) => { e.preventDefault(); navigate('/help'); }}
+            class="hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors duration-150">Help &amp; guide</a>
+          <a href="https://github.com/quivly/setu" target="_blank"
+            class="hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors duration-150">Contribute on GitHub</a>
+        </div>
+      </div>
+      </div>
+
+      <div class="w-52 shrink-0 sticky top-28 z-20 flex flex-col gap-1 backdrop-blur-md bg-white/70 dark:bg-white/10 border border-white/75 dark:border-white/10 shadow-lg rounded-none p-2">
+        <select value={filter} onChange={(e: any) => setFilter(e.target.value)}
+          class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
+          <option value="all">All projects</option>
+          {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
+        </select>
+        <select value={sortKey} onChange={(e: any) => setSortKey(e.target.value)}
+          class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
+          <option value="recent">Recently active</option>
+          <option value="name">Name</option>
+          <option value="created">Created</option>
+        </select>
+        <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
+        <button onClick={() => setOnlyDirty(!onlyDirty)}
+          class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
+            onlyDirty ? 'bg-signal-amber border-signal-amber text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
+          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /></svg>
+          <span class="text-xs text-left">Uncommitted changes</span>
+        </button>
+        <button onClick={() => setOnlyAhead(!onlyAhead)}
+          class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
+            onlyAhead ? 'bg-signal-green border-signal-green text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
+          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m0 0l-6 6m6-6l6 6" /></svg>
+          <span class="text-xs text-left">Ahead of base</span>
+        </button>
+        <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
+        {(['list', 'grid'] as const).map(v => (
+          <button key={v} onClick={() => setView(v)}
+            class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
+              view === v ? 'bg-accent border-accent text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
+            {v === 'list'
+              ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
+              : <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg>}
+            <span class="text-xs text-left">{v === 'list' ? 'List view' : 'Grid view'}</span>
+          </button>
+        ))}
+        <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
+        <button onClick={() => setDark(!dark)}
+          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
+          {dark
+            ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41" /></svg>
+            : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" /></svg>}
+          <span class="text-xs text-left">{dark ? 'Light mode' : 'Dark mode'}</span>
+        </button>
+        <button onClick={() => navigate('/ports')}
+          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
+          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15v3m6-3v3M5 9h14M6 9V6a2 2 0 012-2h8a2 2 0 012 2v3m-14 0v6a2 2 0 002 2h10a2 2 0 002-2V9" /></svg>
+          <span class="text-xs text-left">Active ports</span>
+        </button>
+        <button onClick={() => navigate('/settings')}
+          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
+          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" /></svg>
+          <span class="text-xs text-left">Settings</span>
+        </button>
+      </div>
 
       {createOpen && <CreateModal projects={projects} onClose={() => setCreateOpen(false)} onCreated={refresh} />}
       {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}

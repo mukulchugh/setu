@@ -7,7 +7,7 @@ import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
   mkdirSync, unlinkSync, realpathSync,
 } from 'fs';
-import { homedir } from 'os';
+import { homedir, cpus, totalmem } from 'os';
 import { join, resolve } from 'path';
 import { createHash } from 'crypto';
 
@@ -315,6 +315,35 @@ export function loadSidecars(workspace, repo) {
   } catch { return []; }
 }
 
+// Unfiltered — the settings UI needs to show and edit disabled/incomplete
+// entries too, unlike loadSidecars() (used on the start path, which only
+// ever wants what's actually enabled and runnable).
+export function loadAllSidecars(workspace, repo) {
+  try {
+    const all = JSON.parse(readFileSync(join(workspace, 'sidecars.json'), 'utf8'));
+    return all[repo] ?? [];
+  } catch { return []; }
+}
+
+export function saveSidecars(workspace, repo, sidecars) {
+  const path = join(workspace, 'sidecars.json');
+  let all = {};
+  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first sidecar ever registered */ }
+  all[repo] = sidecars;
+  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+}
+
+// Deregisters a project (drops it from the .projects registry and the "add
+// worktree" dropdown) without touching anything already on disk — existing
+// worktrees, their git history, and their ports keep working exactly as
+// before. Removing a project is a registry edit, not a delete.
+export function removeProject(workspace, name) {
+  const path = join(workspace, '.projects');
+  const lines = readFileSync(path, 'utf8').split('\n')
+    .filter(l => l.trim() && !l.startsWith('#') && l.split(':')[0] !== name);
+  writeFileSync(path, lines.join('\n') + '\n');
+}
+
 export function registerProject(workspace, { name, slug = '', label = '' }) {
   const projects = loadProjects(workspace);
   if (projects[name]) return projects[name].base;
@@ -379,6 +408,27 @@ export function defaultContainerMode(workspace, repo, name) {
   return true;
 }
 
+// Explicit, one-time migration prompt for exactly the sticky-bare case above
+// — a worktree with bare history and no container history. Not automatic:
+// the same silent-switch incident that made defaultContainerMode() sticky in
+// the first place is exactly what "automatically" containerizing on next
+// Start would reintroduce. Answered once (either choice, via
+// markMigrationPrompted) and never asked again for that worktree.
+function migrationMarkerPath(workspace, repo, name) {
+  return join(workspace, repo, name, '.setu-migration-prompted');
+}
+
+export function needsMigrationPrompt(workspace, repo, name) {
+  const wtDir = join(workspace, repo, name);
+  if (existsSync(dockerComposePath(wtDir))) return false; // already containerized at some point
+  if (!existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) return false; // no bare history yet either
+  return !existsSync(migrationMarkerPath(workspace, repo, name));
+}
+
+export function markMigrationPrompted(workspace, repo, name) {
+  writeFileSync(migrationMarkerPath(workspace, repo, name), '');
+}
+
 export function parseMemToMb(v) {
   const m = String(v).trim().match(/^(\d+(?:\.\d+)?)\s*(g|m)$/i);
   if (!m) return null;
@@ -391,6 +441,16 @@ export function parseMemToMb(v) {
 // OrbStack VM has 1 CPU allocated, and the original containerCpuLimit default
 // of 2 failed with "range of CPUs is from 0.01 to 1.00, as there are only 1
 // CPUs available" — .setu.json's configured value can't be trusted blindly.
+// The actual host — what the Mac itself has, independent of whatever a
+// Docker VM has been allocated (which is usually a fraction of this and is
+// what engineCapacity() below reports). The settings UI shows both: this
+// caps how high a concurrency slider can sensibly go, engineCapacity()
+// explains why a container CPU/memory limit above the VM's own allocation
+// gets silently clamped in writeDockerCompose().
+export function macCapacity() {
+  return { cpus: cpus().length, memMb: Math.floor(totalmem() / 1024 / 1024) };
+}
+
 export function engineCapacity() {
   const res = spawnSync('docker', ['info', '--format', '{{.NCPU}}|{{.MemTotal}}'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -524,6 +584,44 @@ export function worktreeBranchMap(repoDir) {
 export function baseBranchRef(repoDir) {
   return branchExists(repoDir, 'staging') ? 'origin/staging'
     : `origin/${git(repoDir, ['symbolic-ref', '--short', 'HEAD']).trim()}`;
+}
+
+// Merges the worktree's resolved base (same one branchMetadata's ahead/behind
+// already compares against) into the worktree's own branch — "sync with
+// staging" in the UI. Deliberately clean-only, by explicit decision: a merge
+// that would conflict is attempted, detected via `git status --porcelain`'s
+// conflict markers (UU/AA/etc — more reliable across git versions than
+// parsing `git merge-tree` output), then immediately aborted so the worktree
+// is never left mid-conflict. Setu tells you what would conflict; resolving
+// it is still the user's job in their own editor.
+export function syncWithBase(wtDir, repoDir) {
+  const base = baseBranchRef(repoDir);
+  const branchName = base.replace(/^origin\//, '');
+  git(wtDir, ['fetch', 'origin', branchName]);
+
+  const dirty = git(wtDir, ['status', '--porcelain']).trim();
+  if (dirty) return { ok: false, error: 'Worktree has uncommitted changes — commit or stash first.' };
+
+  try {
+    git(wtDir, ['merge', base, '--no-edit']);
+    return { ok: true, base };
+  } catch (mergeErr) {
+    const status = git(wtDir, ['status', '--porcelain']);
+    const conflicts = status.split('\n')
+      .filter(l => /^(UU|AA|DD|AU|UA|UD|DU)/.test(l))
+      .map(l => l.slice(3).trim());
+    // Only a real conflict leaves MERGE_HEAD behind — `merge --abort` itself
+    // throws ("no merge to abort") if the failure was something else (e.g.
+    // an unresolvable ref), which would otherwise crash this request instead
+    // of reporting the actual error. --git-path (not a hardcoded .git/...)
+    // because a linked worktree's .git is a file pointing elsewhere, not a
+    // directory — the real MERGE_HEAD lives under the main repo's
+    // worktrees/<name>/ dir, which only `git` itself resolves correctly.
+    const mergeHeadPath = resolve(wtDir, git(wtDir, ['rev-parse', '--git-path', 'MERGE_HEAD']).trim());
+    if (existsSync(mergeHeadPath)) git(wtDir, ['merge', '--abort']);
+    if (!conflicts.length) return { ok: false, error: `Merge failed: ${mergeErr.stderr || mergeErr.message}` };
+    return { ok: false, conflicts, error: `Would conflict in ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} — merge aborted, worktree unchanged.` };
+  }
 }
 
 // One call per repo, not one per worktree — %(ahead-behind:) and

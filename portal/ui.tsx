@@ -75,12 +75,17 @@ export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target
 // shadow that collapses on press (a real button being pushed), not a soft
 // glow. The accent color is reserved for these primary actions only — see
 // --color-accent (Quivly's brand forest green).
-const buttonBase = 'flex-1 whitespace-nowrap board-mono text-[11px] font-bold px-4 py-2.5 rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px';
-export function PrimaryButton({ onClick, disabled, children }: { onClick?: () => void; disabled?: boolean; children: any }) {
-  return <button onClick={onClick} disabled={disabled} class={`${buttonBase} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
+// No flex-1 here — it only worked at the original modal-footer call sites by
+// coincidence (a shrink-to-fit wrapper absorbed the grow), and stretched to
+// fill the row anywhere it was reused unwrapped (e.g. a Section's actions
+// slot). Call sites that actually want two buttons to split width evenly
+// (Cancel/Create, Cancel/Add) add flex-1 explicitly themselves.
+const buttonBase = 'whitespace-nowrap board-mono text-[11px] font-bold px-4 py-2.5 rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px';
+export function PrimaryButton({ onClick, disabled, children, class: cls = '' }: { onClick?: () => void; disabled?: boolean; children: any; class?: string }) {
+  return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${cls} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
 }
-export function SecondaryButton({ onClick, children }: { onClick?: () => void; children: any }) {
-  return <button onClick={onClick} class={`${buttonBase} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
+export function SecondaryButton({ onClick, children, class: cls = '' }: { onClick?: () => void; children: any; class?: string }) {
+  return <button onClick={onClick} class={`${buttonBase} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
 }
 
 export function Modal({ onClose, children, position = 'center' }: any) {
@@ -140,7 +145,7 @@ export const inputCls = 'bg-white border border-zinc-200 text-zinc-800 text-sm r
 // enough to know the right shape — not built ahead of a second consumer.
 export function PageHeader({ back, title, subtitle, actions }: { back?: { label: string; onClick: () => void }; title: any; subtitle?: any; actions?: any }) {
   return (
-    <div class="mb-10">
+    <div class="sticky top-0 z-30 -mx-6 px-6 pt-6 pb-4 mb-6 backdrop-blur-md bg-board/85 dark:bg-board-dark/85">
       {back && (
         <button onClick={back.onClick} class="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-600 transition-colors duration-150 mb-2">
           <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>
@@ -155,7 +160,7 @@ export function PageHeader({ back, title, subtitle, actions }: { back?: { label:
           line, immune to whatever height the actions row happens to be. */}
       <div class="flex items-center justify-between flex-wrap gap-y-3">
         <h1 class="board-mono text-[22px] font-bold text-ink dark:text-ink-dark leading-none truncate">{title}</h1>
-        {actions && <div class="flex items-center gap-3 flex-wrap justify-end">{actions}</div>}
+        {actions && <div class="flex items-center gap-2 flex-wrap justify-end">{actions}</div>}
       </div>
       {subtitle && <div class="mt-3">{subtitle}</div>}
     </div>

@@ -8,6 +8,7 @@
 @import "@fontsource/ibm-plex-mono/500.css";
 @import "@fontsource/ibm-plex-mono/600.css";
 @import "@fontsource/ibm-plex-mono/700.css";
+@import "@fontsource/syne/800.css";
 
 /* Setu = bridge; the actual job of this screen is closer to a dispatch board
    than a SaaS dashboard — many parallel routes, each with a live signal,
@@ -33,39 +34,43 @@
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
-/* Labels, status text, badges — normal-case system sans, no tracking.
-   Superseded the original uppercase/tracked/mono "signage" treatment: it
-   read as industrial/technical rather than the modern SaaS look actually
-   wanted (confirmed head-to-head, see memory: setu-ui-vibrant-strict-rule).
-   Class name kept as-is to avoid renaming it at 30+ call sites — only what
-   it renders as changed. */
+/* Labels, status text, badges — uppercase/tracked system sans. The original
+   pass paired uppercase+tracking with a mono font, which read as industrial
+   signage rather than modern SaaS (confirmed head-to-head, see memory:
+   setu-ui-vibrant-strict-rule) — that A/B test was really about the MONO
+   font, not the case. Uppercase-tracked-sans is a different, still-current
+   pattern (badges/eyebrows in most modern SaaS UI) and was asked for back
+   explicitly. Class name kept as-is to avoid renaming it at 30+ call sites. */
 .board-mono {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  text-transform: none;
-  letter-spacing: 0;
-  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
 }
 
+/* The one place that keeps a distinct display voice after the rest of the
+   type system moved to plain system sans (see setu-ui-vibrant-strict-rule)
+   — Syne's geometric, slightly unusual letterforms read as a real wordmark
+   rather than just bold body text, without dragging the industrial/signage
+   feel back into anything else. */
 .wordmark {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Syne", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-weight: 800;
   letter-spacing: 0;
+  /* Explicit override — this sits inside an h1 that carries .board-mono for
+     the rest of the title row, and board-mono is uppercase; without this,
+     "setu" silently inherits that instead of staying lowercase. */
+  text-transform: none;
 }
 
-/* Structural divider standing in for a plain hairline at meaningful section
-   breaks — two solid rules with a real gap between them, the way rail
-   cross-ties read from a distance. A 1px-repeating gradient anti-aliases
-   into a single fuzzy hairline at normal screen density (the exact generic
-   look this was built to avoid) — two explicit 1px lines top/bottom of a
-   taller box hold their shape instead. Decorative only where the divider
-   itself marks something real (a section boundary), not sprinkled
-   everywhere a hairline used to be. */
+/* Section-break divider. The double-rule "rail cross-tie" texture was part
+   of the earlier industrial/signage concept — dropped along with the rest
+   of that direction (see setu-ui-vibrant-strict-rule) in favor of a single
+   clean hairline, the modern-SaaS-standard way to mark a section boundary. */
 .rail-divider {
-  height: 6px;
-  background:
-    linear-gradient(var(--color-rail), var(--color-rail)) top / 100% 1px no-repeat,
-    linear-gradient(var(--color-rail), var(--color-rail)) bottom / 100% 1px no-repeat;
-  opacity: 0.5;
+  height: 1px;
+  background: var(--color-rail);
+  opacity: 0.25;
 }
 
 /* Split-flap status change — the one deliberate motion moment, earned by the
