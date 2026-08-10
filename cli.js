@@ -29,7 +29,12 @@ function cfg() {
 
 // ── ANSI ──────────────────────────────────────────────────────────────────────
 
-const G  = '\x1b[32m';
+// Truecolor, not the standard ANSI green — matches the exact brand forest
+// green used everywhere else (portal accent, Raycast icon: #085041), so
+// setup's checkmarks read as the same brand rather than a generic terminal
+// color. Falls back gracefully: any terminal without 24-bit color support
+// just ignores the unrecognized SGR and shows default-color text.
+const G  = '\x1b[38;2;8;80;65m';
 const GR = '\x1b[90m';
 const B  = '\x1b[1m';
 const Y  = '\x1b[33m';
@@ -313,7 +318,7 @@ async function cmdSetup() {
   // Raycast (it goes through the app's own Import/Develop flow), so this
   // only ever prints the one manual step rather than pretending to automate it.
   step(8, 8, 'Raycast extension');
-  if (existsSync('/Applications/Raycast.app')) {
+  if (existsSync('/Applications/Raycast.app') || existsSync('/Applications/Raycast Beta.app')) {
     ok('Raycast detected');
     console.log(`  ${GR}run: cd ${SETU_DIR}/raycast && npm install && npx ray develop${R}`);
   } else {

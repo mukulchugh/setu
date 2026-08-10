@@ -20,6 +20,7 @@ type Worktree = {
 };
 type Project = { name: string; label: string; github?: string | null };
 type Sidecar = { name: string; enabled?: boolean; command: string; args?: string[]; env?: Record<string, string> };
+type CustomAgent = { id: string; label: string; command: string };
 type SettingsData = {
   maxConcurrentDevServers: number; containerMemoryLimit: string; containerCpuLimit: number;
   mac: { cpus: number | null; memMb: number | null }; docker: { cpus: number | null; memMb: number | null };
@@ -746,6 +747,91 @@ function SidecarRow({ s, onChange, onRemove }: { s: Sidecar; onChange: (s: Sidec
   );
 }
 
+// One custom-agent row — label/command edited in place. Same controlled-row
+// shape as SidecarRow above: the parent owns the array and re-saves the
+// whole list on "Save custom agents", this is purely a controlled row.
+// `id` is intentionally not editable here — it's either the backend-assigned
+// slug for an existing row (must round-trip unchanged on edit) or '' for a
+// brand-new row (the backend assigns a slug on save).
+function CustomAgentRow({ a, onChange, onRemove }: { a: CustomAgent; onChange: (a: CustomAgent) => void; onRemove: () => void }) {
+  return (
+    <div class="flex items-center gap-2 py-2 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
+      <input value={a.label} onInput={(e: any) => onChange({ ...a, label: e.target.value })} placeholder="label"
+        class={`${inputCls} w-28 text-xs py-1`} />
+      <input value={a.command} onInput={(e: any) => onChange({ ...a, command: e.target.value })} placeholder="mytool --flag"
+        class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
+      <IconButton tone="red" tip="Remove custom agent" onClick={onRemove}>
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+      </IconButton>
+    </div>
+  );
+}
+
+// Raycast dev-mode control — status, start/stop, and a live log tail. Fully
+// self-contained (owns its own polling loop) the same way LiveLog/PortsPage
+// elsewhere in this file are, so SettingsPage doesn't need to know anything
+// about Raycast beyond dropping this component in.
+function RaycastSection({ toast }: { toast: (msg: string) => void }) {
+  const [status, setStatus] = useState<{ running: boolean; dirExists: boolean } | null>(null);
+  const [log, setLog] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const preRef = useRef<HTMLPreElement>(null);
+
+  const load = useCallback(async () => {
+    const s = await fetch('/api/raycast/status').then(r => r.json()).catch(() => null);
+    setStatus(s);
+    if (s?.running) {
+      const data = await fetch('/api/raycast/log?n=150').then(r => r.json()).catch(() => ({ lines: [] }));
+      setLog(data.lines ?? []);
+      // Same scroll-pinning as LiveLog above — without it, every 3s poll
+      // re-renders and the newest output (a compile error, the "ready" line)
+      // scrolls off the bottom unseen while the view stays pinned to the top.
+      requestAnimationFrame(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight; });
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function start() {
+    setBusy(true);
+    const res = await post('/api/raycast/start', {});
+    setBusy(false);
+    if (res?.ok === false) toast(`✗ start failed: ${res.error ?? 'unknown error'}`);
+    load();
+  }
+
+  async function stop() {
+    await post('/api/raycast/stop', {});
+    load();
+  }
+
+  return (
+    <Section title="Raycast Extension">
+      {!status ? <p class="text-sm text-zinc-400">Loading…</p>
+        : !status.dirExists ? <p class="text-sm text-zinc-400">raycast/ not found in the Setu repo</p>
+        : !status.running ? (
+          <div class="flex flex-col items-start gap-2">
+            <PrimaryButton onClick={start} disabled={busy}>{busy ? 'Starting…' : 'Start dev mode'}</PrimaryButton>
+            <p class="text-[11px] text-zinc-400">Runs <span class="font-mono">npm install</span> (first time only) and <span class="font-mono">ray develop</span> in the background — this is what makes Setu show up in Raycast.</p>
+          </div>
+        ) : (
+          <div class="flex flex-col gap-3">
+            <div class="flex items-center gap-2">
+              <StatusDot tone="emerald" />
+              <span class="text-sm">Dev mode running</span>
+              <SecondaryButton onClick={stop}>Stop</SecondaryButton>
+            </div>
+            <pre ref={preRef} class="max-h-64 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-all">{log.length ? log.join('\n') : '(no log yet)'}</pre>
+          </div>
+        )}
+    </Section>
+  );
+}
+
 function SettingsPage({ toast }: { toast: (msg: string) => void }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [saving, setSaving] = useState(false);
@@ -754,6 +840,8 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
   const [sidecarRepo, setSidecarRepo] = useState('');
   const [sidecars, setSidecars] = useState<Sidecar[]>([]);
   const [sidecarsSaving, setSidecarsSaving] = useState(false);
+  const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
+  const [customAgentsSaving, setCustomAgentsSaving] = useState(false);
 
   const loadProjects = useCallback(async () => {
     const ps = await fetch('/api/projects').then(r => r.json()).catch(() => []);
@@ -761,9 +849,14 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
     if (!sidecarRepo && ps.length) setSidecarRepo(ps[0].name);
   }, [sidecarRepo]);
 
+  const loadCustomAgents = useCallback(async () => {
+    setCustomAgents(await fetch('/api/custom-agents').then(r => r.json()).catch(() => []));
+  }, []);
+
   useEffect(() => {
     fetch('/api/settings').then(r => r.json()).then(setSettings).catch(() => {});
     loadProjects();
+    loadCustomAgents();
   }, []);
 
   useEffect(() => {
@@ -794,6 +887,15 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
     const res = await post('/api/sidecars', { repo: sidecarRepo, sidecars: next });
     setSidecarsSaving(false);
     if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
+  }
+
+  async function saveCustomAgentsList(next: CustomAgent[]) {
+    setCustomAgents(next);
+    setCustomAgentsSaving(true);
+    const res = await post('/api/custom-agents', { agents: next });
+    setCustomAgentsSaving(false);
+    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
+    loadCustomAgents(); // re-fetch so backend-assigned ids populate into state
   }
 
   return (
@@ -870,6 +972,23 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
           </div>
         )}
       </Section>
+
+      <Section title="Custom Agents">
+        <div class="flex flex-col gap-2">
+          {customAgents.map((a, i) => (
+            <CustomAgentRow key={i} a={a}
+              onChange={next => setCustomAgents(list => list.map((x, j) => j === i ? next : x))}
+              onRemove={() => saveCustomAgentsList(customAgents.filter((_, j) => j !== i))} />
+          ))}
+          <div class="flex items-center gap-3 pt-2">
+            <SecondaryButton onClick={() => setCustomAgents(list => [...list, { id: '', label: '', command: '' }])}>+ Add custom agent</SecondaryButton>
+            <PrimaryButton onClick={() => saveCustomAgentsList(customAgents)} disabled={customAgentsSaving}>{customAgentsSaving ? 'Saving…' : 'Save custom agents'}</PrimaryButton>
+          </div>
+          <p class="text-[11px] text-zinc-400 mt-1">Shows up in every worktree's "Open in" row alongside Claude/Cursor/etc. Not <span class="font-mono">which</span>-checked — make sure the command actually runs.</p>
+        </div>
+      </Section>
+
+      <RaycastSection toast={toast} />
 
       {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}
     </div>
@@ -1046,6 +1165,7 @@ function App() {
   const [agents, setAgents] = useState<{ id: string; label: string }[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
   const [filter, setFilter] = useState(() => localStorage.getItem('setu-filter') || 'all');
+  const [search, setSearch] = useState('');
   const [view, setView] = useState<'list' | 'grid'>(() => (localStorage.getItem('setu-view') as any) || 'grid');
   const [dark, setDark] = useState(() => localStorage.getItem('setu-theme') === 'dark');
 
@@ -1069,6 +1189,7 @@ function App() {
   useEffect(() => { localStorage.setItem('setu-filter-dirty', onlyDirty ? '1' : '0'); setPage(0); }, [onlyDirty]);
   useEffect(() => { localStorage.setItem('setu-filter-ahead', onlyAhead ? '1' : '0'); setPage(0); }, [onlyAhead]);
   useEffect(() => { localStorage.setItem('setu-filter', filter); setPage(0); }, [filter]);
+  useEffect(() => { setPage(0); }, [search]);
   useEffect(() => { localStorage.setItem('setu-view', view); }, [view]);
   const [toastMsg, setToastMsg] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
@@ -1168,9 +1289,11 @@ function App() {
   // Running (and queued) worktrees float to the top regardless of sort key or
   // view — with 45+ worktrees registered, the 1-2 that are actually live are
   // otherwise buried wherever the chosen sort happens to put them.
+  const searchNeedle = search.trim().toLowerCase();
   const sorted = (filter === 'all' ? worktrees : worktrees.filter(w => w.repo === filter))
     .filter(w => !onlyDirty || w.dirty > 0)
     .filter(w => !onlyAhead || w.ahead > 0)
+    .filter(w => !searchNeedle || `${w.name} ${w.repo} ${w.label} ${w.domain}`.toLowerCase().includes(searchNeedle))
     .slice()
     .sort((a, b) => Number(b.active) - Number(a.active) || Number(b.queued) - Number(a.queued) || SORTERS[sortKey](a, b));
 
@@ -1254,11 +1377,17 @@ function App() {
       {running.length > 0 && rest.length > 0 && (
         <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">All worktrees</h2>
       )}
+      <div class="relative mb-4">
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-300 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
+        <input value={search} onInput={(e: any) => setSearch(e.target.value)}
+          placeholder="Search by name, repo, or branch…"
+          class="w-full h-10 pl-9 pr-3 backdrop-blur-md bg-white/70 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-sm text-zinc-700 dark:text-zinc-300 rounded-none focus:outline-none focus:border-zinc-400 transition-colors duration-150" />
+      </div>
       <div class={view === 'grid' ? 'grid grid-cols-1 lg:grid-cols-2 gap-3 items-start' : 'flex flex-col gap-3'}>
         {!filtered.length
           ? <p class="text-zinc-400 text-sm py-10 text-center">
               {rest.length ? 'No worktrees on this page.' :
-               (onlyDirty || onlyAhead) ? 'No worktrees match the active filters.' :
+               (onlyDirty || onlyAhead || searchNeedle) ? 'No worktrees match the active filters.' :
                running.length ? '' :
                `No worktrees${filter !== 'all' ? ' for this project' : ''} — click + Worktree to create one.`}
             </p>

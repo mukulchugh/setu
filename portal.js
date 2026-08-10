@@ -15,6 +15,7 @@ import {
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject, removeProject,
   git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
   AGENT_CLIS, detectAgentClis, loadSidecars, loadAllSidecars, saveSidecars, killGroup,
+  loadCustomAgents, saveCustomAgents,
   containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
   defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
   worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
@@ -86,6 +87,49 @@ function tailLog(repo, name, type = 'dev', lines = 150) {
     const all  = text.split('\n');
     return { lines: all.slice(-lines), total: all.length };
   } catch { return { lines: [], total: 0 }; }
+}
+
+// ── Raycast extension dev mode ──────────────────────────────────────────────
+// raycast/ lives inside the setu repo itself (PKG_DIR), not a registered
+// project under WORKSPACE — it's Setu's own tooling, not something a
+// worktree owns. `ray develop` is a long-running watch process (like `next
+// dev`), so this is tracked the same shape as a worktree's dev server
+// (procs Map elsewhere) rather than treated as a one-shot command.
+const RAYCAST_DIR = `${PKG_DIR}raycast`;
+let raycastDev = null; // { proc, pid } | null
+
+function raycastLogPath() {
+  const dir = `${LOGS}/_raycast`;
+  mkdirSync(dir, { recursive: true });
+  return `${dir}/dev.log`;
+}
+
+function startRaycastDev() {
+  if (raycastDev) return { ok: true };
+  if (!existsSync(RAYCAST_DIR)) return { ok: false, error: 'raycast/ not found in the setu repo' };
+  const path = raycastLogPath();
+  rotateLog(path);
+  appendFileSync(path, `\n[${new Date().toISOString()}] ── raycast dev start ──\n`);
+  const fd = openSync(path, 'a');
+  // One script, not two spawns — `npm install` only when node_modules is
+  // missing (so toggling dev mode on repeatedly doesn't reinstall every
+  // time), then hands off to `ray develop` in the same process tree so a
+  // single pid covers both steps for stop/kill purposes.
+  const script = `${tmpdir()}/setu-raycast-dev-${Date.now()}.sh`;
+  writeFileSync(script,
+    `#!/bin/zsh\ncd "${RAYCAST_DIR}"\n[ -d node_modules ] || npm install\nexec npx ray develop\n`,
+    { mode: 0o755 });
+  const proc = Bun.spawn(['/bin/zsh', script], { cwd: RAYCAST_DIR, stdout: fd, stderr: fd, detached: true });
+  raycastDev = { proc, pid: proc.pid };
+  proc.exited.then(() => { if (raycastDev?.proc === proc) raycastDev = null; });
+  return { ok: true };
+}
+
+function stopRaycastDev() {
+  if (!raycastDev) return { ok: true };
+  killGroup(raycastDev.pid);
+  raycastDev = null;
+  return { ok: true };
 }
 
 // ── repo metadata ─────────────────────────────────────────────────────────────
@@ -754,7 +798,8 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
 // installed on this machine, not just the tools one project happened to use.
 
 function openInGhostty(wtDir, tool) {
-  const cmd = AGENT_CLIS[tool]?.bin;
+  const cmd = AGENT_CLIS[tool]?.bin
+    ?? loadCustomAgents(WORKSPACE).find(a => a.id === tool)?.command;
   if (!cmd) return { ok: false, error: 'unknown tool' };
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
   writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
@@ -789,7 +834,7 @@ async function handle(req) {
     });
   }
 
-  if (pathname === '/api/agents') return Response.json(detectAgentClis());
+  if (pathname === '/api/agents') return Response.json(detectAgentClis(WORKSPACE));
 
   if (pathname === '/api/projects') return Response.json(
     Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }))
@@ -849,11 +894,35 @@ async function handle(req) {
     }
   }
 
+  // Custom agents: same shape as sidecars above — GET for the settings UI to
+  // edit, POST replaces the whole (global, not per-repo) list.
+  if (pathname === '/api/custom-agents') {
+    if (method === 'GET') return Response.json(loadCustomAgents(WORKSPACE));
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      try { saveCustomAgents(WORKSPACE, body.agents ?? []); return Response.json({ ok: true }); }
+      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+    }
+  }
+
   if (pathname === '/api/logs') {
     const p   = new URL(req.url).searchParams;
     const res = tailLog(p.get('repo'), p.get('name'), p.get('type') ?? 'dev', Number(p.get('n') ?? 150));
     return Response.json(res);
   }
+
+  if (pathname === '/api/raycast/status') {
+    return Response.json({ running: !!raycastDev, dirExists: existsSync(RAYCAST_DIR) });
+  }
+  if (pathname === '/api/raycast/log') {
+    const n = Number(new URL(req.url).searchParams.get('n') ?? 150);
+    try {
+      const all = readFileSync(raycastLogPath(), 'utf8').split('\n');
+      return Response.json({ lines: all.slice(-n) });
+    } catch { return Response.json({ lines: [] }); }
+  }
+  if (method === 'POST' && pathname === '/api/raycast/start') return Response.json(startRaycastDev());
+  if (method === 'POST' && pathname === '/api/raycast/stop') return Response.json(stopRaycastDev());
 
   if (method === 'POST') {
     const body = await req.json().catch(() => ({}));

@@ -144,8 +144,19 @@ export const inputCls = 'bg-white border border-zinc-200 text-zinc-800 text-sm r
 // Two real call sites (the list view's header, the worktree detail page) is
 // enough to know the right shape — not built ahead of a second consumer.
 export function PageHeader({ back, title, subtitle, actions }: { back?: { label: string; onClick: () => void }; title: any; subtitle?: any; actions?: any }) {
+  // Transparent at rest — the glass/blur backdrop only appears once content
+  // has actually scrolled underneath (position:sticky has no stable CSS way
+  // to select "currently stuck", so this is tracked directly).
+  const [stuck, setStuck] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setStuck(window.scrollY > 4);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
   return (
-    <div class="sticky top-0 z-30 -mx-6 px-6 pt-6 pb-4 mb-6 backdrop-blur-md bg-board/85 dark:bg-board-dark/85">
+    <div class={`sticky top-0 z-30 -mx-6 px-6 pt-6 pb-4 mb-6 transition-colors duration-200 ${
+      stuck ? 'backdrop-blur-md bg-board/85 dark:bg-board-dark/85 shadow-sm' : 'bg-transparent'}`}>
       {back && (
         <button onClick={back.onClick} class="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-600 transition-colors duration-150 mb-2">
           <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>

@@ -256,10 +256,14 @@ export function killGroup(pid, signal = 'TERM') {
   catch { return false; }
 }
 
-export function detectAgentClis() {
-  return Object.entries(AGENT_CLIS)
+export function detectAgentClis(workspace) {
+  const builtins = Object.entries(AGENT_CLIS)
     .filter(([, t]) => commandExists(t.bin))
     .map(([id, t]) => ({ id, label: t.label }));
+  // Custom agents are never which-checked (see loadCustomAgents) — appended
+  // as-is after the verified built-ins.
+  const custom = loadCustomAgents(workspace).map(({ id, label }) => ({ id, label }));
+  return [...builtins, ...custom];
 }
 
 export function assignPort(workspace, repo, name) {
@@ -331,6 +335,47 @@ export function saveSidecars(workspace, repo, sidecars) {
   try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first sidecar ever registered */ }
   all[repo] = sidecars;
   writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+}
+
+// ── custom agent CLIs (workspace/custom-agents.json: [{id, label, command}]) ──
+// Same load/save shape as sidecars, but global — not per-repo. "Open in X"
+// is a per-developer tool preference, not scoped to one project. No which()
+// check on these (unlike AGENT_CLIS/detectAgentClis): the user typed the
+// exact command they want run, which may not be a bare PATH binary at all
+// (a shell alias, a script with flags, ...).
+function kebabSlug(s) {
+  return String(s || '').toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+export function loadCustomAgents(workspace) {
+  try {
+    return JSON.parse(readFileSync(join(workspace, 'custom-agents.json'), 'utf8'));
+  } catch { return []; }
+}
+
+// Whole-list overwrite, matching saveSidecars()'s style. Also the sole place
+// `id` is assigned/validated: kept as-is when it's already unique (so editing
+// an existing custom agent's label doesn't silently change its routing id),
+// otherwise derived as a lowercase-kebab slug of the label and deduped —
+// against BOTH the built-in AGENT_CLIS ids and every other custom agent's id
+// — since `id` is the routing key openInGhostty/openTool look up by, and a
+// collision with a built-in would silently hijack that tool's entry.
+export function saveCustomAgents(workspace, agents) {
+  const used = new Set(Object.keys(AGENT_CLIS));
+  const out = agents.map(a => {
+    let id = a.id;
+    if (!id || used.has(id)) {
+      const base = kebabSlug(a.label) || 'agent';
+      id = base;
+      let n = 2;
+      while (used.has(id)) id = `${base}-${n++}`;
+    }
+    used.add(id);
+    return { id, label: a.label, command: a.command };
+  });
+  writeFileSync(join(workspace, 'custom-agents.json'), JSON.stringify(out, null, 2) + '\n');
 }
 
 // Deregisters a project (drops it from the .projects registry and the "add
