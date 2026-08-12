@@ -1,0 +1,92 @@
+// Icon data and small icon-rendering components used across the portal —
+// pure data plus one small render component each, no coupling to app state.
+import { siClaude, siCursor, siOpencode, siAmp, siGoogle, siX, siConvex } from 'simple-icons';
+
+// Real brand marks, SVG path data bundled at build time — not fetched at
+// runtime (a live per-icon image request is a fragile dependency; confirmed
+// twice tonight when chatgpt.com/favicon.ico and openai.com/favicon.ico both
+// returned an HTML challenge page instead of image bytes). Verified directly
+// against the installed simple-icons package (v16.28.0, latest as of this
+// check; scanned all 3453 entries) — it carries no OpenAI/Codex mark at all,
+// a deliberate licensing exclusion rather than a missing slug. The actual
+// OpenAI mark below is sourced once from lobehub/lobe-icons (MIT-licensed,
+// github.com/lobehub/lobe-icons/packages/static-svg — an icon set built
+// specifically for AI-provider brand marks, unlike simple-icons which
+// excludes them) and hardcoded here the same way the simple-icons ones are.
+// Antigravity and Grok get real marks even though neither is "in" either
+// library under its own name: Antigravity is Google's own coding tool (built
+// by the ex-Windsurf team after the acquisition), and Grok is xAI's product,
+// shipped inside and inseparable from the X app — both a legitimate,
+// correct parent-brand icon rather than a fabricated one.
+export const siOpenai = {
+  hex: '000000',
+  path: 'M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z',
+};
+
+export const AGENT_ICON: Record<string, { path: string; hex: string }> = {
+  claude: siClaude, cursor: siCursor, opencode: siOpencode, amp: siAmp,
+  antigravity: siGoogle, grok: siX, codex: siOpenai,
+};
+
+// Bundled SVG path data, not a fetched favicon — an external image request
+// per icon (google's favicon service) is a real network dependency for a
+// purely cosmetic detail, and it failed/hung often enough in practice to
+// leave broken-image placeholders instead of the intended fallback
+// (confirmed live: every agent icon rendered broken, not text, meaning the
+// onError handler never reliably fired). Bundled path data has no such
+// failure mode — it's not a request.
+export function ToolIcon({ id, label }: { id?: string; label: string }) {
+  const icon = id && AGENT_ICON[id];
+  if (icon) return (
+    <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill={`#${icon.hex}`}><path d={icon.path} /></svg>
+  );
+  return <span class="text-[9px] font-bold tracking-tight">{label.slice(0, 2).toUpperCase()}</span>;
+}
+
+// Neither Trigger.dev nor Inngest is a vector mark anywhere (not in
+// simple-icons, not in lobehub/lobe-icons) — their real favicons are small
+// raster PNGs, sourced once (trigger.dev/favicon.ico, inngest.com/favicon.ico)
+// and inlined as data URIs so they're bundled the same as every other icon
+// here: no runtime request, no failure mode to reproduce.
+export const TRIGGER_ICON_URI = 'data:image/png;base64,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';
+export const INNGEST_ICON_URI = 'data:image/png;base64,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';
+export function SidecarIcon({ tool }: { tool: 'trigger' | 'inngest' }) {
+  return <img src={tool === 'trigger' ? TRIGGER_ICON_URI : INNGEST_ICON_URI} class="w-3.5 h-3.5 rounded-none" alt="" />;
+}
+
+export const MUKUL_LOGO_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAFM0lEQVRoBd1ZSUtsRxQ+2s7THzDoi0F9KGpQQReujJsQJRFEXAny3LkV4vADEhcS4kIi4oCCuMnGlYqggggiJuHxVDRq8GmMGsF5Hjrnq3CLe693qO42dncOnL41n++rOnXqVl+iMJcIB/xRXPeGtZD1M9Y41teUKzb2O+uvrB9ZH1mVJY9b9rCi4z2rN0h6x3a3WH9kzWJ1lUhuUcu6wRos0HZ2PzCmryJY+GkrAP83q90gwS7/k7F9aYcebgOfCzZIN/u/MUbsSYN4OPcTq1vnUKn/3oCeM9gg22FEYIWxprISNi3kc1ZRIHKh//MpQ8wFTI1ABqfhRuEiOJPSAFYj4HpIZWZmUlqa6BMqJBP0BFxBFRUVUUtLC8XGxrq2fYkGsOMS8sXkayvgajM5OZnq6+uppqbGtW2gDTIyMqipqYni4lwdQ7qQq83ExESCtra2UnZ2tmt7fxsAfE9PD1VWVioN4dMKYMTc3Fxqa2ujhAThgkpGVBtlZWVRb28vVVRU0NPTE3m9OHacRZlAUlKSHKm2tpbq6upk/iUSOTk51NfXR+Xl5WI4FfBoqEwgJSVF4oRvYkPn5eHtI3ApKCig/v5+Kisr83kwJQKIBvoVgBWE1fb29mflviIoLi4W4EtKSgxdsQIqq6BEwOPxWAKtqqqi0tJSg2FfMgANtyksxJ3JKCrg0QO3LleJioqy3LSRkZEEhcTExFBDQwOlp6fT2dkZXV5eSr26uqLr62vCc3V1lY6Pj0WfxsZGys/PF2l/f5QJmF0IBu/u7uj09FTYRhqz1tzcTNHR0RIPosnj46OIKltbW1RdXS0J3N/jsmct6KciSi4EQFZh8+bmhi4uLqSd0dFRGh8fl3kksELoj5N1bGyM1tfXZf3JyYlMmxOqLqREAMatTkW4BVxFE7hOZ2cnHR0daUXyidkfGBgwbEwnArKjSyIgAgAPv9bL3NwcDQ0N6YtEGmVra2uGcicCWAGVVVAigNmPj483GEfm/Pycbm9vDeXw9+7ublpZwZ3jX8HGHR4e1rLyif1j5+sq4DGQEgGA129MDYEVAdRtbm5SV1cXYZMCyODgIMGFzAKXc9rI5vZWeSUCeIlDmDQLZtAOADb09PQ0LS8v08jIiLmryDsRUF0BpTCKCISzwCzwYbiMlYBcR0cHpaam0u7urlUTEcEQfq0EBFRIPEdlMRpWwI6ARXNZNDMzIw86WahLaAecrsjnpBIBHGLaiau3oJ2o+jJ9GhvUbpOinRMBldnHGEp7ALcxfwjAgJOYzxF92xclYPUagZl1iuN6MHZp+D8iWSCivAJmIw8PD/8pAUyQyir4TQDhE2EwEEEEsxtDBTxsKxGwciG8yAW6/CBg54Yuf6nIeXONQti8dgT0b6JyRB8T2uu41g2uube3R0tLS44RTGvvSgDxXyOAGTs8PBSn68TEBO3v72vj+P0EAYDe2Nig+fl5mpqaooWFBdrZ2XkZAlhKvMfg747Z2VkxM9vb2+KG5TdqXcfJyUkxIYuLi3RwcGB7suu6aEnDjedbLrX8758JePllzsuuZFlv1+8Vyt+BieZCm5x+0OVRJwTRAAdOiAkA4XuGjEL4lLmDgjARTPgysGph9A9Oj6EgTORnxvmXGetbLsA1KtR83YxnkTHafqj4hisRG82dQiUPv/+C1VYiuOZr1lBciV8YV4UtclMFvlr+wIrvxri1B2sFbtj2Kut3rG9Ynwlm3E48XIEvl/jv7xNW/N0GIq8hwIW75kfW96zYsIaDi/P/D/kHGNOpOz6fLmoAAAAASUVORK5CYII=';
+
+// Vercel and Netlify's real logomarks, used by DeployMenu in app.tsx.
+// class defaults to 'w-4 h-4' but every call site can override it (same
+// prop pattern as CloseIcon in ui.tsx), since the two places these get used
+// (the deploy-menu trigger, the deployed-badge link) draw them at different
+// sizes. Both are always drawn with fill="currentColor" rather than either
+// brand's own color, on purpose: it lets this app's own tone system (zinc
+// idle, amber deploying, emerald deployed) recolor them, matching every
+// other icon-as-status-indicator in the app instead of carrying a fixed
+// brand color that would clash with it.
+// Vercel's path is the actual logomark (a plain triangle, vercel.com's own
+// brand asset). Netlify has no equivalent in Tabler at all -- checked both
+// icons/outline and icons/filled trees directly in the tabler/tabler-icons
+// repo: Vercel is there as brand-vercel, Netlify isn't -- so its path comes
+// from the same simple-icons package already imported above for the agent
+// tool logos (siNetlify, the real Netlify press-kit mark).
+export function VercelIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
+  return <svg class={cls} fill="currentColor" viewBox="0 0 76 65"><path d="M37.5274 0L75.0548 65H0L37.5274 0Z" /></svg>;
+}
+export function NetlifyIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
+  return (
+    <svg class={cls} fill="currentColor" viewBox="0 0 24 24">
+      <path d="M6.49 19.04h-.23L5.13 17.9v-.23l1.73-1.71h1.2l.15.15v1.2L6.5 19.04ZM5.13 6.31V6.1l1.13-1.13h.23L8.2 6.68v1.2l-.15.15h-1.2L5.13 6.31Zm9.96 9.09h-1.65l-.14-.13v-3.83c0-.68-.27-1.2-1.1-1.23-.42 0-.9 0-1.43.02l-.07.08v4.96l-.14.14H8.9l-.13-.14V8.73l.13-.14h3.7a2.6 2.6 0 0 1 2.61 2.6v4.08l-.13.14Zm-8.37-2.44H.14L0 12.82v-1.64l.14-.14h6.58l.14.14v1.64l-.14.14Zm17.14 0h-6.58l-.14-.14v-1.64l.14-.14h6.58l.14.14v1.64l-.14.14ZM11.05 6.55V1.64l.14-.14h1.65l.14.14v4.9l-.14.14h-1.65l-.14-.13Zm0 15.81v-4.9l.14-.14h1.65l.14.13v4.91l-.14.14h-1.65l-.14-.14Z" />
+    </svg>
+  );
+}
+
+// Convex's real logomark. Sourced live from the siConvex import above rather
+// than a hardcoded path copy (unlike Vercel/Netlify above) -- both are
+// equally free of any runtime request (simple-icons is bundled at build
+// time either way), so referencing the import directly is just less to keep
+// in sync if the package ever updates the mark.
+export function ConvexIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
+  return <svg class={cls} fill="currentColor" viewBox="0 0 24 24"><path d={siConvex.path} /></svg>;
+}

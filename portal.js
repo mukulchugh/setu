@@ -1,31 +1,43 @@
 #!/usr/bin/env bun
 // Dev portal — http://quivly.local
 
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { join, resolve, dirname } from 'path';
 // Bun bundles + transpiles the Preact UI referenced by this page at serve time
 import indexPage from './portal/index.html';
 import {
-  PORTAL_PORT, CLOUDFLARED_BIN,
+  HOME, PORTAL_PORT, CLOUDFLARED_BIN,
   requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
-  parseEnvFile, pinnedTriggerVersion,
-  readEnvrc, configureWorktreeEnv, reloadCaddy, syncHosts,
+  parseEnvFile, pinnedTriggerVersion, convexDir, slugify,
+  configureWorktreeEnv, reloadCaddy, syncHosts,
   portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject, removeProject,
-  git, branchExists, createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
-  AGENT_CLIS, detectAgentClis, loadSidecars, loadAllSidecars, saveSidecars, killGroup,
-  loadCustomAgents, saveCustomAgents,
+  createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
+  discoverReposAsync, importRepo, cloneBareRepo,
+  AGENT_CLIS, detectAgentClis, commandExists, loadSidecars, loadAllSidecars, saveSidecars, killGroup,
+  loadCustomAgents, saveCustomAgents, loadFileSyncGlobs, saveFileSyncGlobs,
+  isSidecarApproved, approveSidecar, seedSidecarApprovalsIfMissing,
+  loadArchivedWorktrees, appendArchivedWorktree,
   containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
   defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
   worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
+  spawnText, splitKey, baseBranchRef,
+  loadMcpServers, saveMcpServers,
 } from './lib.js';
+import { connectMcpServer, finishMcpAuth, disconnectMcpServer, mcpStatuses } from './mcp.js';
+import { detectPrWalkthroughPlugin, findLatestArtifact, artifactHtmlPath, reviewRunStatus, runDeepReview } from './pr-review.js';
 
 let _cfg;
 try { _cfg = requireConfig(); }
 catch (e) { console.error(`setu portal: ${e.message}`); process.exit(1); }
 
 const WORKSPACE      = _cfg.workspace;
+// Runs once per process start, synchronously, before any route can possibly
+// be handled, so a start request can never race the migration and see a
+// pre-existing sidecar as unapproved. See seedSidecarApprovalsIfMissing's
+// own comment in lib.js for why this only ever runs once.
+seedSidecarApprovalsIfMissing(WORKSPACE);
 const TUNNEL_NAME    = _cfg.tunnel;
 const CF_CREDENTIALS_CFG = _cfg.cfCredentials;
 const PKG_DIR     = new URL('.', import.meta.url).pathname;
@@ -36,7 +48,22 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
 const procs        = new Map();
 const inngestProcs = new Map();
 const triggerProcs = new Map();
+const convexDevProcs = new Map(); // `npx convex dev` per worktree, same shape as triggerProcs (no local port to cross-check)
 const sidecarProcs = new Map(); // key: `${repo}/${name}/${sidecar.name}`
+
+// Idle-timeout tracking (see checkIdleTimeouts near the bottom for the full
+// design). key -> ms epoch of the last real, user-driven activity touching
+// this worktree. Deliberately NOT touched by the passive GET /api/worktrees
+// list poll: app.tsx's refresh() loop hits it for every worktree every
+// 800ms-3s regardless of what's on screen, even from a backgrounded browser
+// tab. Touching it there would make a worktree look active forever just
+// because the dashboard exists somewhere, which defeats the point of an
+// idle timeout.
+const lastSeenAt = new Map();
+
+function touchLastSeen(repo, name) {
+  lastSeenAt.set(`${repo}/${name}`, Date.now());
+}
 
 const INNGEST_CLI    = 'inngest-cli';
 const INNGEST_OFFSET = 5288; // app port 3000 → inngest 8288, 3001 → 8289, …
@@ -54,6 +81,12 @@ const activeTunnelMap = new Map(); // key → { pubDom, port }
 let   tunnelProc      = null;
 
 function inngestPort(appPort) { return appPort + INNGEST_OFFSET; }
+
+// Same path shape lib.js already builds with join() for the same concept.
+// Kept as a template literal here (not join()) only because that's this
+// file's existing convention for WORKSPACE-relative paths throughout.
+function wtPath(repo, name) { return `${WORKSPACE}/${repo}/${name}`; }
+function repoPath(repo)     { return `${WORKSPACE}/${repo}.git`; }
 
 // ── logging ───────────────────────────────────────────────────────────────────
 
@@ -149,7 +182,7 @@ const GIT_META_TTL = 10_000;
 function repoGitMeta(repo) {
   const cached = gitMetaCache.get(repo);
   if (cached && Date.now() - cached.fetchedAt < GIT_META_TTL) return cached;
-  const repoDir = `${WORKSPACE}/${repo}.git`;
+  const repoDir = repoPath(repo);
   let branchMeta = new Map(), pathToBranch = new Map();
   try {
     branchMeta = branchMetadata(repoDir);
@@ -171,19 +204,33 @@ async function fetchDirty(repo, name) {
   const key    = `${repo}/${name}`;
   const cached = dirtyCache.get(key);
   if (cached && Date.now() - cached.fetchedAt < DIRTY_TTL) return cached.count;
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
-  try {
-    const proc = Bun.spawn(['git', '-C', wtDir, '--no-optional-locks', 'status', '--porcelain'],
-      { stdout: 'pipe', stderr: 'ignore' });
-    const raw  = await new Response(proc.stdout).text();
-    await proc.exited;
-    const count = raw.trim() ? raw.trim().split('\n').length : 0;
-    dirtyCache.set(key, { count, fetchedAt: Date.now() });
-    return count;
-  } catch {
-    dirtyCache.set(key, { count: 0, fetchedAt: Date.now() });
-    return 0;
-  }
+  const wtDir = wtPath(repo, name);
+  const raw = await spawnText(['git', '-C', wtDir, '--no-optional-locks', 'status', '--porcelain']);
+  const count = raw ? raw.split('\n').length : 0;
+  dirtyCache.set(key, { count, fetchedAt: Date.now() });
+  return count;
+}
+
+// convexDir() reads + regex-parses up to two directories' worth of env files
+// per worktree -- measured ~1ms/worktree, ~50ms synchronously across the
+// full ~47-worktree registry this portal actually runs against. Unlike the
+// async per-worktree work elsewhere in getWorktrees, that's a single
+// uninterrupted block on the event loop every poll (as often as every
+// 800ms while a start is pending), so it gets the same TTL-cache treatment
+// as dirtyCache above and gitMetaCache below -- Convex configuration
+// essentially never changes mid-session, same justification as those. Only
+// used from the getWorktrees poll path; startConvexDev/deployToConvex below
+// call convexDir() directly so a user action always sees a fresh answer.
+const convexConfigCache = new Map(); // key: `${repo}/${name}` -> { dir, fetchedAt }
+const CONVEX_CONFIG_TTL = 10_000;
+
+function cachedConvexDir(repo, name, wtDir) {
+  const key    = `${repo}/${name}`;
+  const cached = convexConfigCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < CONVEX_CONFIG_TTL) return cached.dir;
+  const dir = convexDir(repo, wtDir);
+  convexConfigCache.set(key, { dir, fetchedAt: Date.now() });
+  return dir;
 }
 
 // ── PR cache ──────────────────────────────────────────────────────────────────
@@ -191,27 +238,273 @@ async function fetchDirty(repo, name) {
 const prCache = new Map();
 const PR_TTL  = 60_000;
 
+// statusCheckRollup mixes two shapes in the same array (confirmed live on a
+// real merged PR that had both): CheckRun (GitHub Actions, status+conclusion)
+// and StatusContext (legacy commit statuses, state only). Collapse both into
+// one summary rather than surfacing per-check detail, the badge only needs
+// passing/failing/pending/none, not a checks list.
+function summarizeChecks(rollup) {
+  if (!Array.isArray(rollup) || rollup.length === 0) return 'none';
+  let sawPending = false;
+  for (const c of rollup) {
+    if (c.__typename === 'StatusContext') {
+      if (c.state === 'FAILURE' || c.state === 'ERROR') return 'failing';
+      if (c.state === 'PENDING' || c.state === 'EXPECTED') sawPending = true;
+      continue;
+    }
+    if (c.status !== 'COMPLETED') { sawPending = true; continue; }
+    // SKIPPED/NEUTRAL aren't failures, a real run (path-filtered CI) can
+    // skip most jobs and still be a passing PR.
+    if (c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED' ||
+        c.conclusion === 'TIMED_OUT' || c.conclusion === 'ACTION_REQUIRED') return 'failing';
+  }
+  return sawPending ? 'pending' : 'passing';
+}
+
 async function fetchPR(repo, name) {
   const key    = `${repo}/${name}`;
   const cached = prCache.get(key);
   if (cached && Date.now() - cached.fetchedAt < PR_TTL) return cached;
   try {
-    // ponytail: Bun.spawn keeps event loop unblocked; execFileSync froze it with 10+ parallel calls
-    const proc = Bun.spawn(['gh', 'pr', 'list', '--head', name,
+    // ponytail: Bun.spawn (via spawnText) keeps event loop unblocked; execFileSync froze it with 10+ parallel calls
+    // `gh pr view <branch>` instead of `pr list --head`: one call gets
+    // state/isDraft/statusCheckRollup alongside number/title/url, where list
+    // only ever returned the bare three.
+    const raw = await spawnText(['gh', 'pr', 'view', name,
       '--repo', REPO_META[repo]?.slug ?? repo,
-      '--json', 'number,title,url', '--limit', '1',
-    ], { stdout: 'pipe', stderr: 'ignore' });
-    const raw  = await new Response(proc.stdout).text();
-    await proc.exited;
-    const pr    = JSON.parse(raw.trim())[0] ?? null;
-    const entry = pr ? { ...pr, fetchedAt: Date.now() } : { fetchedAt: Date.now() };
+      '--json', 'number,title,url,state,isDraft,statusCheckRollup',
+    ]);
+    const raw2 = JSON.parse(raw);
+    // gh's `state` is a real three-value enum (OPEN/CLOSED/MERGED), not a
+    // boolean plus a separate merged flag, confirmed live against several
+    // merged and closed PRs. MERGED/CLOSED are terminal and take precedence
+    // over isDraft: a closed PR can still carry isDraft:true (confirmed live),
+    // but "draft" as a display state only makes sense while still open.
+    const state = raw2.state === 'MERGED' ? 'merged'
+      : raw2.state === 'CLOSED' ? 'closed'
+      : raw2.isDraft ? 'draft' : 'open';
+    const entry = {
+      number: raw2.number, title: raw2.title, url: raw2.url,
+      state, checks: summarizeChecks(raw2.statusCheckRollup),
+      fetchedAt: Date.now(),
+    };
     prCache.set(key, entry);
     return entry;
   } catch {
+    // Empty stdout (no PR for this branch, or `gh` failing) fails JSON.parse
+    // the same way `pr list` returning `[]` used to, same fallback shape.
     const entry = { fetchedAt: Date.now() };
     prCache.set(key, entry);
     return entry;
   }
+}
+
+// Repo-scoped sibling of fetchPR above -- one `gh pr list` call covers every
+// open PR on a repo (cheaper than the per-worktree `gh pr view` calls fetchPR
+// already makes). Deliberately its own Map, not folded into prCache: key
+// collision with prCache's `repo/name` keys is impossible (repo names can't
+// contain '/', see splitKey's own comment), but the value shapes differ
+// (single PR object vs {prs:[...]}), so a shared Map would just be a
+// readability trap. Unlike fetchPR, this is an explicit user-triggered
+// browse action (not a passive per-worktree badge), so "gh failed" and
+// "genuinely zero open PRs" need to stay distinguishable -- error is its own
+// field, not folded into an empty prs array.
+const repoPrsCache = new Map();
+
+async function fetchRepoPRs(repo) {
+  const slug = REPO_META[repo]?.slug;
+  if (!slug) return { prs: [], error: 'no GitHub repo configured for this project' };
+  const cached = repoPrsCache.get(repo);
+  if (cached && Date.now() - cached.fetchedAt < PR_TTL) return cached;
+  // spawnText swallows a bad binary/non-zero exit/timeout into an empty
+  // string rather than throwing (see its own comment in lib.js) and drops
+  // stderr entirely, so a genuine `gh` failure never yields the real reason
+  // -- only that it's not valid JSON. `gh pr list` printing zero PRs is
+  // still a well-formed `[]`, so that case parses fine and never reaches
+  // this branch; only a real call failure (bad auth, unreachable repo,
+  // timeout) does, which is exactly the case worth a clear, actionable
+  // message instead of a raw JSON syntax error.
+  const raw = await spawnText(['gh', 'pr', 'list', '--repo', slug, '--state', 'open',
+    '--json', 'number,title,url,headRefName,isDraft,statusCheckRollup,updatedAt,author', '--limit', '50']);
+  let list;
+  try { list = JSON.parse(raw); }
+  catch {
+    const entry = { prs: [], error: `gh pr list failed for ${slug} -- check "gh auth status" and that the repo is reachable`, fetchedAt: Date.now() };
+    repoPrsCache.set(repo, entry);
+    return entry;
+  }
+  const entry = {
+    prs: list.map(p => ({
+      number: p.number, title: p.title, url: p.url, branch: p.headRefName,
+      isDraft: p.isDraft, checks: summarizeChecks(p.statusCheckRollup),
+      updatedAt: p.updatedAt, author: p.author?.login ?? null,
+    })),
+    error: null, fetchedAt: Date.now(),
+  };
+  repoPrsCache.set(repo, entry);
+  return entry;
+}
+
+// ── diff viewer (per-worktree, computed on demand, no cache unlike the
+// TTL'd caches above: this is fetched once when a human opens the Diff
+// section and on an explicit manual refresh, never on a poll loop, so
+// there's no repeated-request volume to protect against) ────────────────────
+
+// Guards against a genuinely huge diff hanging the request or the browser
+// that renders it, not a feature to make configurable:
+// - a single autogenerated file (a lockfile, a bundled build artifact) can
+//   run tens of thousands of changed lines; past this, show its real +/-
+//   counts but drop the hunk content instead of shipping it to the browser.
+const DIFF_FILE_LINE_CAP = 2000;
+// - a diff spanning hundreds of files (a wide rebase, a vendored directory)
+//   is already unreviewable as a flat list; cap what's sent and say how
+//   many more there are, rather than an unbounded array.
+const DIFF_MAX_FILES = 300;
+
+// Hand-rolled unified-diff parser: no diff-parsing dependency in this
+// project, and the format is regular enough not to need one. Single
+// line-by-line state machine: `cur` is the file entry being built, `hunk`
+// the current hunk within it. `cur.sawHunk` disambiguates the one place the
+// format is genuinely ambiguous: a real content line that happens to start
+// with "--- " or "+++ " (e.g. removing a line of literal "-- foo") would
+// otherwise be mistaken for the file-header lines, which only ever appear
+// once, before the first "@@" of a file.
+function parseUnifiedDiff(raw) {
+  if (!raw) return [];
+  const files = [];
+  let cur = null, hunk = null, oldLine = 0, newLine = 0, seenFiles = 0;
+
+  function flushHunk() {
+    // Once a file is flagged tooLarge its hunks are dropped at render time
+    // anyway, so skip retaining them here: an oversized file's content
+    // shouldn't sit in memory for the rest of the parse.
+    if (cur && hunk && !cur.tooLarge) cur.hunks.push(hunk);
+    hunk = null;
+  }
+  function flushFile() {
+    flushHunk();
+    if (cur) files.push(cur);
+    cur = null;
+  }
+
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      flushFile();
+      seenFiles++;
+      // "a/<path> b/<path>": greedy match backtracks to the rightmost
+      // " b/", which is correct for the common case (identical paths, or a
+      // path that doesn't itself contain the literal substring " b/").
+      const m = line.slice('diff --git '.length).match(/^a\/(.*) b\/(.*)$/);
+      cur = {
+        file: m ? m[2] : line.slice('diff --git '.length), additions: 0, deletions: 0, hunks: [], sawHunk: false,
+        // A file past DIFF_MAX_FILES gets sliced out of the response by
+        // summarizeDiff regardless, so reuse the same skip-building path an
+        // individually oversized file already takes below: count its real
+        // additions/deletions for the summary total, don't materialize its
+        // hunk content just to discard it a moment later.
+        tooLarge: seenFiles > DIFF_MAX_FILES,
+      };
+      continue;
+    }
+    if (!cur) continue; // stray output before the first file header, shouldn't happen
+
+    if (line.startsWith('Binary files ')) {
+      cur.binary = true;
+      const m = line.match(/^Binary files (.+) and (.+) differ$/);
+      if (m) {
+        const a = m[1].replace(/^a\//, ''), b = m[2].replace(/^b\//, '');
+        cur.file = b !== '/dev/null' ? b : a; // deleted binary file, show the old path
+      }
+      continue;
+    }
+    if (!cur.sawHunk && line.startsWith('--- ')) {
+      const p = line.slice(4).replace(/^a\//, '');
+      if (p !== '/dev/null') cur._oldPath = p;
+      continue;
+    }
+    if (!cur.sawHunk && line.startsWith('+++ ')) {
+      const p = line.slice(4).replace(/^b\//, '');
+      cur.file = p !== '/dev/null' ? p : (cur._oldPath ?? cur.file); // deleted file, show the old path
+      continue;
+    }
+    const hm = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hm) {
+      flushHunk();
+      cur.sawHunk = true;
+      oldLine = parseInt(hm[1], 10);
+      newLine = parseInt(hm[2], 10);
+      hunk = { header: line, lines: [] };
+      continue;
+    }
+    if (!hunk) continue; // metadata between file header and first hunk (index/mode/rename lines)
+
+    // Counts and line numbers keep advancing even past the size cap (an
+    // oversized file should still report an accurate total), only the
+    // per-line array stops growing.
+    if (line.startsWith('+')) {
+      cur.additions++;
+      if (!cur.tooLarge) hunk.lines.push({ type: 'add', content: line.slice(1), newLine: newLine++ }); else newLine++;
+    } else if (line.startsWith('-')) {
+      cur.deletions++;
+      if (!cur.tooLarge) hunk.lines.push({ type: 'remove', content: line.slice(1), oldLine: oldLine++ }); else oldLine++;
+    } else if (line.startsWith(' ')) {
+      if (!cur.tooLarge) hunk.lines.push({ type: 'context', content: line.slice(1), oldLine: oldLine++, newLine: newLine++ });
+      else { oldLine++; newLine++; }
+    }
+    // A "\ No newline at end of file" marker matches none of the above and is dropped, as intended.
+
+    if (!cur.tooLarge && cur.additions + cur.deletions > DIFF_FILE_LINE_CAP) cur.tooLarge = true;
+  }
+  flushFile();
+
+  // Strip internal-only bookkeeping before handing back to the caller.
+  return files.map(({ sawHunk, _oldPath, tooLarge, hunks, ...f }) =>
+    tooLarge ? { ...f, hunks: [], tooLarge: true } : { ...f, hunks });
+}
+
+// additions/deletions are summed across ALL parsed files (before the
+// DIFF_MAX_FILES slice) so the summary line stays accurate even when the
+// file list itself is truncated.
+function summarizeDiff(raw) {
+  const all = parseUnifiedDiff(raw);
+  let additions = 0, deletions = 0;
+  for (const f of all) { additions += f.additions; deletions += f.deletions; }
+  return {
+    files: all.slice(0, DIFF_MAX_FILES),
+    additions, deletions,
+    totalFiles: all.length,
+    truncatedFileCount: Math.max(0, all.length - DIFF_MAX_FILES),
+  };
+}
+
+// Two separate diffs, not one merged one: they answer different questions.
+// "committed" is what this branch will actually contribute if merged, a
+// merge-base (three-dot) diff against the same base baseBranchRef() already
+// resolves for ahead/behind, so it only shows what THIS branch did, not
+// whatever base moved on to since divergence. "uncommitted" is what's sitting
+// in the working tree right now and would be lost on a stash/checkout. `git
+// diff HEAD` alone covers both staged and unstaged changes in one pass, since
+// it compares the working tree directly against HEAD regardless of index state.
+async function computeDiff(repo, name) {
+  const wtDir   = wtPath(repo, name);
+  const repoDir = repoPath(repo);
+  const base    = baseBranchRef(repoDir);
+
+  // baseBranchRef always returns a ref name, but that ref may not actually
+  // resolve (origin/<default> never fetched, a stale remote-tracking branch).
+  // spawnText swallows git's non-zero exit into an empty string the same way
+  // a genuinely empty diff would come back, so without this check an
+  // unresolvable base is indistinguishable from "this branch is fully
+  // merged", so the UI would tell a worktree that's 60 commits ahead that it
+  // has no changes. Check explicitly and let the frontend say so.
+  const baseResolved = !!(await spawnText(['git', '-C', wtDir, 'rev-parse', '--verify', '--quiet', base]));
+
+  const [committedRaw, uncommittedRaw] = await Promise.all([
+    baseResolved ? spawnText(['git', '-C', wtDir, 'diff', `${base}...HEAD`]) : Promise.resolve(''),
+    spawnText(['git', '-C', wtDir, 'diff', 'HEAD']),
+  ]);
+
+  return { base, baseResolved, committed: summarizeDiff(committedRaw), uncommitted: summarizeDiff(uncommittedRaw) };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -258,19 +551,13 @@ function killPort(port) {
 async function activeMemMb(entry) {
   if (!entry) return null;
   if (entry.container) {
-    try {
-      const idProc = Bun.spawn(['docker', 'compose', '-p', entry.container, 'ps', '-q'], { stdout: 'pipe', stderr: 'ignore' });
-      const id = (await new Response(idProc.stdout).text()).trim().split('\n')[0];
-      await idProc.exited;
-      if (!id) return null;
-      const statsProc = Bun.spawn(['docker', 'stats', '--no-stream', '--format', '{{.MemUsage}}', id], { stdout: 'pipe', stderr: 'ignore' });
-      const raw = (await new Response(statsProc.stdout).text()).trim();
-      await statsProc.exited;
-      // "123.4MiB / 4GiB" — only the used side matters here
-      const m = raw.match(/^([\d.]+)\s*(MiB|GiB)/);
-      if (!m) return null;
-      return m[2] === 'GiB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
-    } catch { return null; }
+    const id = (await spawnText(['docker', 'compose', '-p', entry.container, 'ps', '-q'])).split('\n')[0];
+    if (!id) return null;
+    const raw = await spawnText(['docker', 'stats', '--no-stream', '--format', '{{.MemUsage}}', id]);
+    // "123.4MiB / 4GiB" — only the used side matters here
+    const m = raw.match(/^([\d.]+)\s*(MiB|GiB)/);
+    if (!m) return null;
+    return m[2] === 'GiB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
   }
   if (entry.pid) return processFootprintMb(entry.pid);
   return null;
@@ -282,7 +569,7 @@ async function getWorktrees() {
     portEntries(WORKSPACE).map(async ({ key, repo, name, port }) => {
       const slug     = name.replace(/\//g, '-');
       const domain   = localDomain(repo, name);
-      const wtDir    = `${WORKSPACE}/${repo}/${name}`;
+      const wtDir    = wtPath(repo, name);
       const tunnelOn = tunnelEnabled(wtDir, _cfg);
       const meta     = REPO_META[repo] ?? { label: repo, github: null };
       const branchUrl = meta.github ? `${meta.github}/tree/${name}` : null;
@@ -317,11 +604,20 @@ async function getWorktrees() {
         queuePosition: queuePosition(key),
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
         label:         meta.label,
+        branch,
         branchUrl,
-        pr:            pr?.url ? { url: pr.url, number: pr.number, title: pr.title } : null,
+        pr:            pr?.url ? { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: pr.checks } : null,
+        vercelDeploy:  vercelStatus(repo, name),
+        netlifyDeploy: netlifyStatus(repo, name),
         inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
         inngestPort:   iPort,
         triggerActive: triggerProcs.has(key),
+        // Gate for whether the Convex section renders at all -- unlike
+        // Inngest/Trigger (assumed available to every worktree), Convex is
+        // only relevant to worktrees that actually have it configured.
+        convexConfigured: cachedConvexDir(repo, name, wtDir) !== null,
+        convexActive:     convexDevProcs.has(key),
+        convexDeploy:     convexDeployStatus(repo, name),
         lastCommitAt:  gm.lastCommitAt,
         ahead:         gm.ahead,
         behind:        gm.behind,
@@ -366,16 +662,15 @@ function drainQueue() {
 
 function spawnWorktree(repo, name, port) {
   const key   = `${repo}/${name}`;
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
-  const env   = { ...process.env, PORT: String(port) };
-  const envrc = readEnvrc(wtDir);
-  for (const m of envrc.matchAll(/^export (\w+)=(.+)$/gm)) env[m[1]] = m[2].trim();
+  const wtDir = wtPath(repo, name);
+  const env  = { ...process.env, PORT: String(port), ...parseEnvFile(join(wtDir, '.envrc')) };
   const fd   = openLogFd(repo, name, 'dev');
   const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stdout: fd, stderr: fd });
   const entry = wrapProc(proc);
   procs.set(key, entry);
+  lastSeenAt.set(key, Date.now()); // idle-timeout baseline: clock starts at spawn, not at zero
   proc.exited.then(() => { if (procs.get(key) === entry) { procs.delete(key); drainQueue(); } });
-  startSidecars(repo, name, port);
+  return { skippedSidecars: startSidecars(repo, name, port) };
 }
 
 // Container path: `docker compose up -d --build` returns as soon as containers
@@ -386,7 +681,7 @@ function spawnWorktree(repo, name, port) {
 // scan sees it — no container-specific polling needed there.
 function spawnContainer(repo, name, port) {
   const key   = `${repo}/${name}`;
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const wtDir = wtPath(repo, name);
   writeDockerCompose(_cfg, repo, name, port);
   const project = composeProjectName(repo, name);
   const fd = openLogFd(repo, name, 'dev');
@@ -402,11 +697,11 @@ function spawnContainer(repo, name, port) {
     // don't leave a phantom "running" entry blocking the concurrency slot.
     if (code !== 0 && procs.get(key) === entry) { procs.delete(key); drainQueue(); }
   });
-  startSidecars(repo, name, port);
+  return { skippedSidecars: startSidecars(repo, name, port) };
 }
 
 function stopContainer(repo, name, project) {
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const wtDir = wtPath(repo, name);
   // No -v: the node_modules named volume survives, so the next `up` skips
   // `bun install` unless the compose file's volume was ever pruned separately.
   try { execFileSync('docker', ['compose', '-p', project, '-f', dockerComposePath(wtDir), 'down'], { stdio: 'ignore' }); }
@@ -426,13 +721,19 @@ function reconcileDevServers() {
   const activePorts = new Map(listActivePorts().map(p => [p.port, p.pid]));
   for (const { key, repo, name, port } of portEntries(WORKSPACE)) {
     if (procs.has(key)) continue;
-    const wtDir = `${WORKSPACE}/${repo}/${name}`;
+    const wtDir = wtPath(repo, name);
     if (existsSync(dockerComposePath(wtDir))) {
       const project = composeProjectName(repo, name);
       if (composeProjectAlive(project)) { procs.set(key, wrapContainer(project)); continue; }
     }
     const pid = activePorts.get(port);
-    if (pid) procs.set(key, wrapPid(+pid));
+    if (pid) {
+      procs.set(key, wrapPid(+pid));
+      // True start time is unknown for a process discovered already running
+      // (it predates this portal instance). Use portal-restart time as a
+      // conservative idle-timeout baseline rather than leaving it untracked.
+      lastSeenAt.set(key, Date.now());
+    }
   }
 }
 
@@ -452,8 +753,12 @@ function startWorktree(repo, name, port, container = true) {
     startQueue.push({ key, repo, name, port, container });
     return { ok: true, queued: true, position: startQueue.length, container };
   }
-  if (container) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
-  return { ok: true, container };
+  const spawned = container ? spawnContainer(repo, name, port) : spawnWorktree(repo, name, port);
+  const result = { ok: true, container };
+  // Only present when something was actually skipped. Every other caller
+  // of /api/start keeps getting the exact response shape it already handles.
+  if (spawned?.skippedSidecars?.length) result.skippedSidecars = spawned.skippedSidecars;
+  return result;
 }
 
 // drain=false is for callers that stop a worktree only to immediately respawn
@@ -475,11 +780,18 @@ function stopWorktree(repo, name, port, { drain = true } = {}) {
   if (entry?.container) {
     stopContainer(repo, name, entry.container);
   } else {
+    // Raw single-pid kill, not killGroup() (lib.js): spawnWorktree() below
+    // spawns the dev server without detached:true, so it shares this portal
+    // process's own pgid rather than leading its own. killGroup would look
+    // that pgid up, see pgid !== pid, and fall back to this exact same
+    // single-pid kill anyway (verified empirically), so this is already
+    // equivalent, not an inconsistency to fix.
     const pid = activePid(port);
     if (pid) { try { execFileSync('kill', [pid]); } catch {} }
   }
   stopInngest(repo, name, port);
   stopTrigger(repo, name);
+  stopConvexDev(repo, name);
   stopSidecars(repo, name);
   if (drain) drainQueue();
 }
@@ -489,11 +801,21 @@ function stopWorktree(repo, name, port, { drain = true } = {}) {
 // project-specific that isn't Inngest or Trigger — a plain cloudflared tunnel,
 // a queue worker, whatever a future project needs. Not hardcoded to quivly-app.
 
+// Returns the names of any sidecars skipped for lacking approval, so the
+// start path (spawnWorktree/spawnContainer -> startWorktree) can surface it
+// to whoever asked for the start, instead of just silently not running.
 function startSidecars(repo, name, port) {
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const wtDir = wtPath(repo, name);
+  const skipped = [];
   for (const s of loadSidecars(WORKSPACE, repo)) {
     const key = `${repo}/${name}/${s.name}`;
     if (sidecarProcs.has(key)) continue;
+    // New or edited since it was last approved: skip only this one sidecar,
+    // the dev server and every other already-approved sidecar still start.
+    // s.name guarded truthy: a nameless row (settings UI allows adding one
+    // with a command but no name yet) still gets gated, just not reported by
+    // an empty string the toast would render as "sidecar '' needs approval".
+    if (!isSidecarApproved(WORKSPACE, repo, s)) { if (s.name) skipped.push(s.name); continue; }
     const fd  = openLogFd(repo, name, `sidecar-${s.name}`);
     const env = { ...process.env, PORT: String(port), ...s.env };
     const proc = Bun.spawn([s.command, ...(s.args ?? [])], { cwd: wtDir, env, stdout: fd, stderr: fd, detached: true });
@@ -501,6 +823,7 @@ function startSidecars(repo, name, port) {
     sidecarProcs.set(key, entry);
     proc.exited.then(() => { if (sidecarProcs.get(key) === entry) sidecarProcs.delete(key); });
   }
+  return skipped;
 }
 
 function stopSidecars(repo, name) {
@@ -567,7 +890,7 @@ const TRIGGER_MAX_CONCURRENT_RUNS = 2;
 function startTrigger(repo, name) {
   const key = `${repo}/${name}`;
   if (triggerProcs.has(key)) return { ok: false, error: 'already running' };
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const wtDir = wtPath(repo, name);
   const fd    = openLogFd(repo, name, 'trigger');
   // trigger tasks import Supabase keys etc. from the shared .env.local at load time
   const env   = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
@@ -600,7 +923,7 @@ function reconcileTriggerSidecars() {
   try { raw = execFileSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8' }); }
   catch { return; }
   const dirToKey = new Map(
-    portEntries(WORKSPACE).map(({ key, repo, name }) => [`${WORKSPACE}/${repo}/${name}`, key])
+    portEntries(WORKSPACE).map(({ key, repo, name }) => [wtPath(repo, name), key])
   );
   for (const line of raw.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+.*\.bin\/trigger dev\b/);
@@ -610,6 +933,313 @@ function reconcileTriggerSidecars() {
     const key = cwd && dirToKey.get(cwd);
     if (key && !triggerProcs.has(key)) triggerProcs.set(key, wrapPid(pid));
   }
+}
+
+// ── convex dev + deploy (per worktree) ──────────────────────────────────────
+// Architecturally different from every provider on either side of this
+// section: `npx convex dev` is a persistent watch process against a cloud dev
+// deployment, no local port to bind or cross-check, the same shape trigger.dev
+// has above -- while `npx convex deploy` is a separate, occasional one-shot
+// action, the same shape vercel/netlify have below. Modeled as both instead
+// of forced into either shape alone. No startup reconciliation (unlike
+// trigger's block above): matching an `npx convex dev` process back to its
+// worktree needs a regex loose enough to also match unrelated processes
+// sharing the same command line, and adopting the wrong pid means killGroup
+// later signals a process this portal never started. No reconciliation is
+// safer than a wrong one, so a convex dev process started before a portal
+// restart just shows as stopped until manually restarted -- startConvexDev's
+// own untracked-process guard below stops that from silently double-spawning
+// a second dev process against the same deployment when Start gets clicked.
+const convexDeploys = new Map(); // key: `${repo}/${name}` -> { deploying, ok, error, target, startedAt }
+
+function convexDeployStatus(repo, name) {
+  return convexDeploys.get(`${repo}/${name}`) ?? null;
+}
+
+// Best-effort duplicate-start guard, not the same thing as the reconciliation
+// this section's own comment above says it deliberately skips: this never
+// adopts a pid into convexDevProcs and never kills anything, it only blocks
+// a Start click with an error, so a loose regex here can't cause the harm a
+// loose regex in an adopt-then-kill path could. Needed because convexDevProcs
+// alone can't see a dev process still alive from before a portal restart
+// (the Map starts empty every restart) -- same problem inngest's own
+// `activePid(iPort)` check on its bound port solves for itself, but convex
+// dev has no local port to check instead.
+function convexDevAlreadyRunning(dir) {
+  let raw;
+  try { raw = execFileSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8' }); }
+  catch { return false; }
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+.*\bconvex dev\b/);
+    if (m && processCwd(+m[1]) === dir) return true;
+  }
+  return false;
+}
+
+function startConvexDev(repo, name) {
+  const key = `${repo}/${name}`;
+  if (convexDevProcs.has(key)) return { ok: false, error: 'already running' };
+  const wtDir = wtPath(repo, name);
+  const dir = convexDir(repo, wtDir);
+  if (!dir) return { ok: false, error: 'Convex is not configured in this worktree' };
+  if (!commandExists('npx')) return { ok: false, error: 'npx not found on PATH' };
+  if (convexDevAlreadyRunning(dir)) {
+    return { ok: false, error: `a convex dev process already appears to be running in ${dir} (untracked, likely from before a portal restart)` };
+  }
+  const fd = openLogFd(repo, name, 'convex');
+  // stdin: 'ignore', not inherited -- detection only proves convex/ or
+  // CONVEX_DEPLOYMENT exist, not that the saved auth token is still valid. A
+  // stale token makes `convex dev` prompt to re-authenticate, the same
+  // failure mode the vercel deploy block below spends its own comment on:
+  // with no terminal attached, an inherited stdin would hang forever with
+  // convexActive stuck true and an empty log, instead of failing the prompt
+  // and exiting so the log actually explains what happened.
+  const proc = Bun.spawn(['npx', 'convex', 'dev'],
+    { cwd: dir, stdout: fd, stderr: fd, stdin: 'ignore', detached: true });
+  const entry = wrapProc(proc);
+  convexDevProcs.set(key, entry);
+  proc.exited.then(() => { if (convexDevProcs.get(key) === entry) convexDevProcs.delete(key); });
+  return { ok: true };
+}
+
+function stopConvexDev(repo, name) {
+  const key   = `${repo}/${name}`;
+  const entry = convexDevProcs.get(key);
+  if (!entry) return { ok: false, error: 'not running' };
+  killGroup(entry.pid);
+  convexDevProcs.delete(key);
+  return { ok: true };
+}
+
+// preview/production are the only two convex deploy modes -- unlike vercel's
+// or netlify's third named-custom-target option, convex's preview-vs-prod
+// split really is just whether --preview-create is passed, so there's
+// nothing a third option would add here. The preview name comes from the
+// worktree's real branch, not the worktree directory name (those two can
+// differ -- see the branch-resolution comment in getWorktrees above), run
+// through the same slugify() every local domain already uses, so one preview
+// deployment always maps to the same branch without the user typing or
+// remembering a name.
+function deployToConvex(repo, name, target) {
+  // Reserved to exactly these two words, not treated as a free-text custom
+  // target the way vercelArgs/netlifyArgs above treat anything that isn't
+  // 'production'/'preview' -- convex genuinely only has two deploy modes (see
+  // this function's own comment above), so an unrecognized target is a
+  // caller mistake, not a third mode to fall through to. Without this guard
+  // a typo like 'staging' would silently run (and store) a preview deploy
+  // under the wrong label instead of failing loudly.
+  if (target !== 'preview' && target !== 'production') {
+    return { ok: false, error: "target must be 'preview' or 'production'" };
+  }
+  const key = `${repo}/${name}`;
+  if (convexDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
+  const wtDir = wtPath(repo, name);
+  const dir = convexDir(repo, wtDir);
+  if (!dir) return { ok: false, error: 'Convex is not configured in this worktree' };
+  if (!commandExists('npx')) return { ok: false, error: 'npx not found on PATH' };
+
+  const { pathToBranch } = repoGitMeta(repo);
+  const branch = pathToBranch.get(resolve(wtDir)) ?? name;
+  const args = target === 'production' ? ['deploy'] : ['deploy', '--preview-create', slugify(branch)];
+
+  convexDeploys.set(key, { deploying: true, ok: false, error: null, target, startedAt: Date.now() });
+  // Piped, not the shared 'convex' log fd directly: startConvexDev above may
+  // already hold that fd open for the persistent dev process, and
+  // openLogFd's own rotateLog call (past 5MB) renames the log path out from
+  // under whichever fd was opened first -- the dev process would keep
+  // writing to the renamed, no-longer-tailed file. Captured here and
+  // appended once at exit instead, so a deploy can never collide with the
+  // dev process's log lifecycle. Tradeoff: no live streaming of deploy
+  // progress in the log tab, only the full output once it finishes --
+  // acceptable for an occasional, normally-short action, unlike the dev
+  // process's own log.
+  const proc = Bun.spawn(['npx', 'convex', ...args],
+    { cwd: dir, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', timeout: 15 * 60 * 1000 });
+
+  (async () => {
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    const code = await proc.exited;
+    const finishedAt = convexDeploys.get(key)?.startedAt ?? Date.now();
+    const combined = `${out}${err}`.trim();
+    appendFileSync(logPath(repo, name, 'convex'), `\n[deploy ${target}]\n${combined}\n`);
+    if (code === 0) {
+      convexDeploys.set(key, { deploying: false, ok: true, error: null, target, startedAt: finishedAt });
+    } else {
+      const reason = combined.split('\n').filter(l => l.trim()).at(-1) ?? `convex deploy exited ${code}`;
+      convexDeploys.set(key, { deploying: false, ok: false, error: reason, target, startedAt: finishedAt });
+    }
+  })();
+
+  return { ok: true, deploying: true, target };
+}
+
+// ── vercel deploy (per worktree, one-shot, not long-running like a dev
+// server) ──────────────────────────────────────────────────────────────────
+// Tracked separately from procs/inngestProcs/triggerProcs: those all model
+// "is a process currently running," but a deploy's interesting state is what
+// it produced (a URL) or why it failed, which outlives the process itself.
+const vercelDeploys = new Map(); // key: `${repo}/${name}` -> { deploying, url, error, target, startedAt }
+
+function vercelStatus(repo, name) {
+  return vercelDeploys.get(`${repo}/${name}`) ?? null;
+}
+
+// preview/production/custom-target are mutually exclusive vercel deploy
+// flags. 'production' and 'preview' are reserved regardless of which path
+// called this (the picker menu or a typed custom name) so a user can't
+// accidentally shadow --prod behind --target=production.
+function vercelArgs(target) {
+  if (target === 'production') return ['deploy', '--yes', '--prod'];
+  if (target === 'preview') return ['deploy', '--yes'];
+  return ['deploy', '--yes', `--target=${target}`];
+}
+
+function deployToVercel(repo, name, target) {
+  const key = `${repo}/${name}`;
+  if (vercelDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
+  if (!commandExists('vercel')) return { ok: false, error: 'vercel CLI not found on PATH, install it first' };
+  const wtDir = wtPath(repo, name);
+  if (!existsSync(join(wtDir, '.vercel', 'project.json'))) {
+    return { ok: false, error: `this worktree isn't linked to a Vercel project, run "vercel link" in ${wtDir} first` };
+  }
+
+  const fd = openLogFd(repo, name, 'vercel');
+  vercelDeploys.set(key, { deploying: true, url: null, error: null, target, startedAt: Date.now() });
+  // stdin: 'ignore', not inherited: --yes skips vercel's own prompts, but a
+  // stale/expired auth token can still make it prompt anyway. Inherited
+  // stdin would then block forever with no terminal attached, wedging
+  // `deploying: true` permanently. Ignored stdin makes that prompt hit EOF
+  // and the process exit (nonzero) instead, so the timeout below is a
+  // backstop for a different failure mode (a genuinely hung network call),
+  // not the only guard against this one.
+  const proc = Bun.spawn(['vercel', ...vercelArgs(target)],
+    { cwd: wtDir, stdout: 'pipe', stderr: fd, stdin: 'ignore', timeout: 15 * 60 * 1000 });
+
+  (async () => {
+    const url = (await new Response(proc.stdout).text()).trim();
+    const code = await proc.exited;
+    const finishedAt = vercelDeploys.get(key)?.startedAt ?? Date.now();
+    if (code === 0 && url) {
+      appendFileSync(logPath(repo, name, 'vercel'), `\n${url}\n`);
+      vercelDeploys.set(key, { deploying: false, url, error: null, target, startedAt: finishedAt });
+    } else {
+      // The real reason (bad auth, project mismatch, build failure) went to
+      // the log fd above, not to stdout, which is why this reads it back
+      // instead of settling for a bare exit code.
+      const reason = tailLog(repo, name, 'vercel', 20).lines.filter(l => l.trim()).at(-1) ?? `vercel exited ${code}`;
+      appendFileSync(logPath(repo, name, 'vercel'), `\n[deploy failed] ${reason}\n`);
+      vercelDeploys.set(key, { deploying: false, url: null, error: reason, target, startedAt: finishedAt });
+    }
+  })();
+
+  return { ok: true, deploying: true, target };
+}
+
+// ── netlify deploy (per worktree, one-shot, mirrors the vercel block above)
+const netlifyDeploys = new Map(); // key: `${repo}/${name}` -> { deploying, url, error, target, startedAt }
+
+function netlifyStatus(repo, name) {
+  return netlifyDeploys.get(`${repo}/${name}`) ?? null;
+}
+
+// preview/production/branch-custom are mutually exclusive netlify deploy
+// modes, same convention as vercelArgs above. netlify deploy has no --yes or
+// --auto flag to skip its own prompts (checked netlify-cli's own commander
+// option list directly, nothing like that exists) -- see deployToNetlify's
+// own comment below for why stdin: 'ignore' is enough on its own.
+function netlifyArgs(target) {
+  if (target === 'production') return ['deploy', '--json', '--prod'];
+  if (target === 'preview') return ['deploy', '--json'];
+  return ['deploy', '--json', '--context', `branch:${target}`];
+}
+
+// netlify deploy --json prints exactly one pretty-printed JSON object to
+// stdout and nothing else (netlify-cli's own log() helper is a no-op once
+// --json is anywhere in argv, confirmed in its source), but a misbehaving
+// local build step could still write noise ahead of it, so this takes the
+// last top-level object in the captured text instead of assuming the whole
+// stream is clean. Works because the real payload is a flat object (no
+// nested braces), so its own opening brace is always the last "{" in the
+// text -- verified against a synthetic noisy sample before wiring this in.
+function parseNetlifyJson(text) {
+  const trimmed = text.trim();
+  try { return JSON.parse(trimmed); } catch {}
+  const idx = trimmed.lastIndexOf('{');
+  if (idx === -1) return null;
+  try { return JSON.parse(trimmed.slice(idx)); } catch { return null; }
+}
+
+function deployToNetlify(repo, name, target) {
+  const key = `${repo}/${name}`;
+  if (netlifyDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
+  if (!commandExists('netlify')) return { ok: false, error: 'netlify CLI not found on PATH, install it first' };
+  const wtDir = wtPath(repo, name);
+  // .netlify/state.json is netlify link's output, same role .vercel/project.json
+  // plays above -- but its mere existence only proves this worktree was linked
+  // at some point, not that the site id it names is still valid. The linked id
+  // read here gets compared against the deploy result's own site_id below,
+  // because a stale or reauthorized netlify token doesn't fail the same way a
+  // bad vercel token does: netlify-cli's own site-resolution logic treats that
+  // as "not linked, not interactive" and silently auto-creates a new site to
+  // deploy to instead of erroring out.
+  let linkedSiteId = null;
+  try { linkedSiteId = JSON.parse(readFileSync(join(wtDir, '.netlify', 'state.json'), 'utf8')).siteId ?? null; } catch {}
+  if (!linkedSiteId) {
+    return { ok: false, error: `this worktree isn't linked to a Netlify site, run "netlify link" in ${wtDir} first` };
+  }
+
+  const fd = openLogFd(repo, name, 'netlify');
+  netlifyDeploys.set(key, { deploying: true, url: null, error: null, target, startedAt: Date.now() });
+  // stdin: 'ignore', not inherited: with no --yes/--auto flag to lean on, the
+  // thing standing between this and a wedged prompt is netlify-cli's own
+  // isInteractive() gate (checked directly in its source), which requires
+  // stdin.isTTY && stdout.isTTY before it will ever call inquirer.prompt.
+  // Ignored stdin makes that false, so every prompt path it has (missing
+  // publish directory, a locked production site, an unlinked project) takes
+  // its non-interactive fallback or fails cleanly instead of hanging with no
+  // terminal attached. The timeout below is a backstop for a different
+  // failure mode (a genuinely hung network call or local build step).
+  const proc = Bun.spawn(['netlify', ...netlifyArgs(target)],
+    { cwd: wtDir, stdout: 'pipe', stderr: fd, stdin: 'ignore', timeout: 15 * 60 * 1000 });
+
+  (async () => {
+    const out = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    const finishedAt = netlifyDeploys.get(key)?.startedAt ?? Date.now();
+    const data = code === 0 ? parseNetlifyJson(out) : null;
+    // A clean exit with a parseable result naming a DIFFERENT site than the
+    // one this worktree is linked to (see the comment above linkedSiteId)
+    // means netlify picked a site on its own -- don't trust that url.
+    const ok = code === 0 && data && data.site_id === linkedSiteId;
+    const url = ok ? (data.url || data.deploy_url || null) : null;
+
+    if (ok && url) {
+      appendFileSync(logPath(repo, name, 'netlify'), `\n${url}\n`);
+      netlifyDeploys.set(key, { deploying: false, url, error: null, target, startedAt: finishedAt });
+      return;
+    }
+
+    let reason;
+    if (code === 0 && data && data.site_id !== linkedSiteId) {
+      reason = `netlify deployed to a different site (${data.site_id}) than the one linked here (${linkedSiteId}), not trusting the result, check the netlify auth token`;
+      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] ${reason}\n`);
+    } else if (code === 0 && !data) {
+      // Exited clean but the --json payload didn't parse -- the log fd above
+      // only captured stderr, and stdout (where the payload actually lands)
+      // is otherwise lost, so dump it here or the log won't explain why.
+      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] could not parse --json output:\n${out}\n`);
+      reason = 'could not parse netlify --json output, see the log';
+    } else {
+      // The real reason (bad auth, build failure, project mismatch) went to
+      // the log fd above, not to stdout, which is why this reads it back
+      // instead of settling for a bare exit code.
+      reason = tailLog(repo, name, 'netlify', 20).lines.filter(l => l.trim()).at(-1) ?? `netlify exited ${code}`;
+      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] ${reason}\n`);
+    }
+    netlifyDeploys.set(key, { deploying: false, url: null, error: reason, target, startedAt: finishedAt });
+  })();
+
+  return { ok: true, deploying: true, target };
 }
 
 // ── single cloudflared process with merged ingress ────────────────────────────
@@ -678,8 +1308,8 @@ function enableTunnel(repo, name, port) {
   // Only one worktree can use the shared tunnel URL — evict any currently active one
   for (const [key, { port: p }] of activeTunnelMap.entries()) {
     if (key === `${repo}/${name}`) continue;
-    const si = key.indexOf('/');
-    disableTunnel(key.slice(0, si), key.slice(si + 1), p);
+    const { repo: kRepo, name: kName } = splitKey(key);
+    disableTunnel(kRepo, kName, p);
   }
   const key = `${repo}/${name}`;
   const wasContainer = !!procs.get(key)?.container;
@@ -725,7 +1355,7 @@ function createWorktree(repo, name, tunnel) {
   return { ok: true, port: res.port, domain: res.localDom };
 }
 
-function removeWorktree(repo, name) {
+function removeWorktree(repo, name, reason = 'manual') {
   // stop dev server and tunnel route first
   const port = getPort(WORKSPACE, repo, name);
   if (port) stopWorktree(repo, name, port);
@@ -738,7 +1368,7 @@ function removeWorktree(repo, name) {
   // pointing at it — the exact kind of disk bloat this tool exists to avoid.
   // Must run before libRemoveWorktree deletes the directory (and the compose
   // file with it) below.
-  const wtDir = `${WORKSPACE}/${repo}/${name}`;
+  const wtDir = wtPath(repo, name);
   if (existsSync(dockerComposePath(wtDir))) {
     try {
       execFileSync('docker',
@@ -747,10 +1377,27 @@ function removeWorktree(repo, name) {
     } catch {}
   }
 
+  // Read everything the archive record needs while the worktree (and its PR
+  // cache entry) still exist, since libRemoveWorktree below deletes the
+  // directory and the key is cleared from prCache right after. Not written
+  // yet: only append once removal actually succeeds, so a failed `git
+  // worktree remove` never leaves a phantom archive entry for a worktree
+  // that's still there.
+  const archiveRecord = {
+    repo, name,
+    label:  REPO_META[repo]?.label ?? repo,
+    branch: repoGitMeta(repo).pathToBranch.get(resolve(wtDir)) ?? name,
+    prUrl:  prCache.get(`${repo}/${name}`)?.url ?? null,
+    removedAt: Math.floor(Date.now() / 1000),
+    reason: reason === 'merged' ? 'merged' : 'manual',
+  };
+
   try { libRemoveWorktree(_cfg, repo, name); }
   catch (e) { return { ok: false, error: String(e) }; }
 
+  appendArchivedWorktree(WORKSPACE, archiveRecord);
   prCache.delete(`${repo}/${name}`);
+  lastSeenAt.delete(`${repo}/${name}`);
   return { ok: true };
 }
 
@@ -767,7 +1414,7 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
   if (!name) return { ok: false, error: 'repo name required' };
 
   const label_ = label.trim() || name;
-  const repoDir = `${WORKSPACE}/${name}.git`;
+  const repoDir = repoPath(name);
 
   if (loadProjects(WORKSPACE)[name]) {
     return { ok: false, error: `${name} is already registered` };
@@ -776,11 +1423,9 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
   // Bare clone (existing) or bare init (new)
   mkdirSync(WORKSPACE, { recursive: true });
   if (slug && !existsSync(repoDir)) {
-    const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
-    if (useGh) execFileSync('gh', ['repo', 'clone', slug, repoDir, '--', '--bare']);
-    else execFileSync('git', ['clone', '--bare', `git@github.com:${slug}.git`, repoDir]);
-    git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
-    git(repoDir, ['fetch', '--all', '--prune']);
+    // stdio: 'pipe' (cloneBareRepo's default is 'inherit', for the CLI path):
+    // this is headless, there's no terminal to show clone progress to.
+    cloneBareRepo(repoDir, `git@github.com:${slug}.git`, slug, { stdio: 'pipe' });
   } else if (!slug) {
     mkdirSync(repoDir, { recursive: true });
     execFileSync('git', ['-C', repoDir, 'init', '--bare']);
@@ -816,46 +1461,73 @@ function openInGhostty(wtDir, tool) {
 
 // ── router ────────────────────────────────────────────────────────────────────
 
-async function handle(req) {
-  const { pathname } = new URL(req.url);
-  const method = req.method;
+// Collapses the try/catch-into-500 pattern repeated across the route
+// branches below. fn can be sync or async: `await` on a plain value is a
+// no-op, so this works uniformly for both.
+async function jsonTry(fn) {
+  try { return Response.json(await fn()); }
+  catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+}
 
-  if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
-
-  if (pathname === '/api/status') {
-    const rt = containerRuntimeAvailable();
-    return Response.json({
-      concurrency: { active: procs.size, max: MAX_CONCURRENT_DEV, queued: startQueue.length },
-      container: {
-        engineAvailable: rt.available, engine: rt.engine,
-        memoryLimit: _cfg.containerMemoryLimit ?? '4g',
-        cpuLimit: _cfg.containerCpuLimit ?? 2,
-      },
-    });
-  }
-
-  if (pathname === '/api/agents') return Response.json(detectAgentClis(WORKSPACE));
-
+// Each domain router below returns a Response for a route it owns, or null
+// to fall through to the next one. handle() tries them in order and 404s
+// if none match. Split by domain (worktree lifecycle, project/sweep,
+// settings, raycast) for size, not by rewriting the dispatch logic itself.
+async function projectRoutes(req, pathname, method, server) {
   if (pathname === '/api/projects') return Response.json(
     Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }))
   );
 
   if (method === 'POST' && pathname === '/api/project/add') {
     const body = await req.json().catch(() => ({}));
-    try { return Response.json(addProject(body)); }
-    catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+    return jsonTry(() => addProject(body));
   }
 
   if (method === 'POST' && pathname === '/api/project/remove') {
     const body = await req.json().catch(() => ({}));
-    try { removeProject(WORKSPACE, body.name); return Response.json({ ok: true }); }
-    catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+    return jsonTry(() => { removeProject(WORKSPACE, body.name); return { ok: true }; });
   }
 
+  // Sweep: finds plain git clones already on disk that were never brought
+  // into Setu's bare+worktree layout. GET runs the (async, batched) home
+  // directory walk — see discoverReposAsync's own comment for why this can't
+  // be the synchronous execFileSync path the CLI uses. POST imports one.
+  if (pathname === '/api/sweep') {
+    // Bun.serve's default idleTimeout is 10s — a full $HOME walk (especially
+    // over iCloud-hosted repos, which stall on materialization) genuinely
+    // takes longer than that. Without this, Bun silently drops the
+    // connection mid-scan and the client sees an empty response, not an
+    // error (confirmed live: curl got "Empty reply from server" at ~9s
+    // while the scan kept running server-side unharmed).
+    server?.timeout(req, 0);
+    return jsonTry(() => discoverReposAsync(HOME));
+  }
+
+  if (method === 'POST' && pathname === '/api/sweep/import') {
+    const body = await req.json().catch(() => ({}));
+    const { name, remoteUrl, label } = body;
+    if (!name || !remoteUrl) return Response.json({ ok: false, error: 'name and remoteUrl required' });
+    // Same guard addProject() already uses — a conflicting candidate should
+    // never reach here (the UI disables those rows), but importRepo() itself
+    // would otherwise silently no-op against the wrong existing project.
+    if (loadProjects(WORKSPACE)[name]) return Response.json({ ok: false, error: `${name} is already registered` });
+    return jsonTry(() => {
+      importRepo(_cfg, { name, remoteUrl, label });
+      REPO_META = loadProjects(WORKSPACE);
+      return { ok: true };
+    });
+  }
+
+  return null;
+}
+
+async function settingsRoutes(req, pathname, method) {
+  if (pathname === '/api/agents') return Response.json(detectAgentClis(WORKSPACE));
+
   // Both GET (read current values + real hardware/Docker capacity for the
-  // settings UI's ranges) and POST (persist a change) live on one path —
-  // handled here, before the generic POST body-parsing block below, so a
-  // POST to this path returns from here and never falls through to it.
+  // settings UI's ranges) and POST (persist a change) live on one path.
+  // Handled here, before worktreeRoutes' generic POST block, so a POST to
+  // this path returns from here and never falls through to it.
   if (pathname === '/api/settings') {
     if (method === 'GET') {
       return Response.json({
@@ -886,11 +1558,48 @@ async function handle(req) {
   // to that array), matching saveSidecars()'s per-repo-overwrite shape.
   if (pathname === '/api/sidecars') {
     const p = new URL(req.url).searchParams;
-    if (method === 'GET') return Response.json(loadAllSidecars(WORKSPACE, p.get('repo') ?? ''));
+    if (method === 'GET') {
+      const repo = p.get('repo') ?? '';
+      // `approved` is computed, not stored on the sidecar itself, so the
+      // settings UI can show a per-row badge without a second request.
+      return Response.json(loadAllSidecars(WORKSPACE, repo).map(s => ({ ...s, approved: isSidecarApproved(WORKSPACE, repo, s) })));
+    }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      try { saveSidecars(WORKSPACE, body.repo, body.sidecars ?? []); return Response.json({ ok: true }); }
-      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+      return jsonTry(() => {
+        // Strip the computed `approved` field the GET above adds, in case
+        // the caller round-trips what it fetched. sidecars.json only ever
+        // owns name/enabled/command/args/env, approval lives in its own file.
+        const sidecars = (body.sidecars ?? []).map(({ approved, ...s }) => s);
+        saveSidecars(WORKSPACE, body.repo, sidecars);
+        return { ok: true };
+      });
+    }
+  }
+
+  // Records the CURRENT command/args for one sidecar as approved, looked up
+  // fresh from sidecars.json rather than trusted from the request body, so a
+  // stale client can't approve a command it no longer matches.
+  if (pathname === '/api/sidecar-approvals/approve' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    return jsonTry(() => {
+      const s = loadAllSidecars(WORKSPACE, body.repo).find(x => x.name === body.name);
+      if (!s) throw new Error(`sidecar '${body.name}' not found for ${body.repo}`);
+      approveSidecar(WORKSPACE, body.repo, s.name, s.command, s.args);
+      return { ok: true };
+    });
+  }
+
+  // File sync globs: same per-repo GET/POST shape as sidecars above — GET
+  // returns the repo's glob list for the settings UI to edit, POST replaces
+  // it wholesale. Read by createWorktree on the next worktree it creates for
+  // this repo, not retroactively applied to worktrees that already exist.
+  if (pathname === '/api/file-sync-globs') {
+    const p = new URL(req.url).searchParams;
+    if (method === 'GET') return Response.json(loadFileSyncGlobs(WORKSPACE, p.get('repo') ?? ''));
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(() => { saveFileSyncGlobs(WORKSPACE, body.repo, body.globs ?? []); return { ok: true }; });
     }
   }
 
@@ -900,17 +1609,84 @@ async function handle(req) {
     if (method === 'GET') return Response.json(loadCustomAgents(WORKSPACE));
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      try { saveCustomAgents(WORKSPACE, body.agents ?? []); return Response.json({ ok: true }); }
-      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+      return jsonTry(() => { saveCustomAgents(WORKSPACE, body.agents ?? []); return { ok: true }; });
     }
   }
 
-  if (pathname === '/api/logs') {
-    const p   = new URL(req.url).searchParams;
-    const res = tailLog(p.get('repo'), p.get('name'), p.get('type') ?? 'dev', Number(p.get('n') ?? 150));
-    return Response.json(res);
+  return null;
+}
+
+function mcpCallbackHtml(title, body) {
+  return new Response(
+    `<!doctype html><html><head><title>${title}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${title}</h2><p>${body}</p></body></html>`,
+    { headers: { 'content-type': 'text/html' } },
+  );
+}
+
+// No WebSocket topic for MCP -- RaycastSection's plain setInterval poll is
+// the precedent (status badge + live refresh, no WS), and connect/authorize
+// is either a fast local spawn or a real browser OAuth round-trip the user
+// is already watching, not something that needs sub-second push. mcpRoutes
+// must run before worktreeRoutes, same ordering constraint as every other
+// domain here (see worktreeRoutes' own comment on why).
+async function mcpRoutes(req, pathname, method) {
+  // GET returns config joined with live status from mcp.js, same
+  // "computed field appended to the response" shape /api/sidecars uses for
+  // its approved field. POST replaces the whole (global) list -- connecting
+  // is a separate action below, saving config never connects anything.
+  if (pathname === '/api/mcp-servers') {
+    if (method === 'GET') {
+      const statuses = mcpStatuses();
+      return Response.json(loadMcpServers(WORKSPACE).map(s => ({ ...s, ...(statuses[s.id] ?? { status: 'disconnected', tools: [], stderrTail: [], error: null }) })));
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(() => { saveMcpServers(WORKSPACE, body.servers ?? []); return { ok: true }; });
+    }
   }
 
+  // Fire-and-forget, matching deployToVercel/deployToNetlify's shape: a
+  // stdio connect is fast, but an HTTP+OAuth one involves a real browser
+  // round-trip the user could take minutes to complete, so this can't block
+  // the HTTP response. The actual outcome (connected/awaiting-auth/error)
+  // shows up on the next /api/mcp-servers poll via mcp.js's own status map.
+  if (pathname === '/api/mcp/connect' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    const server = loadMcpServers(WORKSPACE).find(s => s.id === body.id);
+    if (!server) return Response.json({ ok: false, error: 'server not found' }, { status: 404 });
+    connectMcpServer(server, WORKSPACE).catch(() => {}); // internal errors are already caught and recorded in mcp.js's own status map
+    return Response.json({ ok: true });
+  }
+
+  if (pathname === '/api/mcp/disconnect' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    disconnectMcpServer(body.id);
+    return Response.json({ ok: true });
+  }
+
+  // Hit by a real browser tab redirected here by the authorization server,
+  // not the SPA -- returns human-readable HTML on every leg, not JSON. This
+  // is the one route in this domain that doesn't go through jsonTry.
+  if (pathname.startsWith('/api/mcp/oauth/callback/') && method === 'GET') {
+    const serverId = pathname.slice('/api/mcp/oauth/callback/'.length);
+    const p = new URL(req.url).searchParams;
+    if (p.get('error')) {
+      return mcpCallbackHtml('Authorization denied', `The authorization server reported: ${p.get('error_description') ?? p.get('error')}. You can close this tab and try again from Setu.`);
+    }
+    const code = p.get('code');
+    const state = p.get('state');
+    if (!code || !state) return mcpCallbackHtml('Bad callback', 'Missing code or state parameter. You can close this tab and try again from Setu.');
+    const server = loadMcpServers(WORKSPACE).find(s => s.id === serverId);
+    if (!server) return mcpCallbackHtml('Unknown server', 'This server is no longer configured in Setu. You can close this tab.');
+    const result = await finishMcpAuth(server, code, state);
+    if (!result.ok) return mcpCallbackHtml('Authorization failed', `${result.error} You can close this tab and try again from Setu.`);
+    return mcpCallbackHtml('Authorized', 'You can close this tab and return to Setu.');
+  }
+
+  return null;
+}
+
+async function raycastRoutes(req, pathname, method) {
   if (pathname === '/api/raycast/status') {
     return Response.json({ running: !!raycastDev, dirExists: existsSync(RAYCAST_DIR) });
   }
@@ -924,17 +1700,163 @@ async function handle(req) {
   if (method === 'POST' && pathname === '/api/raycast/start') return Response.json(startRaycastDev());
   if (method === 'POST' && pathname === '/api/raycast/stop') return Response.json(stopRaycastDev());
 
+  return null;
+}
+
+// skill is the only piece of the pr-review API surface that ever selects a
+// filesystem path branch (reviews/ vs briefs/) — repo/name are already safe
+// because they resolve through REPO_META/wtPath, but skill comes straight
+// off the query string / POST body, so every route here validates it
+// against this exact allowlist before it ever reaches pr-review.js.
+const PR_REVIEW_SKILLS = new Set(['pr-walkthrough', 'pr-brief']);
+
+// prReviewRoutes must run before worktreeRoutes, same ordering constraint
+// as every other domain here (see worktreeRoutes' own comment on why).
+async function prReviewRoutes(req, pathname, method) {
+  if (pathname === '/api/pr-review/status' && method === 'GET') {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'), name = p.get('name');
+    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    return jsonTry(async () => {
+      const wtDir = wtPath(repo, name);
+      const pluginInstalled = detectPrWalkthroughPlugin(wtDir);
+      const pr = await fetchPR(repo, name);
+      if (!pr.number) return { pluginInstalled, pr: null, run: null, artifacts: {} };
+      const slug = REPO_META[repo]?.slug ?? repo;
+      const headSha = (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
+      const artifacts = {};
+      for (const skill of PR_REVIEW_SKILLS) artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
+      return { pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name), artifacts };
+    });
+  }
+
+  if (pathname === '/api/pr-review/run' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    const { repo, name, skill } = body;
+    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ ok: false, error: 'unknown skill' }, { status: 400 });
+    return jsonTry(async () => {
+      const pr = await fetchPR(repo, name);
+      if (!pr.number) return { ok: false, error: 'no pull request associated with this worktree' };
+      const slug = REPO_META[repo]?.slug ?? repo;
+      touchLastSeen(repo, name);
+      const fd = openLogFd(repo, name, 'pr-review');
+      return runDeepReview(repo, name, skill, {
+        wtDir: wtPath(repo, name), slug, prNumber: pr.number,
+        logFd: fd, logPath: logPath(repo, name, 'pr-review'), spawnText,
+      });
+    });
+  }
+
+  // Serves the report HTML directly (a genuinely self-contained file, only
+  // external refs are Google Fonts <link> tags) — a new tab, not an iframe,
+  // matching the existing "Open in browser" pattern for worktree URLs.
+  if (pathname === '/api/pr-review/artifact' && method === 'GET') {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'), name = p.get('name'), skill = p.get('skill');
+    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ ok: false, error: 'unknown skill' }, { status: 400 });
+    const pr = await fetchPR(repo, name);
+    if (!pr.number) return new Response('No pull request for this worktree', { status: 404 });
+    const slug = REPO_META[repo]?.slug ?? repo;
+    const artifact = findLatestArtifact(slug, pr.number, skill, null);
+    const path = artifact && artifactHtmlPath(slug, pr.number, skill, artifact.snapshot, artifact.htmlFile);
+    if (!path || !existsSync(path)) return new Response('No report generated yet', { status: 404 });
+    return new Response(Bun.file(path));
+  }
+
+  return null;
+}
+
+// The generic `if (method === 'POST')` block below consumes the request
+// body for ANY POST pathname, not just the ones it recognizes, unlike every
+// other domain above, which gates its own req.json() on a specific pathname
+// match first. That's why worktreeRoutes runs last in handle(): a body can
+// only be read once, and if this ran first it would swallow the body meant
+// for e.g. a POST to /api/settings before settingsRoutes ever saw it.
+async function worktreeRoutes(req, pathname, method) {
+  if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
+
+  // Full list, most-recent-first: same client-side-pagination convention
+  // /api/worktrees already uses (the frontend slices into pages, not this
+  // endpoint), so the archive view stays consistent with the main list
+  // instead of inventing server-side pagination just for itself.
+  if (pathname === '/api/worktrees/archived') {
+    return Response.json([...loadArchivedWorktrees(WORKSPACE)].reverse());
+  }
+
+  if (pathname === '/api/status') {
+    return Response.json(computeStatus());
+  }
+
+  if (pathname === '/api/logs') {
+    const p    = new URL(req.url).searchParams;
+    const repo = p.get('repo'), name = p.get('name');
+    // Polling this endpoint only happens while a LogModal/LiveLog panel is
+    // actually mounted for this worktree (portal/components/logs.tsx). That's
+    // a real "someone is watching" signal, unlike the always-on
+    // /api/worktrees list poll. Counts toward the idle-timeout clock below.
+    if (repo && name) touchLastSeen(repo, name);
+    const res  = tailLog(repo, name, p.get('type') ?? 'dev', Number(p.get('n') ?? 150));
+    return Response.json(res);
+  }
+
+  // Deploy status is also folded into /api/worktrees (vercelDeploy field,
+  // same convention as pr/tunnelRunning) for the poll loop the UI already
+  // runs. This exists alongside that fold for a caller that wants just one
+  // worktree's deploy state without fetching the whole list.
+  if (pathname === '/api/vercel/status') {
+    const p = new URL(req.url).searchParams;
+    return Response.json(vercelStatus(p.get('repo'), p.get('name')));
+  }
+
+  // Same "also reachable standalone" convention as /api/vercel/status above.
+  if (pathname === '/api/netlify/status') {
+    const p = new URL(req.url).searchParams;
+    return Response.json(netlifyStatus(p.get('repo'), p.get('name')));
+  }
+
+  // Same "also reachable standalone" convention as /api/vercel/status above.
+  if (pathname === '/api/convex/status') {
+    const p = new URL(req.url).searchParams;
+    return Response.json(convexDeployStatus(p.get('repo'), p.get('name')));
+  }
+
+  // Manual-fetch, not polled (see DiffViewer): a human actually looking at a
+  // worktree's diff is real activity, same as opening its log viewer above.
+  if (pathname === '/api/diff') {
+    const p    = new URL(req.url).searchParams;
+    const repo = p.get('repo'), name = p.get('name');
+    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    touchLastSeen(repo, name);
+    return jsonTry(() => computeDiff(repo, name));
+  }
+
+  // Repo-scoped, not worktree-scoped -- no touchLastSeen call, unlike every
+  // other route in this block (there's no single worktree this action is
+  // "about"). GET-only, so it's safe to sit inside worktreeRoutes despite
+  // that function's own POST-body-consuming hazard (see worktreeRoutes'
+  // comment above) -- a GET never reads req.json().
+  if (pathname === '/api/repo-prs') {
+    const repo = new URL(req.url).searchParams.get('repo');
+    if (!repo) return Response.json({ ok: false, error: 'repo required' }, { status: 400 });
+    return jsonTry(() => fetchRepoPRs(repo));
+  }
+
   if (method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    const { repo, name, tool, tunnel, container } = body;
+    const { repo, name, tool, tunnel, container, target, reason } = body;
     const wtPort = () => getPort(WORKSPACE, repo, name);
+    // Any POST action referencing a specific worktree (start/stop/sync/
+    // tunnel/inngest/trigger/open) is real, user-driven activity. Touch it
+    // once here rather than at each branch below.
+    if (repo && name) touchLastSeen(repo, name);
 
     if (pathname === '/api/create') {
-      try { return Response.json(createWorktree(repo, name, !!tunnel)); }
-      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+      return jsonTry(() => createWorktree(repo, name, !!tunnel));
     }
     if (pathname === '/api/remove') {
-      return Response.json(removeWorktree(repo, name));
+      return Response.json(removeWorktree(repo, name, reason));
     }
     if (pathname === '/api/start') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -962,10 +1884,9 @@ async function handle(req) {
       stopWorktree(repo, name, port); return Response.json({ ok: true });
     }
     if (pathname === '/api/sync') {
-      const wtDir = `${WORKSPACE}/${repo}/${name}`;
-      const repoDir = `${WORKSPACE}/${repo}.git`;
-      try { return Response.json(syncWithBase(wtDir, repoDir)); }
-      catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+      const wtDir = wtPath(repo, name);
+      const repoDir = repoPath(repo);
+      return jsonTry(() => syncWithBase(wtDir, repoDir));
     }
     if (pathname === '/api/tunnel/enable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -988,8 +1909,26 @@ async function handle(req) {
     if (pathname === '/api/trigger/stop') {
       return Response.json(stopTrigger(repo, name));
     }
+    if (pathname === '/api/convex/start') {
+      return Response.json(startConvexDev(repo, name));
+    }
+    if (pathname === '/api/convex/stop') {
+      return Response.json(stopConvexDev(repo, name));
+    }
+    if (pathname === '/api/convex/deploy') {
+      if (!target) return Response.json({ ok: false, error: 'target required' });
+      return jsonTry(() => deployToConvex(repo, name, target));
+    }
+    if (pathname === '/api/vercel/deploy') {
+      if (!target) return Response.json({ ok: false, error: 'target required' });
+      return jsonTry(() => deployToVercel(repo, name, target));
+    }
+    if (pathname === '/api/netlify/deploy') {
+      if (!target) return Response.json({ ok: false, error: 'target required' });
+      return jsonTry(() => deployToNetlify(repo, name, target));
+    }
     if (pathname === '/api/open') {
-      return Response.json(openInGhostty(`${WORKSPACE}/${repo}/${name}`, tool));
+      return Response.json(openInGhostty(wtPath(repo, name), tool));
     }
     if (pathname === '/api/ports/kill') {
       const { port } = body;
@@ -1003,6 +1942,29 @@ async function handle(req) {
     return Response.json(ports.map(p => ({ ...p, worktree: registry[p.port] ?? null })));
   }
 
+  return null;
+}
+
+async function handle(req, server) {
+  const { pathname } = new URL(req.url);
+  const method = req.method;
+
+  // A successful upgrade must not fall through to the route handlers below,
+  // hence the early return before the loop even starts. data seeds ws.data
+  // with the per-connection Set that open/message/close use to track which
+  // logs:* topics this connection currently holds, populated at upgrade
+  // time rather than reassigned later since ServerWebSocket.data is meant
+  // to be set this way, not written to after the fact.
+  if (pathname === '/ws') {
+    if (server.upgrade(req, { data: new Set() })) return;
+    return new Response('Upgrade failed', { status: 400 });
+  }
+
+  // worktreeRoutes must run last, see its own comment for why.
+  for (const routes of [projectRoutes, settingsRoutes, mcpRoutes, prReviewRoutes, raycastRoutes, worktreeRoutes]) {
+    const res = await routes(req, pathname, method, server);
+    if (res) return res;
+  }
   return new Response('Not found', { status: 404 });
 }
 
@@ -1061,8 +2023,7 @@ function checkMemoryCeilings() {
     }
     const mb = processFootprintMb(entry.pid);
     if (mb > DEV_MEM_CEILING_MB) {
-      const si = key.indexOf('/');
-      const repo = key.slice(0, si), name = key.slice(si + 1);
+      const { repo, name } = splitKey(key);
       const port = getPort(WORKSPACE, repo, name);
       console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
       stopWorktree(repo, name, port, { drain: false });
@@ -1072,6 +2033,75 @@ function checkMemoryCeilings() {
 }
 
 setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
+
+// ── idle-timeout auto-stop ───────────────────────────────────────────────────
+// Opt-in (0 = disabled) companion to checkMemoryCeilings above: stops a bare
+// dev server that's been running with no real activity for longer than a
+// configurable window, so a forgotten worktree doesn't sit there burning a
+// concurrency slot (and memory) indefinitely. Disabled by default, since
+// this changes running-server behavior and shouldn't kick in for anyone who
+// hasn't explicitly opted in via .setu.json's idleTimeoutMs.
+//
+// "Activity" = lastSeenAt (set near the top, by the procs Map declarations),
+// which is only touched by genuine user-driven signals: a bare dev server
+// (re)starting (spawnWorktree, reconcileDevServers), any POST action naming
+// this worktree (start/stop/sync/tunnel/inngest/trigger/open), or a poll of
+// its live log viewer (GET /api/logs, which only fires while a LogModal/
+// LiveLog panel is actually open for it). It is deliberately NOT touched by
+// the passive GET /api/worktrees list poll, which the frontend's main loop
+// fires for every worktree every 800ms-3s regardless of whether its card is
+// even visible, let alone whether the browser tab is focused. Keying
+// idleness off that endpoint would mean a worktree never times out just
+// because the dashboard happens to be open somewhere.
+//
+// Verified LiveLog is scoped correctly for this to work: app.tsx only
+// mounts it inside WorktreePage, which only renders for the single worktree
+// on the current /worktree/:repo/:name route (route.page === 'detail'), not
+// in the list/card view. So GET /api/logs only fires for the one worktree a
+// human actually navigated to, not for every running worktree the way the
+// list poll does.
+//
+// Known limitation, not hidden: browsers throttle but don't fully stop
+// timers in an unfocused, backgrounded tab, so a detail page left open in a
+// background tab can keep polling /api/logs (and therefore keep touching
+// lastSeenAt) even once nobody is actually looking at it. There's no
+// session/viewer/visibility tracking in this portal today. Accepted gap for
+// v1, not a claim of perfect accuracy.
+const IDLE_TIMEOUT_MS     = _cfg.idleTimeoutMs ?? 0; // 0 = disabled
+const IDLE_CHECK_INTERVAL = 60_000;
+// Floor under IDLE_TIMEOUT_MS itself: a worktree younger than this never
+// gets reaped even if someone configures a very small timeout, so a dev
+// server that's still booting can't get stopped mid-start.
+const IDLE_MIN_UPTIME_MS = 2 * 60_000;
+
+function checkIdleTimeouts() {
+  if (!IDLE_TIMEOUT_MS) return;
+  const now = Date.now();
+  const threshold = Math.max(IDLE_TIMEOUT_MS, IDLE_MIN_UPTIME_MS);
+  for (const [key, entry] of procs.entries()) {
+    // Container-mode worktrees already have Docker's own lifecycle (restart
+    // policy, plus checkMemoryCeilings' dead-container reap above). This
+    // check is bare-process-only.
+    if (entry.container) continue;
+    // A worktree with an active public tunnel route can be getting real
+    // traffic from outside this portal entirely (someone hitting the public
+    // URL) — none of that shows up as a portal-side request, so lastSeenAt
+    // can't see it. Leave tunneled worktrees out of idle-timeout scope
+    // rather than risk stopping a server that's actually serving traffic.
+    if (activeTunnelMap.has(key)) continue;
+    const seenAt = lastSeenAt.get(key);
+    if (seenAt == null) continue; // no baseline yet, nothing to measure against
+    const idleMs = now - seenAt;
+    if (idleMs < threshold) continue;
+    const { repo, name } = splitKey(key);
+    const port = getPort(WORKSPACE, repo, name);
+    console.warn(`⚠ ${key} idle for ${Math.round(idleMs / 60_000)}m, exceeds ${Math.round(IDLE_TIMEOUT_MS / 60_000)}m idle timeout — stopping`);
+    stopWorktree(repo, name, port);
+    lastSeenAt.delete(key);
+  }
+}
+
+setInterval(checkIdleTimeouts, IDLE_CHECK_INTERVAL);
 
 // Rebuild merged ingress and restart the single tunnel process for all enabled worktrees
 ;(async () => {
@@ -1085,14 +2115,178 @@ setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
   if (activeTunnelMap.size > 0) restartTunnel();
 })();
 
-Bun.serve({
+// ── WebSocket push (real-time sync) ─────────────────────────────────────────
+// Replaces client HTTP polling of /api/worktrees, /api/status and /api/logs
+// with server push over one shared connection. Two kinds of topic share the
+// same tracking Map, same shape as this file's other subscriber-tracked
+// state (vercelDeploys/netlifyDeploys/sidecarProcs above): 'worktrees' (auto
+// subscribed by every connection, driven by open/close) and one
+// `logs:${repo}/${name}/${type}` per open log viewer (subscriber count
+// driven by client {sub}/{unsub} messages instead, since a client only
+// wants a log topic while that viewer is actually mounted). Every entry
+// carries both lastBroadcast (worktrees only, the last published JSON
+// string, so an unchanged tick never republishes) and lastTotal (logs only,
+// tailLog's line count as of the last tick, same idea) so either kind of
+// tick can be a cheap no-op instead of always publishing.
+const wsTopics = new Map(); // topic -> { interval, subscriberCount, lastBroadcast, lastTotal }
+
+// Exactly what GET /api/status already returns, factored out so the HTTP
+// route and the WS tick below can never drift apart from each other.
+function computeStatus() {
+  const rt = containerRuntimeAvailable();
+  return {
+    concurrency: { active: procs.size, max: MAX_CONCURRENT_DEV, queued: startQueue.length },
+    container: {
+      engineAvailable: rt.available, engine: rt.engine,
+      memoryLimit: _cfg.containerMemoryLimit ?? '4g',
+      cpuLimit: _cfg.containerCpuLimit ?? 2,
+    },
+  };
+}
+
+async function wsTickWorktrees() {
+  const entry = wsTopics.get('worktrees');
+  if (!entry) return; // last subscriber left between the tick firing and it actually running
+  // null, not [], on failure: the client does an unconditional setWorktrees
+  // on every push, so broadcasting an empty list here would blank out its
+  // last good state instead of just skipping this tick like a failed poll
+  // used to.
+  const worktrees = await getWorktrees().catch(() => null);
+  if (!worktrees) return;
+  const payload = { worktrees, status: computeStatus() };
+  const json = JSON.stringify(payload);
+  if (json === entry.lastBroadcast) return;
+  entry.lastBroadcast = json;
+  server.publish('worktrees', JSON.stringify({ topic: 'worktrees', data: payload }));
+}
+
+// repo never contains a slash (same assumption splitKey in lib.js makes for
+// the plain `repo/name` key), but name can, e.g. a branch called
+// "feature/foo", so repo comes from the first slash, type from the last
+// slash, and name is whatever sits between the two.
+function splitLogTopic(topic) {
+  const rest = topic.slice('logs:'.length);
+  const firstSlash = rest.indexOf('/');
+  const lastSlash = rest.lastIndexOf('/');
+  if (firstSlash === -1 || firstSlash === lastSlash) return null; // not repo/name/type shaped
+  return {
+    repo: rest.slice(0, firstSlash),
+    name: rest.slice(firstSlash + 1, lastSlash),
+    type: rest.slice(lastSlash + 1),
+  };
+}
+
+function wsTickLog(topic, repo, name, type) {
+  const entry = wsTopics.get(topic);
+  if (!entry) return; // last subscriber left between the tick firing and it actually running
+  const { lines, total } = tailLog(repo, name, type);
+  if (total === entry.lastTotal) return; // nothing new since the last tick
+  const rotated = total < entry.lastTotal; // rotateLog renamed the file out from under the cursor
+  const delta = total - entry.lastTotal;
+  const newLines = rotated || delta > lines.length ? lines : lines.slice(-delta);
+  entry.lastTotal = total;
+  server.publish(topic, JSON.stringify({ topic, data: newLines }));
+}
+
+function wsSubscribeLog(ws, topic) {
+  if (!topic.startsWith('logs:')) return; // only logs:* topics are sub/unsub driven, see 'worktrees' handling in open/close
+  const parsed = splitLogTopic(topic);
+  if (!parsed) return; // malformed topic, ignore silently same as a malformed frame
+  const { repo, name, type } = parsed;
+  ws.subscribe(topic);
+  ws.data.add(topic);
+  let entry = wsTopics.get(topic);
+  if (!entry) {
+    entry = { interval: null, subscriberCount: 0, lastBroadcast: null, lastTotal: null };
+    wsTopics.set(topic, entry);
+  }
+  entry.subscriberCount++;
+  const { lines, total } = tailLog(repo, name, type);
+  if (entry.subscriberCount === 1) {
+    // First subscriber starts the tick, baselined on this same tailLog call
+    // (not zero), so the first 1000ms tick diffs against real state instead
+    // of re-publishing everything as "new" a second time. This connection's
+    // catch-up is the whole window tailLog just returned.
+    entry.lastTotal = total;
+    entry.interval = setInterval(() => wsTickLog(topic, repo, name, type), 1000);
+    ws.send(JSON.stringify({ topic, data: lines }));
+  } else {
+    // A later subscriber joining an already-ticking topic. Lines beyond the
+    // shared entry.lastTotal baseline are about to go out to everyone (this
+    // connection included, it's already ws.subscribe()'d above) on the next
+    // regular tick, so trim them out of this one-time catch-up. Otherwise
+    // the client's accumulate-by-concat log view would see them twice, once
+    // here and once from that tick's publish.
+    const pending = total - entry.lastTotal;
+    const catchUp = pending > 0 ? lines.slice(0, lines.length - pending) : lines;
+    ws.send(JSON.stringify({ topic, data: catchUp }));
+  }
+}
+
+function wsUnsubscribeLog(ws, topic) {
+  if (!ws.data.has(topic)) return; // not actually subscribed, nothing to do
+  ws.unsubscribe(topic);
+  ws.data.delete(topic);
+  const entry = wsTopics.get(topic);
+  if (!entry) return;
+  entry.subscriberCount--;
+  if (entry.subscriberCount <= 0) {
+    clearInterval(entry.interval);
+    wsTopics.delete(topic);
+  }
+}
+
+async function open(ws) {
+  // ws.data (a Set of logs:* topics this connection currently holds) was
+  // already seeded at server.upgrade(req, { data: new Set() }) in handle().
+  // 'worktrees' isn't tracked in it since every connection always holds
+  // exactly one, unconditionally, so close() below decrements it directly.
+  ws.subscribe('worktrees');
+  let entry = wsTopics.get('worktrees');
+  if (!entry) {
+    entry = { interval: null, subscriberCount: 0, lastBroadcast: null, lastTotal: null };
+    wsTopics.set('worktrees', entry);
+  }
+  entry.subscriberCount++;
+  if (entry.subscriberCount === 1) entry.interval = setInterval(wsTickWorktrees, 3000);
+  // Always send this connection its own immediate snapshot, independent of
+  // the shared tick's diff-guard. Without this, a tab whose WS drops and
+  // reconnects while other tabs stay connected would sit on stale state
+  // until entry.lastBroadcast (shared across every subscriber) next
+  // actually changes -- the diff-guard exists to skip redundant broadcasts
+  // to already-synced connections, not to gate a brand new one's first sync.
+  const worktrees = await getWorktrees().catch(() => null);
+  if (worktrees) ws.send(JSON.stringify({ topic: 'worktrees', data: { worktrees, status: computeStatus() } }));
+}
+
+function message(ws, raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; } // a stray non-JSON frame must not crash the connection
+  if (!msg || typeof msg !== 'object') return;
+  if (typeof msg.sub === 'string') wsSubscribeLog(ws, msg.sub);
+  else if (typeof msg.unsub === 'string') wsUnsubscribeLog(ws, msg.unsub);
+}
+
+function close(ws) {
+  for (const topic of [...ws.data]) wsUnsubscribeLog(ws, topic);
+  const entry = wsTopics.get('worktrees');
+  if (!entry) return;
+  entry.subscriberCount--;
+  if (entry.subscriberCount <= 0) {
+    clearInterval(entry.interval);
+    wsTopics.delete('worktrees');
+  }
+}
+
+const server = Bun.serve({
   port: PORT,
   // Both routes serve the identical SPA shell — the client-side router (app.tsx)
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage },
+  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage, '/archived': indexPage },
   fetch: handle,
+  websocket: { open, message, close },
   development: false,
 });
 console.log(`Portal → http://quivly.local  (localhost:${PORT})`);

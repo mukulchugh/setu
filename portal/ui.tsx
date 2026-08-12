@@ -80,15 +80,45 @@ export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target
 // fill the row anywhere it was reused unwrapped (e.g. a Section's actions
 // slot). Call sites that actually want two buttons to split width evenly
 // (Cancel/Create, Cancel/Add) add flex-1 explicitly themselves.
-const buttonBase = 'whitespace-nowrap board-mono text-[11px] font-bold px-4 py-2.5 rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px';
-export function PrimaryButton({ onClick, disabled, children, class: cls = '' }: { onClick?: () => void; disabled?: boolean; children: any; class?: string }) {
-  return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${cls} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
+// Padding is a variant, not part of the shared base — a later class in the
+// string isn't guaranteed to beat an earlier one in Tailwind's generated
+// stylesheet order, so "compact" swaps px-3/py-1.5 in outright instead of
+// trying to override px-4/py-2.5 via an appended class (the same footgun
+// documented on flex-1 above).
+const buttonBase = 'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px';
+export function PrimaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: any; class?: string; compact?: boolean }) {
+  return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
 }
-export function SecondaryButton({ onClick, children, class: cls = '' }: { onClick?: () => void; children: any; class?: string }) {
-  return <button onClick={onClick} class={`${buttonBase} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
+export function SecondaryButton({ onClick, children, class: cls = '', compact = false }: { onClick?: () => void; children: any; class?: string; compact?: boolean }) {
+  return <button onClick={onClick} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
 }
 
-export function Modal({ onClose, children, position = 'center' }: any) {
+// Toast state (id/tone/timeout) lives in App — the one place that already
+// threads a `toast` prop through every route (WorktreePage, SettingsPage).
+// This just renders the stack; App decides what and when.
+export type ToastItem = { id: number; msg: string; tone: Tone };
+
+const TOAST_BG: Record<Tone, string> = {
+  red: 'bg-signal-red/95 border-signal-red', emerald: 'bg-signal-green/95 border-signal-green',
+  amber: 'bg-signal-amber/95 border-signal-amber', zinc: 'bg-zinc-900/95 border-zinc-800',
+};
+
+export function ToastStack({ toasts, onDismiss }: { toasts: ToastItem[]; onDismiss: (id: number) => void }) {
+  if (!toasts.length) return null;
+  return (
+    <div class="fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] flex flex-col-reverse gap-2 items-center">
+      {toasts.map(t => (
+        <button key={t.id} onClick={() => onDismiss(t.id)}
+          class={`text-xs text-white text-left px-4 py-2.5 rounded-none shadow-lg max-w-md border backdrop-blur-md
+            transition-all duration-200 ease-out animate-[fadeUp_0.2s_ease-out] ${TOAST_BG[t.tone]}`}>
+          {t.msg}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function Modal({ onClose, children, position = 'center' }: { onClose: () => void; children: any; position?: 'center' | 'bottom' }) {
   return (
     <div class={`fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex transition-opacity duration-200 ${position === 'bottom' ? 'items-end justify-stretch' : 'items-center justify-center'}`}
       onClick={(e: any) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -97,10 +127,16 @@ export function Modal({ onClose, children, position = 'center' }: any) {
   );
 }
 
+// Shared X-mark path — CloseBtn below and app.tsx's SidecarRow/CustomAgentRow
+// remove buttons all draw the same icon at different sizes.
+export function CloseIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
+  return <svg class={cls} fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>;
+}
+
 export function CloseBtn({ onClick }: { onClick: () => void }) {
   return (
     <button onClick={onClick} class="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors duration-200">
-      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+      <CloseIcon />
     </button>
   );
 }
@@ -141,12 +177,24 @@ export function MenuItem({ onClick, tone = 'zinc', icon, children }: { onClick: 
 
 export const inputCls = 'bg-white border border-zinc-200 text-zinc-800 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-zinc-400 placeholder-zinc-400 transition-colors duration-150';
 
+// Semantic <kbd> for shortcut badges (⌘K etc.) instead of a plain styled span.
+export function Kbd({ children }: { children: any }) {
+  return (
+    <kbd class="board-mono text-[9px] font-bold text-zinc-500 dark:text-zinc-400 border border-zinc-300 dark:border-zinc-700 rounded-none px-1.5 py-0.5">
+      {children}
+    </kbd>
+  );
+}
+
 // Two real call sites (the list view's header, the worktree detail page) is
 // enough to know the right shape — not built ahead of a second consumer.
 export function PageHeader({ back, title, subtitle, actions }: { back?: { label: string; onClick: () => void }; title: any; subtitle?: any; actions?: any }) {
   // Transparent at rest — the glass/blur backdrop only appears once content
   // has actually scrolled underneath (position:sticky has no stable CSS way
-  // to select "currently stuck", so this is tracked directly).
+  // to select "currently stuck", so this is tracked directly). Stuck state
+  // also compresses the header (shorter padding, smaller title) the way
+  // Linear/Vercel-style dashboards do — a relaxed hero at rest, a tight
+  // utility bar once you're scrolling past it.
   const [stuck, setStuck] = useState(false);
   useEffect(() => {
     const onScroll = () => setStuck(window.scrollY > 4);
@@ -155,11 +203,13 @@ export function PageHeader({ back, title, subtitle, actions }: { back?: { label:
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
   return (
-    <div class={`sticky top-0 z-30 -mx-6 px-6 pt-6 pb-4 mb-6 transition-colors duration-200 ${
-      stuck ? 'backdrop-blur-md bg-board/85 dark:bg-board-dark/85 shadow-sm' : 'bg-transparent'}`}>
+    <div class={`sticky top-0 z-30 -mx-6 px-6 mb-6 border-b transition-all duration-300 ease-out ${
+      stuck
+        ? 'pt-3 pb-3 backdrop-blur-lg bg-board/90 dark:bg-board-dark/90 border-zinc-200/70 dark:border-white/10 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.18)]'
+        : 'pt-6 pb-4 bg-transparent border-transparent'}`}>
       {back && (
         <button onClick={back.onClick} class="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-600 transition-colors duration-150 mb-2">
-          <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M15 6l-6 6l6 6" /></svg>
           {back.label}
         </button>
       )}
@@ -170,10 +220,11 @@ export function PageHeader({ back, title, subtitle, actions }: { back?: { label:
           down into the subtitle row. Subtitle now lives on its own full-width
           line, immune to whatever height the actions row happens to be. */}
       <div class="flex items-center justify-between flex-wrap gap-y-3">
-        <h1 class="board-mono text-[22px] font-bold text-ink dark:text-ink-dark leading-none truncate">{title}</h1>
+        <h1 class={`board-mono font-bold text-ink dark:text-ink-dark leading-none truncate transition-all duration-300 ease-out ${
+          stuck ? 'text-[15px]' : 'text-[22px]'}`}>{title}</h1>
         {actions && <div class="flex items-center gap-2 flex-wrap justify-end">{actions}</div>}
       </div>
-      {subtitle && <div class="mt-3">{subtitle}</div>}
+      {subtitle && !stuck && <div class="mt-3">{subtitle}</div>}
     </div>
   );
 }

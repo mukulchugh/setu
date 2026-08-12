@@ -10,15 +10,16 @@ import {
 } from 'fs';
 import { join, resolve } from 'path';
 import {
-  HOME, CFG_PATH, SETU_DIR, PORTAL_PORT, HOSTS_TMP,
+  HOME, SETU_DIR, PORTAL_PORT, HOSTS_TMP, HOSTS_START,
   BREW_PREFIX, CADDY_BIN, CLOUDFLARED_BIN,
   loadConfig, saveConfig, requireConfig,
   localDomain, publicDomain, envLocalPath, parseEnvFile, tunnelEnabled, pinnedTriggerVersion,
-  writeCaddy, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject,
+  reloadCaddy, syncHosts,
+  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects,
   git, createWorktree, removeWorktree,
+  discoverRepos, importRepo,
   portalPid, portalRequest, commandExists, killGroup, containerRuntimeAvailable,
-  engineCapacity, parseMemToMb,
+  engineCapacity, parseMemToMb, spawnText,
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
@@ -91,6 +92,7 @@ switch (cmd) {
   case 'rm':      await cmdRm(); break;
   case 'ls':      await cmdLs(); break;
   case 'init':    await cmdInit(); break;
+  case 'sweep':   await cmdSweep(); break;
   case 'status':  await cmdLs(); break;
   case 'start':   await cmdStart(); break;
   case 'stop':    await cmdStop(); break;
@@ -138,6 +140,16 @@ function ask(rl, question, defaultVal) {
 function sudoTee(content, dest, mode) {
   execFileSync('sudo', ['tee', dest], { input: content, stdio: ['pipe', 'ignore', 'inherit'] });
   if (mode) execFileSync('sudo', ['chmod', mode, dest], { stdio: 'ignore' });
+}
+
+// Collapses the `.catch(e => ({ok:false,error:String(e)}))` -> `if (!res.ok)
+// die(...)` pattern repeated across most portalRequest call sites below.
+// Not every call site wants this: some warn and continue instead of dying,
+// so those stay on portalRequest directly.
+async function portalCall(path, body, failMsg) {
+  const res = await portalRequest(path, body).catch(e => ({ ok: false, error: String(e) }));
+  if (!res.ok) die(res.error ?? failMsg);
+  return res;
 }
 
 async function ensurePortal(c) {
@@ -382,8 +394,7 @@ async function cmdRm() {
   const c = cfg();
   // Portal owns dev-server/tunnel processes — let it stop them + clean up
   if (portalPid()) {
-    const res = await portalRequest('/api/remove', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
-    if (!res.ok) die(res.error ?? 'remove failed');
+    await portalCall('/api/remove', { repo, name }, 'remove failed');
   } else {
     try { removeWorktree(c, repo, name); } catch (e) { die(e.message); }
   }
@@ -411,8 +422,7 @@ async function cmdStart() {
   const body = { repo, name };
   if (flags.container) body.container = true;
   else if (flags.bare) body.container = false;
-  const res = await portalRequest('/api/start', body).catch(e => ({ ok: false, error: String(e) }));
-  if (!res.ok) die(res.error ?? 'start failed');
+  const res = await portalCall('/api/start', body, 'start failed');
   ok(`started ${repo}/${name}${res.queued ? ' (queued)' : res.container ? ' (containerized)' : ' (bare)'}`);
 }
 
@@ -420,8 +430,7 @@ async function cmdStop() {
   const [repo, name] = args;
   if (!repo || !name) die('Usage: setu stop <repo> <branch>');
   if (!portalPid()) { console.log('Portal not running — nothing to stop.'); return; }
-  const res = await portalRequest('/api/stop', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
-  if (!res.ok) die(res.error ?? 'stop failed');
+  await portalCall('/api/stop', { repo, name }, 'stop failed');
   ok(`stopped ${repo}/${name}`);
 }
 
@@ -445,6 +454,13 @@ async function cmdPrune() {
 
   if (!flags.force) { console.log(`  run with ${B}--force${R} to kill ${orphans.length > 1 ? 'them' : 'it'}\n`); return; }
 
+  // Raw single-pid kill, not killGroup() (lib.js): these pids come from a
+  // live lsof scan, not anything setu spawned, so there's no spawn record to
+  // say whether the pid owns its own process group. killGroup would still
+  // "work" (fall back to a single kill) if it doesn't, but blasting the group
+  // on a pid we have zero attribution for risks killing an unrelated process
+  // that just happens to share it (e.g. an interactive shell's foreground
+  // job). A raw single-pid kill matches exactly what --force authorized.
   for (const p of orphans) {
     try { execFileSync('kill', [p.pid]); ok(`killed pid ${p.pid} (:${p.port})`); }
     catch (e) { fail(`pid ${p.pid}: ${e.message}`); }
@@ -479,25 +495,59 @@ async function cmdLs() {
 async function cmdInit() {
   const [slug, label] = args;
   if (!slug) die('Usage: setu init quivly/quivly-app [label]');
-  const c = cfg();
-  const repo    = slug.split('/').pop();
-  const repoDir = join(c.workspace, `${repo}.git`);
+  const c    = cfg();
+  const repo = slug.split('/').pop();
 
-  if (!existsSync(repoDir)) {
-    console.log(`  Cloning ${slug}...`);
-    const useGh = spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
-    if (useGh) {
-      execFileSync('gh', ['repo', 'clone', slug, repoDir, '--', '--bare'], { stdio: 'inherit' });
-    } else {
-      execFileSync('git', ['clone', '--bare', `git@github.com:${slug}.git`, repoDir], { stdio: 'inherit' });
-    }
-    git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
-    git(repoDir, ['fetch', '--all', '--prune']);
-  }
+  if (!existsSync(join(c.workspace, `${repo}.git`))) console.log(`  Cloning ${slug}...`);
+  try { importRepo(c, { name: repo, remoteUrl: `git@github.com:${slug}.git`, label }); }
+  catch (e) { die(e.message); }
 
-  registerProject(c.workspace, { name: repo, slug, label });
   args.length = 0; args.push(repo, 'main');
   await cmdNew();
+}
+
+// ── setu sweep [--import <name>] [--json] ─────────────────────────────────────
+// Finds plain git clones already on disk that were never brought into Setu's
+// bare-repo+worktree layout, and can bring one in on request. Read-only
+// until --import is passed.
+
+async function cmdSweep() {
+  const c = cfg();
+  // Not just cosmetic: a $HOME with old clones sitting on iCloud Drive can
+  // take a while on a cold cache (each git call is capped, see
+  // SWEEP_GIT_TIMEOUT_MS in lib.js, but a few dozen capped calls still add
+  // up) — without this, a slow scan looks identical to a hung one.
+  if (!asJson) spin(`Scanning ${HOME} for git repos`);
+  const candidates = discoverRepos(HOME);
+  if (!asJson) done();
+
+  if (!flags.import) {
+    if (asJson) { console.log(JSON.stringify(candidates, null, 2)); return; }
+    if (!candidates.length) { console.log('Nothing to sweep in, everything found is already registered.'); return; }
+    console.log();
+    for (const cand of candidates) {
+      const remote = cand.remoteUrl ?? 'no remote';
+      const dirtyFlag = cand.dirty ? `${Y}dirty${R}` : `${GR}clean${R}`;
+      const statusLabel = cand.status === 'importable' ? `${G}importable${R}`
+        : cand.status === 'no-remote' ? `${GR}no remote${R}`
+        : `${Y}conflict with ${cand.conflictWith}${R}`;
+      console.log(`  ${B}${cand.name}${R}  ${GR}${cand.path}${R}`);
+      console.log(`    ${remote}  ${dirtyFlag}  ${statusLabel}`);
+    }
+    console.log(`\n  ${candidates.length} candidate${candidates.length === 1 ? '' : 's'} found. Use --import <name> to bring one in.\n`);
+    return;
+  }
+
+  const name = flags.import;
+  const cand = candidates.find(x => x.name === name);
+  if (!cand) die(`No sweep candidate named '${name}'. Run \`setu sweep\` to list candidates.`);
+  if (cand.status === 'conflict') die(`'${name}' conflicts with already-registered project '${cand.conflictWith}'. Rename or resolve first.`);
+  if (cand.status === 'no-remote') die(`'${name}' has no remote, nothing to clone from.`);
+
+  console.log(`  Importing ${name} from ${cand.remoteUrl}...`);
+  try { importRepo(c, { name: cand.name, remoteUrl: cand.remoteUrl, label: cand.name }); }
+  catch (e) { die(e.message); }
+  ok(`imported ${name} into ${c.workspace}/${name}.git, worktree main ready`);
 }
 
 // ── setu portal [stop] ────────────────────────────────────────────────────────
@@ -528,9 +578,7 @@ async function cmdPortal() {
 
 async function ensureTunnel(c, repo, name) {
   await ensurePortal(c);
-  const res = await portalRequest('/api/tunnel/enable', { repo, name })
-    .catch(e => ({ ok: false, error: String(e) }));
-  if (!res.ok) die(res.error ?? 'tunnel enable failed');
+  await portalCall('/api/tunnel/enable', { repo, name }, 'tunnel enable failed');
 }
 
 async function cmdTunnel() {
@@ -541,9 +589,7 @@ async function cmdTunnel() {
 
   if (action === 'stop') {
     if (!portalPid()) { console.log('Portal not running — tunnel already down.'); return; }
-    const res = await portalRequest('/api/tunnel/disable', { repo, name })
-      .catch(e => ({ ok: false, error: String(e) }));
-    if (!res.ok) die(res.error ?? 'tunnel disable failed');
+    await portalCall('/api/tunnel/disable', { repo, name }, 'tunnel disable failed');
     ok(`tunnel disabled for ${repo}/${name}`);
     return;
   }
@@ -586,12 +632,10 @@ async function cmdTrigger() {
   // see each other and nothing stops both from running at once.
   if (portalPid()) {
     if (action === 'stop') {
-      const res = await portalRequest('/api/trigger/stop', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
-      if (!res.ok) die(res.error ?? 'stop failed');
+      await portalCall('/api/trigger/stop', { repo, name }, 'stop failed');
       ok(`stopped trigger dev for ${repo}/${name}`);
     } else {
-      const res = await portalRequest('/api/trigger/start', { repo, name }).catch(e => ({ ok: false, error: String(e) }));
-      if (!res.ok) die(res.error ?? 'start failed');
+      await portalCall('/api/trigger/start', { repo, name }, 'start failed');
       ok(`Trigger dev started for ${repo}/${name} (via portal)`);
     }
     return;
@@ -758,15 +802,16 @@ function cmdVersion() {
 
 // ── setu doctor [--json] ──────────────────────────────────────────────────────
 
-// Bun.spawn, not execFileSync/spawnSync — checks run concurrently (Promise.all
-// below) instead of one after another; a blocking exec call per check would
-// serialize them on the event loop regardless of the Promise.all wrapper.
-async function spawnText(cmd, args) {
+// lib.js's spawnText() covers every check below except sudoOk, which needs
+// the process exit code to tell "denied" from "allowed". spawnText() only
+// returns stdout text, so this stays a thin local variant instead of forcing
+// that shape onto every caller.
+async function spawnTextCode(cmd, args) {
   try {
     const proc = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'ignore' });
     const text = await new Response(proc.stdout).text();
     await proc.exited;
-    return { text, code: proc.exitCode };
+    return { text: text.trim(), code: proc.exitCode };
   } catch { return { text: '', code: 1 }; }
 }
 
@@ -775,14 +820,17 @@ async function cmdDoctor() {
   const workspace = c.workspace ?? '';
 
   // Shared across multiple checks below — fetch once, not once per check.
-  const [servicesRes, digRes, caddyAdmin] = await Promise.all([
-    spawnText('brew', ['services', 'list']),
-    spawnText('dig', ['+short', '+time=1', '+tries=1', 'test.quivly.local', '@127.0.0.1']),
+  // Bun.spawn (via spawnText), not execFileSync/spawnSync: checks run
+  // concurrently (Promise.all) instead of one after another; a blocking exec
+  // call per check would serialize them on the event loop regardless of the
+  // Promise.all wrapper.
+  const [services, digText, caddyAdmin] = await Promise.all([
+    spawnText(['brew', 'services', 'list']),
+    spawnText(['dig', '+short', '+time=1', '+tries=1', 'test.quivly.local', '@127.0.0.1']),
     fetch('http://localhost:2019/config/', { signal: AbortSignal.timeout(1500) }).then(r => r.ok).catch(() => false),
   ]);
-  const services    = servicesRes.text;
   const dnsmasqLine = services.split('\n').find(l => l.startsWith('dnsmasq')) ?? '';
-  const sudoOk      = async (argv) => (await spawnText('sudo', ['-n', '-l', ...argv])).code === 0;
+  const sudoOk      = async (argv) => (await spawnTextCode('sudo', ['-n', '-l', ...argv])).code === 0;
 
   const checkThunks = [
     ...['caddy', 'cloudflared', 'dnsmasq', 'direnv'].map(pkg => async () => (
@@ -794,7 +842,7 @@ async function cmdDoctor() {
       ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
       fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
     }),
-    async () => ({ name: 'dnsmasq resolves *.quivly.local', ok: digRes.text.includes('127.0.0.1'), fix: 'sudo brew services restart dnsmasq (then re-check)' }),
+    async () => ({ name: 'dnsmasq resolves *.quivly.local', ok: digText.includes('127.0.0.1'), fix: 'sudo brew services restart dnsmasq (then re-check)' }),
     async () => ({ name: '/etc/resolver/quivly.local', ok: existsSync('/etc/resolver/quivly.local'), fix: 'setu setup' }),
     async () => ({ name: 'caddy service', ok: /^caddy\s+started/m.test(services), fix: 'brew services restart caddy' }),
     async () => ({ name: 'caddy admin API (:2019)', ok: caddyAdmin, fix: 'brew services restart caddy' }),
@@ -831,14 +879,14 @@ async function cmdDoctor() {
       fix: 'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)',
     }),
     async () => ({ name: 'sudoers: hosts sync', ok: await sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']), fix: 'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)' }),
-    async () => ({ name: '/etc/hosts quivly block', ok: readFileSync('/etc/hosts', 'utf8').includes('# quivly-start'), fix: 'setu new <repo> <branch> (or any command that syncs hosts)' }),
+    async () => ({ name: '/etc/hosts quivly block', ok: readFileSync('/etc/hosts', 'utf8').includes(HOSTS_START), fix: 'setu new <repo> <branch> (or any command that syncs hosts)' }),
     async () => ({ name: 'cloudflared cert', ok: existsSync(join(HOME, '.cloudflared', 'cert.pem')), fix: 'cloudflared tunnel login' }),
   ];
 
   if (c.tunnel) {
     checkThunks.push(async () => {
-      const tl = await spawnText(CLOUDFLARED_BIN, ['tunnel', 'list']);
-      return { name: `tunnel ${c.tunnel} exists`, ok: tl.text.split('\n').some(l => l.includes(` ${c.tunnel} `)), fix: `cloudflared tunnel create ${c.tunnel}` };
+      const tl = await spawnText([CLOUDFLARED_BIN, 'tunnel', 'list']);
+      return { name: `tunnel ${c.tunnel} exists`, ok: tl.split('\n').some(l => l.includes(` ${c.tunnel} `)), fix: `cloudflared tunnel create ${c.tunnel}` };
     });
   }
 
@@ -950,6 +998,8 @@ function cmdHelp() {
 
   ${C}Repos${R}
     setu init  <gh-slug>             Clone repo + create main worktree
+    setu sweep                       Find plain git clones outside Setu, not yet registered
+    setu sweep --import <name>       Bring one in (bare-clone + register + main worktree)
     setu new   <repo> <branch>       Create worktree (auto port + domain)
     setu new   <repo> <branch> --tunnel   ...and take the public URL
     setu new   <repo> <branch> --start    ...and start its dev server (new worktree → containerized; see below)

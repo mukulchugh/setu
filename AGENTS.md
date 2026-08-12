@@ -57,7 +57,7 @@ refuses connection.
 | GET `/api/projects` | — | registered repos |
 | GET `/api/agents` | — | `[{id, label}]` — AI coding CLIs detected installed on this machine (live `which` check, not a fixed list) |
 | GET `/api/ports` | — | processes listening on 3000–3999 (batched single `lsof` call, ~1-2s cached) |
-| GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|trigger\|sidecar-<name>\|tunnel` | — | tail of that log |
+| GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|trigger\|sidecar-<name>\|tunnel\|pr-review` | — | tail of that log |
 | POST `/api/create` | `{repo, name, tunnel?}` | create worktree (bun install runs in background — poll the `setup` log) |
 | POST `/api/remove` | `{repo, name}` | stop + remove worktree |
 | POST `/api/start` | `{repo, name, container?}` | start dev server. `container: true`/`false` forces that mode. **Omit the field entirely** (not `null` — actually absent) to get the sticky per-worktree default (see Container mode below) instead of a flat global one — this is what the portal UI's Start button does. Container mode requires a reachable Docker-API-compatible daemon, any engine — fails with an explicit error rather than silently falling back to bare if none is reachable. Returns `{ok:true, container}` if actually started (the resolved mode, useful when the caller didn't force one), or `{ok:true, queued:true, position:N, container}` if the concurrent-server cap (`maxConcurrentDevServers`, default 3) is already reached; auto-starts sidecars from `sidecars.json` alongside it |
@@ -67,6 +67,9 @@ refuses connection.
 | POST `/api/inngest/start` / `/api/inngest/stop` | `{repo, name}` | inngest dev server |
 | POST `/api/trigger/start` / `/api/trigger/stop` | `{repo, name}` | trigger.dev dev server (version pinned to the worktree's @trigger.dev/sdk); spawned detached and stopped via its real process group, not just the tracked PID |
 | POST `/api/ports/kill` | `{port}` | stop whatever's on that port — routed through the real container stop path if it belongs to a known container-backed worktree (a raw SIGTERM to a container-published port would hit the engine's port-forwarding helper, not the dev server), otherwise a plain SIGTERM to the PID (bare processes, and unregistered/orphaned ports — `setu prune`'s case) |
+| GET `/api/pr-review/status?repo=&name=` | — | pr-walkthrough plugin install status (scope-checked against this worktree), current deep-review run state, and artifact info (findings count, staleness vs. current HEAD) for `pr-walkthrough`/`pr-brief` if either has been run against this PR |
+| POST `/api/pr-review/run` | `{repo, name, skill}` | fire-and-forget: headlessly invokes the installed `pr-walkthrough`/`pr-brief` Claude Code plugin (`skill` must be one of those two) against this worktree's PR via `claude -p`, single-flight per worktree (both skills share one slot and one log). See `pr-review.js` for the invocation/security model |
+| GET `/api/pr-review/artifact?repo=&name=&skill=` | — | serves the most recent run's self-contained report HTML directly |
 
 All POSTs return `{ok: boolean, error?: string, ...}`. A `queued: true` response means the
 action was accepted but not yet performed — poll `/api/worktrees` and check `active`, not
@@ -165,4 +168,5 @@ would leak forever with nothing left pointing at it.
 - Concurrency: `maxConcurrentDevServers` in `~/.setu.json` (default 3) caps how many dev servers the portal will run at once; anything beyond that queues via `/api/start`'s `queued`/`position` response. Applies identically to bare and containerized worktrees — they share one cap. See "Container mode" above for the same-worktree-restart edge case this cap has to account for.
 - Container mode: see the dedicated section above — it's the default now, not an opt-in aside.
 - AI coding CLI registry: `AGENT_CLIS` in `lib.js` (tool-id → binary name), detected live via `which` — not a fixed list. Add a new tool by adding one entry there; no other file needs to change.
-- Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>}.log`.
+- Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>,pr-review}.log`.
+- PR review (`pr-review.js`): Tier 1 is the existing "Local diff" section (`computeDiff`/`/api/diff`) — a worktree-branch-vs-base diff, not the actual GitHub PR diff, labeled accordingly. Tier 2 shells out to the installed `pr-walkthrough`/`pr-brief` Claude Code plugin headlessly (`claude -p`, `--permission-mode acceptEdits`, `--tools` dropping `Edit`, `--disallowedTools` denying GH/git write-shaped Bash commands as the primary guard — verified empirically, not assumed, see the plugin-marketplace plan). Reads `~/.local/share/pr-walkthrough/{reviews,briefs}/<owner>/<repo>/pr-<N>/latest.json` + that snapshot's `manifest.json` for status/artifacts, never the multi-MB `guide.json`/`brief.json` directly.

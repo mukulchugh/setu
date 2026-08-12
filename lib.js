@@ -5,10 +5,10 @@
 import { execFileSync, spawnSync } from 'child_process';
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
-  mkdirSync, unlinkSync, realpathSync,
+  mkdirSync, unlinkSync, realpathSync, copyFileSync, chmodSync,
 } from 'fs';
 import { homedir, cpus, totalmem } from 'os';
-import { join, resolve } from 'path';
+import { join, resolve, dirname } from 'path';
 import { createHash } from 'crypto';
 
 export const HOME        = homedir();
@@ -17,6 +17,8 @@ export const SETU_DIR    = join(HOME, '.setu');
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
 export const HOSTS_TMP   = '/tmp/setu-hosts';
+export const HOSTS_START = '# quivly-start';
+export const HOSTS_END   = '# quivly-end';
 
 export const BREW_PREFIX = (() => {
   try { return execFileSync('brew', ['--prefix'], { encoding: 'utf8' }).trim(); }
@@ -70,6 +72,30 @@ export function parseEnvFile(path) {
     if (m) out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
   }
   return out;
+}
+
+function hasConvexEnv(dir) {
+  const env = { ...parseEnvFile(join(dir, '.env')), ...parseEnvFile(join(dir, '.env.local')) };
+  return typeof env.CONVEX_DEPLOYMENT === 'string' && env.CONVEX_DEPLOYMENT.length > 0;
+}
+
+// Convex is configured for a worktree when either signal is present: a
+// convex/ folder (checked into git, present from a fresh clone before anyone
+// has ever run `convex dev` locally) or a CONVEX_DEPLOYMENT line (written by
+// a prior `npx convex dev`, which can outlive convex/ being gitignored in
+// some setups). Checked at both the worktree root and the envLocalPath-
+// resolved app dir, root first -- covers a plain repo (the two resolve to the
+// same directory) and a monorepo where the app -- and therefore convex/ --
+// lives nested (apps/quivly-app for the quivly-app repo, the one case
+// envLocalPath already special-cases). Returns the directory Convex actually
+// lives in rather than a bare boolean, so callers spawn `npx convex dev`/
+// `deploy` from the right cwd instead of re-deriving this same resolution
+// themselves.
+export function convexDir(repo, wtDir) {
+  if (existsSync(join(wtDir, 'convex')) || hasConvexEnv(wtDir)) return wtDir;
+  const appDir = dirname(envLocalPath(repo, wtDir));
+  if (appDir !== wtDir && (existsSync(join(appDir, 'convex')) || hasConvexEnv(appDir))) return appDir;
+  return null;
 }
 
 // The trigger.dev CLI aborts if its own version doesn't match the pinned
@@ -145,10 +171,10 @@ export function reloadCaddy(workspace) {
 
 export function syncHosts(workspace) {
   const raw = readFileSync('/etc/hosts', 'utf8');
-  const cleaned = raw.replace(/\n?# quivly-start[\s\S]*?# quivly-end\n?/, '');
+  const cleaned = raw.replace(new RegExp(`\\n?${HOSTS_START}[\\s\\S]*?${HOSTS_END}\\n?`), '');
   const entries = portEntries(workspace)
     .map(({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`);
-  const next = cleaned.trimEnd() + '\n# quivly-start\n' + entries.join('\n') + '\n# quivly-end\n';
+  const next = cleaned.trimEnd() + `\n${HOSTS_START}\n` + entries.join('\n') + `\n${HOSTS_END}\n`;
   writeFileSync(HOSTS_TMP, next);
   try {
     execFileSync('sudo', ['-n', '/bin/cp', HOSTS_TMP, '/etc/hosts'], { stdio: 'ignore' });
@@ -165,13 +191,19 @@ export function portsRaw(workspace) {
   try { return readFileSync(join(workspace, '.ports'), 'utf8').trim(); } catch { return ''; }
 }
 
+// "repo/name" -> {repo, name}, split on the first '/'. A worktree name can
+// itself contain '/' (e.g. a branch like "feat/x"), the repo name can't.
+export function splitKey(key) {
+  const si = key.indexOf('/');
+  return { repo: key.slice(0, si), name: key.slice(si + 1) };
+}
+
 export function portEntries(workspace) {
   return portsRaw(workspace).split('\n').filter(Boolean).map(line => {
     const ci   = line.lastIndexOf(':');
     const key  = line.slice(0, ci);
     const port = parseInt(line.slice(ci + 1), 10);
-    const si   = key.indexOf('/');
-    return { key, repo: key.slice(0, si), name: key.slice(si + 1), port };
+    return { key, ...splitKey(key), port };
   });
 }
 
@@ -337,6 +369,117 @@ export function saveSidecars(workspace, repo, sidecars) {
   writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
 }
 
+// ── file sync (workspace/file-sync.json: { [repo]: string[] } of glob patterns) ──
+// Same per-repo JSON store shape as sidecars.json above, holding the extra
+// gitignored files (beyond the shared .env.local, which is symlinked further
+// down in createWorktree) each project wants copied into every new worktree
+// so it gets its own independently editable copy — a .env.development.local,
+// a config/local.json, whatever a given repo needs that isn't in git.
+export function loadFileSyncGlobs(workspace, repo) {
+  try {
+    const all = JSON.parse(readFileSync(join(workspace, 'file-sync.json'), 'utf8'));
+    return Array.isArray(all[repo]) ? all[repo] : [];
+  } catch { return []; }
+}
+
+export function saveFileSyncGlobs(workspace, repo, globs) {
+  const path = join(workspace, 'file-sync.json');
+  let all = {};
+  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first project to configure file sync */ }
+  all[repo] = globs;
+  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+}
+
+// ── sidecar approval gate (workspace/sidecar-approvals.json: { [repo]: { [name]: approvedSignature } }) ──
+// Same per-repo JSON store shape as sidecars.json/file-sync.json above.
+// Sidecars aren't repo-committed like a real approval-gated hook would be,
+// they're typed into a local Settings input, so this isn't a tamper
+// boundary. It's a sanity-check net: a newly-added or just-edited sidecar
+// command gets one explicit look in the UI before Setu starts running it
+// automatically, instead of silently firing on the next Start. The
+// "approved" value is the literal command+args string, not a hash,
+// comparing two short strings is exactly as correct here and simpler.
+function sidecarSignature(s) {
+  return `${s.command ?? ''} ${(s.args ?? []).join(' ')}`.trim();
+}
+
+export function loadSidecarApprovals(workspace, repo) {
+  try {
+    const all = JSON.parse(readFileSync(join(workspace, 'sidecar-approvals.json'), 'utf8'));
+    return all[repo] ?? {};
+  } catch { return {}; }
+}
+
+export function saveSidecarApprovals(workspace, repo, approvals) {
+  const path = join(workspace, 'sidecar-approvals.json');
+  let all = {};
+  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first sidecar ever approved */ }
+  all[repo] = approvals;
+  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+}
+
+export function isSidecarApproved(workspace, repo, sidecar) {
+  const approvals = loadSidecarApprovals(workspace, repo);
+  return approvals[sidecar.name] === sidecarSignature(sidecar);
+}
+
+export function approveSidecar(workspace, repo, sidecarName, command, args) {
+  const approvals = loadSidecarApprovals(workspace, repo);
+  approvals[sidecarName] = sidecarSignature({ command, args });
+  saveSidecarApprovals(workspace, repo, approvals);
+}
+
+// First-run migration: sidecars configured before this gate existed should
+// keep working exactly as before, not suddenly demand approval. Runs once,
+// detected by the approvals file not existing yet, and auto-approves every
+// sidecar already on record as-is. A sidecars.json that exists but fails to
+// parse (mid-write, corrupt) must NOT be treated as "no sidecars" here: that
+// would write an empty approvals file, mark the migration done for good, and
+// every real pre-existing sidecar would demand approval forever. Bail
+// without writing instead, so the next boot retries.
+export function seedSidecarApprovalsIfMissing(workspace) {
+  const approvalsPath = join(workspace, 'sidecar-approvals.json');
+  if (existsSync(approvalsPath)) return;
+  const sidecarsPath = join(workspace, 'sidecars.json');
+  let all = {};
+  if (existsSync(sidecarsPath)) {
+    try { all = JSON.parse(readFileSync(sidecarsPath, 'utf8')); }
+    catch { return; }
+  }
+  const approvals = {};
+  for (const [repo, sidecars] of Object.entries(all)) {
+    approvals[repo] = {};
+    for (const s of sidecars) approvals[repo][s.name] = sidecarSignature(s);
+  }
+  writeFileSync(approvalsPath, JSON.stringify(approvals, null, 2) + '\n');
+}
+
+// ── archived worktrees (workspace/archived-worktrees.json: array of
+// { repo, name, label, branch, prUrl, removedAt, reason } records) ──
+// Same small-JSON-file convention as sidecars.json/file-sync.json/
+// sidecar-approvals.json above, but a flat array (not repo-keyed): this is a
+// chronological audit log of removed worktrees, not per-repo config. Purely
+// additive record-keeping wrapped around removeWorktree() below. It does not
+// change what gets deleted or how, and it cannot restore anything: the
+// worktree directory is genuinely gone. This is just a browsable history of
+// what was there and when it left.
+const ARCHIVE_CAP = 500; // keep only the most recent 500 removals, drop the oldest beyond that
+
+export function loadArchivedWorktrees(workspace) {
+  try {
+    const all = JSON.parse(readFileSync(join(workspace, 'archived-worktrees.json'), 'utf8'));
+    return Array.isArray(all) ? all : [];
+  } catch { return []; }
+}
+
+export function appendArchivedWorktree(workspace, record) {
+  const path = join(workspace, 'archived-worktrees.json');
+  let all = loadArchivedWorktrees(workspace);
+  all.push(record);
+  if (all.length > ARCHIVE_CAP) all = all.slice(all.length - ARCHIVE_CAP);
+  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+}
+
 // ── custom agent CLIs (workspace/custom-agents.json: [{id, label, command}]) ──
 // Same load/save shape as sidecars, but global — not per-repo. "Open in X"
 // is a per-developer tool preference, not scoped to one project. No which()
@@ -376,6 +519,78 @@ export function saveCustomAgents(workspace, agents) {
     return { id, label: a.label, command: a.command };
   });
   writeFileSync(join(workspace, 'custom-agents.json'), JSON.stringify(out, null, 2) + '\n');
+}
+
+// ── MCP servers (workspace/mcp-servers.json: [{id, name, transport, ...}]) ──
+// Same global (not per-repo), whole-list-overwrite, kebab-slug-id shape as
+// custom agents above — connecting to an MCP server is a per-developer tool
+// preference, not scoped to one project.
+export function loadMcpServers(workspace) {
+  try {
+    return JSON.parse(readFileSync(join(workspace, 'mcp-servers.json'), 'utf8'));
+  } catch { return []; }
+}
+
+// id is kept as-is when already unique (so editing a server's name doesn't
+// change its routing id), otherwise derived as a kebab slug of the name and
+// deduped against every other configured server's id. This id is load-bearing
+// beyond just routing: it's baked into the server's OAuth redirect_uri
+// (/api/mcp/oauth/callback/<id>) at DCR time, so once assigned it must never
+// change for that server, or every future auth attempt fails with a
+// spec-level redirect_uri_mismatch. Renaming a server only ever touches name.
+export function saveMcpServers(workspace, servers) {
+  const used = new Set();
+  const out = servers.map(s => {
+    let id = s.id;
+    if (!id || used.has(id)) {
+      const base = kebabSlug(s.name) || 'mcp-server';
+      id = base;
+      let n = 2;
+      while (used.has(id)) id = `${base}-${n++}`;
+    }
+    used.add(id);
+    const server = { id, name: s.name, transport: s.transport };
+    if (s.transport === 'stdio') {
+      server.command = s.command;
+      if (s.args?.length) server.args = s.args;
+      if (s.env && Object.keys(s.env).length) server.env = s.env;
+    } else if (s.transport === 'http') {
+      server.url = s.url;
+      server.httpAuthMode = s.httpAuthMode === 'oauth' ? 'oauth' : 'headers';
+      if (server.httpAuthMode === 'headers' && s.headers && Object.keys(s.headers).length) server.headers = s.headers;
+    }
+    return server;
+  });
+  writeFileSync(join(workspace, 'mcp-servers.json'), JSON.stringify(out, null, 2) + '\n');
+}
+
+// ── MCP OAuth tokens (workspace/mcp-tokens.json: {[issuer]: {clientInformation, tokens}}) ──
+// Deliberately a separate file from mcp-servers.json, same split as
+// sidecars.json/sidecar-approvals.json: config vs. security state. Keyed by
+// issuer (the resolved authorization server URL), not by server id, per
+// SEP-2352 — two configured servers can share an authorization server and
+// must never get cross-registered client credentials. Only durable post-auth
+// artifacts live here; PKCE verifier, CSRF state, and discovery state are
+// per-attempt and stay in mcp.js's in-memory pendingAuth map, never written
+// to disk (an interrupted attempt isn't resumable across a portal restart
+// regardless, so persisting that material would only be a stray secret on
+// disk with no benefit). Every write chmod's explicitly to 0600 after
+// writing, not via writeFileSync's {mode} option — that option only applies
+// when a file is newly created, not on an overwrite of an existing one,
+// which is this file's actual save pattern (whole-file overwrite every
+// time). Accepted, explicit trade-off for a single-user local tool: the MCP
+// SDK's own docs recommend OS-level secure storage "in production" — a 0600
+// file is the pragmatic choice here, not a silent shortcut.
+export function loadMcpTokens(workspace) {
+  try {
+    return JSON.parse(readFileSync(join(workspace, 'mcp-tokens.json'), 'utf8'));
+  } catch { return {}; }
+}
+
+export function saveMcpTokens(workspace, tokensByIssuer) {
+  const path = join(workspace, 'mcp-tokens.json');
+  writeFileSync(path, JSON.stringify(tokensByIssuer, null, 2) + '\n');
+  chmodSync(path, 0o600);
 }
 
 // Deregisters a project (drops it from the .projects registry and the "add
@@ -536,7 +751,7 @@ export function writeDockerCompose(c, repo, name, port) {
   // twice and Docker's YAML parser rejects the resulting duplicate mapping
   // key outright (`docker compose up` fails before anything starts).
   const env = new Map([['PORT', String(port)]]);
-  for (const m of readEnvrc(wtDir).matchAll(/^export (\w+)=(.+)$/gm)) env.set(m[1], m[2].trim());
+  for (const [k, v] of Object.entries(parseEnvFile(join(wtDir, '.envrc')))) env.set(k, v);
   const envLines = [...env].map(([k, v]) => `      ${k}: ${JSON.stringify(v)}`).join('\n');
 
   const volumes = [
@@ -697,6 +912,42 @@ export function branchMetadata(repoDir) {
   return map;
 }
 
+// Copies each glob's matches from the main worktree into a freshly created
+// one, preserving the relative path and creating parent directories as
+// needed. Copy, not symlink, unlike the .env.local step in createWorktree
+// below: these files are meant to be independently editable per worktree.
+// Globs resolve against mainDir itself (the worktree root), the same base
+// the repo checks out into — not envLocalPath's quivly-app special-case, so
+// a project needing an app-subdir file uses a glob with that subdir already
+// in it, e.g. apps/quivly-app/.env.development.local.
+// Never throws: a missing main worktree (first worktree ever) or a glob
+// that matches nothing are both expected, logged, and skipped, not fatal to
+// worktree creation.
+export function syncIncludedFiles(mainDir, wtDir, globs) {
+  if (!globs?.length) return;
+  if (!existsSync(mainDir)) {
+    console.warn(`⚠  file sync skipped — no main worktree yet at ${mainDir}`);
+    return;
+  }
+  for (const pattern of globs) {
+    let matches;
+    try { matches = [...new Bun.Glob(pattern).scanSync({ cwd: mainDir, dot: true, onlyFiles: true })]; }
+    catch (e) { console.warn(`⚠  file sync: bad glob "${pattern}": ${e.message}`); continue; }
+    if (!matches.length) { console.warn(`⚠  file sync: "${pattern}" matched nothing in ${mainDir}`); continue; }
+    for (const rel of matches) {
+      if (rel.startsWith('..')) continue; // a glob can't reach outside mainDir
+      const dest = join(wtDir, rel);
+      if (existsSync(dest)) continue; // never clobber an already-edited copy
+      try {
+        mkdirSync(dirname(dest), { recursive: true });
+        copyFileSync(join(mainDir, rel), dest);
+      } catch (e) {
+        console.warn(`⚠  file sync: failed to copy ${rel}: ${e.message}`);
+      }
+    }
+  }
+}
+
 // Creates worktree + port + envrc + caddy + env symlink + hosts. Dependency
 // install is the caller's job (CLI runs it inline, portal in the background).
 export function createWorktree(c, repo, name, { tunnel = false } = {}) {
@@ -716,8 +967,7 @@ export function createWorktree(c, repo, name, { tunnel = false } = {}) {
       git(repoDir, ['worktree', 'add', wtDir, name]);
     } else {
       // new branches fork from staging when the repo has one, else the default branch
-      const base = branchExists(repoDir, 'staging') ? 'origin/staging'
-        : `origin/${git(repoDir, ['symbolic-ref', '--short', 'HEAD']).trim()}`;
+      const base = baseBranchRef(repoDir);
       git(repoDir, ['worktree', 'add', '-b', name, wtDir, base]);
     }
   }
@@ -730,6 +980,9 @@ export function createWorktree(c, repo, name, { tunnel = false } = {}) {
   if (existsSync(mainEnv) && !existsSync(wtEnv)) {
     spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
   }
+
+  const mainDir = join(c.workspace, repo, 'main');
+  syncIncludedFiles(mainDir, wtDir, loadFileSyncGlobs(c.workspace, repo));
 
   syncHosts(c.workspace);
   reloadCaddy(c.workspace);
@@ -747,6 +1000,235 @@ export function removeWorktree(c, repo, name) {
   try { unlinkSync(caddySnippetPath(c.workspace, repo, name)); } catch {}
   reloadCaddy(c.workspace);
   syncHosts(c.workspace);
+}
+
+// ── sweep & import (plain git clones outside Setu's bare+worktree layout) ────
+// Finds repos like ~/soma or ~/Personal/skills that were never `setu init`-ed,
+// so they can be brought in on request. Discovery never mutates a candidate:
+// only remote-url and status reads. Import always bare-clones into a fresh
+// ~/workspace/<name>.git and never touches the originally-discovered dir.
+
+// The prune clause skips descending into dotfile-prefixed dirs and
+// node_modules BEFORE find enters them, not after — this is what keeps a
+// full $HOME walk fast and is why it correctly excludes every tool-cache
+// noise source in one rule (.grok, .gemini, .claude, .codex, .zprezto)
+// instead of a per-tool blocklist. `.git` itself is excluded from the
+// dot-prefix prune (`! -name .git`) since a bare `-name '.*'` also matches
+// `.git` and would prune away the exact directories this is looking for
+// before the -name .git branch ever runs, verified live: the plan's original
+// clause without this exclusion returns zero results, always. The trailing
+// -prune after -print stops find from wastefully descending into a matched
+// .git's own internals (objects/, refs/, ...) once it's already been found.
+function sweepFindArgs(homeDir) {
+  return [homeDir, '(', '-name', '.*', '-a', '!', '-name', '.git', '-o', '-name', 'node_modules', ')', '-prune',
+    '-o', '-type', 'd', '-name', '.git', '-print', '-prune'];
+}
+
+// Same slug.split('/').pop() cmdInit already uses to name a project off a
+// gh-slug CLI arg, applied here to whatever the discovered repo's remote URL
+// resolves to instead. Generalized past github.com (a full $HOME walk finds
+// clones from any host, not just GitHub) by stripping any scheme/host or ssh
+// user@host: prefix first. No remote at all leaves only the containing
+// directory's own name to go on.
+function deriveSweepName(remoteUrl, dirName) {
+  if (!remoteUrl) return dirName;
+  const slug = remoteUrl.trim()
+    .replace(/^\w+:\/\/[^/]+\//, '')
+    .replace(/^[^@\s]+@[^:]+:/, '')
+    .replace(/\.git$/, '');
+  return slug.split('/').pop() || dirName;
+}
+
+// Pure, no I/O — shared by both discovery paths so the drop/conflict/
+// importable rule lives in exactly one place. registeredRemotes is every
+// already-registered project's actual origin URL (read from its bare repo,
+// not the .projects slug field, so this compares the real clone source).
+// Returns null for "drop entirely" (same remote already registered).
+function classifySweepCandidate({ path, name, remoteUrl, dirty }, projects, registeredRemotes) {
+  if (remoteUrl && registeredRemotes.has(remoteUrl)) return null;
+  if (projects[name]) return { path, name, remoteUrl, dirty, status: 'conflict', conflictWith: name };
+  return { path, name, remoteUrl, dirty, status: remoteUrl ? 'importable' : 'no-remote', conflictWith: null };
+}
+
+// Per-candidate git probes only (not the find walk, and not git() calls
+// elsewhere in this file) — verified live: a repo living under iCloud Drive
+// (~/Library/Mobile Documents/.../Backup/...) makes `git remote get-url` and
+// `git status` hang for 4s+ per call while iCloud materializes the on-demand
+// placeholder files, and a real $HOME on this machine turned up 20+ such
+// candidates. Real local repos resolve in single-digit milliseconds even for
+// a large monorepo (measured), so this timeout is pure headroom for them and
+// a hard cap on the iCloud (or any other slow/network-mounted path) case.
+const SWEEP_GIT_TIMEOUT_MS = 1500;
+
+function readOriginUrl(dir) {
+  try {
+    return execFileSync('git', ['-C', dir, 'remote', 'get-url', 'origin'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: SWEEP_GIT_TIMEOUT_MS }).trim() || null;
+  } catch { return null; }
+}
+
+function readDirty(dir) {
+  try {
+    return execFileSync('git', ['-C', dir, '--no-optional-locks', 'status', '--porcelain'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: SWEEP_GIT_TIMEOUT_MS }).trim().length > 0;
+  } catch { return false; }
+}
+
+// CLI path: execFileSync, synchronous throughout. Blocking is fine here —
+// this only runs when someone explicitly types `setu sweep`.
+export function discoverRepos(homeDir) {
+  const workspace = loadConfig().workspace;
+  const projects  = workspace ? loadProjects(workspace) : {};
+  const registeredRemotes = new Set(
+    Object.keys(projects).map(name => readOriginUrl(join(workspace, `${name}.git`))).filter(Boolean)
+  );
+
+  let raw;
+  try {
+    // stderr piped (not inherited) — a full $HOME walk hits dozens of
+    // permission-denied system dirs (~/Library/.../TCC, CallHistoryDB, ...)
+    // that find reports on stderr; inheriting it would dump that noise
+    // straight into the user's terminal on every `setu sweep`, verified live.
+    raw = execFileSync('find', sweepFindArgs(homeDir), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { raw = e.stdout ?? ''; } // find exits non-zero on permission-denied subdirs, stdout is still complete
+  const gitDirs = raw.split('\n').filter(Boolean);
+
+  const out = [];
+  for (const gitDir of gitDirs) {
+    const dir  = resolve(gitDir, '..');
+    const t0   = Date.now();
+    const remoteUrl = readOriginUrl(dir);
+    // Sequential (unlike the portal path's Promise.all pair), so a path that
+    // already burned the full timeout on the first call — a git process
+    // actually got killed, not just "no remote configured" — isn't worth
+    // waiting the full timeout on again for the second. dirty is informational
+    // only, false is a safe default for a path this unresponsive.
+    const timedOut = Date.now() - t0 >= SWEEP_GIT_TIMEOUT_MS - 50;
+    const dirty  = timedOut ? false : readDirty(dir);
+    const name   = deriveSweepName(remoteUrl, dir.split('/').pop());
+    const shaped = classifySweepCandidate({ path: dir, name, remoteUrl, dirty }, projects, registeredRemotes);
+    if (shaped) out.push(shaped);
+  }
+  return out;
+}
+
+// Bounded-concurrency batch: chunks of `size` run concurrently via
+// Promise.all, then the next chunk starts. Keeps a dozens-of-candidates sweep
+// from spawning 100+ git processes at once (unbounded parallel would thrash)
+// while staying far faster than fully sequential.
+async function batchMap(items, size, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...await Promise.all(items.slice(i, i + size).map(fn)));
+  }
+  return out;
+}
+
+// Shared by discoverReposAsync below and portal.js's fetchDirty/fetchPR/
+// activeMemMb. Bun.spawn, not execFileSync, since a blocking exec call
+// would freeze the single-threaded request handler for however long the
+// walk/git/docker calls take. Trimmed stdout text on success, empty string
+// on any failure (bad binary, non-zero exit, timeout); callers that need to
+// distinguish "ran and printed nothing" from "failed to run" don't exist
+// today, so this doesn't try to. timeoutMs is opt-in per call; omitted
+// entirely for calls that should never be cut off (e.g. the sweep find walk,
+// which can legitimately take multiple seconds over a full $HOME).
+export async function spawnText(args, { timeoutMs } = {}) {
+  try {
+    const opts = { stdout: 'pipe', stderr: 'ignore' };
+    if (timeoutMs) opts.timeout = timeoutMs;
+    const proc = Bun.spawn(args, opts);
+    const text = await new Response(proc.stdout).text();
+    await proc.exited;
+    return text.trim();
+  } catch { return ''; }
+}
+
+async function readOriginUrlAsync(dir) {
+  const out = await spawnText(['git', '-C', dir, 'remote', 'get-url', 'origin'], { timeoutMs: SWEEP_GIT_TIMEOUT_MS });
+  return out || null;
+}
+
+async function readDirtyAsync(dir) {
+  return (await spawnText(['git', '-C', dir, '--no-optional-locks', 'status', '--porcelain'], { timeoutMs: SWEEP_GIT_TIMEOUT_MS })).length > 0;
+}
+
+// Portal path: Bun.spawn based, async throughout (including the find walk
+// itself, which can take multiple seconds over a full $HOME). Never blocks
+// the event loop the way execFileSync would — this codebase has already hit
+// and fixed that exact class of bug twice (fetchPR, the old per-worktree
+// git() calls in getWorktrees()). Per-candidate git reads (remote-url +
+// status, 2 spawns each) run in bounded batches, not fully unbounded
+// parallel — a dozens-of-candidates home directory can otherwise spawn 100+
+// processes at once.
+export async function discoverReposAsync(homeDir) {
+  const workspace = loadConfig().workspace;
+  const projects  = workspace ? loadProjects(workspace) : {};
+  const registeredRemotes = new Set(
+    (await batchMap(Object.keys(projects), 8, name => readOriginUrlAsync(join(workspace, `${name}.git`))))
+      .filter(Boolean)
+  );
+
+  const raw     = await spawnText(['find', ...sweepFindArgs(homeDir)]);
+  const gitDirs = raw.split('\n').filter(Boolean);
+  const dirs    = gitDirs.map(g => resolve(g, '..'));
+
+  const shaped = await batchMap(dirs, 8, async dir => {
+    const [remoteUrl, dirty] = await Promise.all([readOriginUrlAsync(dir), readDirtyAsync(dir)]);
+    const name = deriveSweepName(remoteUrl, dir.split('/').pop());
+    return classifySweepCandidate({ path: dir, name, remoteUrl, dirty }, projects, registeredRemotes);
+  });
+  return shaped.filter(Boolean);
+}
+
+// gh-clone when authenticated (keeps whatever SSH/HTTPS creds `gh auth
+// login` already set up), else a plain git clone against remoteUrl directly.
+// Either way, forces the origin fetch refspec afterward, since a bare clone's
+// default refspec only tracks the one branch that was checked out, then
+// does the first fetch. Shared by importRepo below and portal.js's
+// addProject; stdio defaults to 'inherit' (importRepo's CLI callers want
+// clone progress visible), addProject passes 'pipe' since it's headless.
+export function cloneBareRepo(repoDir, remoteUrl, ghSlug, { stdio = 'inherit' } = {}) {
+  const useGh = ghSlug && spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
+  if (useGh) {
+    execFileSync('gh', ['repo', 'clone', ghSlug, repoDir, '--', '--bare'], { stdio });
+  } else {
+    execFileSync('git', ['clone', '--bare', remoteUrl, repoDir], { stdio });
+  }
+  git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
+  git(repoDir, ['fetch', '--all', '--prune']);
+}
+
+// Extracted from cmdInit's clone->register->create-main-worktree sequence so
+// `setu init` (a github slug) and sweep --import (an already-discovered
+// clone's exact origin URL) share one implementation instead of two that can
+// drift. Takes the full config object, not just the workspace path, because
+// createWorktree needs it — same convention createWorktree/removeWorktree
+// above already use. Never touches whatever directory the caller discovered
+// remoteUrl from: this always clones fresh into workspace/<name>.git.
+export function importRepo(c, { name, remoteUrl, label = '' }) {
+  const repoDir = join(c.workspace, `${name}.git`);
+  const ghSlug  = remoteUrl?.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? '';
+
+  if (!existsSync(repoDir)) {
+    if (!remoteUrl) throw new Error(`No remote URL for ${name}, cannot clone.`);
+    // createWorktree() below runs `git worktree add` into
+    // join(c.workspace, name, 'main'). If that directory already exists (a
+    // plain clone discovered by sweep, sitting at exactly this project's
+    // derived name) the worktree lands as an untracked subfolder inside it
+    // instead of getting its own clean directory. Verified live via sweep
+    // --import. Only checked here, gated on repoDir not existing yet, so a
+    // re-run of setu init on an already-initialized project, where this
+    // directory is expected to exist and is setu's own, is unaffected.
+    const wtParentDir = join(c.workspace, name);
+    if (existsSync(wtParentDir)) {
+      throw new Error(`A directory already exists at ${wtParentDir} and importing would nest a worktree inside it. Move or rename it first, or choose a different project name.`);
+    }
+    cloneBareRepo(repoDir, remoteUrl, ghSlug);
+  }
+
+  registerProject(c.workspace, { name, slug: ghSlug, label });
+  return createWorktree(c, name, 'main');
 }
 
 // ── portal client (used by CLI to talk to the running portal) ────────────────

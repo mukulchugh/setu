@@ -3,29 +3,70 @@ import { render } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import {
   Badge, StatusDot, StatusFlap, IconButton, PrimaryButton, SecondaryButton,
-  Modal, CloseBtn, Menu, MenuItem, inputCls, type Tone, PageHeader, Section,
+  Modal, CloseBtn, CloseIcon, Menu, MenuItem, inputCls, type Tone, PageHeader, Section,
+  ToastStack, type ToastItem,
 } from './ui';
-import { siClaude, siCursor, siOpencode, siAmp, siGoogle, siX } from 'simple-icons';
+import { ToolIcon, SidecarIcon, MUKUL_LOGO_URI, VercelIcon, NetlifyIcon, ConvexIcon } from './components/icons';
+import { TriviaCard } from './components/trivia-card';
+import { LogModal, LiveLog } from './components/logs';
+import { post, postOrToast } from './api';
+import { PortsPage } from './components/ports-page';
+import { DiffViewer } from './components/diff-viewer';
+import { CommandBar } from './components/command-bar';
+import { HelpPage } from './components/help-page';
+import { RaycastSection, DiscoverProjectsSection, McpSection } from './components/settings-sections';
+import { ArchivedPage } from './components/archived-page';
+import { RepoPrsModal } from './components/repo-prs-modal';
+import { Pagination } from './components/pagination';
+import { relativeTime } from './components/relative-time';
+import { type PrChecks, checksTone } from './components/pr-status';
+import { getWs } from './ws';
 
-type Worktree = {
+// Shared shape for both deploy providers below (vercelDeploy/netlifyDeploy) --
+// same fields either one's status Map on the server settles into.
+export type DeployStatus = { deploying: boolean; url: string | null; error: string | null; target: string; startedAt: number } | null;
+export type DeployProvider = 'vercel' | 'netlify';
+
+// Convex's deploy state isn't shaped like DeployStatus above: a convex
+// deploy never produces a clickable URL the way vercel/netlify do, so
+// "succeeded" needs its own explicit signal (ok) rather than being inferred
+// from a url field that would just always be null.
+export type ConvexDeployStatus = { deploying: boolean; ok: boolean; error: string | null; target: 'preview' | 'production'; startedAt: number } | null;
+
+export type Worktree = {
   key: string; repo: string; name: string; slug: string; port: number;
   domain: string; pubDomain: string; tunnelOn: boolean; active: boolean;
   container: string | null; nextStartMode: 'container' | 'bare'; needsMigrationPrompt: boolean;
-  tunnelRunning: boolean; label: string; branchUrl: string | null;
-  pr: { url: string; number: number; title: string } | null;
+  tunnelRunning: boolean; label: string; branch: string; branchUrl: string | null;
+  pr: { url: string; number: number; title: string; state: PrState; checks: PrChecks } | null;
+  vercelDeploy: DeployStatus;
+  netlifyDeploy: DeployStatus;
   inngestActive: boolean; inngestPort: number; triggerActive: boolean;
+  // convexConfigured gates whether any Convex UI renders at all -- unlike
+  // Inngest/Trigger (assumed available everywhere), Convex only applies to
+  // worktrees that actually have it set up.
+  convexConfigured: boolean; convexActive: boolean; convexDeploy: ConvexDeployStatus;
   queued?: boolean; queuePosition?: number | null;
   lastCommitAt: number | null; ahead: number; behind: number; dirty: number; memMb: number | null;
   createdAt: number | null;
 };
+type PrState = 'open' | 'merged' | 'closed' | 'draft';
+// One record per removed worktree, a history entry, not a live worktree.
+// The directory itself is gone by the time this exists; branch is what
+// Recreate re-checks-out, not something that can be restored to.
+export type ArchivedWorktree = {
+  repo: string; name: string; label: string; branch: string;
+  prUrl: string | null; removedAt: number; reason: 'manual' | 'merged';
+};
 type Project = { name: string; label: string; github?: string | null };
-type Sidecar = { name: string; enabled?: boolean; command: string; args?: string[]; env?: Record<string, string> };
+// approved is server-computed (current command+args matched against the last
+// approved value), not something a caller sets, present once fetched from GET.
+type Sidecar = { name: string; enabled?: boolean; command: string; args?: string[]; env?: Record<string, string>; approved?: boolean };
 type CustomAgent = { id: string; label: string; command: string };
 type SettingsData = {
   maxConcurrentDevServers: number; containerMemoryLimit: string; containerCpuLimit: number;
   mac: { cpus: number | null; memMb: number | null }; docker: { cpus: number | null; memMb: number | null };
 };
-type PortInfo = { port: number; pid: string; cmd: string; worktree: string | null };
 type Status = {
   concurrency: { active: number; max: number; queued: number };
   container: { engineAvailable: boolean; engine: string | null; memoryLimit: string; cpuLimit: number };
@@ -34,12 +75,13 @@ type Status = {
 // Minimal router — one detail view alongside the existing list/grid doesn't
 // justify a router dependency; history.pushState + popstate is the native
 // platform feature that already does exactly this.
-type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' };
+type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' } | { page: 'archived' };
 
 function parseRoute(pathname: string): Route {
   if (pathname === '/settings') return { page: 'settings' };
   if (pathname === '/help') return { page: 'help' };
   if (pathname === '/ports') return { page: 'ports' };
+  if (pathname === '/archived') return { page: 'archived' };
   const m = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
   return m ? { page: 'detail', repo: decodeURIComponent(m[1]), name: decodeURIComponent(m[2]) } : { page: 'list' };
 }
@@ -59,84 +101,78 @@ function useRoute(): Route {
   return route;
 }
 
-async function post(url: string, body: any) {
-  try {
-    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    return await r.json();
-  } catch (e) { return { ok: false, error: String(e) }; }
+// Shared status derivation for WorktreeCard and WorktreePage — same
+// active/queued/stopped tone and label logic, previously copy-pasted in both.
+function worktreeStatus(w: Worktree): { tone: Tone; text: string } {
+  const tone: Tone = w.active ? 'emerald' : w.queued ? 'amber' : 'zinc';
+  const text = w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped';
+  return { tone, text };
 }
 
-// "3h ago" style — lastCommitAt is a unix-seconds timestamp from the batched
-// git for-each-ref call (see repoGitMeta in portal.js), null if a branch's
-// commit data wasn't resolvable (e.g. a worktree whose branch got renamed
-// out from under the registry).
-function relativeTime(unixSeconds: number | null): string {
-  if (!unixSeconds) return '';
-  const s = Date.now() / 1000 - unixSeconds;
-  if (s < 60) return 'just now';
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  if (s < 2592000) return `${Math.floor(s / 86400)}d ago`;
-  return `${Math.floor(s / 2592000)}mo ago`;
+// Shared by WorktreeCard and WorktreePage, same deploying/error/url/idle
+// tone and label logic, matching worktreeStatus's shape above. Provider-
+// agnostic on purpose: vercelDeploy and netlifyDeploy are the same shape,
+// so one function covers both instead of two copies that would only ever
+// differ by which field they read.
+function deployTone(d: DeployStatus): Tone {
+  if (!d) return 'zinc';
+  if (d.deploying) return 'amber';
+  if (d.error) return 'red';
+  if (d.url) return 'emerald';
+  return 'zinc';
+}
+function deployStatusText(d: DeployStatus): string {
+  if (!d) return 'Not deployed';
+  if (d.deploying) return `Deploying (${d.target})…`;
+  if (d.error) return 'Deploy failed';
+  if (d.url) return `Deployed to ${d.target}`;
+  return 'Not deployed';
 }
 
-// Real brand marks, SVG path data bundled at build time — not fetched at
-// runtime (a live per-icon image request is a fragile dependency; confirmed
-// twice tonight when chatgpt.com/favicon.ico and openai.com/favicon.ico both
-// returned an HTML challenge page instead of image bytes). Verified directly
-// against the installed simple-icons package (v16.28.0, latest as of this
-// check; scanned all 3453 entries) — it carries no OpenAI/Codex mark at all,
-// a deliberate licensing exclusion rather than a missing slug. The actual
-// OpenAI mark below is sourced once from lobehub/lobe-icons (MIT-licensed,
-// github.com/lobehub/lobe-icons/packages/static-svg — an icon set built
-// specifically for AI-provider brand marks, unlike simple-icons which
-// excludes them) and hardcoded here the same way the simple-icons ones are.
-// Antigravity and Grok get real marks even though neither is "in" either
-// library under its own name: Antigravity is Google's own coding tool (built
-// by the ex-Windsurf team after the acquisition), and Grok is xAI's product,
-// shipped inside and inseparable from the X app — both a legitimate,
-// correct parent-brand icon rather than a fabricated one.
-const siOpenai = {
-  hex: '000000',
-  path: 'M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z',
-};
-
-const AGENT_ICON: Record<string, { path: string; hex: string }> = {
-  claude: siClaude, cursor: siCursor, opencode: siOpencode, amp: siAmp,
-  antigravity: siGoogle, grok: siX, codex: siOpenai,
-};
-
-// Bundled SVG path data, not a fetched favicon — an external image request
-// per icon (google's favicon service) is a real network dependency for a
-// purely cosmetic detail, and it failed/hung often enough in practice to
-// leave broken-image placeholders instead of the intended fallback
-// (confirmed live: every agent icon rendered broken, not text, meaning the
-// onError handler never reliably fired). Bundled path data has no such
-// failure mode — it's not a request.
-function ToolIcon({ id, label }: { id?: string; label: string }) {
-  const icon = id && AGENT_ICON[id];
-  if (icon) return (
-    <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill={`#${icon.hex}`}><path d={icon.path} /></svg>
-  );
-  return <span class="text-[9px] font-bold tracking-tight">{label.slice(0, 2).toUpperCase()}</span>;
+// Shared by WorktreeCard and WorktreePage, same shape as deployTone/
+// deployStatusText above. zinc for open matches every other "default,
+// nothing to flag" state in this file (container, → mode, etc.), merged is
+// the one state that's actually actionable, so it gets the loud color.
+function prTone(state: PrState): Tone {
+  if (state === 'merged') return 'emerald';
+  if (state === 'closed') return 'red';
+  if (state === 'draft') return 'amber';
+  return 'zinc';
+}
+// Card-compact PR link recolors itself by state, same recipe as the vercel
+// deploying/deployed/failed items in the same row (signal-* text classes),
+// not a Badge pill: this row is plain clickable references (branch/PR/
+// tunnel), Badge lives in the summary-chip row above instead.
+function prLinkClass(state: PrState): string {
+  if (state === 'merged') return 'text-signal-green hover:opacity-80';
+  if (state === 'closed') return 'text-signal-red hover:opacity-80';
+  if (state === 'draft') return 'text-signal-amber hover:opacity-80';
+  return 'hover:text-zinc-600';
 }
 
-// Neither Trigger.dev nor Inngest is a vector mark anywhere (not in
-// simple-icons, not in lobehub/lobe-icons) — their real favicons are small
-// raster PNGs, sourced once (trigger.dev/favicon.ico, inngest.com/favicon.ico)
-// and inlined as data URIs so they're bundled the same as every other icon
-// here: no runtime request, no failure mode to reproduce.
-const TRIGGER_ICON_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAHLUlEQVRoBdVaWWhUVxj+ZsssmUxmMtkTs9SFtBobpHFBMS51oSItErSYxkBR9K0PUgotlNJCn/pQ6ItdHkptkVIKtQ+1SKyFhkKNKGhoRcVo3LJP9pnJZO70+zO5mclkMktyk+hP/tz9P993/uWcc+fqECU57gIzD3dRm6jbqAVUI3U5ZYKNd1FbqN9SL/f3dfm5nRSdukPwhdx/n9pIdarnn7Gth3i+p35KEp2CzSD/psCf4e4xqkXOPaNiJa5N1NVWm/1Pr3d0xEDwGTzxCVXAPy9SRaBmm81+Sc+d3dSG5wV5FM6GEPCqga6Q3q+NuqDtLlvBdKZpalrCySAekGqzKGIw6JBh0SMkJBZHtgkBqT6aSzAYwpYdThx/pxRCZJGkUAhoXuelxx1OI5pOFaPxRBFers2CEFoEMQoBzUVRQth70I2N27Lhcplw7GQxbJmGRQklzQkoClBUasZbx4uRYdIjiBDq9rgmVYhpLZoT0DHcDx0tQNX6TCgEL2K1GtBIL7jzMjT3gqYEFMb5mpdsqG8smFE5hUhNrQMH6/NIQFsvaErAlKFHw/EilJRapvo+EjBGVqI33y5E+UortAwlzQhIland6sD+N3IJfnYvixcqV1lxpKlQ07KqCQGJiiyHEcdOlcCZbYoDP+KJ14/ko3qDdmVVEwISErsP5GBznRMThM9CFFeDPC+J3MCEttq0KasLJhAi2vxiMw6fKIberIesNMajVI6j1UuCW/fnYMsupya5sGACOlo4cDQfK2vsGCM4HwFPK0PLx26PJiDXDOz9eo7STjfDbXa68I7UZUEEpPHsHBM27snBBAeAaKABFtIb10dw/lwXfEKEmFQVolWbs7HzEMvqAgc3mU5/lDrfmXfKoBXwK7jTNspe1SOvwgo9R19ZxHr9IXzz8QNc/LEbNTtdcDD25bzkgWhIr0N+mQVXLw1g2EO6YmwesiAC0p54oeexH63NA2j/bwzZJWa4Siy40uzBT58/gqcnAIXYqne5oNDfQkJVe24GfN4g2v4anAf08CMLJiBmdOxNZSKEjltjaL3oQfcTP1p+6cXTe17oOYB13veh8pUsuMutBK+jB0TFE/QCvfbv34PoZyeInXRFEwKTjbJtAeAbU3D76jD6noxDz2OJDP9YECODQaxj9QFHaxV8gA+a7QYYuei5SY8pciFNDvNK4kSVQwCrwNXelOOblwdw5UIfSyxJ8oKoJL2Xuu41N6p2MMTmkdBpExCAtmyugRj7iYgQV0T4zDhjvfnLp+jmOykZJ9SKJUT0diO2s6xmcu2Qss0p62mFkJS8vNU2HP5iDex5JvQyxv0jjGRhxb9EIuE12DkOS64JKzY5phNZElpCycE1RP9DPx5dH04rF9IiIKFQd7oMNfX5qNzuRNlGB7yMbU+HD0oglLQUSgf0PfCjgmXV7I4tq3pkr7DgDnPBR5vSJ6lIygRkrl/GwWfHB+WMISYig8/BBlfty4GLU+SeW154+1hjEjQsnvKy5ssYUEYSYkPyVi2rVnrVP6qgo4VlNYGdaGKp5QDjPYNr2g2chBnZc2oSyrwmxPMv7HMjq4gv+FIJYJJo+7kb964MTSe0mg8spHiRq7m86kyEUnwJkBIBcX0FpwulVB9BRxoMJ+PNX3vx6J8h6FJ4fSIeGu0NoPXMYwyzvEbbEtsZnBhWc2Jo4MQwFUl6l3SqldOAtez9INe2avkLN6xDz0MfrhFMYDQ4OZjJgJZMZa7d/ns/bv8WLqtiS/WqbFcczEURcywVLyR/J0QGlVzLOrmmlR5SRfYkTHvv+2DnSks0HRFwHo6+YxMKdMbogGcx4OKo6mQJuluHEBhilkRfjmlEx7fTEVQxFyV0spigdefWwrHKNgVfhR5+LET7k6GfoBHVbLyGZDoeARgxogQUXD19F+1nOxOGZkIPSExXNBXBTPDi2rCojUxt+QtDPGDq3dHbRPfFXtNxVlvOd0udlz3wPub4PUewz0lAXOxinS/kGjYCPgIntsHIlfBesutyV7J7LOvtKD5aiHufdcSanz6OT4CWZdVUwjhEnpmVItxUsgaTXU8FtIpMbImP8xsL0cVkH2kbiRtKcQlI7Lv25iB7v3uq99WwUc0n7z2tyOhKrShgBRx79y5CHO1jJS4BWZxb1mXCc2NkzlI221Ss6ZnH6dwffa+MG+Akz8TxYbydwRyTC/GrEB8SEpM+jLY2E9PSHRFPaJyjfpzRWTwgU5GZniBoxcfR5lkAL900O4LlrMiEAJffW0vlaJbM/eCsW5fpRKdEVMsyNa5Fsy1C4Cy1XwtrS2xDMH8nBJqpPyxx41o0J5gvGfhzfZAvt67zYDVVfgF/HuQ8Qb7H7yUGOZPhmwF+cyDfHnBXvlZZQ01vaskHlkgG2M7XVAEvxSf8sYfsTJH4g7vXqCaqi2qjSpgtp0iZf0q9QP2Q+pX0PLeT8j+8SZ2ylEDB+QAAAABJRU5ErkJggg==';
-const INNGEST_ICON_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFXElEQVRYCe1WaVDUZRj/LbvLfSwgNyjHylkxhFyCKJhNahMGJkb4qQ99qCa17DBrOtTu0aZmHD80NQ7glbcWOVEYoIAYXhwiiMDKLct9s/Y8L7Pb7v4R/aRfeD/se+z7nO/z/H5/2T0aeIzD4jHaFqbnHJjLgOJhi3Dqng5NfR2o17ZCJpNBrfLGAid3WMhmT+LdkX6SuQPt6CDsldZY6OILDztng9mHcmBkcgx5VX/hQPXfaB/qIWEZvOydkRmWgqyI5bBRWBoU6hejk+M401CKQzXn0EBO815uIUeURxC+Tn0N7rYqcfWBDgxNjGDPv6eQc/1PMGCEuvpBRwuO6sdLx2GjtEJWeKrerpgHxlnmpHB4bGocvo7u8KSotSODkozJZgOi/rEh/FBxHAdrCmEpV+DVyJXIDE8Be/LT1d/xy9U/EOHmj73PbYKztb0w3kup/r7iKI7U/gMrygxnKCNkCVxtHDE8MQoFZUFH2Heu+QpCXPxw3wxoRwewq/xXHKsrEVG+/nQaKUuF0mJa5Hl1PE7Qf51DWvTQO7MD/N7flR/GybrzsLe0wZuL1mBd2DKDjB3VAI9T9RfwSdE+RHsFz+xA13Afvi07hNP1pXC0ssVbi9KxNjRZeC900A8rY2cmdVPiqJtkvriwH/m3yqGydsCmmAy8GJxE7y4tUpWVPZRyOaq7m6QOcJF9SYrONl6CCynaHPsS0oIXQ25W7VxEGaFLwFSiozf5tHgfCm5Xws3OCe/ErcPqoHh6b5neX5OZi5b1TegmTR3QDHRh5/n9KGyqhDsVzZb4TKwMjJ1RkTUpeSN6DW73tZNMHoparsHb3hXvJazHCv9o0aomVo02lzpuYmhiDGpn7/8dYEU7SnJRrLkOH4d5eD/hZSz3j6KGmzkK1sed8HlJDspbazGfMOGDhCwsnR85iwRQ2lojWpOfZnVQ3LQDt3rbRArLSJG/kwe2Ls5Cst9TRj5Ll/x+bLySomFQ+jAxGwk+4dKLRidlZHw7ybQOdIvgMriuukemC46j4JRsW5yNeJ8wIzHp8kpnAz4rzkFVdyPCXOdjGxmP9gyWXjQ6KdJcw86SPDRSpuO8Q/E21Qm3puIwIdV02t3wUeIG8aeRnGRZ3lYrnupGTwsi3YNIJhtPuAVI7ukPGLwKmy6LOmmhGkv0jRBBBjh5iiuK3xrKMKXTUb8ufaDxYiq0HRcoit52xHiGiLQzMt5vcIecbazAV6UH0DbYgxSqD35eP0JG/bDQ0HvYEZxGeaj1Z5L5HrVZAXUGt9ptMs5RbE18BYXNl7H74hGq6FGJjI7Ii3GEO6SdwGpFQDQ+TtpgYpyFFJZypehHJouZBsNm/q2L+Kb0IDpI0bIFkSKF7BQTzfjUhKhmZjn9YOY8Tii5i1CRWXBVUCzejV9vICD9PZ4tOIWMZv1jw8bnYs2KTtwsIYTLQ8ewFs8GUhRUJ9ym5JfAB5Y1zgDvD1UXCiTtHR1C2sJE0Z569jM3otgSl4k6KqgEqvw2QkEd1YOKcJ2J6BSl8Oer+cK5FxYmCISbZ+MkdDD2M/BUtNfhDN3zdXATdHv0RhH2Vp4GUzjD98bYDDD03m8Y2LB18C42F+wBsxl7y8TS3N8pEI0xfWNMOhGOg4meYzeKsf18rnhCxgJmujqtRsAzfyswGTlY2prImG8MbKgkYUe6fLPnDjT9XbCi2lA7+yA9JEmQCrOb+ViljhPpz60qEF9KXBcM4WtDkrHhyWfoC0gqY67DkAH+gymYP7l4ZmcCKSoml9ngmIuUO6meIud2DlR5wV/lKSEvc8P6vYkD+sNHOUvJ+lFaJ1tzDsxl4D8OwEPYk6xOegAAAABJRU5ErkJggg==';
-function SidecarIcon({ tool }: { tool: 'trigger' | 'inngest' }) {
-  return <img src={tool === 'trigger' ? TRIGGER_ICON_URI : INNGEST_ICON_URI} class="w-3.5 h-3.5 rounded-none" alt="" />;
+// 8192MB is the amber warning threshold shared by WorktreeCard's badge and
+// WorktreePage's metric — one source of truth for the number.
+function memTone(mb: number): Tone { return mb > 8192 ? 'amber' : 'zinc'; }
+
+// short=true gives the compact card-badge form (g/m), the default gives the
+// spelled-out detail-page form (GB/MB) — same threshold, different label
+// length for two different amounts of surrounding space.
+function formatMem(mb: number, short = false): string {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)}${short ? 'g' : 'GB'}` : `${Math.round(mb)}${short ? 'm' : 'MB'}`;
 }
 
-const MUKUL_LOGO_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAMKADAAQAAAABAAAAMAAAAADbN2wMAAAFM0lEQVRoBd1ZSUtsRxQ+2s7THzDoi0F9KGpQQReujJsQJRFEXAny3LkV4vADEhcS4kIi4oCCuMnGlYqggggiJuHxVDRq8GmMGsF5Hjrnq3CLe693qO42dncOnL41n++rOnXqVl+iMJcIB/xRXPeGtZD1M9Y41teUKzb2O+uvrB9ZH1mVJY9b9rCi4z2rN0h6x3a3WH9kzWJ1lUhuUcu6wRos0HZ2PzCmryJY+GkrAP83q90gwS7/k7F9aYcebgOfCzZIN/u/MUbsSYN4OPcTq1vnUKn/3oCeM9gg22FEYIWxprISNi3kc1ZRIHKh//MpQ8wFTI1ABqfhRuEiOJPSAFYj4HpIZWZmUlqa6BMqJBP0BFxBFRUVUUtLC8XGxrq2fYkGsOMS8sXkayvgajM5OZnq6+uppqbGtW2gDTIyMqipqYni4lwdQ7qQq83ExESCtra2UnZ2tmt7fxsAfE9PD1VWVioN4dMKYMTc3Fxqa2ujhAThgkpGVBtlZWVRb28vVVRU0NPTE3m9OHacRZlAUlKSHKm2tpbq6upk/iUSOTk51NfXR+Xl5WI4FfBoqEwgJSVF4oRvYkPn5eHtI3ApKCig/v5+Kisr83kwJQKIBvoVgBWE1fb29mflviIoLi4W4EtKSgxdsQIqq6BEwOPxWAKtqqqi0tJSg2FfMgANtyksxJ3JKCrg0QO3LleJioqy3LSRkZEEhcTExFBDQwOlp6fT2dkZXV5eSr26uqLr62vCc3V1lY6Pj0WfxsZGys/PF2l/f5QJmF0IBu/u7uj09FTYRhqz1tzcTNHR0RIPosnj46OIKltbW1RdXS0J3N/jsmct6KciSi4EQFZh8+bmhi4uLqSd0dFRGh8fl3kksELoj5N1bGyM1tfXZf3JyYlMmxOqLqREAMatTkW4BVxFE7hOZ2cnHR0daUXyidkfGBgwbEwnArKjSyIgAgAPv9bL3NwcDQ0N6YtEGmVra2uGcicCWAGVVVAigNmPj483GEfm/Pycbm9vDeXw9+7ublpZwZ3jX8HGHR4e1rLyif1j5+sq4DGQEgGA129MDYEVAdRtbm5SV1cXYZMCyODgIMGFzAKXc9rI5vZWeSUCeIlDmDQLZtAOADb09PQ0LS8v08jIiLmryDsRUF0BpTCKCISzwCzwYbiMlYBcR0cHpaam0u7urlUTEcEQfq0EBFRIPEdlMRpWwI6ARXNZNDMzIw86WahLaAecrsjnpBIBHGLaiau3oJ2o+jJ9GhvUbpOinRMBldnHGEp7ALcxfwjAgJOYzxF92xclYPUagZl1iuN6MHZp+D8iWSCivAJmIw8PD/8pAUyQyir4TQDhE2EwEEEEsxtDBTxsKxGwciG8yAW6/CBg54Yuf6nIeXONQti8dgT0b6JyRB8T2uu41g2uube3R0tLS44RTGvvSgDxXyOAGTs8PBSn68TEBO3v72vj+P0EAYDe2Nig+fl5mpqaooWFBdrZ2XkZAlhKvMfg747Z2VkxM9vb2+KG5TdqXcfJyUkxIYuLi3RwcGB7suu6aEnDjedbLrX8758JePllzsuuZFlv1+8Vyt+BieZCm5x+0OVRJwTRAAdOiAkA4XuGjEL4lLmDgjARTPgysGph9A9Oj6EgTORnxvmXGetbLsA1KtR83YxnkTHafqj4hisRG82dQiUPv/+C1VYiuOZr1lBciV8YV4UtclMFvlr+wIrvxri1B2sFbtj2Kut3rG9Ynwlm3E48XIEvl/jv7xNW/N0GIq8hwIW75kfW96zYsIaDi/P/D/kHGNOpOz6fLmoAAAAASUVORK5CYII=';
+// Same "cd into this worktree" string used by both the card's copy button and
+// the detail page's "Copy cd command" action.
+function cdCommand(w: Worktree): string { return `cd ~/workspace/${w.repo}/${w.name}`; }
 
-function CreateModal({ projects, onClose, onCreated }: any) {
-  const [repo, setRepo] = useState(projects[0]?.name ?? '');
-  const [name, setName] = useState('');
+// initialRepo/initialName prefill the Recreate flow from an archived
+// worktree's record (same repo+branch, a fresh checkout). The plain
+// + Worktree button omits both and falls back to the first project / blank.
+function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }: {
+  projects: Project[]; initialRepo?: string; initialName?: string; onClose: () => void; onCreated: () => void;
+}) {
+  const [repo, setRepo] = useState(initialRepo ?? projects[0]?.name ?? '');
+  const [name, setName] = useState(initialName ?? '');
   const [tunnel, setTunnel] = useState(false);
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
@@ -191,7 +227,7 @@ function CreateModal({ projects, onClose, onCreated }: any) {
   );
 }
 
-function AddProjectModal({ onClose, onAdded }: any) {
+function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
   const [tab, setTab] = useState<'existing' | 'new'>('existing');
   const [github, setGithub] = useState('');
   const [newName, setNewName] = useState('');
@@ -204,7 +240,7 @@ function AddProjectModal({ onClose, onAdded }: any) {
     const gh = tab === 'existing' ? github.trim() : '';
     if (tab === 'existing' ? !gh : !name) return;
     setBusy(true);
-    setStatus(tab === 'existing' ? 'Cloning repo…' : 'Initialising repo…');
+    setStatus(tab === 'existing' ? 'Cloning repo…' : 'Initializing repo…');
     const res = await post('/api/project/add', { github: gh, name, label: label.trim() });
     if (res.ok) {
       setStatus(`✓ Added ${res.name} (port band ${res.base}–${res.base + 99})`);
@@ -266,51 +302,6 @@ function AddProjectModal({ onClose, onAdded }: any) {
   );
 }
 
-const LOG_TABS = ['dev', 'tunnel', 'inngest', 'trigger', 'setup'] as const;
-
-function LogModal({ repo, name, initialType, onClose }: any) {
-  const [type, setType] = useState(initialType ?? 'dev');
-  const [text, setText] = useState('Loading…');
-  const preRef = useRef<HTMLPreElement>(null);
-
-  useEffect(() => {
-    let alive = true;
-    async function load() {
-      const data = await fetch(`/api/logs?repo=${repo}&name=${encodeURIComponent(name)}&type=${type}`)
-        .then(r => r.json()).catch(() => ({ lines: [] }));
-      if (!alive) return;
-      setText(data.lines.length ? data.lines.join('\n') : '(no log yet — start the dev server first)');
-      requestAnimationFrame(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight; });
-    }
-    load();
-    const t = setInterval(load, 2000);
-    return () => { alive = false; clearInterval(t); };
-  }, [repo, name, type]);
-
-  return (
-    <Modal onClose={onClose} position="bottom">
-      <div class="bg-white border-t border-zinc-200 shadow-2xl w-full" style="height:60vh; display:flex; flex-direction:column;">
-        <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 shrink-0">
-          <div class="flex gap-1 bg-zinc-100 rounded-none p-0.5">
-            {LOG_TABS.map(t => (
-              <button key={t} onClick={() => setType(t)}
-                class={`text-xs font-medium px-3 py-1 rounded-none transition-all duration-150 ${type === t ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}>
-                {t === 'dev' ? 'Dev server' : t[0].toUpperCase() + t.slice(1)}
-              </button>
-            ))}
-          </div>
-          <span class="text-xs text-zinc-400 flex-1">{repo}/{name} • {type}.log</span>
-          <IconButton tip="Copy all" onClick={() => navigator.clipboard.writeText(text).catch(() => {})}>
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-          </IconButton>
-          <CloseBtn onClick={onClose} />
-        </div>
-        <pre ref={preRef} class="flex-1 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 bg-zinc-50 px-5 py-4 whitespace-pre-wrap break-all">{text}</pre>
-      </div>
-    </Modal>
-  );
-}
-
 // Start is a split action: the primary click uses the sticky per-worktree
 // default (mode omitted from the request entirely — see lib.js's
 // defaultContainerMode), the caret forces a specific mode. Showing
@@ -322,7 +313,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   if (pending) {
     return (
       <IconButton tone="emerald" tip="Starting…" disabled>
-        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
       </IconButton>
     );
   }
@@ -335,7 +326,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
     return (
       <Menu trigger={toggle => (
         <IconButton tone="emerald" tip="This worktree has always run bare — migrate to a container?" onClick={toggle}>
-          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
         </IconButton>
       )}>
         <MenuItem onClick={() => onStart(w, 'container')}>Migrate to container</MenuItem>
@@ -346,12 +337,12 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   return (
     <div class="flex items-center">
       <IconButton tone="emerald" tip={`Start — will run ${w.nextStartMode}`} onClick={() => onStart(w)}>
-        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
       </IconButton>
       <Menu trigger={toggle => (
         <button onClick={(e: any) => { e.stopPropagation(); toggle(); }} data-tip="Force a mode"
           class="tip w-4 h-6 flex items-center justify-center text-zinc-300 hover:text-zinc-500 transition-colors duration-150 -ml-1">
-          <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z" /></svg>
+          <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M18 9c.852 0 1.297 .986 .783 1.623l-.076 .084l-6 6a1 1 0 0 1 -1.32 .083l-.094 -.083l-6 -6l-.083 -.094l-.054 -.077l-.054 -.096l-.017 -.036l-.027 -.067l-.032 -.108l-.01 -.053l-.01 -.06l-.004 -.057v-.118l.005 -.058l.009 -.06l.01 -.052l.032 -.108l.027 -.067l.07 -.132l.065 -.09l.073 -.081l.094 -.083l.077 -.054l.096 -.054l.036 -.017l.067 -.027l.108 -.032l.053 -.01l.06 -.01l.057 -.004l12.059 -.002z" /></svg>
         </button>
       )}>
         <MenuItem onClick={() => onStart(w, 'bare')}>Force bare (no cap)</MenuItem>
@@ -361,18 +352,324 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   );
 }
 
-function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTool, onRemove, toast, gridMode }: any) {
+// Per-provider bits DeployMenu/DeployStatusChips/DeploySection below all
+// need: the label for tooltips/section titles, the real brand icon (see
+// components/icons.tsx), and the custom-target prompt copy. Vercel's custom
+// target is a named environment; netlify's is a branch name fed through
+// --context branch:<name> server-side, different enough that one prompt
+// string doesn't read right for both. Icon is a component reference, not a
+// pre-built element -- reusing the same vnode instance across every
+// worktree card on the page is exactly the kind of thing Preact expects a
+// component (mounted fresh per call site) to handle instead.
+const DEPLOY_PROVIDER: Record<DeployProvider, { label: string; Icon: (props: { class?: string }) => any; customPrompt: string }> = {
+  vercel:  { label: 'Vercel',  Icon: VercelIcon,  customPrompt: 'Custom environment name (e.g. staging):' },
+  netlify: { label: 'Netlify', Icon: NetlifyIcon, customPrompt: 'Branch name for the deploy context (e.g. staging):' },
+};
+
+// Same "icon button opens a picker" shape as StartControl's force-mode menu
+// above, for the same reason: deploying needs a target choice (preview,
+// production, or a named custom environment), not a bare click. A running
+// deploy is one-shot and not cancellable from here, so it renders as a
+// disabled pulsing indicator instead of a clickable trigger; clicking
+// "deploy" again mid-deploy isn't a meaningful action. One component covers
+// both Vercel and Netlify -- they differ only in which Worktree field holds
+// the deploy state and the DEPLOY_PROVIDER lookup above, not in shape.
+function DeployMenu({ w, provider, deploy, onDeploy }: {
+  w: Worktree; provider: DeployProvider; deploy: DeployStatus;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+}) {
+  const { label, Icon, customPrompt } = DEPLOY_PROVIDER[provider];
+  if (deploy?.deploying) {
+    return (
+      <IconButton tone="amber" tip={`Deploying to ${label} (${deploy.target})…`} disabled>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+      </IconButton>
+    );
+  }
+  return (
+    <Menu trigger={toggle => (
+      <IconButton tone="zinc" tip={`Deploy to ${label}`} onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+        <Icon class="w-4 h-4" />
+      </IconButton>
+    )}>
+      <MenuItem onClick={() => onDeploy(w, provider, 'preview')}>Deploy preview</MenuItem>
+      <MenuItem onClick={() => onDeploy(w, provider, 'production')}>Deploy production</MenuItem>
+      <MenuItem onClick={() => {
+        const custom = window.prompt(customPrompt);
+        if (custom && custom.trim()) onDeploy(w, provider, custom.trim());
+      }}>Deploy custom…</MenuItem>
+    </Menu>
+  );
+}
+
+// WorktreeCard's compact inline status chips (deploying/deployed/failed) for
+// one provider -- previously inlined once for vercel only, now shared the
+// same way DeployMenu above is so adding netlify didn't mean pasting a
+// second copy of this same three-branch block.
+function DeployStatusChips({ w, provider, deploy, onOpenLogs }: {
+  w: Worktree; provider: DeployProvider; deploy: DeployStatus; onOpenLogs: (repo: string, name: string, type: string) => void;
+}) {
+  const { label, Icon } = DEPLOY_PROVIDER[provider];
+  return <>
+    {deploy?.deploying && (
+      <button onClick={() => onOpenLogs(w.repo, w.name, provider)}
+        title={`Deploying to ${label} (${deploy.target}), click to view progress`}
+        class="flex items-center gap-1.5 text-signal-amber hover:opacity-80 transition-opacity duration-150 shrink-0">
+        <StatusDot tone="amber" pulse />deploying
+      </button>
+    )}
+    {deploy?.url && !deploy.deploying && (
+      <a href={deploy.url} target="_blank" title={`Deployed to ${deploy.target}`}
+        class="flex items-center gap-1 text-signal-green hover:text-zinc-600 transition-colors duration-150 shrink-0">
+        <Icon class="w-3 h-3" />deployed
+      </a>
+    )}
+    {deploy?.error && !deploy.deploying && (
+      <button onClick={() => onOpenLogs(w.repo, w.name, provider)} title={deploy.error}
+        class="flex items-center gap-1 text-signal-red hover:opacity-80 transition-opacity duration-150 shrink-0">
+        deploy failed
+      </button>
+    )}
+  </>;
+}
+
+// Backend shape from GET /api/pr-review/status -- see pr-review.js's
+// reviewRunStatus/findLatestArtifact for where each field comes from.
+type PrReviewRun = {
+  running: boolean; skill: string; startedAt: number;
+  exitCode: 'success' | 'error' | 'timeout' | null; costUsd: number | null;
+  error: string | null; dirtyAfter: boolean | null;
+} | null;
+type PrReviewArtifact = {
+  snapshot: string; generatedAt: string; headSha: string;
+  htmlFile: string | null; findings: number | null; stale: boolean;
+} | null;
+type PrReviewStatus = {
+  pluginInstalled: boolean; pr: { number: number } | null; run: PrReviewRun;
+  artifacts: Record<'pr-walkthrough' | 'pr-brief', PrReviewArtifact>;
+};
+
+const PR_REVIEW_SKILLS = ['pr-walkthrough', 'pr-brief'] as const;
+const PR_REVIEW_LABEL: Record<typeof PR_REVIEW_SKILLS[number], string> = { 'pr-walkthrough': 'Deep review', 'pr-brief': 'Brief' };
+
+// Tier 2 of PR review -- shells out to the installed pr-walkthrough/pr-brief
+// Claude Code plugin (see pr-review.js). Self-contained, same "owns its own
+// polling loop" convention as RaycastSection: WorktreePage doesn't need to
+// know anything about this beyond dropping it in. Renders nothing when the
+// worktree has no associated PR -- there's nothing to review.
+function PrReviewSection({ w, toast, onOpenLogs }: {
+  w: Worktree; toast: (msg: string, tone?: Tone) => void; onOpenLogs: (repo: string, name: string, type: string) => void;
+}) {
+  const [status, setStatus] = useState<PrReviewStatus | null>(null);
+
+  const load = useCallback(async () => {
+    setStatus(await fetch(`/api/pr-review/status?repo=${encodeURIComponent(w.repo)}&name=${encodeURIComponent(w.name)}`).then(r => r.json()).catch(() => null));
+  }, [w.repo, w.name]);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function run(skill: string) {
+    const res = await postOrToast('/api/pr-review/run', { repo: w.repo, name: w.name, skill }, toast, 'pr-review failed to start');
+    if (res?.ok) load();
+  }
+
+  if (!w.pr) return null;
+
+  const running = status?.run?.running ?? false;
+
+  return (
+    <Section title="PR Review">
+      {!status ? <p class="text-sm text-zinc-400">Loading…</p> : !status.pluginInstalled ? (
+        <p class="text-xs text-zinc-400">
+          The pr-walkthrough plugin isn't installed for this worktree. Install it with{' '}
+          <code class="font-mono text-zinc-500">claude plugin install pr-walkthrough@mukulchugh-skills</code>.
+        </p>
+      ) : (
+        <div class="flex flex-col gap-3">
+          <div class="flex items-center gap-3 flex-wrap">
+            {running ? (
+              <button onClick={() => onOpenLogs(w.repo, w.name, 'pr-review')}
+                title={`Running ${PR_REVIEW_LABEL[status!.run!.skill as typeof PR_REVIEW_SKILLS[number]]}, click to view progress`}
+                class="flex items-center gap-1.5 text-xs text-signal-amber hover:opacity-80 transition-opacity duration-150">
+                <StatusDot tone="amber" pulse />running {PR_REVIEW_LABEL[status!.run!.skill as typeof PR_REVIEW_SKILLS[number]]}…
+              </button>
+            ) : (
+              PR_REVIEW_SKILLS.map(skill => (
+                <SecondaryButton key={skill} compact onClick={() => run(skill)}>{PR_REVIEW_LABEL[skill]}</SecondaryButton>
+              ))
+            )}
+            {status?.run && !running && status.run.exitCode !== 'success' && (
+              <button onClick={() => onOpenLogs(w.repo, w.name, 'pr-review')}
+                class="flex items-center gap-1 text-xs text-signal-red hover:opacity-80 transition-opacity duration-150">
+                {status.run.exitCode === 'timeout' ? 'timed out' : 'failed'} — view log
+              </button>
+            )}
+            {status?.run && !running && status.run.exitCode === 'success' && status.run.costUsd != null && (
+              <span class="text-xs text-zinc-400">last run cost ${status.run.costUsd.toFixed(2)}</span>
+            )}
+            {status?.run?.dirtyAfter && (
+              <span class="text-xs text-signal-red">warning: worktree changed during the run — check with git status</span>
+            )}
+          </div>
+
+          {status && PR_REVIEW_SKILLS.map(skill => {
+            const a = status.artifacts[skill];
+            if (!a || !a.htmlFile) return null;
+            return (
+              <div key={skill} class="flex items-center gap-2 text-xs">
+                <a href={`/api/pr-review/artifact?repo=${encodeURIComponent(w.repo)}&name=${encodeURIComponent(w.name)}&skill=${skill}`}
+                  target="_blank" class="text-zinc-700 dark:text-zinc-300 hover:text-accent transition-colors">
+                  Open {PR_REVIEW_LABEL[skill].toLowerCase()}
+                </a>
+                {a.findings != null && <Badge tone="zinc">{a.findings} finding{a.findings === 1 ? '' : 's'}</Badge>}
+                {a.stale && <span class="text-signal-amber">stale — reviewed {a.headSha.slice(0, 7)}, head has moved on</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+// WorktreePage's "<Provider> deploy" Section -- previously written out once
+// for Vercel only, now shared with Netlify the same way everything else on
+// this page is (DeployMenu, DeployStatusChips above).
+function DeploySection({ w, provider, deploy, onDeploy, onOpenLogs }: {
+  w: Worktree; provider: DeployProvider; deploy: DeployStatus;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+  onOpenLogs: (repo: string, name: string, type: string) => void;
+}) {
+  const { label } = DEPLOY_PROVIDER[provider];
+  return (
+    <Section title={`${label} deploy`}>
+      <div class="flex items-center justify-between flex-wrap gap-3 text-sm">
+        <div class="flex items-center gap-2 min-w-0">
+          <StatusDot tone={deployTone(deploy)} pulse={!!deploy?.deploying} />
+          <span>{deployStatusText(deploy)}</span>
+          {deploy?.url && !deploy.deploying && (
+            <a href={deploy.url} target="_blank" class="text-xs text-emerald-600 hover:underline truncate max-w-xs">{deploy.url}</a>
+          )}
+          {deploy && (
+            <button onClick={() => onOpenLogs(w.repo, w.name, provider)} class="text-xs text-zinc-500 hover:underline shrink-0">view log</button>
+          )}
+        </div>
+        <DeployMenu w={w} provider={provider} deploy={deploy} onDeploy={onDeploy} />
+      </div>
+      {deploy?.error && !deploy.deploying && <p class="text-xs text-signal-red mt-2">{deploy.error}</p>}
+    </Section>
+  );
+}
+
+// Convex's own tone/text pair, same shape as deployTone/deployStatusText
+// above but reading `ok` instead of `url` -- see ConvexDeployStatus's own
+// comment for why a convex deploy needs an explicit success signal rather
+// than inferring it from a url field that would just always be null.
+function convexDeployTone(d: ConvexDeployStatus): Tone {
+  if (!d) return 'zinc';
+  if (d.deploying) return 'amber';
+  if (d.error) return 'red';
+  if (d.ok) return 'emerald';
+  return 'zinc';
+}
+function convexDeployText(d: ConvexDeployStatus): string {
+  if (!d) return 'Not deployed';
+  if (d.deploying) return `Deploying (${d.target})…`;
+  if (d.error) return 'Deploy failed';
+  if (d.ok) return `Deployed (${d.target})`;
+  return 'Not deployed';
+}
+
+// Same "icon button opens a picker" shape as DeployMenu above, but not built
+// on the DEPLOY_PROVIDER record -- convex only ever has two targets (no
+// named-custom-target option makes sense for it, see deployToConvex's own
+// comment in portal.js), so a dedicated two-item menu reads more directly
+// than forcing convex into a three-provider abstraction built for a third
+// option it doesn't have.
+function ConvexDeployMenu({ w, deploy, onConvexDeploy }: {
+  w: Worktree; deploy: ConvexDeployStatus;
+  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+}) {
+  if (deploy?.deploying) {
+    return (
+      <IconButton tone="amber" tip={`Deploying to Convex (${deploy.target})…`} disabled>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+      </IconButton>
+    );
+  }
+  return (
+    <Menu trigger={toggle => (
+      <IconButton tone="zinc" tip="Deploy to Convex" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+        <ConvexIcon class="w-4 h-4" />
+      </IconButton>
+    )}>
+      <MenuItem onClick={() => onConvexDeploy(w, 'preview')}>Deploy preview</MenuItem>
+      <MenuItem onClick={() => onConvexDeploy(w, 'production')}>Deploy production</MenuItem>
+    </Menu>
+  );
+}
+
+// WorktreePage's "Convex" Section -- only ever rendered by its caller when
+// w.convexConfigured is true (see WorktreePage below). Combines a sidecar-
+// style start/stop row (mirroring the Inngest row in the Sidecars Section
+// below exactly) with a small Deploy action (mirroring DeploySection above),
+// since Convex genuinely has both shapes: a persistent dev process and a
+// separate occasional deploy.
+function ConvexSection({ w, onAct, onOpenLogs, onConvexDeploy }: {
+  w: Worktree;
+  onAct: (url: string, w: Worktree) => void; onOpenLogs: (repo: string, name: string, type: string) => void;
+  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+}) {
+  const deploy = w.convexDeploy;
+  return (
+    <Section title="Convex">
+      <div class="flex items-center justify-between flex-wrap gap-3 text-sm">
+        <div class="flex items-center gap-2">
+          <ConvexIcon class="w-4 h-4" />
+          <StatusDot tone={w.convexActive ? 'emerald' : 'zinc'} />
+          <span>{w.convexActive ? 'dev running' : 'dev stopped'}</span>
+          {w.convexActive
+            ? <button onClick={() => onAct('/api/convex/stop', w)} class="text-xs text-red-500 hover:underline">stop</button>
+            : <button onClick={() => onAct('/api/convex/start', w)} class="text-xs text-zinc-500 hover:underline">start</button>}
+          <button onClick={() => onOpenLogs(w.repo, w.name, 'convex')} class="text-xs text-zinc-500 hover:underline">view log</button>
+        </div>
+        <div class="flex items-center gap-2 min-w-0">
+          <StatusDot tone={convexDeployTone(deploy)} pulse={!!deploy?.deploying} />
+          <span class="text-xs text-zinc-500">{convexDeployText(deploy)}</span>
+          <ConvexDeployMenu w={w} deploy={deploy} onConvexDeploy={onConvexDeploy} />
+        </div>
+      </div>
+      {deploy?.error && !deploy.deploying && <p class="text-xs text-signal-red mt-2">{deploy.error}</p>}
+    </Section>
+  );
+}
+
+function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs, onOpenTool, onRemove, toast, gridMode }: {
+  w: Worktree; pending: boolean; agents: { id: string; label: string }[];
+  onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+  onOpenLogs: (repo: string, name: string, type: string) => void; onOpenTool: (w: Worktree, tool: string) => void;
+  onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void; toast: (msg: string, tone?: Tone) => void; gridMode: boolean;
+}) {
   const [copied, setCopied] = useState(false);
 
   function copyCD() {
-    navigator.clipboard.writeText(`cd ~/workspace/${w.repo}/${w.name}`)
+    navigator.clipboard.writeText(cdCommand(w))
       .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); })
-      .catch(() => toast('clipboard unavailable'));
+      .catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'));
   }
 
-  const statusTone: Tone = w.active ? 'emerald' : w.queued ? 'amber' : 'zinc';
+  const { tone: statusTone, text: statusText } = worktreeStatus(w);
   const showInngestInline = w.inngestActive;
   const showTriggerInline = w.triggerActive;
+  // Two-part gate, unlike the two above: Convex isn't assumed available on
+  // every worktree, so the inline chip needs both "configured" and "active",
+  // not just "active" alone.
+  const showConvexInline = w.convexConfigured && w.convexActive;
 
   return (
     <div class={`wt-card group rounded-none border bg-white/85 dark:bg-zinc-900/55 backdrop-blur-md transition-all duration-200 ease-out hover:border-zinc-300 dark:hover:border-zinc-700 hover:bg-white/95 dark:hover:bg-zinc-900/75 ${
@@ -387,7 +684,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
           <span class="board-mono text-[10px] text-zinc-300 font-bold shrink-0">{w.label}</span>
           <span class="flex items-center gap-1.5 shrink-0">
             <StatusDot tone={statusTone} pulse={w.active} />
-            <StatusFlap text={w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped'} tone={statusTone} />
+            <StatusFlap text={statusText} tone={statusTone} />
           </span>
           {w.container && <Badge tone="zinc" tip="Running in a container — real memory/CPU cap">container</Badge>}
           {!w.active && !w.queued && (
@@ -398,8 +695,8 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
             </Badge>
           )}
           {w.active && w.memMb != null && (
-            <Badge tone={w.memMb > 8192 ? 'amber' : 'zinc'} tip="Live memory footprint of this dev server">
-              {w.memMb >= 1024 ? `${(w.memMb / 1024).toFixed(1)}g` : `${Math.round(w.memMb)}m`}
+            <Badge tone={memTone(w.memMb)} tip="Live memory footprint of this dev server">
+              {formatMem(w.memMb, true)}
             </Badge>
           )}
           {w.dirty > 0 && (
@@ -429,20 +726,34 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
               <SidecarIcon tool="trigger" />trigger
             </button>
           )}
+          {showConvexInline && (
+            <button onClick={() => onOpenLogs(w.repo, w.name, 'convex')} title="Convex dev logs"
+              class="flex items-center gap-1.5 hover:text-zinc-600 transition-colors duration-150 shrink-0">
+              <ConvexIcon class="w-3 h-3" />convex
+            </button>
+          )}
           {w.branchUrl && (
             <a href={w.branchUrl} target="_blank" class="flex items-center gap-1 hover:text-zinc-600 transition-colors duration-150 shrink-0">
               <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm3-8.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z" /></svg>branch
             </a>
           )}
           {w.pr && (
-            <a href={w.pr.url} target="_blank" class="flex items-center gap-1 hover:text-zinc-600 transition-colors duration-150 shrink-0">
-              <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm8.25.75a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z" /></svg>PR #{w.pr.number}
+            <a href={w.pr.url} target="_blank" title={`${w.pr.state}: ${w.pr.title}`}
+              class={`flex items-center gap-1 transition-colors duration-150 shrink-0 ${prLinkClass(w.pr.state)}`}>
+              <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm8.25.75a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z" /></svg>
+              PR #{w.pr.number}
+              {w.pr.state === 'merged' && <span class="board-mono text-[8px] font-bold">MERGED</span>}
+              {(w.pr.state === 'open' || w.pr.state === 'draft') && w.pr.checks !== 'none' && (
+                <StatusDot tone={checksTone(w.pr.checks)} pulse={w.pr.checks === 'pending'} />
+              )}
             </a>
           )}
+          <DeployStatusChips w={w} provider="vercel" deploy={w.vercelDeploy} onOpenLogs={onOpenLogs} />
+          <DeployStatusChips w={w} provider="netlify" deploy={w.netlifyDeploy} onOpenLogs={onOpenLogs} />
         </div>
       </div>
 
-    <div class={gridMode ? 'flex items-center justify-between gap-2 pt-1 border-t border-zinc-100 dark:border-zinc-800' : 'contents'}>
+    <div class={gridMode ? 'flex items-center justify-between gap-2 -mx-5 -mb-5 mt-1 px-5 py-2.5 border-t border-zinc-100 dark:border-zinc-800 bg-zinc-100/70 dark:bg-black/20' : 'contents'}>
       {/* Hidden until hover — a clean card at rest, the tool-launch icons
           only when you're actually looking at this specific card. The
           Start/Stop/More row below stays always-visible; that's the one
@@ -450,7 +761,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
       <div class={`flex items-center gap-0.5 shrink-0 flex-wrap transition-opacity duration-150 ${
         gridMode ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'}`}>
         <IconButton tone="zinc" tip="Open in browser" disabled={!w.active} href={`http://${w.domain}`} target="_blank">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" /><path d="M11 13l9 -9" /><path d="M15 4h5v5" /></svg>
         </IconButton>
         {agents.map((a: { id: string; label: string }) => (
           <IconButton key={a.id} tone="zinc" tip={`Open in ${a.label}`} onClick={() => onOpenTool(w, a.id)}>
@@ -459,37 +770,50 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
         ))}
         <IconButton tone="zinc" tip="Copy cd command" onClick={copyCD}>
           {copied
-            ? <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" /></svg>
-            : <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>}
+            ? <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M5 12l5 5l10 -10" /></svg>
+            : <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M7 9.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667l0 -8.666" /><path d="M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1" /></svg>}
         </IconButton>
         <IconButton tone={w.tunnelRunning ? 'emerald' : 'zinc'}
           tip={w.tunnelRunning ? 'Tunnel live — click to disable' : w.tunnelOn ? 'Tunnel configured, not running' : 'Enable tunnel'}
           onClick={() => onAct(w.tunnelOn ? '/api/tunnel/disable' : '/api/tunnel/enable', w)}>
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" /></svg>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M3.6 9h16.8" /><path d="M3.6 15h16.8" /><path d="M11.5 3a17 17 0 0 0 0 18" /><path d="M12.5 3a17 17 0 0 1 0 18" /></svg>
         </IconButton>
+        <DeployMenu w={w} provider="vercel" deploy={w.vercelDeploy} onDeploy={onDeploy} />
+        <DeployMenu w={w} provider="netlify" deploy={w.netlifyDeploy} onDeploy={onDeploy} />
+        {/* Merged-PR shortcut straight to the same confirm()-gated remove
+            flow the "Remove worktree" menu item below already uses, not a
+            second removal pathway, just a faster route to the one that
+            exists. Emerald (not the menu item's red) to read as "safe to do
+            now" rather than "destructive", since the PR being merged is
+            exactly what makes it safe. */}
+        {w.pr?.state === 'merged' && (
+          <IconButton tone="emerald" tip="PR merged, clean up worktree" onClick={() => onRemove(w, 'merged')}>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>
+          </IconButton>
+        )}
       </div>
 
       {/* Always visible: the one thing you came here to do, and the menu for everything else. */}
       <div class="flex items-center gap-1 shrink-0">
         {w.active ? (
           <IconButton tone="red" tip="Stop server" onClick={() => onAct('/api/stop', w)}>
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M17 4h-10a3 3 0 0 0 -3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3 -3v-10a3 3 0 0 0 -3 -3z" /></svg>
           </IconButton>
         ) : w.queued ? (
           <IconButton tone="amber" tip={`Queued #${w.queuePosition} — click to cancel`} onClick={() => onAct('/api/stop', w)}>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path stroke-linecap="round" d="M12 6v6l4 2" /></svg>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M12 7v5l3 3" /></svg>
           </IconButton>
         ) : (
           <StartControl w={w} pending={pending} onStart={onStart} />
         )}
 
         <Menu trigger={toggle => (
-          <IconButton tone="zinc" tip="More" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="12" cy="19" r="1.5" /></svg>
+          <IconButton tone="zinc" tip="More actions" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M14 12a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 19a2 2 0 1 1 -4 0q 0 -.052 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 5a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /></svg>
           </IconButton>
         )}>
           <MenuItem onClick={() => onOpenLogs(w.repo, w.name, 'dev')}
-            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>}>
+            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4" /><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /><path d="M9 9l1 0" /><path d="M9 13l6 0" /><path d="M9 17l6 0" /></svg>}>
             View logs
           </MenuItem>
           {!showInngestInline && (
@@ -512,19 +836,55 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onOpenLogs, onOpenTo
               Stop trigger.dev
             </MenuItem>
           )}
+          {w.convexConfigured && !w.convexActive && (
+            <MenuItem onClick={() => onAct('/api/convex/start', w)} icon={<ConvexIcon class="w-3 h-3" />}>
+              Start Convex dev
+            </MenuItem>
+          )}
+          {w.convexConfigured && w.convexActive && (
+            <MenuItem onClick={() => onAct('/api/convex/stop', w)} icon={<ConvexIcon class="w-3 h-3" />}>
+              Stop Convex dev
+            </MenuItem>
+          )}
           <div class="my-1 border-t border-zinc-100" />
           <MenuItem onClick={() => onAct('/api/sync', w)}
-            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}>
+            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>}>
             Sync with staging
           </MenuItem>
           <div class="my-1 border-t border-zinc-100" />
           <MenuItem tone="red" onClick={() => onRemove(w)}
-            icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>}>
+            icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>}>
             Remove worktree
           </MenuItem>
         </Menu>
       </div>
     </div>
+    </div>
+  );
+}
+
+// Same grid/flex wrapper and WorktreeCard mapping used for both the "Now
+// running" section and the main paginated list — previously duplicated with
+// identical prop-drilling. emptyMessage is only ever passed by the main list;
+// "Now running" is only rendered when its items are non-empty, so its call
+// never hits the empty branch and the paragraph never shows there.
+function WorktreeList({ items, gridMode, onAct, onStart, onDeploy, onRemove, toast, onOpenLogs, onOpenTool, pendingStart, agents, emptyMessage }: {
+  items: Worktree[]; gridMode: boolean;
+  onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+  onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void; toast: (msg: string, tone?: Tone) => void;
+  onOpenLogs: (repo: string, name: string, type: string) => void; onOpenTool: (w: Worktree, tool: string) => void;
+  pendingStart: Set<string>; agents: { id: string; label: string }[]; emptyMessage?: string;
+}) {
+  return (
+    <div class={gridMode ? 'grid grid-cols-1 lg:grid-cols-2 gap-3 items-start' : 'flex flex-col gap-3'}>
+      {!items.length
+        ? <p class="text-zinc-400 text-sm py-10 text-center">{emptyMessage}</p>
+        : items.map(w => (
+          <WorktreeCard key={w.key} w={w} gridMode={gridMode} pending={pendingStart.has(w.key)} agents={agents}
+            onAct={onAct} onStart={onStart} onDeploy={onDeploy} onRemove={onRemove} toast={toast}
+            onOpenLogs={onOpenLogs} onOpenTool={onOpenTool} />
+        ))}
     </div>
   );
 }
@@ -541,45 +901,27 @@ function StatusStrip({ status }: { status: Status | null }) {
   const atCap = concurrency.active >= concurrency.max;
   return (
     <div class="inline-flex items-stretch text-[11px] board-mono border border-zinc-300 dark:border-zinc-700 divide-x divide-zinc-300 dark:divide-zinc-700">
-      <span data-tip="Dev servers running vs. maxConcurrentDevServers" class="tip flex items-center gap-1.5 px-2.5 py-1">
+      <span data-tip={`${concurrency.active} of ${concurrency.max} dev servers running`} class="tip flex items-center gap-1.5 px-2.5 py-1">
         <StatusDot tone={atCap ? 'amber' : 'emerald'} />
-        {concurrency.active}/{concurrency.max} running
+        {concurrency.active} running
         {concurrency.queued > 0 && <span class="text-signal-amber">·{concurrency.queued}q</span>}
       </span>
-      <span data-tip={container.engineAvailable ? `Engine: ${container.engine}` : 'No container runtime reachable — setu start falls back to --bare'}
+      <span data-tip={container.engineAvailable ? `Engine: ${container.engine}, ${container.memoryLimit} memory limit` : 'No container runtime reachable — setu start falls back to --bare'}
         class={`tip flex items-center gap-1.5 px-2.5 py-1 ${container.engineAvailable ? 'text-zinc-500' : 'text-signal-amber'}`}>
         <StatusDot tone={container.engineAvailable ? 'emerald' : 'amber'} />
-        {container.memoryLimit}/{container.cpuLimit}cpu
+        {container.cpuLimit} cpu
       </span>
     </div>
   );
 }
 
-// Live-updating log tail — same polling fetch LogModal already does, without
-// the modal chrome (this renders inline in a Section, not an overlay).
-function LiveLog({ repo, name, type }: { repo: string; name: string; type: string }) {
-  const [text, setText] = useState('Loading…');
-  const preRef = useRef<HTMLPreElement>(null);
-  useEffect(() => {
-    let alive = true;
-    async function load() {
-      const data = await fetch(`/api/logs?repo=${repo}&name=${encodeURIComponent(name)}&type=${type}`)
-        .then(r => r.json()).catch(() => ({ lines: [] }));
-      if (!alive) return;
-      setText(data.lines.length ? data.lines.join('\n') : '(no log yet)');
-      requestAnimationFrame(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight; });
-    }
-    load();
-    const t = setInterval(load, 2000);
-    return () => { alive = false; clearInterval(t); };
-  }, [repo, name, type]);
-  return <pre ref={preRef} class="max-h-64 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-all">{text}</pre>;
-}
-
-function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove, toast }: {
+function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDeploy, onOpenLogs, onOpenTool, onRemove, toast }: {
   w: Worktree | undefined; loaded: boolean; agents: { id: string; label: string }[];
   onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
-  onOpenTool: (w: Worktree, tool: string) => void; onRemove: (w: Worktree) => void; toast: (msg: string) => void;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+  onOpenLogs: (repo: string, name: string, type: string) => void;
+  onOpenTool: (w: Worktree, tool: string) => void; onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void; toast: (msg: string, tone?: Tone) => void;
 }) {
   // Distinguish "the initial /api/worktrees fetch hasn't resolved yet" (a
   // direct link or hard refresh always starts with an empty worktrees array)
@@ -594,7 +936,7 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
     );
   }
 
-  const statusTone: Tone = w.active ? 'emerald' : w.queued ? 'amber' : 'zinc';
+  const { tone: statusTone, text: statusText } = worktreeStatus(w);
 
   return (
     <div class="max-w-3xl mx-auto px-6 py-12">
@@ -605,7 +947,7 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
           <div class="flex items-center gap-2 flex-wrap">
             <span class="flex items-center gap-1.5">
               <StatusDot tone={statusTone} pulse={w.active} />
-              <StatusFlap text={w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped'} tone={statusTone} />
+              <StatusFlap text={statusText} tone={statusTone} />
             </span>
             <Badge tone="zinc">{w.label}</Badge>
             {w.container && <Badge tone="zinc" tip="Real memory/CPU cap enforced">container</Badge>}
@@ -626,6 +968,23 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
         }
       />
 
+      {/* Distinct banner, not folded into the Overview grid below: this is
+          the one PR state that asks for a decision (clean up or not), the
+          others (open/closed/draft) are just informational. "Clean up
+          worktree" calls the same onRemove as the Remove button at the
+          bottom of this page, so it's still confirm()-gated and still
+          leaves the branch alone, a shortcut to the existing flow, not a
+          second one. */}
+      {w.pr?.state === 'merged' && (
+        <div class="flex items-center justify-between gap-3 mb-6 px-4 py-3 border border-signal-green/30 bg-signal-green/5 rounded-none text-sm">
+          <span class="flex items-center gap-2 text-zinc-700 dark:text-zinc-300">
+            <StatusDot tone="emerald" />
+            PR #{w.pr.number} merged, ready to clean up
+          </span>
+          <SecondaryButton compact onClick={() => onRemove(w, 'merged')}>Clean up worktree</SecondaryButton>
+        </div>
+      )}
+
       <Section title="Overview" actions={<SecondaryButton onClick={() => onAct('/api/sync', w)}>Sync with staging</SecondaryButton>}>
         <div class="grid grid-cols-2 gap-4 text-sm">
           <div>
@@ -645,9 +1004,17 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
             </div>
           )}
           {w.pr && (
-            <div>
+            <div class="min-w-0">
               <div class="text-zinc-400 text-xs mb-0.5">Pull request</div>
-              <a href={w.pr.url} target="_blank" class="text-zinc-700 dark:text-zinc-300 hover:text-accent transition-colors truncate block">PR #{w.pr.number} — {w.pr.title}</a>
+              <div class="flex items-center gap-2 min-w-0">
+                <a href={w.pr.url} target="_blank" class="text-zinc-700 dark:text-zinc-300 hover:text-accent transition-colors truncate">PR #{w.pr.number} — {w.pr.title}</a>
+                <Badge tone={prTone(w.pr.state)}>{w.pr.state}</Badge>
+                {(w.pr.state === 'open' || w.pr.state === 'draft') && w.pr.checks !== 'none' && (
+                  <span class="tip shrink-0" data-tip={`checks: ${w.pr.checks}`}>
+                    <StatusDot tone={checksTone(w.pr.checks)} pulse={w.pr.checks === 'pending'} />
+                  </span>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -661,11 +1028,26 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
           <div><div class="text-zinc-400 text-xs mb-0.5">Uncommitted changes</div><div>{w.dirty > 0 ? <span class="text-signal-amber">{w.dirty} files</span> : 'clean'}</div></div>
           {w.active && w.memMb != null && (
             <div><div class="text-zinc-400 text-xs mb-0.5">Memory footprint</div>
-              <div class={w.memMb > 8192 ? 'text-signal-amber' : ''}>{w.memMb >= 1024 ? `${(w.memMb / 1024).toFixed(1)}GB` : `${Math.round(w.memMb)}MB`}</div>
+              <div class={memTone(w.memMb) === 'amber' ? 'text-signal-amber' : ''}>{formatMem(w.memMb)}</div>
             </div>
           )}
         </div>
       </Section>
+
+      {/* Natural expansion of Metrics' ahead/behind/dirty counts above: this
+          is the actual content behind those numbers, not a separate concern.
+          Labeled "Local diff", not "PR diff" or "Diff review" — this is the
+          worktree branch diffed against a locally-resolved base ref, not the
+          actual GitHub PR diff (they usually coincide but aren't guaranteed
+          to: the PR's real base can differ from baseBranchRef(), or local
+          HEAD can diverge from what's pushed). DiffViewer's own body already
+          names the resolved base per group ("since branching from <base>"),
+          so this title doesn't repeat it. */}
+      <Section title="Local diff">
+        <DiffViewer repo={w.repo} name={w.name} dirty={w.dirty} />
+      </Section>
+
+      <PrReviewSection w={w} toast={toast} onOpenLogs={onOpenLogs} />
 
       <Section title="Sidecars">
         <div class="flex items-center gap-6 text-sm">
@@ -698,6 +1080,17 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
         </div>
       </Section>
 
+      {/* Only rendered when this worktree actually has Convex configured --
+          unlike the Sidecars Section above (Inngest/Trigger/Tunnel, assumed
+          relevant everywhere), an empty Convex section on every worktree
+          that doesn't use it would just be noise. */}
+      {w.convexConfigured && (
+        <ConvexSection w={w} onAct={onAct} onOpenLogs={onOpenLogs} onConvexDeploy={onConvexDeploy} />
+      )}
+
+      <DeploySection w={w} provider="vercel" deploy={w.vercelDeploy} onDeploy={onDeploy} onOpenLogs={onOpenLogs} />
+      <DeploySection w={w} provider="netlify" deploy={w.netlifyDeploy} onDeploy={onDeploy} onOpenLogs={onOpenLogs} />
+
       <Section title="Open in">
         <div class="flex items-center gap-2 flex-wrap">
           {agents.map(a => (
@@ -706,7 +1099,7 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onOpenTool, onRemove,
               <ToolIcon id={a.id} label={a.label} />{a.label}
             </button>
           ))}
-          <button onClick={() => navigator.clipboard.writeText(`cd ~/workspace/${w.repo}/${w.name}`).then(() => toast('Copied')).catch(() => toast('clipboard unavailable'))}
+          <button onClick={() => navigator.clipboard.writeText(cdCommand(w)).then(() => toast('Copied', 'emerald')).catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'))}
             class="text-xs px-2.5 py-1.5 rounded-none border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors duration-150">
             Copy cd command
           </button>
@@ -729,7 +1122,11 @@ function fmtGb(mb: number | null) { return mb == null ? '?' : `${(mb / 1024).toF
 // One sidecar row — name/command/args/enabled, edited in place. The parent
 // owns the array and re-saves the whole thing on "Save sidecars"; this is
 // purely a controlled row, no independent state or its own save action.
-function SidecarRow({ s, onChange, onRemove }: { s: Sidecar; onChange: (s: Sidecar) => void; onRemove: () => void }) {
+function SidecarRow({ s, onChange, onRemove, onApprove }: { s: Sidecar; onChange: (s: Sidecar) => void; onRemove: () => void; onApprove: () => void }) {
+  // approved is only meaningful for a row that's actually been saved and
+  // fetched back (a brand-new unsaved row has approved === undefined, not
+  // false, so it never shows the badge before there's anything to approve).
+  const needsApproval = s.approved === false && s.enabled !== false && !!s.command;
   return (
     <div class="flex items-center gap-2 py-2 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
       <input type="checkbox" checked={s.enabled !== false} onChange={(e: any) => onChange({ ...s, enabled: e.target.checked })}
@@ -740,8 +1137,14 @@ function SidecarRow({ s, onChange, onRemove }: { s: Sidecar; onChange: (s: Sidec
         class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
       <input value={(s.args ?? []).join(' ')} onInput={(e: any) => onChange({ ...s, args: e.target.value.split(' ').filter(Boolean) })}
         placeholder="args (space-separated)" class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
+      {needsApproval && (
+        <>
+          <Badge tone="amber" tip="Command changed or never approved, will be skipped on Start until approved">needs approval</Badge>
+          <button onClick={onApprove} class="text-xs text-emerald-600 hover:underline">Approve</button>
+        </>
+      )}
       <IconButton tone="red" tip="Remove sidecar" onClick={onRemove}>
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        <CloseIcon class="w-3.5 h-3.5" />
       </IconButton>
     </div>
   );
@@ -761,78 +1164,13 @@ function CustomAgentRow({ a, onChange, onRemove }: { a: CustomAgent; onChange: (
       <input value={a.command} onInput={(e: any) => onChange({ ...a, command: e.target.value })} placeholder="mytool --flag"
         class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
       <IconButton tone="red" tip="Remove custom agent" onClick={onRemove}>
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        <CloseIcon class="w-3.5 h-3.5" />
       </IconButton>
     </div>
   );
 }
 
-// Raycast dev-mode control — status, start/stop, and a live log tail. Fully
-// self-contained (owns its own polling loop) the same way LiveLog/PortsPage
-// elsewhere in this file are, so SettingsPage doesn't need to know anything
-// about Raycast beyond dropping this component in.
-function RaycastSection({ toast }: { toast: (msg: string) => void }) {
-  const [status, setStatus] = useState<{ running: boolean; dirExists: boolean } | null>(null);
-  const [log, setLog] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  const preRef = useRef<HTMLPreElement>(null);
-
-  const load = useCallback(async () => {
-    const s = await fetch('/api/raycast/status').then(r => r.json()).catch(() => null);
-    setStatus(s);
-    if (s?.running) {
-      const data = await fetch('/api/raycast/log?n=150').then(r => r.json()).catch(() => ({ lines: [] }));
-      setLog(data.lines ?? []);
-      // Same scroll-pinning as LiveLog above — without it, every 3s poll
-      // re-renders and the newest output (a compile error, the "ready" line)
-      // scrolls off the bottom unseen while the view stays pinned to the top.
-      requestAnimationFrame(() => { if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight; });
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
-  }, [load]);
-
-  async function start() {
-    setBusy(true);
-    const res = await post('/api/raycast/start', {});
-    setBusy(false);
-    if (res?.ok === false) toast(`✗ start failed: ${res.error ?? 'unknown error'}`);
-    load();
-  }
-
-  async function stop() {
-    await post('/api/raycast/stop', {});
-    load();
-  }
-
-  return (
-    <Section title="Raycast Extension">
-      {!status ? <p class="text-sm text-zinc-400">Loading…</p>
-        : !status.dirExists ? <p class="text-sm text-zinc-400">raycast/ not found in the Setu repo</p>
-        : !status.running ? (
-          <div class="flex flex-col items-start gap-2">
-            <PrimaryButton onClick={start} disabled={busy}>{busy ? 'Starting…' : 'Start dev mode'}</PrimaryButton>
-            <p class="text-[11px] text-zinc-400">Runs <span class="font-mono">npm install</span> (first time only) and <span class="font-mono">ray develop</span> in the background — this is what makes Setu show up in Raycast.</p>
-          </div>
-        ) : (
-          <div class="flex flex-col gap-3">
-            <div class="flex items-center gap-2">
-              <StatusDot tone="emerald" />
-              <span class="text-sm">Dev mode running</span>
-              <SecondaryButton onClick={stop}>Stop</SecondaryButton>
-            </div>
-            <pre ref={preRef} class="max-h-64 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-all">{log.length ? log.join('\n') : '(no log yet)'}</pre>
-          </div>
-        )}
-    </Section>
-  );
-}
-
-function SettingsPage({ toast }: { toast: (msg: string) => void }) {
+function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [saving, setSaving] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -840,6 +1178,9 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
   const [sidecarRepo, setSidecarRepo] = useState('');
   const [sidecars, setSidecars] = useState<Sidecar[]>([]);
   const [sidecarsSaving, setSidecarsSaving] = useState(false);
+  const [fileSyncRepo, setFileSyncRepo] = useState('');
+  const [fileSyncText, setFileSyncText] = useState('');
+  const [fileSyncSaving, setFileSyncSaving] = useState(false);
   const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
   const [customAgentsSaving, setCustomAgentsSaving] = useState(false);
 
@@ -847,7 +1188,8 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
     const ps = await fetch('/api/projects').then(r => r.json()).catch(() => []);
     setProjects(ps);
     if (!sidecarRepo && ps.length) setSidecarRepo(ps[0].name);
-  }, [sidecarRepo]);
+    if (!fileSyncRepo && ps.length) setFileSyncRepo(ps[0].name);
+  }, [sidecarRepo, fileSyncRepo]);
 
   const loadCustomAgents = useCallback(async () => {
     setCustomAgents(await fetch('/api/custom-agents').then(r => r.json()).catch(() => []));
@@ -859,42 +1201,64 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
     loadCustomAgents();
   }, []);
 
-  useEffect(() => {
-    if (!sidecarRepo) return;
-    fetch(`/api/sidecars?repo=${encodeURIComponent(sidecarRepo)}`).then(r => r.json()).then(setSidecars).catch(() => setSidecars([]));
+  // Pulled out of the effect below so saveSidecarsList/approveSidecarRow can
+  // re-fetch too, refreshing each row's approved badge after either action.
+  const loadSidecarsList = useCallback(async () => {
+    if (!sidecarRepo) { setSidecars([]); return; }
+    setSidecars(await fetch(`/api/sidecars?repo=${encodeURIComponent(sidecarRepo)}`).then(r => r.json()).catch(() => []));
   }, [sidecarRepo]);
+
+  useEffect(() => { loadSidecarsList(); }, [loadSidecarsList]);
+
+  useEffect(() => {
+    if (!fileSyncRepo) return;
+    fetch(`/api/file-sync-globs?repo=${encodeURIComponent(fileSyncRepo)}`).then(r => r.json())
+      .then((globs: string[]) => setFileSyncText((Array.isArray(globs) ? globs : []).join('\n')))
+      .catch(() => setFileSyncText(''));
+  }, [fileSyncRepo]);
 
   async function saveSettings(patch: Partial<SettingsData>) {
     if (!settings) return;
     const next = { ...settings, ...patch };
     setSettings(next);
     setSaving(true);
-    const res = await post('/api/settings', patch);
+    await postOrToast('/api/settings', patch, toast, 'settings save failed');
     setSaving(false);
-    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
   }
 
   async function removeProject(name: string) {
     if (!confirm(`Remove project "${name}"? Existing worktrees keep working — this only drops it from the registry.`)) return;
-    const res = await post('/api/project/remove', { name });
-    if (res?.ok === false) toast(`✗ remove failed: ${res.error ?? 'unknown error'}`);
+    await postOrToast('/api/project/remove', { name }, toast, 'remove failed');
     loadProjects();
   }
 
   async function saveSidecarsList(next: Sidecar[]) {
     setSidecars(next);
     setSidecarsSaving(true);
-    const res = await post('/api/sidecars', { repo: sidecarRepo, sidecars: next });
+    await postOrToast('/api/sidecars', { repo: sidecarRepo, sidecars: next }, toast, 'save failed');
     setSidecarsSaving(false);
-    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
+    loadSidecarsList(); // re-fetch so a just-edited command's approved badge updates
+  }
+
+  async function approveSidecarRow(name: string) {
+    await postOrToast('/api/sidecar-approvals/approve', { repo: sidecarRepo, name }, toast, 'approve failed');
+    loadSidecarsList();
+  }
+
+  // Splits on comma or newline so either style of pasting a glob list works,
+  // matching the "comma-or-newline-separated" input the settings field asks for.
+  async function saveFileSyncGlobsList() {
+    const globs = fileSyncText.split(/[,\n]/).map(g => g.trim()).filter(Boolean);
+    setFileSyncSaving(true);
+    await postOrToast('/api/file-sync-globs', { repo: fileSyncRepo, globs }, toast, 'save failed');
+    setFileSyncSaving(false);
   }
 
   async function saveCustomAgentsList(next: CustomAgent[]) {
     setCustomAgents(next);
     setCustomAgentsSaving(true);
-    const res = await post('/api/custom-agents', { agents: next });
+    await postOrToast('/api/custom-agents', { agents: next }, toast, 'save failed');
     setCustomAgentsSaving(false);
-    if (res?.ok === false) toast(`✗ save failed: ${res.error ?? 'unknown error'}`);
     loadCustomAgents(); // re-fetch so backend-assigned ids populate into state
   }
 
@@ -937,7 +1301,7 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
       </Section>
 
       <Section title="Projects" actions={<SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>}>
-        {!projects.length ? <p class="text-sm text-zinc-400">No projects registered.</p> : (
+        {!projects.length ? <p class="text-sm text-zinc-400">No projects registered yet. Click + Project to add one.</p> : (
           <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
             {projects.map(p => (
               <div key={p.name} class="flex items-center gap-3 py-2 text-sm">
@@ -949,6 +1313,8 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
           </div>
         )}
       </Section>
+
+      <DiscoverProjectsSection toast={toast} onImported={loadProjects} />
 
       <Section title="Sidecars" actions={
         projects.length > 1 && (
@@ -962,13 +1328,34 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
             {sidecars.map((s, i) => (
               <SidecarRow key={i} s={s}
                 onChange={next => setSidecars(list => list.map((x, j) => j === i ? next : x))}
-                onRemove={() => saveSidecarsList(sidecars.filter((_, j) => j !== i))} />
+                onRemove={() => saveSidecarsList(sidecars.filter((_, j) => j !== i))}
+                onApprove={() => approveSidecarRow(s.name)} />
             ))}
             <div class="flex items-center gap-3 pt-2">
               <SecondaryButton onClick={() => setSidecars(list => [...list, { name: '', command: '', args: [], enabled: true }])}>+ Add sidecar</SecondaryButton>
               <PrimaryButton onClick={() => saveSidecarsList(sidecars)} disabled={sidecarsSaving}>{sidecarsSaving ? 'Saving…' : 'Save sidecars'}</PrimaryButton>
             </div>
             <p class="text-[11px] text-zinc-400 mt-1">Runs alongside the dev server on Start — for anything that isn't Inngest/trigger.dev/tunnel, which already have first-class controls on each worktree's page.</p>
+          </div>
+        )}
+      </Section>
+
+      <Section title="File Sync" actions={
+        projects.length > 1 && (
+          <select value={fileSyncRepo} onChange={(e: any) => setFileSyncRepo(e.target.value)} class={`${inputCls} text-xs py-1`}>
+            {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
+          </select>
+        )
+      }>
+        {!projects.length ? <p class="text-sm text-zinc-400">Add a project first.</p> : (
+          <div class="flex flex-col gap-2">
+            <textarea value={fileSyncText} onInput={(e: any) => setFileSyncText(e.target.value)}
+              placeholder="*.local.json&#10;config/local.json" rows={3}
+              class={`${inputCls} w-full text-xs py-1 font-mono`} />
+            <div class="flex items-center gap-3 pt-2">
+              <PrimaryButton onClick={saveFileSyncGlobsList} disabled={fileSyncSaving}>{fileSyncSaving ? 'Saving…' : 'Save file sync'}</PrimaryButton>
+            </div>
+            <p class="text-[11px] text-zinc-400 mt-1">Comma or newline separated glob patterns. Matching gitignored files are copied (not symlinked, unlike .env.local) from the main worktree into every newly created worktree, so each one gets its own editable copy. Patterns resolve against the main worktree's root, not an app subdir — for quivly-app include the subdir, e.g. apps/quivly-app/.env.development.local.</p>
           </div>
         )}
       </Section>
@@ -988,6 +1375,8 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
         </div>
       </Section>
 
+      <McpSection toast={toast} />
+
       <RaycastSection toast={toast} />
 
       {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}
@@ -995,167 +1384,41 @@ function SettingsPage({ toast }: { toast: (msg: string) => void }) {
   );
 }
 
-function HelpTopic({ title, children }: { title: string; children: any }) {
+// Local to App only — collapses the sidebar's repeated button-chrome shell
+// (dirty/ahead toggles, dark mode, ports/settings/raycast links). Each
+// button's active-state coloring differs (amber/green/accent/none), so it's
+// passed in per call site rather than baked into one scheme. `right` covers
+// Raycast's trailing status text, the one button here with extra content.
+function SidebarButton({ icon, label, active = false, activeClass, tip, onClick, right }: {
+  icon: any; label: any; active?: boolean; activeClass?: string; tip?: string; onClick: () => void; right?: any;
+}) {
+  const cls = `flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
+    active ? activeClass : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`;
   return (
-    <div class="mb-5 last:mb-0">
-      <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-1">{title}</h3>
-      <div class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed">{children}</div>
-    </div>
+    <button onClick={onClick} {...(tip ? { 'data-tip': tip } : {})} class={tip ? `tip ${cls}` : cls}>
+      {icon}
+      <span class={right ? 'text-xs text-left flex-1' : 'text-xs text-left'}>{label}</span>
+      {right}
+    </button>
   );
 }
 
-function HelpPage() {
-  return (
-    <div class="max-w-3xl mx-auto px-6 py-12">
-      <PageHeader back={{ label: 'All worktrees', onClick: () => navigate('/') }} title="Help & guide" />
-
-      <Section title="Worktrees">
-        <HelpTopic title="What's a worktree, here?">
-          A separate checkout of one branch from a shared bare repo — its own directory, own dev server, own port and local domain (<span class="font-mono text-xs">*.quivly.local</span>), so you can run several branches of the same project side by side without switching branches in one folder.
-        </HelpTopic>
-        <HelpTopic title="Bare vs container mode">
-          <strong>Bare</strong> runs the dev server as a plain process on your Mac — fast to start, no memory/CPU cap. <strong>Container</strong> runs it in Docker with a real memory/CPU ceiling, isolated from the host. A worktree's mode is <em>sticky</em>: whichever it last ran as, it keeps running as, until you explicitly force the other mode (the caret next to Start, or the migration prompt on a worktree's first Start after this feature shipped). This is deliberate — an earlier version silently switched an established worktree into a container on restart with nobody asking for it.
-        </HelpTopic>
-        <HelpTopic title="Sync with staging">
-          Merges the worktree's resolved base branch (staging if the repo has one, otherwise its default branch) into the worktree's own branch. Only proceeds if the merge is clean — if it would conflict, Setu aborts automatically and tells you which files, rather than leaving the worktree half-merged. Resolve conflicts yourself in your editor, then try again.
-        </HelpTopic>
-      </Section>
-
-      <Section title="Sidecars, ports & domains">
-        <HelpTopic title="Sidecars">
-          Anything a project needs alongside its dev server that isn't Inngest, trigger.dev, or a tunnel (which already have first-class controls) — a plain process Setu starts and stops with the worktree. Configure them per-project in Settings.
-        </HelpTopic>
-        <HelpTopic title="Ports & local domains">
-          Each registered project owns a 100-port band; each worktree gets one port from it plus a local domain that Caddy reverse-proxies to that port. See every process currently bound in 3000–3999 under Active ports.
-        </HelpTopic>
-      </Section>
-
-      <Section title="Performance">
-        <HelpTopic title="Concurrency cap">
-          The max number of dev servers running at once — starting one more queues it instead of over-committing your Mac. Adjust it in Settings; it's clamped to what's actually reasonable for your hardware, not an arbitrary number.
-        </HelpTopic>
-        <HelpTopic title="Container limits">
-          Memory/CPU ceiling for container-mode worktrees. A limit above what your Docker engine actually has allocated (visible in Settings) gets silently clamped when the container starts — Docker itself refuses higher.
-        </HelpTopic>
-      </Section>
-
-      <Section title="Keyboard shortcuts">
-        <div class="flex items-center gap-3 text-sm">
-          <span class="board-mono text-[10px] font-bold text-zinc-500 border border-zinc-300 dark:border-zinc-700 px-1.5 py-0.5">⌘K</span>
-          <span class="text-zinc-600 dark:text-zinc-400">Jump to any registered worktree by name, repo, or branch — bypasses filtering and pagination entirely.</span>
-        </div>
-      </Section>
-
-      <Section title="Contributing">
-        <p class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed mb-3">
-          Setu is open source. Issues, ideas, and pull requests are welcome.
-        </p>
-        <SecondaryButton onClick={() => window.open('https://github.com/quivly/setu', '_blank')}>Open github.com/quivly/setu</SecondaryButton>
-      </Section>
-    </div>
-  );
-}
-
-function PortsPage() {
-  const [ports, setPorts] = useState<PortInfo[]>([]);
-  const [loaded, setLoaded] = useState(false);
-
-  const load = useCallback(async () => {
-    setPorts(await fetch('/api/ports').then(r => r.json()).catch(() => []));
-    setLoaded(true);
-  }, []);
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
-  }, [load]);
-
-  async function kill(port: number) {
-    await post('/api/ports/kill', { port });
-    load();
-  }
-
-  return (
-    <div class="max-w-3xl mx-auto px-6 py-12">
-      <PageHeader back={{ label: 'All worktrees', onClick: () => navigate('/') }} title="Active ports"
-        subtitle={<span class="text-xs text-zinc-400">Every process bound in 3000–3999, worktree-registered or not</span>} />
-
-      <div class="backdrop-blur-md bg-white/70 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm rounded-none overflow-hidden text-sm">
-        {!loaded
-          ? <p class="text-zinc-400 px-4 py-6 text-center">Loading…</p>
-          : !ports.length
-          ? <p class="text-zinc-400 px-4 py-6 text-center">No processes on ports 3000–3999</p>
-          : ports.map(p => (
-            <div key={p.port} class="flex items-center gap-4 px-4 py-3 border-b border-zinc-100 dark:border-white/5 last:border-0 hover:bg-white/50 dark:hover:bg-white/5 transition-colors duration-150">
-              <span class="font-mono font-medium text-zinc-900 dark:text-zinc-100 w-14">{p.port}</span>
-              <span class="text-zinc-400 w-20">PID {p.pid}</span>
-              <span class="text-zinc-500 dark:text-zinc-400 flex-1 truncate">{p.cmd}{p.worktree && <span class="text-zinc-400"> · {p.worktree}</span>}</span>
-              <button onClick={() => kill(p.port)}
-                class="text-red-500 hover:text-white hover:bg-red-500 transition-colors duration-150 px-3 py-1.5 rounded-none font-medium border border-red-200 dark:border-red-900">Kill</button>
-            </div>
-          ))}
-      </div>
-    </div>
-  );
-}
-
-// Jump-to-worktree, not a task runner — the one thing 45+ registered
-// worktrees actually need is "find the one I'm thinking of" faster than
-// scrolling three paginated grid pages. No fuzzy-match library: a plain
-// substring filter over name/repo/branch/domain is enough at this scale and
-// keeps this framework-agnostic (cmdk itself is a React library; this is
-// Preact, so a ~40-line native implementation beats wiring a compat shim
-// for one modal).
-function CommandBar({ worktrees, onClose }: { worktrees: Worktree[]; onClose: () => void }) {
-  const [q, setQ] = useState('');
-  const [sel, setSel] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  const needle = q.trim().toLowerCase();
-  const results = (needle
-    ? worktrees.filter(w => `${w.name} ${w.repo} ${w.label} ${w.domain}`.toLowerCase().includes(needle))
-    : worktrees
-  ).slice(0, 8);
-
-  function go(w: Worktree) {
-    navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`);
-    onClose();
-  }
-
-  function onKeyDown(e: any) {
-    if (e.key === 'Escape') onClose();
-    else if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(s + 1, results.length - 1)); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(s - 1, 0)); }
-    else if (e.key === 'Enter' && results[sel]) go(results[sel]);
-  }
-
-  return (
-    <Modal onClose={onClose}>
-      <div class="bg-white dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl w-full max-w-md mx-4" onKeyDown={onKeyDown}>
-        <div class="flex items-center gap-2.5 px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
-          <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
-          <input ref={inputRef} value={q} onInput={(e: any) => { setQ(e.target.value); setSel(0); }}
-            placeholder="Jump to a worktree…" autocomplete="off"
-            class="flex-1 text-sm bg-transparent outline-none placeholder-zinc-400 text-zinc-900 dark:text-zinc-100" />
-          <span class="board-mono text-[10px] text-zinc-300 shrink-0">ESC</span>
-        </div>
-        <div class="max-h-80 overflow-auto py-1">
-          {!results.length && <p class="text-xs text-zinc-400 px-4 py-6 text-center">No worktrees match "{q}"</p>}
-          {results.map((w, i) => (
-            <button key={w.key} onClick={() => go(w)} onMouseEnter={() => setSel(i)}
-              class={`w-full flex items-center gap-2.5 px-4 py-2 text-left transition-colors duration-100 ${i === sel ? 'bg-zinc-100 dark:bg-zinc-800' : ''}`}>
-              <StatusDot tone={w.active ? 'emerald' : w.queued ? 'amber' : 'zinc'} />
-              <span class="text-sm text-zinc-900 dark:text-zinc-100 truncate">{w.name}</span>
-              <span class="board-mono text-[9px] text-zinc-300 font-bold shrink-0 ml-auto">{w.label}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-    </Modal>
-  );
-}
+// Human phrasing for each endpoint act() posts to, only used to name what
+// failed in the toast (postOrToast still appends the server's own reason).
+// Matches the wording already used for the same action elsewhere (menu
+// items, section buttons) instead of echoing the raw url path fragment.
+const ACT_LABEL: Record<string, string> = {
+  '/api/stop': 'Stop server',
+  '/api/sync': 'Sync with staging',
+  '/api/inngest/start': 'Start Inngest',
+  '/api/inngest/stop': 'Stop Inngest',
+  '/api/trigger/start': 'Start trigger.dev',
+  '/api/trigger/stop': 'Stop trigger.dev',
+  '/api/convex/start': 'Start Convex dev',
+  '/api/convex/stop': 'Stop Convex dev',
+  '/api/tunnel/enable': 'Enable tunnel',
+  '/api/tunnel/disable': 'Disable tunnel',
+};
 
 function App() {
   const route = useRoute();
@@ -1175,6 +1438,7 @@ function App() {
   // a real client-vs-server staleness problem for zero benefit over this.
   const [sortKey, setSortKey] = useState<'recent' | 'name' | 'created'>(
     () => (localStorage.getItem('setu-sort') as any) || 'recent');
+  const [search, setSearch] = useState('');
   const [onlyDirty, setOnlyDirty] = useState(() => localStorage.getItem('setu-filter-dirty') === '1');
   const [onlyAhead, setOnlyAhead] = useState(() => localStorage.getItem('setu-filter-ahead') === '1');
   const [page, setPage] = useState(0);
@@ -1188,14 +1452,32 @@ function App() {
   useEffect(() => { localStorage.setItem('setu-filter-dirty', onlyDirty ? '1' : '0'); setPage(0); }, [onlyDirty]);
   useEffect(() => { localStorage.setItem('setu-filter-ahead', onlyAhead ? '1' : '0'); setPage(0); }, [onlyAhead]);
   useEffect(() => { localStorage.setItem('setu-filter', filter); setPage(0); }, [filter]);
+  useEffect(() => { setPage(0); }, [search]);
   useEffect(() => { localStorage.setItem('setu-view', view); }, [view]);
-  const [toastMsg, setToastMsg] = useState('');
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastId = useRef(0);
   const [createOpen, setCreateOpen] = useState(false);
+  // Set by the Archived view's Recreate button: carries the repo+branch to
+  // prefill CreateModal with, distinct from createOpen (which opens it blank
+  // via + Worktree) so both flows can share the one modal.
+  const [recreatePrefill, setRecreatePrefill] = useState<{ repo: string; name: string } | null>(null);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [logView, setLogView] = useState<{ repo: string; name: string; type: string } | null>(null);
   const [commandOpen, setCommandOpen] = useState(false);
+  // Repo the "Browse PRs" sidebar button opened, or null when closed. Set
+  // from the sidebar filter's currently-selected repo, not a separate
+  // picker -- this view is always scoped to whichever repo is filtered to.
+  const [prsRepo, setPrsRepo] = useState<string | null>(null);
   const pendingStart = useRef(new Set<string>());
-  const toastTimer = useRef<any>(null);
+
+  // Same one-handler-sets-both-states shape as ArchivedPage's onRecreate
+  // below: closing RepoPrsModal and setting recreatePrefill happen in the
+  // same synchronous click handler, so Preact batches them into one commit
+  // and there's never a frame with both modals mounted.
+  const onCreateFromPr = (repo: string, branch: string) => {
+    setPrsRepo(null);
+    setRecreatePrefill({ repo, name: branch });
+  };
 
   // Lightweight — just a status dot for the sidebar's quick-access entry
   // point. The actual controls (start/stop, live log) live in Settings'
@@ -1219,11 +1501,14 @@ function App() {
     return () => document.removeEventListener('keydown', onKey);
   }, []);
 
-  function toast(msg: string) {
-    setToastMsg(msg);
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToastMsg(''), 5000);
+  // Auto-tones off the '✗ ' prefix every failure call site already uses —
+  // callers that want a specific tone (success, a heads-up) pass one explicitly.
+  function toast(msg: string, tone: Tone = msg.startsWith('✗') ? 'red' : 'zinc') {
+    const id = ++toastId.current;
+    setToasts(ts => [...ts, { id, msg, tone }]);
+    setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 5000);
   }
+  const dismissToast = (id: number) => setToasts(ts => ts.filter(t => t.id !== id));
 
   const refresh = useCallback(async () => {
     const wts: Worktree[] = await fetch('/api/worktrees').then(r => r.json()).catch(() => []);
@@ -1243,23 +1528,30 @@ function App() {
     setAgents(await fetch('/api/agents').then(r => r.json()).catch(() => []));
   }, []);
 
-  // poll — fast while a start is pending
   useEffect(() => {
     loadProjects();
     loadAgents();
-    let alive = true;
-    (async function loop() {
-      while (alive) {
-        await refresh();
-        await new Promise(r => setTimeout(r, pendingStart.current.size ? 800 : 3000));
-      }
-    })();
-    return () => { alive = false; };
+    refresh(); // initial hydration -- fills the page before the WS handshake completes
   }, [refresh, loadProjects, loadAgents]);
 
+  // Live worktree list + status, pushed by the server over WS -- replaces
+  // the old poll loop. The server auto-subscribes every connection to
+  // 'worktrees' the moment it opens, so this just registers the handler.
+  useEffect(() => {
+    const ws = getWs();
+    const onMessage = (data: { worktrees: Worktree[]; status: Status | null }) => {
+      const wts = data.worktrees ?? [];
+      for (const w of wts) if (w.active) pendingStart.current.delete(w.key);
+      setWorktrees(wts);
+      setStatus(data.status ?? null);
+      setLoaded(true);
+    };
+    ws.subscribe('worktrees', onMessage);
+    return () => ws.unsubscribe('worktrees', onMessage);
+  }, []);
+
   async function act(url: string, w: Worktree) {
-    const res = await post(url, { repo: w.repo, name: w.name });
-    if (res && res.ok === false) toast(`✗ ${url.replace('/api/', '')} failed: ${res.error ?? 'unknown error'}`);
+    await postOrToast(url, { repo: w.repo, name: w.name }, toast, `${ACT_LABEL[url] ?? url.replace('/api/', '')} failed`);
     refresh();
   }
 
@@ -1271,8 +1563,7 @@ function App() {
   // still isn't proof of a visible window), but it at least surfaces the
   // failure mode this endpoint CAN detect, matching how act()/start() already behave.
   async function openTool(w: Worktree, tool: string) {
-    const res = await post('/api/open', { repo: w.repo, name: w.name, tool });
-    if (res && res.ok === false) toast(`✗ open failed: ${res.error ?? 'unknown error'}`);
+    await postOrToast('/api/open', { repo: w.repo, name: w.name, tool }, toast, 'open failed');
   }
 
   async function start(w: Worktree, force?: 'container' | 'bare') {
@@ -1280,15 +1571,44 @@ function App() {
     setWorktrees([...worktrees]);
     const body: any = { repo: w.repo, name: w.name };
     if (force) body.container = force === 'container';
-    const res = await post('/api/start', body);
-    if (res && res.ok === false) { toast(`✗ start failed: ${res.error ?? 'unknown error'}`); pendingStart.current.delete(w.key); }
+    const res = await postOrToast('/api/start', body, toast, 'start failed');
+    if (!res?.ok) pendingStart.current.delete(w.key);
+    // Dev server (and every already-approved sidecar) still started fine,
+    // this is just telling the user one sidecar sat out and why.
+    for (const name of res?.skippedSidecars ?? []) {
+      toast(`✗ sidecar '${name}' needs approval before it will run. Approve it in Settings.`, 'amber');
+    }
     refresh();
   }
 
-  async function remove(w: Worktree) {
+  async function remove(w: Worktree, reason: 'manual' | 'merged' = 'manual') {
     if (!confirm(`Remove worktree "${w.name}"? The branch will not be deleted.`)) return;
-    const res = await post('/api/remove', { repo: w.repo, name: w.name });
-    if (!res.ok) toast(`✗ remove failed: ${res.error ?? 'unknown error'}`);
+    await postOrToast('/api/remove', { repo: w.repo, name: w.name, reason }, toast, 'remove failed');
+    refresh();
+  }
+
+  // Fire-and-forget like start() above, minus the pendingStart bookkeeping:
+  // a deploy doesn't gate the concurrency queue that pendingStart exists for.
+  // The deploy's own deploying/url/error state comes back on the next
+  // /api/worktrees poll (vercelDeploy/netlifyDeploy field), same as every
+  // other ephemeral per-worktree field already surfaced that way. One
+  // handler for both providers, posting to /api/<provider>/deploy, since
+  // deployToVercel and deployToNetlify on the server take the same
+  // (repo, name, target) shape.
+  async function deploy(w: Worktree, provider: DeployProvider, target: string) {
+    await postOrToast(`/api/${provider}/deploy`, { repo: w.repo, name: w.name, target }, toast, 'deploy failed');
+    refresh();
+  }
+
+  // Same fire-and-forget shape as deploy() above -- convexDeploy's own
+  // deploying/ok/error state comes back on the next /api/worktrees poll
+  // (convexDeploy field), not a separate handler. Kept as its own function
+  // rather than folded into deploy() above: convex's target is a fixed
+  // 'preview' | 'production' union, not the free-text string vercel/netlify
+  // accept for a custom target, so sharing one function would just widen the
+  // type back out for no real benefit.
+  async function convexDeploy(w: Worktree, target: 'preview' | 'production') {
+    await postOrToast('/api/convex/deploy', { repo: w.repo, name: w.name, target }, toast, 'convex deploy failed');
     refresh();
   }
 
@@ -1301,9 +1621,11 @@ function App() {
   // Running (and queued) worktrees float to the top regardless of sort key or
   // view — with 45+ worktrees registered, the 1-2 that are actually live are
   // otherwise buried wherever the chosen sort happens to put them.
+  const needle = search.trim().toLowerCase();
   const sorted = (filter === 'all' ? worktrees : worktrees.filter(w => w.repo === filter))
     .filter(w => !onlyDirty || w.dirty > 0)
     .filter(w => !onlyAhead || w.ahead > 0)
+    .filter(w => !needle || `${w.name} ${w.repo} ${w.label} ${w.domain}`.toLowerCase().includes(needle))
     .slice()
     .sort((a, b) => Number(b.active) - Number(a.active) || Number(b.queued) - Number(a.queued) || SORTERS[sortKey](a, b));
 
@@ -1320,29 +1642,50 @@ function App() {
   if (route.page === 'detail') {
     const w = worktrees.find(x => x.repo === route.repo && x.name === route.name);
     return <>
-      <WorktreePage w={w} loaded={loaded} agents={agents} onAct={act} onStart={start} onOpenTool={openTool} onRemove={remove} toast={toast} />
-      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+      <WorktreePage w={w} loaded={loaded} agents={agents} onAct={act} onStart={start} onDeploy={deploy} onConvexDeploy={convexDeploy}
+        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool} onRemove={remove} toast={toast} />
+      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type} onClose={() => setLogView(null)} />}
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </>;
   }
 
   if (route.page === 'settings') {
     return <>
       <SettingsPage toast={toast} />
-      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </>;
   }
 
   if (route.page === 'help') {
     return <>
-      <HelpPage />
-      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+      <HelpPage onBack={() => navigate('/')} />
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </>;
   }
 
   if (route.page === 'ports') {
     return <>
-      <PortsPage />
-      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
+      <PortsPage onBack={() => navigate('/')} />
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+    </>;
+  }
+
+  if (route.page === 'archived') {
+    // Recreate hands off to the list page's own CreateModal (prefilled)
+    // rather than duplicating the create flow here, so navigate there first
+    // to make sure it's actually visible.
+    const onRecreate = (a: ArchivedWorktree) => {
+      setRecreatePrefill({ repo: a.repo, name: a.branch || a.name });
+      navigate('/');
+    };
+    return <>
+      <ArchivedPage onBack={() => navigate('/')} onRecreate={onRecreate} />
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </>;
   }
 
@@ -1356,17 +1699,11 @@ function App() {
           </span>
         } subtitle={
           <p class="text-xs text-zinc-400 dark:text-zinc-500 max-w-xl">
-            Parallel branches, dedicated dev servers, sidecars, and synced environments — one bridge for every feature an agent is building at once.
+            Parallel branches, dedicated dev servers, sidecars, and synced environments. One bridge for every feature an agent is building at once.
           </p>
         } actions={<>
-          <SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>
-          <PrimaryButton onClick={() => setCreateOpen(true)}>+ Worktree</PrimaryButton>
-          <button onClick={() => setCommandOpen(true)} data-tip="Jump to a worktree"
-            class="tip flex items-center gap-1.5 h-9 w-32 px-2.5 rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors duration-150">
-            <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="M21 21l-4.3-4.3" /></svg>
-            <span class="text-xs flex-1 text-left">Search</span>
-            <span class="board-mono text-[9px] font-bold shrink-0">⌘K</span>
-          </button>
+          <SecondaryButton compact onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>
+          <PrimaryButton compact onClick={() => setCreateOpen(true)}>+ Worktree</PrimaryButton>
         </>} />
 
       <div class="rail-divider mb-8" />
@@ -1376,14 +1713,9 @@ function App() {
           <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">
             Now running <span class="text-zinc-300">({running.length})</span>
           </h2>
-          <div class={view === 'grid' ? 'grid grid-cols-1 lg:grid-cols-2 gap-3 items-start' : 'flex flex-col gap-3'}>
-            {running.map(w => (
-              <WorktreeCard key={w.key} w={w} gridMode={view === 'grid'} pending={pendingStart.current.has(w.key)} agents={agents}
-                onAct={act} onStart={start} onRemove={remove} toast={toast}
-                onOpenLogs={(repo: string, name: string, type: string) => setLogView({ repo, name, type })}
-                onOpenTool={openTool} />
-            ))}
-          </div>
+          <WorktreeList items={running} gridMode={view === 'grid'} onAct={act} onStart={start} onDeploy={deploy} onRemove={remove}
+            toast={toast} onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })}
+            onOpenTool={openTool} pendingStart={pendingStart.current} agents={agents} />
           <div class="rail-divider mt-8 mb-8" />
         </div>
       )}
@@ -1391,31 +1723,27 @@ function App() {
       {running.length > 0 && rest.length > 0 && (
         <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">All worktrees</h2>
       )}
-      <div class={view === 'grid' ? 'grid grid-cols-1 lg:grid-cols-2 gap-3 items-start' : 'flex flex-col gap-3'}>
-        {!filtered.length
-          ? <p class="text-zinc-400 text-sm py-10 text-center">
-              {rest.length ? 'No worktrees on this page.' :
-               (onlyDirty || onlyAhead) ? 'No worktrees match the active filters.' :
-               running.length ? '' :
-               `No worktrees${filter !== 'all' ? ' for this project' : ''} — click + Worktree to create one.`}
-            </p>
-          : filtered.map(w => (
-            <WorktreeCard key={w.key} w={w} gridMode={view === 'grid'} pending={pendingStart.current.has(w.key)} agents={agents}
-              onAct={act} onStart={start} onRemove={remove} toast={toast}
-              onOpenLogs={(repo: string, name: string, type: string) => setLogView({ repo, name, type })}
-              onOpenTool={openTool} />
-          ))}
+      {/* Live substring filter over the currently visible/paginated list
+          (name/repo/label/domain) — narrows what's already on this page.
+          CommandBar (still reachable via Cmd K, no header button anymore) is
+          a different tool: it searches every registered worktree, including
+          ones on other pages, and jumps straight to one. Two different jobs,
+          not a duplicate of each other. */}
+      <div class="relative mb-4">
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-300 dark:text-zinc-600 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
+        <input value={search} onInput={(e: any) => setSearch(e.target.value)}
+          placeholder="Search worktrees by name, repo, or label…" autocomplete="off"
+          class="w-full text-sm bg-white/60 dark:bg-white/5 backdrop-blur-md border border-white/75 dark:border-white/10 shadow-sm rounded-none pl-9 pr-3 py-2.5 text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-500 transition-colors duration-150" />
       </div>
+      <WorktreeList items={filtered} gridMode={view === 'grid'} onAct={act} onStart={start} onDeploy={deploy} onRemove={remove}
+        toast={toast} onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })}
+        onOpenTool={openTool} pendingStart={pendingStart.current} agents={agents}
+        emptyMessage={rest.length ? 'No worktrees on this page.' :
+          (onlyDirty || onlyAhead || needle) ? 'No worktrees match the active filters.' :
+          running.length ? '' :
+          `No worktrees${filter !== 'all' ? ' for this project' : ''}. Click + Worktree to create one.`} />
 
-      {pageCount > 1 && (
-        <div class="flex items-center justify-center gap-3 mt-6 text-sm text-zinc-500">
-          <button onClick={() => setPage(p => Math.max(0, p - 1))} disabled={page === 0}
-            class="w-8 h-8 flex items-center justify-center rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm disabled:opacity-40 transition-all duration-150 hover:text-zinc-800 dark:hover:text-zinc-200">‹</button>
-          <span>{page + 1} / {pageCount}</span>
-          <button onClick={() => setPage(p => Math.min(pageCount - 1, p + 1))} disabled={page >= pageCount - 1}
-            class="w-8 h-8 flex items-center justify-center rounded-none backdrop-blur-md bg-white/60 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm disabled:opacity-40 transition-all duration-150 hover:text-zinc-800 dark:hover:text-zinc-200">›</button>
-        </div>
-      )}
+      <Pagination page={page} pageCount={pageCount} onPage={setPage} />
 
       <div class="rail-divider mt-10 mb-4" />
       <div class="flex items-center justify-between flex-wrap gap-3 text-xs text-zinc-400">
@@ -1433,12 +1761,21 @@ function App() {
       </div>
       </div>
 
-      <div class="w-52 shrink-0 sticky top-28 z-20 flex flex-col gap-1 backdrop-blur-md bg-white/70 dark:bg-white/10 border border-white/75 dark:border-white/10 shadow-lg rounded-none p-2">
+      <div class="w-52 shrink-0 sticky top-28 z-20 flex flex-col gap-4">
+      <div class="flex flex-col gap-1 backdrop-blur-md bg-white/70 dark:bg-white/10 border border-white/75 dark:border-white/10 shadow-lg rounded-none p-2">
         <select value={filter} onChange={(e: any) => setFilter(e.target.value)}
           class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
           <option value="all">All projects</option>
           {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
         </select>
+        {filter !== 'all' && projects.find(p => p.name === filter)?.github && (
+          <SidebarButton onClick={() => setPrsRepo(filter)}
+            icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+              <circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" />
+              <path d="M6 8.5v7" /><path d="M18 8.5a8 8 0 0 1 -8 8" />
+            </svg>}
+            label="Browse PRs" />
+        )}
         <select value={sortKey} onChange={(e: any) => setSortKey(e.target.value)}
           class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
           <option value="recent">Recently active</option>
@@ -1446,65 +1783,57 @@ function App() {
           <option value="created">Created</option>
         </select>
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
-        <button onClick={() => setOnlyDirty(!onlyDirty)}
-          class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
-            onlyDirty ? 'bg-signal-amber border-signal-amber text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
-          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /></svg>
-          <span class="text-xs text-left">Uncommitted changes</span>
-        </button>
-        <button onClick={() => setOnlyAhead(!onlyAhead)}
-          class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
-            onlyAhead ? 'bg-signal-green border-signal-green text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
-          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m0 0l-6 6m6-6l6 6" /></svg>
-          <span class="text-xs text-left">Ahead of base</span>
-        </button>
+        <SidebarButton onClick={() => setOnlyDirty(!onlyDirty)} active={onlyDirty} activeClass="bg-signal-amber border-signal-amber text-white"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0" /></svg>}
+          label="Uncommitted changes" />
+        <SidebarButton onClick={() => setOnlyAhead(!onlyAhead)} active={onlyAhead} activeClass="bg-signal-green border-signal-green text-white"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 5l0 14" /><path d="M18 11l-6 -6" /><path d="M6 11l6 -6" /></svg>}
+          label="Ahead of base" />
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
         {(['list', 'grid'] as const).map(v => (
           <button key={v} onClick={() => setView(v)}
             class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
               view === v ? 'bg-accent border-accent text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
             {v === 'list'
-              ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
-              : <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg>}
+              ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 6l16 0" /><path d="M4 12l16 0" /><path d="M4 18l16 0" /></svg>
+              : <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M14 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M4 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M14 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /></svg>}
             <span class="text-xs text-left">{v === 'list' ? 'List view' : 'Grid view'}</span>
           </button>
         ))}
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
-        <button onClick={() => setDark(!dark)}
-          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
-          {dark
-            ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41" /></svg>
-            : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" /></svg>}
-          <span class="text-xs text-left">{dark ? 'Light mode' : 'Dark mode'}</span>
-        </button>
-        <button onClick={() => navigate('/ports')}
-          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
-          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15v3m6-3v3M5 9h14M6 9V6a2 2 0 012-2h8a2 2 0 012 2v3m-14 0v6a2 2 0 002 2h10a2 2 0 002-2V9" /></svg>
-          <span class="text-xs text-left">Active ports</span>
-        </button>
-        <button onClick={() => navigate('/settings')}
-          class="flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
-          <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" /></svg>
-          <span class="text-xs text-left">Settings</span>
-        </button>
-        <button onClick={() => navigate('/settings')} data-tip={raycastRunning ? 'Raycast dev mode is running' : 'Set up the Raycast extension'}
-          class="tip flex items-center gap-2.5 h-9 px-2 rounded-none border border-transparent bg-white/70 dark:bg-white/5 text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10 transition-all duration-150">
-          <StatusDot tone={raycastRunning ? 'emerald' : 'zinc'} />
-          <span class="text-xs text-left flex-1">Raycast</span>
-          <span class="text-[10px] text-zinc-400">{raycastRunning ? 'running' : 'set up'}</span>
-        </button>
+        <SidebarButton onClick={() => setDark(!dark)} label={dark ? 'Light mode' : 'Dark mode'}
+          icon={dark
+            ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0" /><path d="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7" /></svg>
+            : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 1.992a10 10 0 1 0 9.236 13.838c.341 -.82 -.476 -1.644 -1.298 -1.31a6.5 6.5 0 0 1 -6.864 -10.787l.077 -.08c.551 -.63 .113 -1.653 -.758 -1.653h-.266l-.068 -.006l-.06 -.002z" /></svg>} />
+        <SidebarButton onClick={() => navigate('/ports')} label="Active ports"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M9.785 6l8.215 8.215l-2.054 2.054a5.81 5.81 0 1 1 -8.215 -8.215l2.054 -2.054" /><path d="M4 20l3.5 -3.5" /><path d="M15 4l-3.5 3.5" /><path d="M20 9l-3.5 3.5" /></svg>} />
+        <SidebarButton onClick={() => navigate('/archived')} label="Archived"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2" /><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-10" /><path d="M10 12l4 0" /></svg>} />
+        <SidebarButton onClick={() => navigate('/settings')} label="Settings"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065" /><path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /></svg>} />
+        <SidebarButton onClick={() => navigate('/settings')} label="Raycast"
+          tip={raycastRunning ? 'Raycast dev mode is running' : 'Set up the Raycast extension'}
+          icon={<StatusDot tone={raycastRunning ? 'emerald' : 'zinc'} />}
+          right={<span class="text-[10px] text-zinc-400">{raycastRunning ? 'running' : 'set up'}</span>} />
       </div>
 
-      {createOpen && <CreateModal projects={projects} onClose={() => setCreateOpen(false)} onCreated={refresh} />}
+      <TriviaCard />
+      </div>
+
+      {(createOpen || recreatePrefill) && (
+        <CreateModal projects={projects} initialRepo={recreatePrefill?.repo} initialName={recreatePrefill?.name}
+          onClose={() => { setCreateOpen(false); setRecreatePrefill(null); }} onCreated={refresh} />
+      )}
       {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}
       {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type} onClose={() => setLogView(null)} />}
-      {commandOpen && <CommandBar worktrees={worktrees} onClose={() => setCommandOpen(false)} />}
-      {toastMsg && (
-        <div class="fixed bottom-5 left-1/2 -translate-x-1/2 bg-zinc-900 text-white text-xs px-4 py-2.5 rounded-none shadow-lg z-[60] max-w-md
-          transition-all duration-200 ease-out animate-[fadeUp_0.2s_ease-out]">
-          {toastMsg}
-        </div>
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      {prsRepo && (
+        <RepoPrsModal repo={prsRepo} label={projects.find(p => p.name === prsRepo)?.label ?? prsRepo}
+          worktrees={worktrees} loaded={loaded} onClose={() => setPrsRepo(null)}
+          onOpenWorktree={(name) => { setPrsRepo(null); navigate(`/worktree/${prsRepo}/${encodeURIComponent(name)}`); }}
+          onCreateFromPr={onCreateFromPr} />
       )}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
