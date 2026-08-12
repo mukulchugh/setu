@@ -1237,10 +1237,22 @@ export function portalPid() {
   return activePid(PORTAL_PORT);
 }
 
+// The portal's own API isn't uniform: GET /api/worktrees and /api/projects
+// return a raw array with no `ok` field at all, POST routes return
+// {ok, error?, ...}. A bare `res.json()` used to resolve either way,
+// including a jsonTry 500 (`{ok:false,...}`), which meant a genuine
+// failure looked identical to success to every caller unless they happened
+// to already check `.ok` themselves. Throw only on an explicit
+// `ok === false` (mutating routes' own failure shape); an array or a
+// plain object with no `ok` key at all is success, not "no field to check."
 export async function portalRequest(path, body) {
   const res = await fetch(`http://localhost:${PORTAL_PORT}${path}`, body === undefined
     ? { signal: AbortSignal.timeout(5000) }
     : { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
-  return res.json();
+  const data = await res.json();
+  if (data && typeof data === 'object' && !Array.isArray(data) && data.ok === false) {
+    throw new Error(data.error ?? `${path} failed`);
+  }
+  return data;
 }

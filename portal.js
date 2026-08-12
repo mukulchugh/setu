@@ -27,6 +27,7 @@ import {
 } from './lib.js';
 import { connectMcpServer, finishMcpAuth, disconnectMcpServer, mcpStatuses } from './mcp.js';
 import { detectPrWalkthroughPlugin, findLatestArtifact, artifactHtmlPath, reviewRunStatus, runDeepReview } from './pr-review.js';
+import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 
 let _cfg;
 try { _cfg = requireConfig(); }
@@ -523,6 +524,13 @@ function activePortsCached() {
   return _portsCache;
 }
 
+// Shared by /api/ports and mcp-server.js's list_ports tool.
+function listPortsWithWorktree() {
+  const ports = activePortsCached();
+  const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
+  return ports.map(p => ({ ...p, worktree: registry[p.port] ?? null }));
+}
+
 function killPort(port) {
   // A container-published port's host-side "process" is the engine's own
   // port-forwarding helper, not the dev server itself — signaling it directly
@@ -794,6 +802,24 @@ function stopWorktree(repo, name, port, { drain = true } = {}) {
   stopConvexDev(repo, name);
   stopSidecars(repo, name);
   if (drain) drainQueue();
+}
+
+// Port + container-mode resolution wrapped around startWorktree/stopWorktree
+// so /api/start, /api/stop, and mcp-server.js's start_worktree/stop_worktree
+// tools share one implementation instead of three copies of this logic.
+function startWorktreeByName(repo, name, container) {
+  const port = getPort(WORKSPACE, repo, name);
+  if (!port) return { ok: false };
+  const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
+  if (container !== undefined && needsMigrationPrompt(WORKSPACE, repo, name)) markMigrationPrompted(WORKSPACE, repo, name);
+  return startWorktree(repo, name, port, useContainer);
+}
+
+function stopWorktreeByName(repo, name) {
+  const port = getPort(WORKSPACE, repo, name);
+  if (!port) return { ok: false };
+  stopWorktree(repo, name, port);
+  return { ok: true };
 }
 
 // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
@@ -1469,14 +1495,17 @@ async function jsonTry(fn) {
   catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
 }
 
+// Shared by /api/projects and mcp-server.js's list_projects tool.
+function listProjectsSummary() {
+  return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }));
+}
+
 // Each domain router below returns a Response for a route it owns, or null
 // to fall through to the next one. handle() tries them in order and 404s
 // if none match. Split by domain (worktree lifecycle, project/sweep,
 // settings, raycast) for size, not by rewriting the dispatch logic itself.
 async function projectRoutes(req, pathname, method, server) {
-  if (pathname === '/api/projects') return Response.json(
-    Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }))
-  );
+  if (pathname === '/api/projects') return Response.json(listProjectsSummary());
 
   if (method === 'POST' && pathname === '/api/project/add') {
     const body = await req.json().catch(() => ({}));
@@ -1710,6 +1739,34 @@ async function raycastRoutes(req, pathname, method) {
 // against this exact allowlist before it ever reaches pr-review.js.
 const PR_REVIEW_SKILLS = new Set(['pr-walkthrough', 'pr-brief']);
 
+// Shared by /api/pr-review/status and mcp-server.js's get_pr_review_status
+// tool (direct call, not a self-fetch — see initMcpServer below).
+async function prReviewStatus(repo, name) {
+  const wtDir = wtPath(repo, name);
+  const pluginInstalled = detectPrWalkthroughPlugin(wtDir);
+  const pr = await fetchPR(repo, name);
+  if (!pr.number) return { pluginInstalled, pr: null, run: null, artifacts: {} };
+  const slug = REPO_META[repo]?.slug ?? repo;
+  const headSha = (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
+  const artifacts = {};
+  for (const skill of PR_REVIEW_SKILLS) artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
+  return { pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name), artifacts };
+}
+
+// Shared by /api/pr-review/run and mcp-server.js's run_pr_review tool.
+async function prReviewRun(repo, name, skill) {
+  if (!PR_REVIEW_SKILLS.has(skill)) throw new Error('unknown skill');
+  const pr = await fetchPR(repo, name);
+  if (!pr.number) return { ok: false, error: 'no pull request associated with this worktree' };
+  const slug = REPO_META[repo]?.slug ?? repo;
+  touchLastSeen(repo, name);
+  const fd = openLogFd(repo, name, 'pr-review');
+  return runDeepReview(repo, name, skill, {
+    wtDir: wtPath(repo, name), slug, prNumber: pr.number,
+    logFd: fd, logPath: logPath(repo, name, 'pr-review'), spawnText,
+  });
+}
+
 // prReviewRoutes must run before worktreeRoutes, same ordering constraint
 // as every other domain here (see worktreeRoutes' own comment on why).
 async function prReviewRoutes(req, pathname, method) {
@@ -1717,17 +1774,7 @@ async function prReviewRoutes(req, pathname, method) {
     const p = new URL(req.url).searchParams;
     const repo = p.get('repo'), name = p.get('name');
     if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
-    return jsonTry(async () => {
-      const wtDir = wtPath(repo, name);
-      const pluginInstalled = detectPrWalkthroughPlugin(wtDir);
-      const pr = await fetchPR(repo, name);
-      if (!pr.number) return { pluginInstalled, pr: null, run: null, artifacts: {} };
-      const slug = REPO_META[repo]?.slug ?? repo;
-      const headSha = (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
-      const artifacts = {};
-      for (const skill of PR_REVIEW_SKILLS) artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
-      return { pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name), artifacts };
-    });
+    return jsonTry(() => prReviewStatus(repo, name));
   }
 
   if (pathname === '/api/pr-review/run' && method === 'POST') {
@@ -1735,17 +1782,7 @@ async function prReviewRoutes(req, pathname, method) {
     const { repo, name, skill } = body;
     if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
     if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ ok: false, error: 'unknown skill' }, { status: 400 });
-    return jsonTry(async () => {
-      const pr = await fetchPR(repo, name);
-      if (!pr.number) return { ok: false, error: 'no pull request associated with this worktree' };
-      const slug = REPO_META[repo]?.slug ?? repo;
-      touchLastSeen(repo, name);
-      const fd = openLogFd(repo, name, 'pr-review');
-      return runDeepReview(repo, name, skill, {
-        wtDir: wtPath(repo, name), slug, prNumber: pr.number,
-        logFd: fd, logPath: logPath(repo, name, 'pr-review'), spawnText,
-      });
-    });
+    return jsonTry(() => prReviewRun(repo, name, skill));
   }
 
   // Serves the report HTML directly (a genuinely self-contained file, only
@@ -1774,8 +1811,16 @@ async function prReviewRoutes(req, pathname, method) {
 // match first. That's why worktreeRoutes runs last in handle(): a body can
 // only be read once, and if this ran first it would swallow the body meant
 // for e.g. a POST to /api/settings before settingsRoutes ever saw it.
-async function worktreeRoutes(req, pathname, method) {
-  if (pathname === '/api/worktrees') return Response.json(await getWorktrees());
+async function worktreeRoutes(req, pathname, method, server) {
+  if (pathname === '/api/worktrees') {
+    // Same idleTimeout hazard /api/sweep already documents and fixes (see
+    // its own comment) -- 45+ worktrees each potentially needing an
+    // uncached `gh pr view` subprocess (fetchPR's 60s TTL, cold right after
+    // a portal restart) can genuinely exceed Bun's default 10s idle timeout
+    // for a real HTTP client (web UI, Raycast) hitting this route directly.
+    server?.timeout(req, 0);
+    return Response.json(await getWorktrees());
+  }
 
   // Full list, most-recent-first: same client-side-pagination convention
   // /api/worktrees already uses (the frontend slices into pages, not this
@@ -1859,7 +1904,6 @@ async function worktreeRoutes(req, pathname, method) {
       return Response.json(removeWorktree(repo, name, reason));
     }
     if (pathname === '/api/start') {
-      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
       // Container is the default for dev servers, not opt-in — but ONLY when
       // nobody expressed a preference. `container` explicitly true/false
       // (a CLI --container/--bare flag) always wins. Omitted entirely (a
@@ -1871,17 +1915,10 @@ async function worktreeRoutes(req, pathname, method) {
       // one having asked for that. Native stays for the tooling around it
       // (portal, Caddy, dnsmasq, git) regardless — this only governs how the
       // dev server process itself runs.
-      const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
-      // An explicit mode choice (from either the Force bare/container menu
-      // or the one-time migration prompt) settles needsMigrationPrompt for
-      // good, regardless of which mode was actually picked — the point was
-      // never "must containerize," it was "must not decide silently."
-      if (container !== undefined && needsMigrationPrompt(WORKSPACE, repo, name)) markMigrationPrompted(WORKSPACE, repo, name);
-      return Response.json(startWorktree(repo, name, port, useContainer));
+      return Response.json(startWorktreeByName(repo, name, container));
     }
     if (pathname === '/api/stop') {
-      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      stopWorktree(repo, name, port); return Response.json({ ok: true });
+      return Response.json(stopWorktreeByName(repo, name));
     }
     if (pathname === '/api/sync') {
       const wtDir = wtPath(repo, name);
@@ -1937,9 +1974,7 @@ async function worktreeRoutes(req, pathname, method) {
   }
 
   if (pathname === '/api/ports') {
-    const ports = activePortsCached();
-    const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
-    return Response.json(ports.map(p => ({ ...p, worktree: registry[p.port] ?? null })));
+    return Response.json(listPortsWithWorktree());
   }
 
   return null;
@@ -1958,6 +1993,22 @@ async function handle(req, server) {
   if (pathname === '/ws') {
     if (server.upgrade(req, { data: new Set() })) return;
     return new Response('Upgrade failed', { status: 400 });
+  }
+
+  // Setu-as-an-MCP-server (the reverse of mcp.js, which connects Setu TO
+  // other servers) -- mounted here rather than folded into mcpRoutes below,
+  // which handles that opposite direction and would be a confusing place to
+  // also register this. A plain HTTP route, not an upgrade, but still needs
+  // `server` directly: tools call straight into this file's own functions
+  // (initMcpServer below wires that up -- no self-fetch back into this
+  // server, deliberately, after that pattern was found to hang the whole
+  // portal during live testing). Some of those calls are still genuinely
+  // slow (list_worktrees over 45+ worktrees with a cold PR cache), so this
+  // request itself still needs the same idleTimeout override /api/sweep and
+  // /api/worktrees already document.
+  if (pathname === '/mcp') {
+    server?.timeout(req, 0);
+    return handleMcpRequest(req);
   }
 
   // worktreeRoutes must run last, see its own comment for why.
@@ -2277,6 +2328,18 @@ function close(ws) {
     wsTopics.delete('worktrees');
   }
 }
+
+// Wires mcp-server.js's tools straight to this file's own functions --
+// direct in-process calls, not HTTP, so /mcp never opens a second request
+// back into this same server. Function declarations are hoisted, so every
+// name here is already defined despite most living further up the file.
+initMcpServer({
+  getWorktrees, createWorktree, removeWorktree,
+  startWorktree: startWorktreeByName, stopWorktree: stopWorktreeByName,
+  computeDiff, tailLog,
+  listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,
+  fetchRepoPRs, prReviewStatus, prReviewRun,
+});
 
 const server = Bun.serve({
   port: PORT,
