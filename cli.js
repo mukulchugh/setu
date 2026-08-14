@@ -23,6 +23,7 @@ import {
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
+const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
 
 function cfg() {
   try { return requireConfig(); } catch (e) { die(e.message); }
@@ -98,6 +99,7 @@ switch (cmd) {
   case 'stop':    await cmdStop(); break;
   case 'prune':   await cmdPrune(); break;
   case 'portal':  await cmdPortal(); break;
+  case 'mcp':     await cmdMcp(); break;
   case 'tunnel':  await cmdTunnel(); break;
   case 'trigger': await cmdTrigger(); break;
   case 'fetch':   await cmdFetch(); break;
@@ -573,6 +575,66 @@ async function cmdPortal() {
   ok('Portal → http://quivly.local');
 }
 
+// ── setu mcp install <target> ─────────────────────────────────────────────────
+// Setu's own MCP server (mcp-server.js) is mounted at /mcp on the portal
+// regardless of which client connects to it -- this just registers that one
+// URL with whichever client's own config file/format expects it. Claude Code
+// isn't handled here: it already has a real installable plugin at
+// claude-plugin/ (a marketplace-installable package, not a config-file edit),
+// so that path is pointed at below rather than duplicated.
+
+// TOML, confirmed against OpenAI's own config reference (developers.openai.com/codex/config-reference):
+// mcp_servers.<id> with a bare `url` field selects Streamable HTTP -- no
+// separate transport/type key needed, `command` is what would select stdio
+// instead. Appended, not parsed+rewritten: a hand-rolled TOML parser risks
+// mangling real config (model settings, other mcp_servers) for a one-block
+// addition; a new top-level table appended at file end is valid TOML
+// regardless of what's above it, and the regex guard below makes this safe
+// to re-run without duplicating the block.
+function mcpInstallCodex() {
+  const dir  = join(HOME, '.codex');
+  const path = join(dir, 'config.toml');
+  mkdirSync(dir, { recursive: true });
+  const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  if (/^\[mcp_servers\.setu\]/m.test(text)) { ok(`Already configured in ${path}`); return; }
+  writeFileSync(path, text.replace(/\n*$/, '\n') + `\n[mcp_servers.setu]\nurl = "${MCP_URL}"\n`);
+  ok(`Added Setu MCP server to ${path}`);
+  console.log(`  Run ${B}codex${R}, then ${B}/mcp${R} to confirm it's connected.`);
+}
+
+// JSON, confirmed against Cursor's own docs (cursor.com/docs/context/mcp):
+// mcpServers.<name> with a bare `url` field is enough for a remote server --
+// no `type` key (that's stdio-only, per the same docs), unlike Claude Code's
+// plugin schema which requires one. Real parse+merge here (not an append),
+// since JSON.parse/stringify make it safe to preserve whatever else is
+// already in this file, unlike the TOML case above.
+function mcpInstallCursor() {
+  const dir  = join(HOME, '.cursor');
+  const path = join(dir, 'mcp.json');
+  mkdirSync(dir, { recursive: true });
+  let conf = {};
+  if (existsSync(path)) {
+    try { conf = JSON.parse(readFileSync(path, 'utf8')); }
+    catch (e) { die(`${path} has invalid JSON -- fix it manually first: ${e.message}`); }
+  }
+  conf.mcpServers ??= {};
+  if (conf.mcpServers.setu) { ok(`Already configured in ${path}`); return; }
+  conf.mcpServers.setu = { url: MCP_URL };
+  writeFileSync(path, JSON.stringify(conf, null, 2) + '\n');
+  ok(`Added Setu MCP server to ${path}`);
+  console.log('  Restart Cursor (or reload its MCP servers) to pick it up.');
+}
+
+async function cmdMcp() {
+  const [sub, target] = args;
+  if (sub !== 'install' || !target) die('Usage: setu mcp install <codex|cursor>');
+  if (target === 'codex')  return mcpInstallCodex();
+  if (target === 'cursor') return mcpInstallCursor();
+  die(`Unknown target '${target}'. Supported: codex, cursor.\n` +
+    `  Claude Code: claude --plugin-dir ${PKG_DIR}claude-plugin (already packaged, see claude-plugin/).\n` +
+    `  Anything else with its own MCP client: point it at ${MCP_URL} (Streamable HTTP, no auth) in whatever config format it expects.`);
+}
+
 // ── setu tunnel <repo> <branch> [stop] ────────────────────────────────────────
 // The portal owns the cloudflared process — the CLI just asks it.
 
@@ -1026,6 +1088,11 @@ function cmdHelp() {
   ${C}Portal${R}
     setu portal                      Start web UI at http://quivly.local
     setu portal stop                 Stop portal
+
+  ${C}MCP — let an agent drive Setu directly${R}
+    setu mcp install codex           Register Setu's MCP server in ~/.codex/config.toml
+    setu mcp install cursor          Register Setu's MCP server in ~/.cursor/mcp.json
+                                      Claude Code: claude --plugin-dir <setu>/claude-plugin (already packaged)
 
   ${C}Meta${R}
     setu update                      Update setu (stash-safe, shows changelog)

@@ -36,6 +36,8 @@ setu tunnel <repo> <branch> [stop]   # point the shared public URL at this workt
 setu trigger <repo> <branch> [stop]  # trigger.dev dev server per worktree — delegates to the portal
                                       # (/api/trigger/start|stop) when one is running, falls back to a
                                       # standalone detached process (own PID file) only when it isn't
+setu mcp install <codex|cursor>      # register the portal's MCP server (see below) in that
+                                      # client's own config — idempotent, preserves existing config
 setu update                          # stash-safe git pull + bun link + portal restart
 setu version                         # version + commit sha
 ```
@@ -74,6 +76,28 @@ refuses connection.
 All POSTs return `{ok: boolean, error?: string, ...}`. A `queued: true` response means the
 action was accepted but not yet performed — poll `/api/worktrees` and check `active`, not
 just `ok`, to know if a dev server is actually running.
+
+## MCP server (localhost:2999/mcp) — let an agent drive Setu directly
+
+Same portal, same backend functions, a fourth front door (web UI / CLI / Raycast / MCP, in
+that order of age) — `mcp-server.js`'s 12 tools (`list_worktrees`, `create_worktree`,
+`start_worktree`, `stop_worktree`, `remove_worktree`, `get_diff`, `get_logs`, `list_ports`,
+`list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`) call straight into
+portal.js's own functions in-process, not over HTTP — no self-fetch loopback. Streamable
+HTTP, stateless (fresh `McpServer` per request), DNS-rebinding protection on, no CORS.
+
+Register it with whatever's connecting:
+- **Claude Code**: `claude --plugin-dir <setu>/claude-plugin` (a real packaged plugin — `.mcp.json` at its root, not inside `.claude-plugin/`).
+- **Codex**: `setu mcp install codex` — appends `[mcp_servers.setu]` to `~/.codex/config.toml`.
+- **Cursor**: `setu mcp install cursor` — merges `mcpServers.setu` into `~/.cursor/mcp.json`.
+- **Anything else with an MCP client**: point it at `http://localhost:2999/mcp` (Streamable HTTP, no auth) in whatever config format it expects — no per-client code needed, it's a standard MCP server.
+
+The portal must already be running when the client starts — no retry-on-demand if `/mcp` is
+unreachable at session start. Known open risk, not yet fixed: `create_worktree`/
+`remove_worktree`/`start_worktree`/`stop_worktree` route through synchronous
+`execFileSync`/`spawnSync` calls (`git()`, `activePid()`, `listActivePorts()`, `killGroup()`
+in lib.js) that can stall the whole single-threaded portal under contention — same failure
+class `fetchPR` hit and fixed once already, not yet converted at these sites.
 
 ## Container mode (the default since 2026-08-10, sticky per worktree since the same day)
 
