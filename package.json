@@ -18,13 +18,22 @@
   "engines": {
     "bun": ">=1.0.0"
   },
+  "overrides": {
+    "react": "npm:@preact/compat@^18.3.2",
+    "react-dom": "npm:@preact/compat@^18.3.2"
+  },
   "dependencies": {
+    "@base-ui/react": "^1.7.0",
     "@fontsource/ibm-plex-mono": "^5.3.0",
     "@fontsource/syne": "^5.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@tabler/icons": "^3.46.0",
     "bun-plugin-tailwind": "^0.1.2",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
     "preact": "^10.29.7",
     "simple-icons": "^16.28.0",
+    "tailwind-merge": "latest",
     "tailwindcss": "^4.3.2",
     "zod": "^4.4.3"
   }
