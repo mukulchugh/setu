@@ -93,7 +93,8 @@
 .dark .icon-btn { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); }
 .dark .icon-btn:hover { background:rgba(255,255,255,0.12); }
 .tip { position:relative; }
-.tip::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%); background:#18181B; color:#fff; font-size:11px; padding:3px 8px; border-radius:0; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity 0.12s; z-index:100; font-family:-apple-system,sans-serif; }
+.tip::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%); background:#fff; color:#18181B; border:1px solid rgba(0,0,0,0.08); box-shadow:0 2px 8px rgba(0,0,0,0.12); font-size:11px; padding:3px 8px; border-radius:0; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity 0.12s; z-index:100; font-family:-apple-system,sans-serif; }
+.dark .tip::after { background:#18181B; color:#fff; border-color:rgba(255,255,255,0.1); box-shadow:0 2px 8px rgba(0,0,0,0.35); }
 
 /* A card with an open dropdown (kebab / force-start menu) must outrank the
    next card in the grid. backdrop-blur on the card creates its own stacking
