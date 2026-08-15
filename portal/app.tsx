@@ -1,11 +1,23 @@
 // setu portal UI — Preact, bundled by Bun.serve at runtime (see portal.js)
 import { render } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import {
-  Badge, StatusDot, StatusFlap, IconButton, PrimaryButton, SecondaryButton,
-  Modal, CloseBtn, CloseIcon, Menu, MenuItem, inputCls, type Tone, PageHeader, Section,
-  ToastStack, type ToastItem,
-} from './ui';
+// PageHeader/Section/inputCls stay on the old hand-rolled kit -- no shadcn
+// equivalent needed, ui.tsx keeps exporting them untouched. Everything else
+// below now comes from portal/ui/* (Base UI-backed): Badge/StatusDot/
+// StatusFlap keep their exact old names and prop shapes (only the import
+// path moved); PrimaryButton/SecondaryButton collapse into one Button with a
+// variant prop; Modal/CloseBtn become a Dialog composition; Menu/MenuItem
+// become a DropdownMenu composition (see the per-call-site conversions
+// below for both). CloseIcon has no new-kit export -- it's a bare two-stroke
+// X glyph, not a "primitive" with a shadcn equivalent -- so it's declared
+// locally in this file instead of imported (matches how portal/ui/dialog.tsx
+// inlines its own copy of the same glyph rather than importing ui.tsx's).
+import { Badge, StatusDot, StatusFlap, type Tone } from './ui/badge';
+import { Button, IconButton } from './ui/button';
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from './ui/dialog';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from './ui/dropdown-menu';
+import { ToastStack, type ToastItem } from './ui/toast';
+import { inputCls, PageHeader, Section } from './ui';
 import { ToolIcon, SidecarIcon, MUKUL_LOGO_URI, VercelIcon, NetlifyIcon, ConvexIcon } from './components/icons';
 import { TriviaCard } from './components/trivia-card';
 import { LogModal, LiveLog } from './components/logs';
@@ -20,6 +32,15 @@ import { Pagination } from './components/pagination';
 import { relativeTime } from './components/relative-time';
 import { type PrChecks, checksTone } from './components/pr-status';
 import { getWs } from './ws';
+
+// Same X-mark path as the old ui.tsx's CloseIcon (and portal/ui/dialog.tsx's
+// own inlined copy of it) -- a plain two-stroke glyph, not a sourced brand
+// mark, so there's no reason to import it from the file this migration is
+// replacing. Used by CreateModal/AddProjectModal's DialogClose button and by
+// SidecarRow/CustomAgentRow's "remove" IconButton.
+function CloseIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
+  return <svg class={cls} fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>;
+}
 
 // Shared shape for both deploy providers below (vercelDeploy/netlifyDeploy) --
 // same fields either one's status Map on the server settles into.
@@ -179,6 +200,15 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
   const [tunnel, setTunnel] = useState(false);
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  // Real regression, not a style nicety: DialogContent's Popup moves focus
+  // to the first tabbable element on open (Base UI's own default), and the
+  // header row's DialogClose renders before this input in DOM order -- so
+  // without this, focus silently lands on the close X instead (Enter/Space
+  // there closes the dialog instead of submitting). The old bare `autoFocus`
+  // attribute on the input no longer wins against Base UI's own focus
+  // management; `initialFocus` (a DialogPopup prop, threaded through
+  // DialogContent's ...props) is the real replacement.
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   async function create() {
     if (!name.trim()) return;
@@ -196,11 +226,25 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
   }
 
   return (
-    <Modal onClose={onClose}>
-      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl p-6 w-full max-w-sm mx-4">
+    // Root's `open` stays a literal `true` -- this component is only ever
+    // mounted while open (App's `{(createOpen || recreatePrefill) &&
+    // <CreateModal .../>}`), same conditional-mount pattern the old Modal
+    // used, so there's no separate "closed but still mounted" state to
+    // control here. onOpenChange fires for every Root-owned close path
+    // (Escape, outside-press, DialogClose below) and just delegates to the
+    // same onClose the old backdrop-click handler used to call directly.
+    <Dialog open onOpenChange={(o: boolean) => { if (!o) onClose(); }}>
+      {/* DialogContent already carries the old wrapper div's exact panel
+          skin (bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none
+          border-zinc-200 dark:border-zinc-800 shadow-2xl p-6, max-w-sm) --
+          see portal/ui/dialog.tsx's panelBase/panelPosition.center -- so
+          that wrapper div itself is gone, not just its Modal parent. */}
+      <DialogContent initialFocus={nameInputRef}>
         <div class="flex items-center justify-between mb-5">
-          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">New worktree</h2>
-          <CloseBtn onClick={onClose} />
+          <DialogTitle class="text-base font-semibold text-zinc-900 dark:text-zinc-100">New worktree</DialogTitle>
+          <DialogClose class="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors duration-200">
+            <CloseIcon />
+          </DialogClose>
         </div>
         <div class="flex flex-col gap-4">
           <div class="flex flex-col gap-1.5">
@@ -211,8 +255,8 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
           </div>
           <div class="flex flex-col gap-1.5">
             <label class="text-xs text-zinc-500">Branch name</label>
-            <input value={name} onInput={(e: any) => setName(e.target.value)} placeholder="feat-my-feature"
-              autocomplete="off" autoFocus class={inputCls}
+            <input ref={nameInputRef} value={name} onInput={(e: any) => setName(e.target.value)} placeholder="feat-my-feature"
+              autocomplete="off" class={inputCls}
               onKeyDown={(e: any) => { if (e.key === 'Enter') create(); }} />
           </div>
           <div class="flex items-center gap-2">
@@ -221,12 +265,12 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
           </div>
           {status && <p class="text-xs text-zinc-500">{status}</p>}
           <div class="flex gap-3 pt-1">
-            <SecondaryButton class="flex-1" onClick={onClose}>Cancel</SecondaryButton>
-            <PrimaryButton class="flex-1" onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create'}</PrimaryButton>
+            <Button variant="secondary" class="flex-1" onClick={onClose}>Cancel</Button>
+            <Button variant="primary" class="flex-1" onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create'}</Button>
           </div>
         </div>
-      </div>
-    </Modal>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -237,6 +281,12 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
   const [label, setLabel] = useState('');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  // Same real regression as CreateModal's nameInputRef above -- see its
+  // comment. One shared ref (not one per tab) because only one of the two
+  // tab inputs below is ever actually mounted at a time (the tab === 'new'
+  // ? ... : ... ternary), so there's never a collision; whichever one is
+  // showing when the dialog opens is the one Base UI focuses.
+  const tabInputRef = useRef<HTMLInputElement>(null);
 
   async function submit() {
     const name = tab === 'new' ? newName.trim() : '';
@@ -258,14 +308,18 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
   const tabCls = (t: string) => `flex-1 text-xs font-medium py-1.5 rounded-none transition-all duration-150 ${tab === t ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500'}`;
 
   return (
-    <Modal onClose={onClose}>
-      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl p-6 w-full max-w-sm mx-4">
+    // Same conditional-mount/controlled-open shape as CreateModal above --
+    // see its own comment for why `open` is a literal `true` here.
+    <Dialog open onOpenChange={(o: boolean) => { if (!o) onClose(); }}>
+      <DialogContent initialFocus={tabInputRef}>
         <div class="flex items-center justify-between mb-5">
           <div>
-            <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Add project</h2>
-            <p class="text-xs text-zinc-400 mt-0.5">Register a new or existing repo</p>
+            <DialogTitle class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Add project</DialogTitle>
+            <DialogDescription class="text-zinc-400 mt-0.5">Register a new or existing repo</DialogDescription>
           </div>
-          <CloseBtn onClick={onClose} />
+          <DialogClose class="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors duration-200">
+            <CloseIcon />
+          </DialogClose>
         </div>
         <div class="flex flex-col gap-4">
           <div class="flex gap-1 bg-zinc-100 rounded-none p-0.5 mb-1">
@@ -276,14 +330,14 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
           {tab === 'existing' ? (
             <div class="flex flex-col gap-1.5">
               <label class="text-xs text-zinc-500">GitHub URL or slug</label>
-              <input value={github} onInput={(e: any) => setGithub(e.target.value)}
-                placeholder="org/repo or https://github.com/org/repo" autocomplete="off" autoFocus class={inputCls} />
+              <input ref={tabInputRef} value={github} onInput={(e: any) => setGithub(e.target.value)}
+                placeholder="org/repo or https://github.com/org/repo" autocomplete="off" class={inputCls} />
             </div>
           ) : (
             <div class="flex flex-col gap-1.5">
               <label class="text-xs text-zinc-500">Repo name</label>
-              <input value={newName} onInput={(e: any) => setNewName(e.target.value)}
-                placeholder="my-new-project" autocomplete="off" autoFocus class={inputCls} />
+              <input ref={tabInputRef} value={newName} onInput={(e: any) => setNewName(e.target.value)}
+                placeholder="my-new-project" autocomplete="off" class={inputCls} />
               <p class="text-[11px] text-zinc-400">Creates a bare local repo at ~/workspace/&lt;name&gt;.git — push a remote later.</p>
             </div>
           )}
@@ -296,12 +350,12 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
           {status && <p class="text-xs text-zinc-500">{status}</p>}
 
           <div class="flex gap-3 pt-1">
-            <SecondaryButton class="flex-1" onClick={onClose}>Cancel</SecondaryButton>
-            <PrimaryButton class="flex-1" onClick={submit} disabled={busy}>{busy ? 'Adding…' : 'Add'}</PrimaryButton>
+            <Button variant="secondary" class="flex-1" onClick={onClose}>Cancel</Button>
+            <Button variant="primary" class="flex-1" onClick={submit} disabled={busy}>{busy ? 'Adding…' : 'Add'}</Button>
           </div>
         </div>
-      </div>
-    </Modal>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -327,14 +381,22 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   // never nagged again — see task/memory on why this isn't fully automatic.
   if (w.needsMigrationPrompt) {
     return (
-      <Menu trigger={toggle => (
-        <IconButton tone="emerald" tip="This worktree has always run bare — migrate to a container?" onClick={toggle}>
+      // IconButton's tone/tip chrome reproduced directly on the trigger
+      // (`tip icon-btn ... text-signal-green hover:bg-current/10`, matching
+      // IconButton's tone="emerald" output) rather than composed via
+      // `render={<IconButton/>}` -- DropdownMenuTrigger renders unstyled by
+      // design and IconButton doesn't forward a ref/spread props, see
+      // portal/ui/dropdown-menu.tsx's own comment on this exact tradeoff.
+      <DropdownMenu>
+        <DropdownMenuTrigger data-tip="This worktree has always run bare — migrate to a container?"
+          class="tip icon-btn transition-all duration-200 ease-out text-signal-green hover:bg-current/10">
           <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
-        </IconButton>
-      )}>
-        <MenuItem onClick={() => onStart(w, 'container')}>Migrate to container</MenuItem>
-        <MenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</MenuItem>
-      </Menu>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <DropdownMenuItem onClick={() => onStart(w, 'container')}>Migrate to container</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     );
   }
   return (
@@ -342,15 +404,16 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
       <IconButton tone="emerald" tip={`Start — will run ${w.nextStartMode}`} onClick={() => onStart(w)}>
         <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
       </IconButton>
-      <Menu trigger={toggle => (
-        <button onClick={(e: any) => { e.stopPropagation(); toggle(); }} data-tip="Force a mode"
+      <DropdownMenu>
+        <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Force a mode"
           class="tip w-4 h-6 flex items-center justify-center text-zinc-300 hover:text-zinc-500 transition-colors duration-150 -ml-1">
           <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M18 9c.852 0 1.297 .986 .783 1.623l-.076 .084l-6 6a1 1 0 0 1 -1.32 .083l-.094 -.083l-6 -6l-.083 -.094l-.054 -.077l-.054 -.096l-.017 -.036l-.027 -.067l-.032 -.108l-.01 -.053l-.01 -.06l-.004 -.057v-.118l.005 -.058l.009 -.06l.01 -.052l.032 -.108l.027 -.067l.07 -.132l.065 -.09l.073 -.081l.094 -.083l.077 -.054l.096 -.054l.036 -.017l.067 -.027l.108 -.032l.053 -.01l.06 -.01l.057 -.004l12.059 -.002z" /></svg>
-        </button>
-      )}>
-        <MenuItem onClick={() => onStart(w, 'bare')}>Force bare (no cap)</MenuItem>
-        <MenuItem onClick={() => onStart(w, 'container')}>Force container</MenuItem>
-      </Menu>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent>
+          <DropdownMenuItem onClick={() => onStart(w, 'bare')}>Force bare (no cap)</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => onStart(w, 'container')}>Force container</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
@@ -390,18 +453,22 @@ function DeployMenu({ w, provider, deploy, onDeploy }: {
     );
   }
   return (
-    <Menu trigger={toggle => (
-      <IconButton tone="zinc" tip={`Deploy to ${label}`} onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+    // tone="zinc" IconButton chrome reproduced on the trigger directly --
+    // see StartControl's needsMigrationPrompt branch above for why.
+    <DropdownMenu>
+      <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip={`Deploy to ${label}`}
+        class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
         <Icon class="w-4 h-4" />
-      </IconButton>
-    )}>
-      <MenuItem onClick={() => onDeploy(w, provider, 'preview')}>Deploy preview</MenuItem>
-      <MenuItem onClick={() => onDeploy(w, provider, 'production')}>Deploy production</MenuItem>
-      <MenuItem onClick={() => {
-        const custom = window.prompt(customPrompt);
-        if (custom && custom.trim()) onDeploy(w, provider, custom.trim());
-      }}>Deploy custom…</MenuItem>
-    </Menu>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuItem onClick={() => onDeploy(w, provider, 'preview')}>Deploy preview</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => onDeploy(w, provider, 'production')}>Deploy production</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => {
+          const custom = window.prompt(customPrompt);
+          if (custom && custom.trim()) onDeploy(w, provider, custom.trim());
+        }}>Deploy custom…</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -502,7 +569,7 @@ function PrReviewSection({ w, toast, onOpenLogs }: {
               </button>
             ) : (
               PR_REVIEW_SKILLS.map(skill => (
-                <SecondaryButton key={skill} compact onClick={() => run(skill)}>{PR_REVIEW_LABEL[skill]}</SecondaryButton>
+                <Button variant="secondary" key={skill} compact onClick={() => run(skill)}>{PR_REVIEW_LABEL[skill]}</Button>
               ))
             )}
             {status?.run && !running && status.run.exitCode !== 'success' && (
@@ -583,14 +650,14 @@ function GithubActionsSection({ w, toast, onRefresh }: {
             null there regardless of GitHub state. Without this check the
             button would offer to PR main against itself. */}
         {!w.pr && w.name !== 'main' && (
-          <SecondaryButton compact onClick={createPr} disabled={busy === 'create'}>
+          <Button variant="secondary" compact onClick={createPr} disabled={busy === 'create'}>
             {busy === 'create' ? 'Creating…' : 'Create PR'}
-          </SecondaryButton>
+          </Button>
         )}
         {w.pr && (w.pr.state === 'open' || w.pr.state === 'draft') && (
-          <SecondaryButton compact onClick={() => toggleReady(w.pr!.state === 'draft')} disabled={busy === 'ready'}>
+          <Button variant="secondary" compact onClick={() => toggleReady(w.pr!.state === 'draft')} disabled={busy === 'ready'}>
             {busy === 'ready' ? 'Updating…' : w.pr.state === 'draft' ? 'Mark ready for review' : 'Convert to draft'}
-          </SecondaryButton>
+          </Button>
         )}
         {ciUrl && (
           <a href={ciUrl} target="_blank" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-accent transition-colors duration-150">
@@ -668,14 +735,16 @@ function ConvexDeployMenu({ w, deploy, onConvexDeploy }: {
     );
   }
   return (
-    <Menu trigger={toggle => (
-      <IconButton tone="zinc" tip="Deploy to Convex" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+    <DropdownMenu>
+      <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Deploy to Convex"
+        class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
         <ConvexIcon class="w-4 h-4" />
-      </IconButton>
-    )}>
-      <MenuItem onClick={() => onConvexDeploy(w, 'preview')}>Deploy preview</MenuItem>
-      <MenuItem onClick={() => onConvexDeploy(w, 'production')}>Deploy production</MenuItem>
-    </Menu>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuItem onClick={() => onConvexDeploy(w, 'preview')}>Deploy preview</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => onConvexDeploy(w, 'production')}>Deploy production</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -829,9 +898,21 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
       {/* Hidden until hover — a clean card at rest, the tool-launch icons
           only when you're actually looking at this specific card. The
           Start/Stop/More row below stays always-visible; that's the one
-          thing you came here to do, not a secondary action to reveal. */}
+          thing you came here to do, not a secondary action to reveal.
+          has-[[data-popup-open]]:opacity-100 is load-bearing, not decorative:
+          the "Open in tool"/Deploy dropdowns inside this row portal their
+          popup to <body> (Base UI's own Portal, unlike the old Menu's
+          in-card absolute div), so once the pointer moves onto the open
+          popup it's no longer a DOM descendant of this row -- :hover and
+          focus-within both go false and the row would fade out from under
+          an open menu. data-popup-open is the real attribute Base UI's own
+          Menu.Trigger sets while its menu is open (verified against
+          node_modules/@base-ui/react/menu/trigger/MenuTrigger.mjs --
+          NOT aria-expanded, Menu.Trigger never sets that), so this reaches
+          into whichever trigger is currently open and keeps the row visible
+          for as long as it is, regardless of where the pointer currently is. */}
       <div class={`flex items-center gap-0.5 shrink-0 flex-wrap transition-opacity duration-150 ${
-        gridMode ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'}`}>
+        gridMode ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 has-[[data-popup-open]]:opacity-100'}`}>
         <IconButton tone="zinc" tip="Open in browser" disabled={!w.active} href={`http://${w.domain}`} target="_blank">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" /><path d="M11 13l9 -9" /><path d="M15 4h5v5" /></svg>
         </IconButton>
@@ -840,17 +921,19 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
             used to run to a dozen+ icon buttons per card, across 40+ cards
             in list view. */}
         {agents.length > 0 && (
-          <Menu trigger={toggle => (
-            <IconButton tone="zinc" tip="Open in tool" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+          <DropdownMenu>
+            <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Open in tool"
+              class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M8 9l3 3l-3 3" /><path d="M13 15l3 0" /><path d="M3 4m0 2a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z" /></svg>
-            </IconButton>
-          )}>
-            {agents.map((a: { id: string; label: string }) => (
-              <MenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
-                {a.label}
-              </MenuItem>
-            ))}
-          </Menu>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent>
+              {agents.map((a: { id: string; label: string }) => (
+                <DropdownMenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
+                  {a.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <IconButton tone="zinc" tip="Copy cd command" onClick={copyCD}>
           {copied
@@ -891,56 +974,58 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
           <StartControl w={w} pending={pending} onStart={onStart} />
         )}
 
-        <Menu trigger={toggle => (
-          <IconButton tone="zinc" tip="More actions" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+        <DropdownMenu>
+          <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="More actions"
+            class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M14 12a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 19a2 2 0 1 1 -4 0q 0 -.052 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 5a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /></svg>
-          </IconButton>
-        )}>
-          <MenuItem onClick={() => onOpenLogs(w.repo, w.name, 'dev')}
-            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4" /><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /><path d="M9 9l1 0" /><path d="M9 13l6 0" /><path d="M9 17l6 0" /></svg>}>
-            View logs
-          </MenuItem>
-          {!showInngestInline && (
-            <MenuItem onClick={() => onAct('/api/inngest/start', w)} icon={<ToolIcon label="Inngest" />}>
-              Start Inngest
-            </MenuItem>
-          )}
-          {showInngestInline && (
-            <MenuItem onClick={() => onAct('/api/inngest/stop', w)} icon={<ToolIcon label="Inngest" />}>
-              Stop Inngest
-            </MenuItem>
-          )}
-          {!showTriggerInline && (
-            <MenuItem onClick={() => onAct('/api/trigger/start', w)} icon={<ToolIcon label="Trigger" />}>
-              Start trigger.dev
-            </MenuItem>
-          )}
-          {showTriggerInline && (
-            <MenuItem onClick={() => onAct('/api/trigger/stop', w)} icon={<ToolIcon label="Trigger" />}>
-              Stop trigger.dev
-            </MenuItem>
-          )}
-          {w.convexConfigured && !w.convexActive && (
-            <MenuItem onClick={() => onAct('/api/convex/start', w)} icon={<ConvexIcon class="w-3 h-3" />}>
-              Start Convex dev
-            </MenuItem>
-          )}
-          {w.convexConfigured && w.convexActive && (
-            <MenuItem onClick={() => onAct('/api/convex/stop', w)} icon={<ConvexIcon class="w-3 h-3" />}>
-              Stop Convex dev
-            </MenuItem>
-          )}
-          <div class="my-1 border-t border-zinc-100" />
-          <MenuItem onClick={() => onAct('/api/sync', w)}
-            icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>}>
-            Sync with staging
-          </MenuItem>
-          <div class="my-1 border-t border-zinc-100" />
-          <MenuItem tone="red" onClick={() => onRemove(w)}
-            icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>}>
-            Remove worktree
-          </MenuItem>
-        </Menu>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem onClick={() => onOpenLogs(w.repo, w.name, 'dev')}
+              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4" /><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /><path d="M9 9l1 0" /><path d="M9 13l6 0" /><path d="M9 17l6 0" /></svg>}>
+              View logs
+            </DropdownMenuItem>
+            {!showInngestInline && (
+              <DropdownMenuItem onClick={() => onAct('/api/inngest/start', w)} icon={<ToolIcon label="Inngest" />}>
+                Start Inngest
+              </DropdownMenuItem>
+            )}
+            {showInngestInline && (
+              <DropdownMenuItem onClick={() => onAct('/api/inngest/stop', w)} icon={<ToolIcon label="Inngest" />}>
+                Stop Inngest
+              </DropdownMenuItem>
+            )}
+            {!showTriggerInline && (
+              <DropdownMenuItem onClick={() => onAct('/api/trigger/start', w)} icon={<ToolIcon label="Trigger" />}>
+                Start trigger.dev
+              </DropdownMenuItem>
+            )}
+            {showTriggerInline && (
+              <DropdownMenuItem onClick={() => onAct('/api/trigger/stop', w)} icon={<ToolIcon label="Trigger" />}>
+                Stop trigger.dev
+              </DropdownMenuItem>
+            )}
+            {w.convexConfigured && !w.convexActive && (
+              <DropdownMenuItem onClick={() => onAct('/api/convex/start', w)} icon={<ConvexIcon class="w-3 h-3" />}>
+                Start Convex dev
+              </DropdownMenuItem>
+            )}
+            {w.convexConfigured && w.convexActive && (
+              <DropdownMenuItem onClick={() => onAct('/api/convex/stop', w)} icon={<ConvexIcon class="w-3 h-3" />}>
+                Stop Convex dev
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => onAct('/api/sync', w)}
+              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>}>
+              Sync with staging
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem tone="red" onClick={() => onRemove(w)}
+              icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>}>
+              Remove worktree
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </div>
     </div>
@@ -999,6 +1084,29 @@ function StatusStrip({ status }: { status: Status | null }) {
   );
 }
 
+// Two spots below need a DropdownMenuTrigger that looks like a full
+// Button (primary/secondary), not an icon button -- DropdownMenuTrigger
+// renders unstyled by design (portal/ui/dropdown-menu.tsx), and Button
+// itself can't be composed onto it via `render` either (same no-ref/no-
+// prop-forwarding gap as IconButton, see the DropdownMenu comments above).
+// Adapted from (not copied byte-for-byte from) portal/ui/button.tsx's
+// buttonVariants output -- variant=primary/compact=false for
+// TRIGGER_BUTTON_CLS.primary, variant=secondary/compact=true for
+// .secondaryCompact -- rather than duplicating that cva() call here.
+// One real deviation from that source, not a typo: button.tsx's secondary
+// variant styles its own open-state with `aria-expanded:bg-white/85` on the
+// theory that Base UI sets aria-expanded on whatever it's composed onto via
+// `render`. For an actual Menu.Trigger (this file's only two consumers of
+// this constant) that's incorrect -- verified against
+// node_modules/@base-ui/react/menu/trigger/MenuTrigger.mjs, which sets
+// `aria-haspopup="menu"` and a `data-popup-open` presence attribute, never
+// aria-expanded. `aria-expanded:` here would just be dead CSS (never
+// matches), so this uses the attribute Base UI's Menu.Trigger actually sets.
+const TRIGGER_BUTTON_CLS = {
+  primary: 'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px px-4 py-2.5 bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none',
+  secondaryCompact: 'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px px-3 py-1.5 bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10 data-popup-open:bg-white/85',
+};
+
 function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDeploy, onOpenLogs, onOpenTool, onRemove, onRefresh, toast }: {
   w: Worktree | undefined; loaded: boolean; agents: { id: string; label: string }[];
   onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
@@ -1041,14 +1149,19 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
         }
         actions={
           w.active ? (
-            <PrimaryButton onClick={() => onAct('/api/stop', w)}>Stop</PrimaryButton>
+            <Button variant="primary" onClick={() => onAct('/api/stop', w)}>Stop</Button>
           ) : w.needsMigrationPrompt ? (
-            <Menu align="right" trigger={toggle => <PrimaryButton onClick={toggle}>Start — choose mode</PrimaryButton>}>
-              <MenuItem onClick={() => onStart(w, 'container')}>Migrate to container</MenuItem>
-              <MenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</MenuItem>
-            </Menu>
+            // align defaults to 'end' (right-flush), matching the old
+            // Menu's align="right" here -- no need to pass it explicitly.
+            <DropdownMenu>
+              <DropdownMenuTrigger class={TRIGGER_BUTTON_CLS.primary}>Start — choose mode</DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem onClick={() => onStart(w, 'container')}>Migrate to container</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => onStart(w, 'bare')}>Keep bare, start now</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           ) : (
-            <PrimaryButton onClick={() => onStart(w)}>Start ({w.nextStartMode})</PrimaryButton>
+            <Button variant="primary" onClick={() => onStart(w)}>Start ({w.nextStartMode})</Button>
           )
         }
       />
@@ -1066,11 +1179,11 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
             <StatusDot tone="emerald" />
             PR #{w.pr.number} merged, ready to clean up
           </span>
-          <SecondaryButton compact onClick={() => onRemove(w, 'merged')}>Clean up worktree</SecondaryButton>
+          <Button variant="secondary" compact onClick={() => onRemove(w, 'merged')}>Clean up worktree</Button>
         </div>
       )}
 
-      <Section title="Overview" actions={<SecondaryButton onClick={() => onAct('/api/sync', w)}>Sync with staging</SecondaryButton>}>
+      <Section title="Overview" actions={<Button variant="secondary" onClick={() => onAct('/api/sync', w)}>Sync with staging</Button>}>
         <div class="grid grid-cols-2 gap-4 text-sm">
           <div>
             <div class="text-zinc-400 text-xs mb-0.5">Local domain</div>
@@ -1195,18 +1308,21 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
           an "open in a tool" action. */}
       <Section title="Open in">
         <div class="flex items-center gap-2">
-          <Menu align="left" trigger={toggle => (
-            <SecondaryButton compact onClick={toggle}>Open in tool ▾</SecondaryButton>
-          )}>
-            {agents.map(a => (
-              <MenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
-                {a.label}
-              </MenuItem>
-            ))}
-          </Menu>
-          <SecondaryButton compact onClick={() => navigator.clipboard.writeText(cdCommand(w)).then(() => toast('Copied', 'emerald')).catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'))}>
+          <DropdownMenu>
+            {/* align="start" (old align="left") -- the only Menu trigger in
+                this file that diverges from the default right-flush align. */}
+            <DropdownMenuTrigger class={TRIGGER_BUTTON_CLS.secondaryCompact}>Open in tool ▾</DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              {agents.map(a => (
+                <DropdownMenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
+                  {a.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <Button variant="secondary" compact onClick={() => navigator.clipboard.writeText(cdCommand(w)).then(() => toast('Copied', 'emerald')).catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'))}>
             Copy cd command
-          </SecondaryButton>
+          </Button>
         </div>
       </Section>
 
@@ -1320,7 +1436,7 @@ function RepoPage({ repo, label, github, worktrees, agents, pendingStart, onAct,
           <a href={github} target="_blank"
             class="text-xs text-zinc-400 hover:text-accent transition-colors duration-150">{github}</a>
         ) : undefined}
-        actions={<PrimaryButton compact onClick={onCreateWorktree}>+ Worktree</PrimaryButton>} />
+        actions={<Button variant="primary" compact onClick={onCreateWorktree}>+ Worktree</Button>} />
 
       <div class="mt-8">
         <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">Worktrees ({repoWorktrees.length})</h2>
@@ -1364,9 +1480,9 @@ function RepoPage({ repo, label, github, worktrees, agents, pendingStart, onAct,
                 </div>
               </div>
               {match ? (
-                <SecondaryButton compact onClick={() => navigate(`/worktree/${repo}/${encodeURIComponent(match.name)}`)}>Open</SecondaryButton>
+                <Button variant="secondary" compact onClick={() => navigate(`/worktree/${repo}/${encodeURIComponent(match.name)}`)}>Open</Button>
               ) : (
-                <SecondaryButton compact onClick={() => onCreateFromPr(repo, pr.branch)}>Create worktree</SecondaryButton>
+                <Button variant="secondary" compact onClick={() => onCreateFromPr(repo, pr.branch)}>Create worktree</Button>
               )}
             </div>
           );
@@ -1545,7 +1661,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
         )}
       </Section>
 
-      <Section title="Projects" actions={<SecondaryButton onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>}>
+      <Section title="Projects" actions={<Button variant="secondary" onClick={() => setAddProjectOpen(true)}>+ Project</Button>}>
         {!projects.length ? <p class="text-sm text-zinc-400">No projects registered yet. Click + Project to add one.</p> : (
           <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
             {projects.map(p => (
@@ -1577,8 +1693,8 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
                 onApprove={() => approveSidecarRow(s.name)} />
             ))}
             <div class="flex items-center gap-3 pt-2">
-              <SecondaryButton onClick={() => setSidecars(list => [...list, { name: '', command: '', args: [], enabled: true }])}>+ Add sidecar</SecondaryButton>
-              <PrimaryButton onClick={() => saveSidecarsList(sidecars)} disabled={sidecarsSaving}>{sidecarsSaving ? 'Saving…' : 'Save sidecars'}</PrimaryButton>
+              <Button variant="secondary" onClick={() => setSidecars(list => [...list, { name: '', command: '', args: [], enabled: true }])}>+ Add sidecar</Button>
+              <Button variant="primary" onClick={() => saveSidecarsList(sidecars)} disabled={sidecarsSaving}>{sidecarsSaving ? 'Saving…' : 'Save sidecars'}</Button>
             </div>
             <p class="text-[11px] text-zinc-400 mt-1">Runs alongside the dev server on Start — for anything that isn't Inngest/trigger.dev/tunnel, which already have first-class controls on each worktree's page.</p>
           </div>
@@ -1598,7 +1714,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
               placeholder="*.local.json&#10;config/local.json" rows={3}
               class={`${inputCls} w-full text-xs py-1 font-mono`} />
             <div class="flex items-center gap-3 pt-2">
-              <PrimaryButton onClick={saveFileSyncGlobsList} disabled={fileSyncSaving}>{fileSyncSaving ? 'Saving…' : 'Save file sync'}</PrimaryButton>
+              <Button variant="primary" onClick={saveFileSyncGlobsList} disabled={fileSyncSaving}>{fileSyncSaving ? 'Saving…' : 'Save file sync'}</Button>
             </div>
             <p class="text-[11px] text-zinc-400 mt-1">Comma or newline separated glob patterns. Matching gitignored files are copied (not symlinked, unlike .env.local) from the main worktree into every newly created worktree, so each one gets its own editable copy. Patterns resolve against the main worktree's root, not an app subdir — for quivly-app include the subdir, e.g. apps/quivly-app/.env.development.local.</p>
           </div>
@@ -1613,8 +1729,8 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
               onRemove={() => saveCustomAgentsList(customAgents.filter((_, j) => j !== i))} />
           ))}
           <div class="flex items-center gap-3 pt-2">
-            <SecondaryButton onClick={() => setCustomAgents(list => [...list, { id: '', label: '', command: '' }])}>+ Add custom agent</SecondaryButton>
-            <PrimaryButton onClick={() => saveCustomAgentsList(customAgents)} disabled={customAgentsSaving}>{customAgentsSaving ? 'Saving…' : 'Save custom agents'}</PrimaryButton>
+            <Button variant="secondary" onClick={() => setCustomAgents(list => [...list, { id: '', label: '', command: '' }])}>+ Add custom agent</Button>
+            <Button variant="primary" onClick={() => saveCustomAgentsList(customAgents)} disabled={customAgentsSaving}>{customAgentsSaving ? 'Saving…' : 'Save custom agents'}</Button>
           </div>
           <p class="text-[11px] text-zinc-400 mt-1">Shows up in every worktree's "Open in" row alongside Claude/Cursor/etc. Not <span class="font-mono">which</span>-checked — make sure the command actually runs.</p>
         </div>
@@ -1965,8 +2081,8 @@ function App() {
             Parallel branches, dedicated dev servers, sidecars, and synced environments. One bridge for every feature an agent is building at once.
           </p>
         } actions={<>
-          <SecondaryButton compact onClick={() => setAddProjectOpen(true)}>+ Project</SecondaryButton>
-          <PrimaryButton compact onClick={() => setCreateOpen(true)}>+ Worktree</PrimaryButton>
+          <Button variant="secondary" compact onClick={() => setAddProjectOpen(true)}>+ Project</Button>
+          <Button variant="primary" compact onClick={() => setCreateOpen(true)}>+ Worktree</Button>
         </>} />
 
       <div class="rail-divider mb-8" />
@@ -1993,7 +2109,7 @@ function App() {
           ones on other pages, and jumps straight to one. Two different jobs,
           not a duplicate of each other. */}
       <div class="relative mb-4">
-        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-300 dark:text-zinc-600 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400 dark:text-zinc-500 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
         <input value={search} onInput={(e: any) => setSearch(e.target.value)}
           placeholder="Search worktrees by name, repo, or label…" autocomplete="off"
           class="w-full text-sm bg-white/60 dark:bg-white/5 backdrop-blur-md border border-white/75 dark:border-white/10 shadow-sm rounded-none pl-9 pr-3 py-2.5 text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-500 transition-colors duration-150" />

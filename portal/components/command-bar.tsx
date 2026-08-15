@@ -6,15 +6,15 @@
 // Preact, so a ~40-line native implementation beats wiring a compat shim
 // for one modal). onSelect is how a chosen worktree navigates — the router
 // itself (navigate/parseRoute/useRoute) stays in app.tsx.
-import { useState, useEffect, useRef } from 'preact/hooks';
-import { Modal, StatusDot } from '../ui';
+import { useState, useRef } from 'preact/hooks';
+import { Dialog, DialogContent } from '../ui/dialog';
+import { StatusDot } from '../ui/badge';
 import type { Worktree } from '../app';
 
 export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktree[]; onSelect: (w: Worktree) => void; onClose: () => void }) {
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
 
   const needle = q.trim().toLowerCase();
   const results = (needle
@@ -27,16 +27,24 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
     onClose();
   }
 
+  // Escape is no longer handled here — Base UI's Dialog Root owns
+  // Escape-to-close natively now (see onOpenChange below), so a local branch
+  // would just double-fire onClose redundantly. ArrowUp/ArrowDown/Enter stay
+  // hand-rolled: they drive this component's own result-list selection, a
+  // concern Base UI's Dialog has no opinion on.
   function onKeyDown(e: any) {
-    if (e.key === 'Escape') onClose();
-    else if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(s + 1, results.length - 1)); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(s + 1, results.length - 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(s - 1, 0)); }
     else if (e.key === 'Enter' && results[sel]) go(results[sel]);
   }
 
   return (
-    <Modal onClose={onClose}>
-      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl w-full max-w-md mx-4" onKeyDown={onKeyDown}>
+    <Dialog open onOpenChange={(open: boolean) => { if (!open) onClose(); }}>
+      {/* initialFocus replaces the old manual inputRef.current?.focus() effect —
+          Base UI's Popup otherwise focuses the first tabbable element on open
+          on its own, which happens to be this same input today, but pinning
+          it explicitly stops that from being an accident of DOM order. */}
+      <DialogContent class="p-0 sm:max-w-md" initialFocus={inputRef} onKeyDown={onKeyDown}>
         <div class="flex items-center gap-2.5 px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
           <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
           <input ref={inputRef} value={q} onInput={(e: any) => { setQ(e.target.value); setSel(0); }}
@@ -55,7 +63,7 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
             </button>
           ))}
         </div>
-      </div>
-    </Modal>
+      </DialogContent>
+    </Dialog>
   );
 }

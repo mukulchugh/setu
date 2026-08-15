@@ -3,7 +3,8 @@
 // refresh only, no interval poll: unlike LiveLog above, this isn't a stream
 // to watch, it's a "let me look at what changed" snapshot.
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { Badge, IconButton } from '../ui';
+import { Badge } from '../ui/badge';
+import { IconButton } from '../ui/button';
 
 type DiffLine = { type: 'add' | 'remove' | 'context'; content: string; oldLine?: number; newLine?: number };
 type DiffHunk = { header: string; lines: DiffLine[] };

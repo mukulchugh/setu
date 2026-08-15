@@ -6,7 +6,9 @@
 // back-navigation and a recreate callback from the caller (the router
 // itself stays in app.tsx).
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { PageHeader, Badge, SecondaryButton } from '../ui';
+import { PageHeader } from '../ui';
+import { Badge } from '../ui/badge';
+import { Button } from '../ui/button';
 import { relativeTime } from './relative-time';
 import { Pagination } from './pagination';
 import type { ArchivedWorktree } from '../app';
@@ -64,7 +66,7 @@ export function ArchivedPage({ onBack, onRecreate }: { onBack: () => void; onRec
                   )}
                 </div>
               </div>
-              <SecondaryButton compact onClick={() => onRecreate(a)}>Recreate</SecondaryButton>
+              <Button variant="secondary" compact onClick={() => onRecreate(a)}>Recreate</Button>
             </div>
           ))}
       </div>

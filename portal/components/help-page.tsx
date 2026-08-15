@@ -1,6 +1,7 @@
 // Static help/guide content — no state, no fetches, only a back-navigation
 // callback from the caller (the router itself stays in app.tsx).
-import { PageHeader, Section, SecondaryButton, Kbd } from '../ui';
+import { PageHeader, Section, Kbd } from '../ui';
+import { Button } from '../ui/button';
 
 function HelpTopic({ title, children }: { title: string; children: any }) {
   return (
@@ -57,7 +58,7 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
         <p class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed mb-3">
           Setu is open source. Issues, ideas, and pull requests are welcome.
         </p>
-        <SecondaryButton onClick={() => window.open('https://github.com/quivly/setu', '_blank')}>Open github.com/quivly/setu</SecondaryButton>
+        <Button variant="secondary" onClick={() => window.open('https://github.com/quivly/setu', '_blank')}>Open github.com/quivly/setu</Button>
       </Section>
     </div>
   );

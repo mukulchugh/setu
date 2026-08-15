@@ -97,3 +97,74 @@ export function NetlifyIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
 export function ConvexIcon({ class: cls = 'w-4 h-4' }: { class?: string }) {
   return <svg class={cls} fill="currentColor" viewBox="0 0 24 24"><path d={siConvex.path} /></svg>;
 }
+
+// ---------------------------------------------------------------------------
+// Tabler-sourced icon path data. The installed @tabler/icons package (v3.46.0
+// — node_modules/@tabler/icons/package.json — pinned here since there's no
+// JS/JSON export to import a version from) ships only raw SVG files under
+// icons/outline/*.svg and icons/filled/*.svg (exports map "./*": "./icons/*"),
+// no path-data module the way simple-icons has. Path data extracted by hand
+// from those files and hardcoded here the same way siOpenai above is (that
+// constant's own `path` already concatenates several "M..." subpaths into one
+// string for the same reason — SVG allows multiple subpaths in a single `d`
+// attribute, each new "M" opening one) — not a runtime .svg import.
+//
+// Every constant below was matched to a real installed file by grepping a
+// distinctive fragment of the codebase's EXISTING hand-drawn inline icon (the
+// one this constant is meant to eventually replace) against
+// icons/{outline,filled}/*.svg, then diffed byte-for-byte against that file's
+// own <path> content — not guessed from the icon's apparent shape or name.
+// Most of this codebase's hand-drawn "Tabler-style" icons turned out to
+// already be verbatim copies of the real path data; these exports make that a
+// stated, sourced fact instead of an unverified coincidence. One exception:
+// the "Repo overview" sidebar icon (app.tsx, three connected dots) draws real
+// SVG <circle> elements, which no actual Tabler file does (even Tabler's own
+// circular glyphs are drawn as an arc path, e.g. tablerCircle below) — no
+// Tabler equivalent exists for it, so it has no constant here, same as
+// Netlify's mark above having no Tabler equivalent either.
+//
+// `path` concatenates every <path d="..."> in the source file, skipping the
+// leading `<path stroke="none" d="M0 0h24v24H0z" fill="none" />` bounding-box
+// filler every outline.svg starts with — `<path d={icon.path} />` alone
+// reproduces the original multi-stroke icon exactly (each subpath strokes
+// independently). Outline icons (fill="none" stroke) render with
+// fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+// stroke-linejoin="round" viewBox="0 0 24 24" — the exact attributes every
+// hand-drawn outline icon in this codebase already uses. Filled icons
+// (`*Filled` below, sourced from icons/filled/ instead of icons/outline/)
+// render with just fill="currentColor" viewBox="0 0 24 24", no stroke
+// attributes — same as ToolIcon's brand-mark rendering above.
+//
+// Wiring these into real call sites in place of the inline hand-drawn SVGs
+// they were extracted from is a separate, larger follow-up, out of scope
+// here — these are the sourced, verified constants that follow-up wires up.
+export const tablerSearch = { path: 'M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0 M21 21l-6 -6' };
+export const tablerRefresh = { path: 'M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4 M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4' };
+export const tablerExternalLink = { path: 'M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6 M11 13l9 -9 M15 4h5v5' };
+export const tablerTerminal2 = { path: 'M8 9l3 3l-3 3 M13 15l3 0 M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2l0 -12' };
+export const tablerCheck = { path: 'M5 12l5 5l10 -10' };
+export const tablerCopy = { path: 'M7 9.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667l0 -8.666 M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1' };
+export const tablerWorld = { path: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0 M3.6 9h16.8 M3.6 15h16.8 M11.5 3a17 17 0 0 0 0 18 M12.5 3a17 17 0 0 1 0 18' };
+export const tablerTrash = { path: 'M4 7l16 0 M10 11l0 6 M14 11l0 6 M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12 M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3' };
+export const tablerClock = { path: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0 M12 7v5l3 3' };
+export const tablerCircle = { path: 'M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0' };
+export const tablerArrowUp = { path: 'M12 5l0 14 M18 11l-6 -6 M6 11l6 -6' };
+export const tablerFileText = { path: 'M14 3v4a1 1 0 0 0 1 1h4 M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2 M9 9l1 0 M9 13l6 0 M9 17l6 0' };
+export const tablerArchive = { path: 'M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2 M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-10 M10 12l4 0' };
+export const tablerPlug = { path: 'M9.785 6l8.215 8.215l-2.054 2.054a5.81 5.81 0 1 1 -8.215 -8.215l2.054 -2.054 M4 20l3.5 -3.5 M15 4l-3.5 3.5 M20 9l-3.5 3.5' };
+export const tablerSettings = { path: 'M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065 M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0' };
+export const tablerSun = { path: 'M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0 M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7' };
+export const tablerChevronRight = { path: 'M9 6l6 6l-6 6' };
+// The app's "list view" toggle icon (app.tsx) draws this exact path but is
+// not Tabler's own list.svg (which adds bullet-point dots this app's version
+// never had) — it's really Tabler's menu-2.
+export const tablerMenu2 = { path: 'M4 6l16 0 M4 12l16 0 M4 18l16 0' };
+export const tablerLayoutGrid = { path: 'M4 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4 M14 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4 M4 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4 M14 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4' };
+
+// Filled variants (fill="currentColor", no stroke attributes) — source files
+// live under @tabler/icons' icons/filled/ tree, not icons/outline/.
+export const tablerPlayerPlayFilled = { path: 'M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z' };
+export const tablerCaretDownFilled = { path: 'M18 9c.852 0 1.297 .986 .783 1.623l-.076 .084l-6 6a1 1 0 0 1 -1.32 .083l-.094 -.083l-6 -6l-.083 -.094l-.054 -.077l-.054 -.096l-.017 -.036l-.027 -.067l-.032 -.108l-.01 -.053l-.01 -.06l-.004 -.057v-.118l.005 -.058l.009 -.06l.01 -.052l.032 -.108l.027 -.067l.07 -.132l.065 -.09l.073 -.081l.094 -.083l.077 -.054l.096 -.054l.036 -.017l.067 -.027l.108 -.032l.053 -.01l.06 -.01l.057 -.004l12.059 -.002z' };
+export const tablerDotsVerticalFilled = { path: 'M14 12a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2 M14 19a2 2 0 1 1 -4 0q 0 -.052 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2 M14 5a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2' };
+export const tablerMoonFilled = { path: 'M12 1.992a10 10 0 1 0 9.236 13.838c.341 -.82 -.476 -1.644 -1.298 -1.31a6.5 6.5 0 0 1 -6.864 -10.787l.077 -.08c.551 -.63 .113 -1.653 -.758 -1.653h-.266l-.068 -.006l-.06 -.002z' };
+export const tablerPlayerStopFilled = { path: 'M17 4h-10a3 3 0 0 0 -3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3 -3v-10a3 3 0 0 0 -3 -3z' };

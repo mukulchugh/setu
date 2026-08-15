@@ -1,7 +1,9 @@
 // Three self-contained Settings sections — each owns its own state/fetch loop,
 // documented as intentionally independent of SettingsPage's own state.
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { Section, PrimaryButton, SecondaryButton, IconButton, StatusDot, Badge, CloseIcon, inputCls, type Tone } from '../ui';
+import { Section, CloseIcon, inputCls } from '../ui';
+import { Button, IconButton } from '../ui/button';
+import { Badge, StatusDot, type Tone } from '../ui/badge';
 import { post, postOrToast } from '../api';
 import { useLogPoll } from './logs';
 
@@ -51,7 +53,7 @@ export function RaycastSection({ toast }: { toast: (msg: string, tone?: Tone) =>
         : !status.dirExists ? <p class="text-sm text-zinc-400">raycast/ not found in the Setu repo</p>
         : !status.running ? (
           <div class="flex flex-col items-start gap-2">
-            <PrimaryButton onClick={start} disabled={busy}>{busy ? 'Starting…' : 'Start dev mode'}</PrimaryButton>
+            <Button onClick={start} disabled={busy}>{busy ? 'Starting…' : 'Start dev mode'}</Button>
             <p class="text-[11px] text-zinc-400">Runs <span class="font-mono">npm install</span> (first time only) and <span class="font-mono">ray develop</span> in the background — this is what makes Setu show up in Raycast.</p>
           </div>
         ) : (
@@ -59,7 +61,7 @@ export function RaycastSection({ toast }: { toast: (msg: string, tone?: Tone) =>
             <div class="flex items-center gap-2">
               <StatusDot tone="emerald" />
               <span class="text-sm">Dev mode running</span>
-              <SecondaryButton onClick={stop}>Stop</SecondaryButton>
+              <Button variant="secondary" onClick={stop}>Stop</Button>
             </div>
             <pre ref={preRef} class="max-h-64 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-all">{log.length ? log.join('\n') : '(no log yet)'}</pre>
           </div>
@@ -122,7 +124,7 @@ export function DiscoverProjectsSection({ toast, onImported }: { toast: (msg: st
 
   return (
     <Section title="Discover Projects" actions={
-      <PrimaryButton onClick={scan} disabled={scanning}>{scanning ? 'Scanning…' : 'Scan'}</PrimaryButton>
+      <Button onClick={scan} disabled={scanning}>{scanning ? 'Scanning…' : 'Scan'}</Button>
     }>
       {candidates === null ? (
         <p class="text-sm text-zinc-400">Finds git repos on this Mac that aren't registered with Setu yet. A full home directory scan, so it can take a few seconds.</p>
@@ -160,9 +162,9 @@ export function DiscoverProjectsSection({ toast, onImported }: { toast: (msg: st
             })}
           </div>
           <div class="flex items-center gap-3 pt-2">
-            <PrimaryButton onClick={importSelected} disabled={!selected.size || importing}>
+            <Button onClick={importSelected} disabled={!selected.size || importing}>
               {importing ? 'Importing…' : `Import selected (${selected.size})`}
-            </PrimaryButton>
+            </Button>
           </div>
           <p class="text-[11px] text-zinc-400 mt-1">Imports run one at a time, cloning each repo's origin remote into Setu's bare-repo layout. The original directory on disk is left untouched either way.</p>
         </div>
@@ -274,7 +276,7 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
 
   return (
     <Section title="MCP Servers" actions={
-      <SecondaryButton onClick={() => setAdding(a => !a)} compact>{adding ? 'Cancel' : '+ Add server'}</SecondaryButton>
+      <Button variant="secondary" onClick={() => setAdding(a => !a)} compact>{adding ? 'Cancel' : '+ Add server'}</Button>
     }>
       <div class="flex flex-col gap-3">
         {adding && (
@@ -307,7 +309,7 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
               </>
             )}
             <div class="pt-1">
-              <PrimaryButton onClick={addServer} compact>Add</PrimaryButton>
+              <Button onClick={addServer} compact>Add</Button>
             </div>
           </div>
         )}
@@ -324,8 +326,8 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
                     <Badge tone="zinc">{s.transport}</Badge>
                     <span class="text-xs text-zinc-400 flex-1">{MCP_LABEL[s.status]}</span>
                     {s.status === 'disconnected' || s.status === 'error'
-                      ? <SecondaryButton compact onClick={() => connect(s.id)}>Connect</SecondaryButton>
-                      : <SecondaryButton compact onClick={() => disconnect(s.id)}>Disconnect</SecondaryButton>}
+                      ? <Button variant="secondary" compact onClick={() => connect(s.id)}>Connect</Button>
+                      : <Button variant="secondary" compact onClick={() => disconnect(s.id)}>Disconnect</Button>}
                     <IconButton tone="red" tip="Remove server" onClick={() => remove(s)}>
                       <CloseIcon class="w-3.5 h-3.5" />
                     </IconButton>

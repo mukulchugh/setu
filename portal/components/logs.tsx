@@ -4,7 +4,8 @@
 // themselves are built on useLogStream below instead, a WS-based sibling
 // with the same return shape.
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { Modal, CloseBtn, IconButton } from '../ui';
+import { Dialog, DialogContent, DialogClose } from '../ui/dialog';
+import { IconButton } from '../ui/button';
 import { getWs } from '../ws';
 
 export const LOG_TABS = ['dev', 'tunnel', 'inngest', 'trigger', 'convex', 'vercel', 'netlify', 'setup', 'pr-review'] as const;
@@ -82,8 +83,8 @@ export function LogModal({ repo, name, initialType, extraTabs, onClose }: { repo
   const tabs = [...LOG_TABS, ...(extraTabs ?? []).map(n => `sidecar-${n}`)];
 
   return (
-    <Modal onClose={onClose} position="bottom">
-      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl border-t border-zinc-200 dark:border-zinc-800 shadow-2xl w-full" style="height:60vh; display:flex; flex-direction:column;">
+    <Dialog open onOpenChange={(open: boolean) => { if (!open) onClose(); }}>
+      <DialogContent position="bottom" class="flex flex-col h-[60vh]">
         <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 dark:border-zinc-800 shrink-0">
           <div class="flex gap-1 bg-zinc-100 dark:bg-zinc-800 rounded-none p-0.5 overflow-x-auto">
             {tabs.map(t => (
@@ -97,11 +98,13 @@ export function LogModal({ repo, name, initialType, extraTabs, onClose }: { repo
           <IconButton tip="Copy all" onClick={() => navigator.clipboard.writeText(text).catch(() => {})}>
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M7 9.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667l0 -8.666" /><path d="M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1" /></svg>
           </IconButton>
-          <CloseBtn onClick={onClose} />
+          <DialogClose class="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors duration-200">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>
+          </DialogClose>
         </div>
         <pre ref={preRef} class="flex-1 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 bg-zinc-50/80 dark:bg-black/20 px-5 py-4 whitespace-pre-wrap break-all">{text}</pre>
-      </div>
-    </Modal>
+      </DialogContent>
+    </Dialog>
   );
 }
 
