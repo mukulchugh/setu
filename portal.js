@@ -2039,10 +2039,61 @@ async function worktreeRoutes(req, pathname, method, server) {
   return null;
 }
 
+// ── action log ────────────────────────────────────────────────────────────────
+// A structured record of every mutating request this portal serves: route,
+// repo/name (when present), and whether it succeeded. This is the exact gap
+// a real incident hit (google-calendar-meeting-prep silently switched from
+// bare to a container mid-use) -- portal.js logged nothing about its own
+// requests anywhere retrievable, so root-causing it meant correlating three
+// separate external log sources by hand (OrbStack's own log, Caddy's log,
+// the worktree's own dev.log) instead of one grep. GET routes aren't logged
+// here -- they're reads, not actions, and the list/status polls alone
+// (800ms-3s intervals) would drown out everything else at that volume.
+const ACTIONS_LOG = `${LOGS}/actions.log`;
+
+function logAction(pathname, body, ok, error) {
+  rotateLog(ACTIONS_LOG);
+  const entry = {
+    ts: new Date().toISOString(),
+    route: pathname,
+    repo: body?.repo ?? null,
+    name: body?.name ?? null,
+    ok,
+    ...(error ? { error: String(error).slice(0, 500) } : {}),
+  };
+  try { appendFileSync(ACTIONS_LOG, JSON.stringify(entry) + '\n'); } catch {}
+}
+
 async function handle(req, server) {
   const { pathname } = new URL(req.url);
   const method = req.method;
 
+  // Only POST /api/* is a mutating action worth logging -- /ws (an upgrade,
+  // not a normal response) and every GET route fall straight through to the
+  // real router with no cloning overhead. /mcp is deliberately excluded too,
+  // not an oversight: it's a JSON-RPC envelope (repo/name would be nested
+  // under params.arguments, not top-level) and a stateless response can be
+  // SSE-framed rather than plain JSON, so res.clone().json() would silently
+  // fail to parse it -- every MCP-driven action would log as a false "ok"
+  // instead of its real result. Covering MCP calls needs its own envelope-
+  // aware handling, not a blind extension of this wrapper -- real, tracked
+  // gap, not solved here.
+  if (method !== 'POST' || !pathname.startsWith('/api/')) return routeRequest(req, server, pathname, method);
+
+  // Request bodies can only be read once and every route handler below
+  // already does its own req.json() internally -- clone before routing so
+  // this wrapper can independently read the same body for the log entry.
+  const bodyClone = req.clone();
+  const res = await routeRequest(req, server, pathname, method);
+  const [body, resBody] = await Promise.all([
+    bodyClone.json().catch(() => null),
+    res.clone().json().catch(() => null),
+  ]);
+  logAction(pathname, body, resBody?.ok !== false, resBody?.error);
+  return res;
+}
+
+async function routeRequest(req, server, pathname, method) {
   // A successful upgrade must not fall through to the route handlers below,
   // hence the early return before the loop even starts. data seeds ws.data
   // with the per-connection Set that open/message/close use to track which
