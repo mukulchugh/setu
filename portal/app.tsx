@@ -539,6 +539,69 @@ function PrReviewSection({ w, toast, onOpenLogs }: {
   );
 }
 
+// One-click GitHub actions for a worktree's branch/PR: create a PR when
+// there isn't one yet, flip draft<->ready when there is, and a plain link
+// to the branch's CI checks either way. Hidden entirely for a repo with no
+// GitHub remote configured (branchUrl is null in that case, same gate the
+// Overview section's own Branch row already uses) -- there's nothing
+// GitHub-shaped to do for a purely local project.
+function GithubActionsSection({ w, toast, onRefresh }: {
+  w: Worktree; toast: (msg: string, tone?: Tone) => void; onRefresh: () => void;
+}) {
+  const [busy, setBusy] = useState<'create' | 'ready' | null>(null);
+
+  async function createPr() {
+    setBusy('create');
+    const res = await postOrToast('/api/pr/create', { repo: w.repo, name: w.name }, toast, 'create PR failed');
+    setBusy(null);
+    if (res?.ok) { toast(`PR created`, 'emerald'); onRefresh(); }
+  }
+
+  async function toggleReady(ready: boolean) {
+    setBusy('ready');
+    const res = await postOrToast('/api/pr/ready', { repo: w.repo, name: w.name, ready }, toast, `mark ${ready ? 'ready' : 'draft'} failed`);
+    setBusy(null);
+    if (res?.ok) onRefresh();
+  }
+
+  if (!w.pr && !w.branchUrl) return null;
+
+  // A PR's own /checks path is the direct checks tab; without a PR yet,
+  // fall back to the repo's Actions list filtered to this branch --
+  // branchUrl is `${github}/tree/${name}`, strip the /tree/... suffix to
+  // get back to the bare repo URL.
+  const ciUrl = w.pr ? `${w.pr.url}/checks`
+    : w.branchUrl ? `${w.branchUrl.replace(/\/tree\/.*$/, '')}/actions?query=${encodeURIComponent(`branch:${w.name}`)}`
+    : null;
+
+  return (
+    <Section title="GitHub">
+      <div class="flex items-center gap-4 flex-wrap text-sm">
+        {/* w.name !== 'main': mirrors getWorktrees()'s own fetchPR gate
+            (portal.js) -- 'main' is Setu's fixed slot name for a project's
+            primary worktree, never itself a PR candidate, so w.pr is always
+            null there regardless of GitHub state. Without this check the
+            button would offer to PR main against itself. */}
+        {!w.pr && w.name !== 'main' && (
+          <SecondaryButton compact onClick={createPr} disabled={busy === 'create'}>
+            {busy === 'create' ? 'Creating…' : 'Create PR'}
+          </SecondaryButton>
+        )}
+        {w.pr && (w.pr.state === 'open' || w.pr.state === 'draft') && (
+          <SecondaryButton compact onClick={() => toggleReady(w.pr!.state === 'draft')} disabled={busy === 'ready'}>
+            {busy === 'ready' ? 'Updating…' : w.pr.state === 'draft' ? 'Mark ready for review' : 'Convert to draft'}
+          </SecondaryButton>
+        )}
+        {ciUrl && (
+          <a href={ciUrl} target="_blank" class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-accent transition-colors duration-150">
+            View CI runs →
+          </a>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 // WorktreePage's "<Provider> deploy" Section -- previously written out once
 // for Vercel only, now shared with Netlify the same way everything else on
 // this page is (DeployMenu, DeployStatusChips above).
@@ -772,11 +835,23 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
         <IconButton tone="zinc" tip="Open in browser" disabled={!w.active} href={`http://${w.domain}`} target="_blank">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" /><path d="M11 13l9 -9" /><path d="M15 4h5v5" /></svg>
         </IconButton>
-        {agents.map((a: { id: string; label: string }) => (
-          <IconButton key={a.id} tone="zinc" tip={`Open in ${a.label}`} onClick={() => onOpenTool(w, a.id)}>
-            <ToolIcon id={a.id} label={a.label} />
-          </IconButton>
-        ))}
+        {/* One dropdown for every detected CLI agent, not one icon button
+            each -- with most of the 8 registered tools installed this row
+            used to run to a dozen+ icon buttons per card, across 40+ cards
+            in list view. */}
+        {agents.length > 0 && (
+          <Menu trigger={toggle => (
+            <IconButton tone="zinc" tip="Open in tool" onClick={(e: any) => { e.stopPropagation(); toggle(); }}>
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M8 9l3 3l-3 3" /><path d="M13 15l3 0" /><path d="M3 4m0 2a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z" /></svg>
+            </IconButton>
+          )}>
+            {agents.map((a: { id: string; label: string }) => (
+              <MenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
+                {a.label}
+              </MenuItem>
+            ))}
+          </Menu>
+        )}
         <IconButton tone="zinc" tip="Copy cd command" onClick={copyCD}>
           {copied
             ? <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M5 12l5 5l10 -10" /></svg>
@@ -924,13 +999,14 @@ function StatusStrip({ status }: { status: Status | null }) {
   );
 }
 
-function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDeploy, onOpenLogs, onOpenTool, onRemove, toast }: {
+function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDeploy, onOpenLogs, onOpenTool, onRemove, onRefresh, toast }: {
   w: Worktree | undefined; loaded: boolean; agents: { id: string; label: string }[];
   onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
   onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
   onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
   onOpenLogs: (repo: string, name: string, type: string) => void;
-  onOpenTool: (w: Worktree, tool: string) => void; onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void; toast: (msg: string, tone?: Tone) => void;
+  onOpenTool: (w: Worktree, tool: string) => void; onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void;
+  onRefresh: () => void; toast: (msg: string, tone?: Tone) => void;
 }) {
   // Distinguish "the initial /api/worktrees fetch hasn't resolved yet" (a
   // direct link or hard refresh always starts with an empty worktrees array)
@@ -1058,6 +1134,8 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
 
       <PrReviewSection w={w} toast={toast} onOpenLogs={onOpenLogs} />
 
+      <GithubActionsSection w={w} toast={toast} onRefresh={onRefresh} />
+
       <Section title="Sidecars">
         <div class="flex items-center gap-6 text-sm">
           <div class="flex items-center gap-2">
@@ -1110,18 +1188,25 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
       <DeploySection w={w} provider="vercel" deploy={w.vercelDeploy} onDeploy={onDeploy} onOpenLogs={onOpenLogs} />
       <DeploySection w={w} provider="netlify" deploy={w.netlifyDeploy} onDeploy={onDeploy} onOpenLogs={onOpenLogs} />
 
+      {/* Was one bordered button per detected CLI (up to 8) plus Copy cd
+          command, wrapping across several lines on a real machine with
+          most of them installed. One dropdown trigger covers every tool;
+          Copy cd command stays as its own visible button since it isn't
+          an "open in a tool" action. */}
       <Section title="Open in">
-        <div class="flex items-center gap-2 flex-wrap">
-          {agents.map(a => (
-            <button key={a.id} onClick={() => onOpenTool(w, a.id)}
-              class="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-none border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors duration-150">
-              <ToolIcon id={a.id} label={a.label} />{a.label}
-            </button>
-          ))}
-          <button onClick={() => navigator.clipboard.writeText(cdCommand(w)).then(() => toast('Copied', 'emerald')).catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'))}
-            class="text-xs px-2.5 py-1.5 rounded-none border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-300 transition-colors duration-150">
+        <div class="flex items-center gap-2">
+          <Menu align="left" trigger={toggle => (
+            <SecondaryButton compact onClick={toggle}>Open in tool ▾</SecondaryButton>
+          )}>
+            {agents.map(a => (
+              <MenuItem key={a.id} icon={<ToolIcon id={a.id} label={a.label} />} onClick={() => onOpenTool(w, a.id)}>
+                {a.label}
+              </MenuItem>
+            ))}
+          </Menu>
+          <SecondaryButton compact onClick={() => navigator.clipboard.writeText(cdCommand(w)).then(() => toast('Copied', 'emerald')).catch(() => toast(`✗ Couldn't copy to clipboard. Run it manually: ${cdCommand(w)}`, 'red'))}>
             Copy cd command
-          </button>
+          </SecondaryButton>
         </div>
       </Section>
 
@@ -1801,7 +1886,7 @@ function App() {
     const w = worktrees.find(x => x.repo === route.repo && x.name === route.name);
     return <>
       <WorktreePage w={w} loaded={loaded} agents={agents} onAct={act} onStart={start} onDeploy={deploy} onConvexDeploy={convexDeploy}
-        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool} onRemove={remove} toast={toast} />
+        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool} onRemove={remove} onRefresh={refresh} toast={toast} />
       {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type}
         extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
         onClose={() => setLogView(null)} />}

@@ -346,6 +346,48 @@ async function fetchRepoPRs(repo) {
   return entry;
 }
 
+// ── GitHub actions (create PR, draft/ready toggle) ───────────────────────────
+// Bun.spawn, not execFileSync/spawnSync -- same reason as everything else
+// converted this session (a blocking subprocess call freezes the whole
+// portal for every concurrent request, not just this one). Unlike
+// spawnText, this doesn't swallow a failure into '': create/ready are
+// mutating, user-triggered actions, so a real error (no commits to PR,
+// PR already exists, gh not authenticated) needs to surface as a message,
+// not silently look like nothing happened.
+async function spawnRun(cwd, args) {
+  const proc = Bun.spawn(args, { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const code = await proc.exited;
+  if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || `${args.join(' ')} failed (exit ${code})`);
+  return stdout.trim();
+}
+
+async function createPr(repo, name) {
+  const slug = REPO_META[repo]?.slug;
+  if (!slug) throw new Error('no GitHub repo configured for this project');
+  const wtDir = wtPath(repo, name);
+  // gh pr create prompts interactively when the branch isn't fully pushed
+  // yet -- with stdin ignored that would just hang, so push explicitly
+  // first rather than relying on gh's own interactive fallback.
+  await spawnRun(wtDir, ['git', 'push', '-u', 'origin', name]);
+  const url = await spawnRun(wtDir, ['gh', 'pr', 'create', '--fill', '--repo', slug]);
+  prCache.delete(`${repo}/${name}`); // force a fresh fetchPR instead of showing "no PR" until the TTL expires
+  return { ok: true, url };
+}
+
+async function setPrReady(repo, name, ready) {
+  const slug = REPO_META[repo]?.slug;
+  if (!slug) throw new Error('no GitHub repo configured for this project');
+  const args = ['pr', 'ready', name, '--repo', slug];
+  if (!ready) args.push('--undo');
+  await spawnRun(wtPath(repo, name), ['gh', ...args]);
+  prCache.delete(`${repo}/${name}`);
+  return { ok: true };
+}
+
 // ── diff viewer (per-worktree, computed on demand, no cache unlike the
 // TTL'd caches above: this is fetched once when a human opens the Diff
 // section and on an explicit manual refresh, never on a poll loop, so
@@ -1935,6 +1977,12 @@ async function worktreeRoutes(req, pathname, method, server) {
     }
     if (pathname === '/api/sync') {
       return jsonTry(() => syncWorktreeByName(repo, name));
+    }
+    if (pathname === '/api/pr/create') {
+      return jsonTry(() => createPr(repo, name));
+    }
+    if (pathname === '/api/pr/ready') {
+      return jsonTry(() => setPrReady(repo, name, !!body.ready));
     }
     if (pathname === '/api/tunnel/enable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });

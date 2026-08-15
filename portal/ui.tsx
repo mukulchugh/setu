@@ -89,8 +89,8 @@ const buttonBase = 'whitespace-nowrap board-mono text-[11px] font-bold rounded-n
 export function PrimaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: any; class?: string; compact?: boolean }) {
   return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
 }
-export function SecondaryButton({ onClick, children, class: cls = '', compact = false }: { onClick?: () => void; children: any; class?: string; compact?: boolean }) {
-  return <button onClick={onClick} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
+export function SecondaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: any; class?: string; compact?: boolean }) {
+  return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
 }
 
 // Toast state (id/tone/timeout) lives in App — the one place that already
@@ -157,7 +157,7 @@ export function Menu({ trigger, children, align = 'right' }: { trigger: (toggle:
       {trigger(() => setOpen(o => !o))}
       {open && (
         <div onClick={() => setOpen(false)}
-          class={`menu-panel-open absolute ${align === 'right' ? 'right-0' : 'left-0'} top-8 bg-white/95 backdrop-blur-md border border-zinc-200 rounded-none shadow-lg z-30 py-1 min-w-[170px] origin-top transition-all duration-150 ease-out`}>
+          class={`menu-panel-open absolute ${align === 'right' ? 'right-0' : 'left-0'} top-8 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md border border-zinc-200 dark:border-zinc-700 rounded-none shadow-lg z-30 py-1 min-w-[170px] origin-top transition-all duration-150 ease-out`}>
           {children}
         </div>
       )}
@@ -169,7 +169,7 @@ export function MenuItem({ onClick, tone = 'zinc', icon, children }: { onClick: 
   return (
     <button onClick={onClick}
       class={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 whitespace-nowrap transition-colors duration-150 ${
-        tone === 'red' ? 'text-red-600 hover:bg-red-50' : 'text-zinc-700 hover:bg-zinc-50'}`}>
+        tone === 'red' ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10' : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-white/10'}`}>
       {icon}{children}
     </button>
   );

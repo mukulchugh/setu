@@ -3,26 +3,31 @@
 import { useState, useEffect } from 'preact/hooks';
 
 // Real, specific facts about what setu does, not filler copy — each one
-// traces back to an actual mechanism in lib.js/portal.js/cli.js.
+// traces back to an actual mechanism in lib.js/portal.js/cli.js. Refreshed
+// periodically as real features land, not written once and left stale —
+// the weakest, most generic entries from the first pass (self-referential
+// "the help page has docs", thin UI-polish notes) got cut in favor of
+// facts that actually say something about how the tool works.
 const SETU_FACTS = [
   'Projects live as one bare repo plus lightweight worktrees, so every branch shares history instead of a full clone.',
   'Every worktree gets its own *.quivly.local subdomain, wired up by Caddy and dnsmasq automatically.',
   'Port bands are handed out in blocks of 100 starting at 3000, one block per project.',
   "Sync with staging only ever does a clean merge. If it can't merge cleanly, it aborts and leaves your branch exactly as it was.",
   "Container mode works with any Docker daemon, OrbStack included. It's engine agnostic by design.",
-  'Concurrency limits auto clamp to your machine\'s real CPU and memory, not a hardcoded number.',
+  "In container mode, node_modules lives in its own Docker volume, not a bind mount — so a native macOS binary in it never has to run inside the Linux container.",
+  "Concurrency limits auto clamp to your machine's real CPU and memory, not a hardcoded number.",
   'Sidecars are defined per project in sidecars.json, so each repo can run its own supporting processes.',
-  'Custom CLI agents get collision safe kebab case ids, so two agents named the same thing never overwrite each other.',
-  'The Raycast extension talks to the same portal API the web UI uses. No separate backend to maintain.',
+  "A sidecar's command has to be explicitly approved before it's allowed to run. Edit it later, even by one character, and that approval is revoked automatically.",
+  'The web UI, the CLI, the Raycast extension, and the MCP server are four different doors onto the exact same portal API. None of them duplicate a line of business logic.',
+  'Setu runs its own MCP server, so an agent in Claude Code, Codex, or Cursor can create, start, stop, and sync worktrees directly — no browser required.',
   'Cloudflare tunnels are optional per worktree, for sharing a branch outside your machine.',
-  'The sidebar remembers your filter, sort order, and view mode across reloads.',
-  'The command bar opens with Cmd K from anywhere in the app.',
-  'The header stays transparent until you actually scroll. No blur without something to blur against.',
+  'Every registered repo gets its own overview page — worktrees, open PRs, and sidecar config in one place, one URL you can bookmark or share.',
+  "Killing a process from the Ports page asks you to confirm first. It's the one action there that can't be undone.",
   'The split flap status text only animates on a real state change, never idles for effect.',
   'The bridge glyph in the logo is the same icon used for the Raycast extension and the browser favicon.',
+  'Custom CLI agents get collision safe kebab case ids, so two agents named the same thing never overwrite each other.',
   'The ports page gives every active process on your machine its own dedicated view.',
-  'The help and guide page documents the full command reference, plus how to contribute.',
-  "Dark mode is a real second theme, not just an inverted filter.",
+  'Dark mode is a real second theme, not just an inverted filter.',
   'Removing a worktree never deletes its branch. The branch stays in git history.',
   'Setu was built to answer one question: which of my branches actually has a server running right now.',
 ];
