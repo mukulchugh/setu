@@ -2365,7 +2365,7 @@ const server = Bun.serve({
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage, '/archived': indexPage },
+  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage, '/archived': indexPage },
   fetch: handle,
   websocket: { open, message, close },
   development: false,

@@ -16,7 +16,6 @@ import { CommandBar } from './components/command-bar';
 import { HelpPage } from './components/help-page';
 import { RaycastSection, DiscoverProjectsSection, McpSection } from './components/settings-sections';
 import { ArchivedPage } from './components/archived-page';
-import { RepoPrsModal } from './components/repo-prs-modal';
 import { Pagination } from './components/pagination';
 import { relativeTime } from './components/relative-time';
 import { type PrChecks, checksTone } from './components/pr-status';
@@ -76,15 +75,18 @@ type Status = {
 // Minimal router — one detail view alongside the existing list/grid doesn't
 // justify a router dependency; history.pushState + popstate is the native
 // platform feature that already does exactly this.
-type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' } | { page: 'archived' };
+type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'repo'; repo: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' } | { page: 'archived' };
 
 function parseRoute(pathname: string): Route {
   if (pathname === '/settings') return { page: 'settings' };
   if (pathname === '/help') return { page: 'help' };
   if (pathname === '/ports') return { page: 'ports' };
   if (pathname === '/archived') return { page: 'archived' };
-  const m = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
-  return m ? { page: 'detail', repo: decodeURIComponent(m[1]), name: decodeURIComponent(m[2]) } : { page: 'list' };
+  const wt = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
+  if (wt) return { page: 'detail', repo: decodeURIComponent(wt[1]), name: decodeURIComponent(wt[2]) };
+  const repo = pathname.match(/^\/repo\/([^/]+)$/);
+  if (repo) return { page: 'repo', repo: decodeURIComponent(repo[1]) };
+  return { page: 'list' };
 }
 
 function navigate(path: string) {
@@ -1187,6 +1189,147 @@ function CustomAgentRow({ a, onChange, onRemove }: { a: CustomAgent; onChange: (
   );
 }
 
+type RepoPr = {
+  number: number; title: string; url: string; branch: string;
+  isDraft: boolean; checks: PrChecks; updatedAt: string; author: string | null;
+};
+type RepoPrsResponse = { prs: RepoPr[]; error: string | null };
+
+// Repo-level overview: this repo's own worktrees, its open PRs (replacing
+// the old RepoPrsModal bottom-sheet -- same fetch, page chrome instead of
+// modal chrome), and a read-only summary of its sidecar/file-sync config.
+// Editing that config still happens in Settings (loadSidecarsList/
+// saveFileSyncGlobsList there own the actual save logic) rather than
+// duplicating it here -- this page links out instead.
+function RepoPage({ repo, label, github, worktrees, agents, pendingStart, onAct, onStart, onDeploy, onOpenLogs, onOpenTool, onRemove, toast, onBack, onCreateWorktree, onCreateFromPr }: {
+  repo: string; label: string; github?: string | null; worktrees: Worktree[];
+  agents: { id: string; label: string }[]; pendingStart: Set<string>;
+  onAct: (url: string, w: Worktree) => void; onStart: (w: Worktree, force?: 'container' | 'bare') => void;
+  onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
+  onOpenLogs: (repo: string, name: string, type: string) => void; onOpenTool: (w: Worktree, tool: string) => void;
+  onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void; toast: (msg: string, tone?: Tone) => void;
+  onBack: () => void; onCreateWorktree: () => void; onCreateFromPr: (repo: string, branch: string) => void;
+}) {
+  const [prs, setPrs] = useState<RepoPrsResponse | null>(null);
+  const [sidecars, setSidecars] = useState<Sidecar[] | null>(null);
+  const [fileSyncGlobs, setFileSyncGlobs] = useState<string[] | null>(null);
+
+  const loadPrs = useCallback(async () => {
+    setPrs(await fetch(`/api/repo-prs?repo=${encodeURIComponent(repo)}`).then(r => r.json()).catch(() => ({ prs: [], error: 'request failed' })));
+  }, [repo]);
+  useEffect(() => { loadPrs(); }, [loadPrs]);
+
+  useEffect(() => {
+    setSidecars(null); setFileSyncGlobs(null);
+    fetch(`/api/sidecars?repo=${encodeURIComponent(repo)}`).then(r => r.json()).then(setSidecars).catch(() => setSidecars([]));
+    fetch(`/api/file-sync-globs?repo=${encodeURIComponent(repo)}`).then(r => r.json())
+      .then((globs: string[]) => setFileSyncGlobs(Array.isArray(globs) ? globs : [])).catch(() => setFileSyncGlobs([]));
+  }, [repo]);
+
+  const repoWorktrees = worktrees.filter(w => w.repo === repo);
+
+  return (
+    <div class="max-w-3xl mx-auto px-6 py-12">
+      <PageHeader back={{ label: 'All worktrees', onClick: onBack }} title={label}
+        subtitle={github ? (
+          <a href={github} target="_blank"
+            class="text-xs text-zinc-400 hover:text-accent transition-colors duration-150">{github}</a>
+        ) : undefined}
+        actions={<PrimaryButton compact onClick={onCreateWorktree}>+ Worktree</PrimaryButton>} />
+
+      <div class="mt-8">
+        <h2 class="board-mono text-[11px] font-bold text-zinc-400 mb-3">Worktrees ({repoWorktrees.length})</h2>
+        <WorktreeList items={repoWorktrees} gridMode={false} onAct={onAct} onStart={onStart} onDeploy={onDeploy}
+          onRemove={onRemove} toast={toast} onOpenLogs={onOpenLogs} onOpenTool={onOpenTool}
+          pendingStart={pendingStart} agents={agents} emptyMessage="No worktrees for this repo yet." />
+      </div>
+
+      <div class="rail-divider my-8" />
+
+      <Section title="Open PRs">
+        {!prs ? (
+          <p class="text-zinc-400 text-sm py-6 text-center">Loading…</p>
+        ) : prs.error ? (
+          <p class="text-signal-red text-sm py-6 text-center">{prs.error}</p>
+        ) : !prs.prs.length ? (
+          <p class="text-zinc-400 text-sm py-6 text-center">No open PRs on this repo</p>
+        ) : prs.prs.map(pr => {
+          const match = repoWorktrees.find(w => w.branch === pr.branch);
+          return (
+            <div key={pr.number}
+              class="flex items-center gap-4 py-3 border-b border-zinc-100 dark:border-white/5 last:border-0">
+              <div class="min-w-0 flex-1">
+                <div class="flex items-baseline gap-2 min-w-0 flex-wrap">
+                  <a href={pr.url} target="_blank"
+                    class="text-zinc-900 dark:text-zinc-100 font-medium truncate hover:text-accent transition-colors">
+                    #{pr.number} — {pr.title}
+                  </a>
+                  {pr.isDraft && <Badge tone="amber">draft</Badge>}
+                  {pr.checks !== 'none' && (
+                    <span class="tip shrink-0" data-tip={`checks: ${pr.checks}`}>
+                      <StatusDot tone={checksTone(pr.checks)} pulse={pr.checks === 'pending'} />
+                    </span>
+                  )}
+                </div>
+                <div class="flex items-center gap-3 text-xs text-zinc-400 min-w-0 flex-wrap mt-0.5">
+                  <span class="font-mono truncate">{pr.branch}</span>
+                  {pr.author && <span class="shrink-0">{pr.author}</span>}
+                  {/* gh returns ISO8601; relativeTime takes unix seconds, not ms */}
+                  <span class="shrink-0">Updated {relativeTime(new Date(pr.updatedAt).getTime() / 1000)}</span>
+                </div>
+              </div>
+              {match ? (
+                <SecondaryButton compact onClick={() => navigate(`/worktree/${repo}/${encodeURIComponent(match.name)}`)}>Open</SecondaryButton>
+              ) : (
+                <SecondaryButton compact onClick={() => onCreateFromPr(repo, pr.branch)}>Create worktree</SecondaryButton>
+              )}
+            </div>
+          );
+        })}
+      </Section>
+
+      <div class="rail-divider my-8" />
+
+      <Section title="Sidecars & file sync" actions={
+        <a href="/settings" onClick={(e: any) => { e.preventDefault(); navigate('/settings'); }}
+          class="text-xs text-accent hover:opacity-80 transition-opacity duration-150">Edit in Settings →</a>
+      }>
+        {sidecars === null || fileSyncGlobs === null ? (
+          <p class="text-zinc-400 text-sm py-4 text-center">Loading…</p>
+        ) : (
+          <div class="flex flex-col gap-4 text-sm">
+            <div>
+              <div class="text-xs text-zinc-400 mb-1.5">Sidecars</div>
+              {(() => {
+                // A blank name/command row is an in-progress edit from the
+                // Settings form (its own +Add sidecar default), not a real
+                // sidecar -- startSidecars() (portal.js) applies the same
+                // s.name-truthy filter when deciding what actually runs.
+                const named = sidecars.filter(s => s.name);
+                return !named.length ? <p class="text-zinc-400 text-xs">None configured</p> : (
+                  <div class="flex flex-wrap gap-1.5">
+                    {named.map(s => (
+                      <Badge key={s.name} tone={s.approved ? 'emerald' : 'amber'}>{s.name}{s.approved ? '' : ' — needs approval'}</Badge>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+            <div>
+              <div class="text-xs text-zinc-400 mb-1.5">File sync globs</div>
+              {!fileSyncGlobs.length ? <p class="text-zinc-400 text-xs">None configured</p> : (
+                <ul class="font-mono text-xs text-zinc-600 dark:text-zinc-400 flex flex-col gap-0.5">
+                  {fileSyncGlobs.map(g => <li key={g}>{g}</li>)}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
 function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1474,26 +1617,24 @@ function App() {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastId = useRef(0);
   const [createOpen, setCreateOpen] = useState(false);
-  // Set by the Archived view's Recreate button: carries the repo+branch to
-  // prefill CreateModal with, distinct from createOpen (which opens it blank
-  // via + Worktree) so both flows can share the one modal.
-  const [recreatePrefill, setRecreatePrefill] = useState<{ repo: string; name: string } | null>(null);
+  // Set by the Archived view's Recreate button and RepoPage's PR/+Worktree
+  // actions: carries the repo (and branch, when known) to prefill
+  // CreateModal with, distinct from createOpen (which opens it blank via
+  // + Worktree on the list page) so all these flows share the one modal.
+  // name is optional -- RepoPage's own "+ Worktree" button has a repo but
+  // no branch yet, unlike a PR-driven or Recreate-driven prefill.
+  const [recreatePrefill, setRecreatePrefill] = useState<{ repo: string; name?: string } | null>(null);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [logView, setLogView] = useState<{ repo: string; name: string; type: string } | null>(null);
   const [commandOpen, setCommandOpen] = useState(false);
-  // Repo the "Browse PRs" sidebar button opened, or null when closed. Set
-  // from the sidebar filter's currently-selected repo, not a separate
-  // picker -- this view is always scoped to whichever repo is filtered to.
-  const [prsRepo, setPrsRepo] = useState<string | null>(null);
   const pendingStart = useRef(new Set<string>());
 
-  // Same one-handler-sets-both-states shape as ArchivedPage's onRecreate
-  // below: closing RepoPrsModal and setting recreatePrefill happen in the
-  // same synchronous click handler, so Preact batches them into one commit
-  // and there's never a frame with both modals mounted.
+  // RepoPage isn't rendered on the same branch as CreateModal (see the
+  // route.page === 'repo' dispatch below), so both callbacks navigate to
+  // the list page first, same as ArchivedPage's onRecreate does.
   const onCreateFromPr = (repo: string, branch: string) => {
-    setPrsRepo(null);
     setRecreatePrefill({ repo, name: branch });
+    navigate('/');
   };
 
   // Lightweight — just a status dot for the sidebar's quick-access entry
@@ -1693,6 +1834,24 @@ function App() {
     </>;
   }
 
+  if (route.page === 'repo') {
+    const proj = projects.find(p => p.name === route.repo);
+    return <>
+      <RepoPage repo={route.repo} label={proj?.label ?? route.repo} github={proj?.github}
+        worktrees={worktrees} agents={agents} pendingStart={pendingStart.current}
+        onAct={act} onStart={start} onDeploy={deploy} onRemove={remove} toast={toast}
+        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool}
+        onBack={() => navigate('/')}
+        onCreateWorktree={() => { setRecreatePrefill({ repo: route.repo }); navigate('/'); }}
+        onCreateFromPr={onCreateFromPr} />
+      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type}
+        extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
+        onClose={() => setLogView(null)} />}
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+    </>;
+  }
+
   if (route.page === 'archived') {
     // Recreate hands off to the list page's own CreateModal (prefilled)
     // rather than duplicating the create flow here, so navigate there first
@@ -1787,13 +1946,13 @@ function App() {
           <option value="all">All projects</option>
           {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
         </select>
-        {filter !== 'all' && projects.find(p => p.name === filter)?.github && (
-          <SidebarButton onClick={() => setPrsRepo(filter)}
+        {filter !== 'all' && (
+          <SidebarButton onClick={() => navigate(`/repo/${filter}`)}
             icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
               <circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" />
               <path d="M6 8.5v7" /><path d="M18 8.5a8 8 0 0 1 -8 8" />
             </svg>}
-            label="Browse PRs" />
+            label="Repo overview" />
         )}
         <select value={sortKey} onChange={(e: any) => setSortKey(e.target.value)}
           class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
@@ -1848,12 +2007,6 @@ function App() {
         extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
         onClose={() => setLogView(null)} />}
       {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
-      {prsRepo && (
-        <RepoPrsModal repo={prsRepo} label={projects.find(p => p.name === prsRepo)?.label ?? prsRepo}
-          worktrees={worktrees} loaded={loaded} onClose={() => setPrsRepo(null)}
-          onOpenWorktree={(name) => { setPrsRepo(null); navigate(`/worktree/${prsRepo}/${encodeURIComponent(name)}`); }}
-          onCreateFromPr={onCreateFromPr} />
-      )}
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
