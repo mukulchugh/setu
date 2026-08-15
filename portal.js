@@ -12,10 +12,10 @@ import {
   requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
   parseEnvFile, pinnedTriggerVersion, convexDir, slugify,
   configureWorktreeEnv, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, listActivePorts, processCwd, loadProjects, registerProject, removeProject,
+  portEntries, getPort, activePid, activePidAsync, listActivePorts, listActivePortsAsync, processCwd, loadProjects, registerProject, removeProject,
   createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
   discoverReposAsync, importRepo, cloneBareRepo,
-  AGENT_CLIS, detectAgentClis, commandExists, loadSidecars, loadAllSidecars, saveSidecars, killGroup,
+  AGENT_CLIS, detectAgentClis, commandExists, loadSidecars, loadAllSidecars, saveSidecars, killGroup, killGroupAsync,
   loadCustomAgents, saveCustomAgents, loadFileSyncGlobs, saveFileSyncGlobs,
   isSidecarApproved, approveSidecar, seedSidecarApprovalsIfMissing,
   loadArchivedWorktrees, appendArchivedWorktree,
@@ -159,9 +159,9 @@ function startRaycastDev() {
   return { ok: true };
 }
 
-function stopRaycastDev() {
+async function stopRaycastDev() {
   if (!raycastDev) return { ok: true };
-  killGroup(raycastDev.pid);
+  await killGroupAsync(raycastDev.pid);
   raycastDev = null;
   return { ok: true };
 }
@@ -516,22 +516,22 @@ async function computeDiff(repo, name) {
 let _portsCache = null, _portsCacheAt = 0;
 const PORTS_TTL = 1500;
 
-function activePortsCached() {
+async function activePortsCached() {
   const now = Date.now();
   if (_portsCache && now - _portsCacheAt < PORTS_TTL) return _portsCache;
-  _portsCache = listActivePorts();
+  _portsCache = await listActivePortsAsync();
   _portsCacheAt = now;
   return _portsCache;
 }
 
 // Shared by /api/ports and mcp-server.js's list_ports tool.
-function listPortsWithWorktree() {
-  const ports = activePortsCached();
+async function listPortsWithWorktree() {
+  const ports = await activePortsCached();
   const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
   return ports.map(p => ({ ...p, worktree: registry[p.port] ?? null }));
 }
 
-function killPort(port) {
+async function killPort(port) {
   // A container-published port's host-side "process" is the engine's own
   // port-forwarding helper, not the dev server itself — signaling it directly
   // isn't scoped to one container (reconcileDevServers hits this exact hazard
@@ -547,7 +547,7 @@ function killPort(port) {
     drainQueue();
     return { ok: true };
   }
-  const pid = activePid(port);
+  const pid = await activePidAsync(port);
   if (!pid) return { ok: false, error: 'nothing on that port' };
   try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
   catch (e) { return { ok: false, error: String(e) }; }
@@ -572,7 +572,7 @@ async function activeMemMb(entry) {
 }
 
 async function getWorktrees() {
-  const activePorts = new Set(activePortsCached().map(p => p.port));
+  const activePorts = new Set((await activePortsCached()).map(p => p.port));
   return Promise.all(
     portEntries(WORKSPACE).map(async ({ key, repo, name, port }) => {
       const slug     = name.replace(/\//g, '-');
@@ -787,7 +787,7 @@ function startWorktree(repo, name, port, container = true) {
 // respawn itself later fails, spawnWorktree/spawnContainer's own `.then`
 // handlers already drain the queue — so skipping the drain here never leaves
 // a slot stuck, it only avoids double-counting during a same-worktree restart.
-function stopWorktree(repo, name, port, { drain = true } = {}) {
+async function stopWorktree(repo, name, port, { drain = true } = {}) {
   const key = `${repo}/${name}`;
   const qi = startQueue.findIndex(q => q.key === key);
   if (qi !== -1) startQueue.splice(qi, 1);
@@ -802,13 +802,15 @@ function stopWorktree(repo, name, port, { drain = true } = {}) {
     // that pgid up, see pgid !== pid, and fall back to this exact same
     // single-pid kill anyway (verified empirically), so this is already
     // equivalent, not an inconsistency to fix.
-    const pid = activePid(port);
+    const pid = await activePidAsync(port);
     if (pid) { try { execFileSync('kill', [pid]); } catch {} }
   }
-  stopInngest(repo, name, port);
-  stopTrigger(repo, name);
-  stopConvexDev(repo, name);
-  stopSidecars(repo, name);
+  await Promise.all([
+    stopInngest(repo, name, port),
+    stopTrigger(repo, name),
+    stopConvexDev(repo, name),
+    stopSidecars(repo, name),
+  ]);
   if (drain) drainQueue();
 }
 
@@ -823,15 +825,15 @@ function startWorktreeByName(repo, name, container) {
   return startWorktree(repo, name, port, useContainer);
 }
 
-function stopWorktreeByName(repo, name) {
+async function stopWorktreeByName(repo, name) {
   const port = getPort(WORKSPACE, repo, name);
   if (!port) return { ok: false };
-  stopWorktree(repo, name, port);
+  await stopWorktree(repo, name, port);
   return { ok: true };
 }
 
 // Shared by /api/sync and mcp-server.js's sync_worktree tool.
-function syncWorktreeByName(repo, name) {
+async function syncWorktreeByName(repo, name) {
   return syncWithBase(wtPath(repo, name), repoPath(repo));
 }
 
@@ -865,13 +867,11 @@ function startSidecars(repo, name, port) {
   return skipped;
 }
 
-function stopSidecars(repo, name) {
+async function stopSidecars(repo, name) {
   const prefix = `${repo}/${name}/`;
-  for (const [key, entry] of sidecarProcs.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    killGroup(entry.pid);
-    sidecarProcs.delete(key);
-  }
+  const keys = [...sidecarProcs.keys()].filter(k => k.startsWith(prefix));
+  await Promise.all(keys.map(k => killGroupAsync(sidecarProcs.get(k).pid)));
+  for (const k of keys) sidecarProcs.delete(k);
 }
 
 // Uniform wrapper for both freshly-spawned (native Bun.Subprocess) and reconciled
@@ -888,11 +888,11 @@ function wrapContainer(project) { return { pid: null, native: null, container: p
 
 // ── inngest dev server ────────────────────────────────────────────────────────
 
-function startInngest(repo, name, port) {
+async function startInngest(repo, name, port) {
   const key   = `${repo}/${name}`;
   if (inngestProcs.has(key)) return { ok: false, error: 'already running' };
   const iPort = inngestPort(port);
-  if (activePid(iPort)) return { ok: false, error: `port ${iPort} already in use (untracked process)` };
+  if (await activePidAsync(iPort)) return { ok: false, error: `port ${iPort} already in use (untracked process)` };
   const fd    = openLogFd(repo, name, 'inngest');
   const proc  = Bun.spawn(
     [INNGEST_CLI, 'dev', '-p', String(iPort), '-u', `http://localhost:${port}/api/inngest`, '--no-discovery'],
@@ -904,16 +904,16 @@ function startInngest(repo, name, port) {
   return { ok: true, port: iPort };
 }
 
-function stopInngest(repo, name, port) {
+async function stopInngest(repo, name, port) {
   const key   = `${repo}/${name}`;
   const entry = inngestProcs.get(key);
-  if (entry) killGroup(entry.pid);
+  if (entry) await killGroupAsync(entry.pid);
   inngestProcs.delete(key);
   // fall back to whatever's actually bound to the inngest port, same pattern as
   // stopWorktree — the tracked entry can be stale after a portal restart
   const iPort = port != null ? inngestPort(port) : null;
-  const pid   = iPort ? activePid(iPort) : null;
-  if (pid) killGroup(pid);
+  const pid   = iPort ? await activePidAsync(iPort) : null;
+  if (pid) await killGroupAsync(pid);
   if (!entry && !pid) return { ok: false, error: 'not running' };
   return { ok: true };
 }
@@ -942,14 +942,14 @@ function startTrigger(repo, name) {
   return { ok: true };
 }
 
-function stopTrigger(repo, name) {
+async function stopTrigger(repo, name) {
   const key   = `${repo}/${name}`;
   const entry = triggerProcs.get(key);
   if (!entry) return { ok: false, error: 'not running' };
   // group-kill, not entry.native?.kill() — trigger.dev v4.5.3's own SIGTERM handler
   // races ahead of and defeats the code path that would dispose its esbuild child
   // (source-verified), so signal the whole process group directly instead
-  killGroup(entry.pid);
+  await killGroupAsync(entry.pid);
   triggerProcs.delete(key);
   return { ok: true };
 }
@@ -1041,11 +1041,11 @@ function startConvexDev(repo, name) {
   return { ok: true };
 }
 
-function stopConvexDev(repo, name) {
+async function stopConvexDev(repo, name) {
   const key   = `${repo}/${name}`;
   const entry = convexDevProcs.get(key);
   if (!entry) return { ok: false, error: 'not running' };
-  killGroup(entry.pid);
+  await killGroupAsync(entry.pid);
   convexDevProcs.delete(key);
   return { ok: true };
 }
@@ -1343,21 +1343,21 @@ function respawnAsBefore(repo, name, port, wasContainer) {
   if (wasContainer) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
 }
 
-function enableTunnel(repo, name, port) {
+async function enableTunnel(repo, name, port) {
   // Only one worktree can use the shared tunnel URL — evict any currently active one
   for (const [key, { port: p }] of activeTunnelMap.entries()) {
     if (key === `${repo}/${name}`) continue;
     const { repo: kRepo, name: kName } = splitKey(key);
-    disableTunnel(kRepo, kName, p);
+    await disableTunnel(kRepo, kName, p);
   }
   const key = `${repo}/${name}`;
   const wasContainer = !!procs.get(key)?.container;
-  const wasRunning = !!activePid(port);
+  const wasRunning = !!(await activePidAsync(port));
   const pubDom = publicDomain(_cfg);
   // drain: false — this is a same-worktree restart, not a real vacancy; see
   // stopWorktree's comment. Captured wasContainer before stopping since
   // stopWorktree deletes the procs entry.
-  if (wasRunning) stopWorktree(repo, name, port, { drain: false });
+  if (wasRunning) await stopWorktree(repo, name, port, { drain: false });
   configureWorktreeEnv(_cfg, repo, name, port, true);
   reloadCaddy(WORKSPACE);
   addTunnelRoute(repo, name, pubDom, port);
@@ -1368,11 +1368,11 @@ function enableTunnel(repo, name, port) {
   return { ok: true };
 }
 
-function disableTunnel(repo, name, port) {
+async function disableTunnel(repo, name, port) {
   const key = `${repo}/${name}`;
   const wasContainer = !!procs.get(key)?.container;
-  const wasRunning = !!activePid(port);
-  if (wasRunning) stopWorktree(repo, name, port, { drain: false });
+  const wasRunning = !!(await activePidAsync(port));
+  if (wasRunning) await stopWorktree(repo, name, port, { drain: false });
   removeTunnelRoute(repo, name);
   configureWorktreeEnv(_cfg, repo, name, port, false);
   reloadCaddy(WORKSPACE);
@@ -1382,8 +1382,8 @@ function disableTunnel(repo, name, port) {
 
 // ── create / remove worktree ──────────────────────────────────────────────────
 
-function createWorktree(repo, name, tunnel) {
-  const res = libCreateWorktree(_cfg, repo, name, { tunnel });
+async function createWorktree(repo, name, tunnel) {
+  const res = await libCreateWorktree(_cfg, repo, name, { tunnel });
   if (tunnel) addTunnelRoute(repo, name, publicDomain(_cfg), res.port);
 
   // mise trust + bun install (background — takes a while)
@@ -1394,10 +1394,10 @@ function createWorktree(repo, name, tunnel) {
   return { ok: true, port: res.port, domain: res.localDom };
 }
 
-function removeWorktree(repo, name, reason = 'manual') {
+async function removeWorktree(repo, name, reason = 'manual') {
   // stop dev server and tunnel route first
   const port = getPort(WORKSPACE, repo, name);
-  if (port) stopWorktree(repo, name, port);
+  if (port) await stopWorktree(repo, name, port);
   if (activeTunnelMap.has(`${repo}/${name}`)) removeTunnelRoute(repo, name);
 
   // The worktree is being permanently removed, not just stopped — unlike a
@@ -1553,8 +1553,8 @@ async function projectRoutes(req, pathname, method, server) {
     // never reach here (the UI disables those rows), but importRepo() itself
     // would otherwise silently no-op against the wrong existing project.
     if (loadProjects(WORKSPACE)[name]) return Response.json({ ok: false, error: `${name} is already registered` });
-    return jsonTry(() => {
-      importRepo(_cfg, { name, remoteUrl, label });
+    return jsonTry(async () => {
+      await importRepo(_cfg, { name, remoteUrl, label });
       REPO_META = loadProjects(WORKSPACE);
       return { ok: true };
     });
@@ -1740,7 +1740,7 @@ async function raycastRoutes(req, pathname, method) {
     } catch { return Response.json({ lines: [] }); }
   }
   if (method === 'POST' && pathname === '/api/raycast/start') return Response.json(startRaycastDev());
-  if (method === 'POST' && pathname === '/api/raycast/stop') return Response.json(stopRaycastDev());
+  if (method === 'POST' && pathname === '/api/raycast/stop') return Response.json(await stopRaycastDev());
 
   return null;
 }
@@ -1914,7 +1914,7 @@ async function worktreeRoutes(req, pathname, method, server) {
       return jsonTry(() => createWorktree(repo, name, !!tunnel));
     }
     if (pathname === '/api/remove') {
-      return Response.json(removeWorktree(repo, name, reason));
+      return Response.json(await removeWorktree(repo, name, reason));
     }
     if (pathname === '/api/start') {
       // Container is the default for dev servers, not opt-in — but ONLY when
@@ -1931,37 +1931,37 @@ async function worktreeRoutes(req, pathname, method, server) {
       return Response.json(startWorktreeByName(repo, name, container));
     }
     if (pathname === '/api/stop') {
-      return Response.json(stopWorktreeByName(repo, name));
+      return Response.json(await stopWorktreeByName(repo, name));
     }
     if (pathname === '/api/sync') {
       return jsonTry(() => syncWorktreeByName(repo, name));
     }
     if (pathname === '/api/tunnel/enable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      return Response.json(enableTunnel(repo, name, port));
+      return Response.json(await enableTunnel(repo, name, port));
     }
     if (pathname === '/api/tunnel/disable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      return Response.json(disableTunnel(repo, name, port));
+      return Response.json(await disableTunnel(repo, name, port));
     }
     if (pathname === '/api/inngest/start') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      return Response.json(startInngest(repo, name, port));
+      return Response.json(await startInngest(repo, name, port));
     }
     if (pathname === '/api/inngest/stop') {
-      return Response.json(stopInngest(repo, name, wtPort()));
+      return Response.json(await stopInngest(repo, name, wtPort()));
     }
     if (pathname === '/api/trigger/start') {
       return Response.json(startTrigger(repo, name));
     }
     if (pathname === '/api/trigger/stop') {
-      return Response.json(stopTrigger(repo, name));
+      return Response.json(await stopTrigger(repo, name));
     }
     if (pathname === '/api/convex/start') {
       return Response.json(startConvexDev(repo, name));
     }
     if (pathname === '/api/convex/stop') {
-      return Response.json(stopConvexDev(repo, name));
+      return Response.json(await stopConvexDev(repo, name));
     }
     if (pathname === '/api/convex/deploy') {
       if (!target) return Response.json({ ok: false, error: 'target required' });
@@ -1980,12 +1980,12 @@ async function worktreeRoutes(req, pathname, method, server) {
     }
     if (pathname === '/api/ports/kill') {
       const { port } = body;
-      return Response.json(killPort(port));
+      return Response.json(await killPort(port));
     }
   }
 
   if (pathname === '/api/ports') {
-    return Response.json(listPortsWithWorktree());
+    return Response.json(await listPortsWithWorktree());
   }
 
   return null;
@@ -2051,7 +2051,7 @@ function processFootprintMb(pid) {
 
 const deadContainerStrikes = new Map(); // key -> consecutive "not alive" readings
 
-function checkMemoryCeilings() {
+async function checkMemoryCeilings() {
   for (const [key, entry] of procs.entries()) {
     if (entry.container) {
       // Docker's own cgroup limit + `restart: on-failure:3` already enforce
@@ -2088,7 +2088,10 @@ function checkMemoryCeilings() {
       const { repo, name } = splitKey(key);
       const port = getPort(WORKSPACE, repo, name);
       console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
-      stopWorktree(repo, name, port, { drain: false });
+      // Awaited, not fire-and-forget: stopWorktree's kill is now async
+      // (activePidAsync/killGroupAsync), and spawnWorktree respawning on the
+      // same port before the old process is actually gone would race it.
+      await stopWorktree(repo, name, port, { drain: false });
       if (port) spawnWorktree(repo, name, port);
     }
   }
@@ -2158,6 +2161,9 @@ function checkIdleTimeouts() {
     const { repo, name } = splitKey(key);
     const port = getPort(WORKSPACE, repo, name);
     console.warn(`⚠ ${key} idle for ${Math.round(idleMs / 60_000)}m, exceeds ${Math.round(IDLE_TIMEOUT_MS / 60_000)}m idle timeout — stopping`);
+    // Not awaited: stopWorktree is async now, but nothing here depends on
+    // its kill actually finishing before the next line — unlike the memory-
+    // ceiling restart path, there's no immediate respawn to race.
     stopWorktree(repo, name, port);
     lastSeenAt.delete(key);
   }

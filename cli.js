@@ -359,7 +359,7 @@ async function cmdNew() {
   const withTunnel = !!flags.tunnel;
 
   let res;
-  try { res = createWorktree(c, repo, name, { tunnel: withTunnel }); }
+  try { res = await createWorktree(c, repo, name, { tunnel: withTunnel }); }
   catch (e) { die(e.message); }
 
   if (withTunnel) await ensureTunnel(c, repo, name);
@@ -502,7 +502,7 @@ async function cmdInit() {
   const repo = slug.split('/').pop();
 
   if (!existsSync(join(c.workspace, `${repo}.git`))) console.log(`  Cloning ${slug}...`);
-  try { importRepo(c, { name: repo, remoteUrl: `git@github.com:${slug}.git`, label }); }
+  try { await importRepo(c, { name: repo, remoteUrl: `git@github.com:${slug}.git`, label }); }
   catch (e) { die(e.message); }
 
   args.length = 0; args.push(repo, 'main');
@@ -548,7 +548,7 @@ async function cmdSweep() {
   if (cand.status === 'no-remote') die(`'${name}' has no remote, nothing to clone from.`);
 
   console.log(`  Importing ${name} from ${cand.remoteUrl}...`);
-  try { importRepo(c, { name: cand.name, remoteUrl: cand.remoteUrl, label: cand.name }); }
+  try { await importRepo(c, { name: cand.name, remoteUrl: cand.remoteUrl, label: cand.name }); }
   catch (e) { die(e.message); }
   ok(`imported ${name} into ${c.workspace}/${name}.git, worktree main ready`);
 }

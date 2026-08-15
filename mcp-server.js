@@ -128,7 +128,7 @@ function registerTools(server) {
       tunnel: z.boolean().optional().describe('enable the shared public tunnel for this worktree on creation'),
     },
   }, async ({ repo, name, tunnel }) => {
-    return text(unwrap(deps.createWorktree(repo, name, !!tunnel)));
+    return text(unwrap(await deps.createWorktree(repo, name, !!tunnel)));
   });
 
   server.registerTool('start_worktree', {
@@ -148,7 +148,7 @@ function registerTools(server) {
     inputSchema: { repo: z.string(), name: z.string() },
     annotations: { destructiveHint: true },
   }, async ({ repo, name }) => {
-    return text(unwrap(deps.stopWorktree(repo, name)));
+    return text(unwrap(await deps.stopWorktree(repo, name)));
   });
 
   server.registerTool('sync_worktree', {
@@ -156,7 +156,7 @@ function registerTools(server) {
     description: 'Merge the worktree\'s resolved base branch (staging, or the repo\'s default) into it. Clean merges only: a would-be conflict is attempted, detected, and aborted (worktree left unchanged), never left mid-conflict -- resolving a real conflict is still the caller\'s job. Fails if the worktree has uncommitted changes.',
     inputSchema: { repo: z.string(), name: z.string() },
   }, async ({ repo, name }) => {
-    return text(unwrap(deps.syncWorktree(repo, name)));
+    return text(unwrap(await deps.syncWorktree(repo, name)));
   });
 
   server.registerTool('remove_worktree', {
@@ -168,7 +168,7 @@ function registerTools(server) {
     },
     annotations: { destructiveHint: true },
   }, async ({ repo, name, reason }) => {
-    return text(unwrap(deps.removeWorktree(repo, name, reason ?? 'manual')));
+    return text(unwrap(await deps.removeWorktree(repo, name, reason ?? 'manual')));
   });
 
   server.registerTool('get_diff', {
@@ -208,7 +208,7 @@ function registerTools(server) {
     inputSchema: {},
     annotations: { readOnlyHint: true },
   }, async () => {
-    return text(deps.listPorts());
+    return text(await deps.listPorts());
   });
 
   server.registerTool('list_projects', {

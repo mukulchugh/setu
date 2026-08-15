@@ -218,6 +218,15 @@ export function activePid(port) {
   } catch { return ''; }
 }
 
+// Async sibling of activePid, for portal.js's request-handler hot paths —
+// execFileSync blocks Bun's single JS thread for the whole lsof call,
+// stalling every other in-flight request (same class of bug fetchPR hit,
+// see its own comment). cli.js keeps calling the sync version: a one-shot
+// foreground process has no concurrent requests to starve.
+export async function activePidAsync(port) {
+  return spawnText(['lsof', '-i', `:${port}`, '-sTCP:LISTEN', '-t']);
+}
+
 // Covers app dev-server ports (3000-3999) and inngest sidecar ports (appPort+5288,
 // i.e. 8288-9287) in one lsof call. spawnSync, not execFileSync: with two -i
 // selectors lsof exits 1 even when it successfully printed matches (verified) —
@@ -227,6 +236,20 @@ export function listActivePorts() {
     ['-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
     { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
   const out = res.stdout ?? '';
+  const results = []; let cur = {};
+  for (const line of out.split('\n')) {
+    if (line.startsWith('p')) cur = { pid: line.slice(1) };
+    else if (line.startsWith('c')) cur.cmd = line.slice(1);
+    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ port: +m[1], pid: cur.pid, cmd: cur.cmd }); }
+  }
+  return results;
+}
+
+// Async sibling of listActivePorts — same parsing, sourced from spawnText
+// (which already tolerates lsof's exit-1-on-success quirk by never
+// throwing). portal.js's hot paths use this; cli.js keeps the sync version.
+export async function listActivePortsAsync() {
+  const out = await spawnText(['lsof', '-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn']);
   const results = []; let cur = {};
   for (const line of out.split('\n')) {
     if (line.startsWith('p')) cur = { pid: line.slice(1) };
@@ -286,6 +309,19 @@ export function killGroup(pid, signal = 'TERM') {
   const target = pgid === pid ? `-${pgid}` : String(pid);
   try { execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' }); return true; }
   catch { return false; }
+}
+
+// Async sibling of killGroup — same pgid-then-kill shape, Bun.spawn instead
+// of execFileSync so a stop/remove request doesn't block the whole portal.
+export async function killGroupAsync(pid, signal = 'TERM') {
+  let pgid = pid;
+  const out = (await spawnText(['ps', '-o', 'pgid=', '-p', String(pid)])).trim();
+  if (out) pgid = parseInt(out, 10);
+  const target = pgid === pid ? `-${pgid}` : String(pid);
+  try {
+    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], { stdout: 'ignore', stderr: 'ignore' });
+    return (await proc.exited) === 0;
+  } catch { return false; }
 }
 
 export function detectAgentClis(workspace) {
@@ -802,6 +838,25 @@ export function git(repoDir, args, opts = {}) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 }
 
+// Async counterpart to git() for the two call sites that are genuinely
+// network-bound (createWorktree's `fetch --all --prune`, syncWithBase's
+// `fetch origin <branch>`) -- every other git() call is local filesystem
+// work (~7-12ms), not worth converting. Bun.spawn instead of execFileSync so
+// a slow/hung remote doesn't block the whole portal, same class of bug
+// fetchPR already fixed. Throws on failure like git() itself (unlike
+// spawnText, which silently returns '') -- both callers rely on a failed
+// fetch aborting rather than silently proceeding against a stale base.
+async function gitFetchAsync(dir, args) {
+  const proc = Bun.spawn(['git', '-C', dir, ...args], { stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const code = await proc.exited;
+  if (code !== 0) throw new Error(stderr.trim() || `git ${args.join(' ')} failed (exit ${code})`);
+  return stdout;
+}
+
 export function branchExists(repoDir, name) {
   for (const ref of [`refs/heads/${name}`, `refs/remotes/origin/${name}`]) {
     if (spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', ref]).status === 0) return true;
@@ -854,10 +909,10 @@ export function baseBranchRef(repoDir) {
 // parsing `git merge-tree` output), then immediately aborted so the worktree
 // is never left mid-conflict. Setu tells you what would conflict; resolving
 // it is still the user's job in their own editor.
-export function syncWithBase(wtDir, repoDir) {
+export async function syncWithBase(wtDir, repoDir) {
   const base = baseBranchRef(repoDir);
   const branchName = base.replace(/^origin\//, '');
-  git(wtDir, ['fetch', 'origin', branchName]);
+  await gitFetchAsync(wtDir, ['fetch', 'origin', branchName]);
 
   const dirty = git(wtDir, ['status', '--porcelain']).trim();
   if (dirty) return { ok: false, error: 'Worktree has uncommitted changes — commit or stash first.' };
@@ -950,12 +1005,12 @@ export function syncIncludedFiles(mainDir, wtDir, globs) {
 
 // Creates worktree + port + envrc + caddy + env symlink + hosts. Dependency
 // install is the caller's job (CLI runs it inline, portal in the background).
-export function createWorktree(c, repo, name, { tunnel = false } = {}) {
+export async function createWorktree(c, repo, name, { tunnel = false } = {}) {
   const repoDir = join(c.workspace, `${repo}.git`);
   const wtDir   = join(c.workspace, repo, name);
   if (!existsSync(repoDir)) throw new Error(`Bare repo not found: ${repoDir}\nRun: setu init <gh-slug>`);
 
-  git(repoDir, ['fetch', '--all', '--prune']);
+  await gitFetchAsync(repoDir, ['fetch', '--all', '--prune']);
   git(repoDir, ['worktree', 'prune']);
 
   if (!existsSync(wtDir)) {
