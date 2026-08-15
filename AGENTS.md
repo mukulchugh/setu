@@ -95,11 +95,15 @@ Register it with whatever's connecting:
 - **Anything else with an MCP client**: point it at `http://localhost:2999/mcp` (Streamable HTTP, no auth) in whatever config format it expects — no per-client code needed, it's a standard MCP server.
 
 The portal must already be running when the client starts — no retry-on-demand if `/mcp` is
-unreachable at session start. Known open risk, not yet fixed: `create_worktree`/
-`remove_worktree`/`start_worktree`/`stop_worktree` route through synchronous
-`execFileSync`/`spawnSync` calls (`git()`, `activePid()`, `listActivePorts()`, `killGroup()`
-in lib.js) that can stall the whole single-threaded portal under contention — same failure
-class `fetchPR` hit and fixed once already, not yet converted at these sites.
+unreachable at session start. `create_worktree`/`remove_worktree`/`start_worktree`/
+`stop_worktree` and the other route-handler hot paths (tunnel/inngest/trigger/convex
+start/stop) now go through async siblings (`activePidAsync`/`listActivePortsAsync`/
+`killGroupAsync`/`gitFetchAsync` in lib.js, `Bun.spawn`-based) instead of
+`execFileSync`/`spawnSync`, so a slow git/lsof/kill call no longer stalls the whole
+single-threaded portal for every other in-flight request — same fix pattern `fetchPR` proved
+out earlier. `cli.js` still uses the synchronous versions (one-shot foreground process, no
+concurrent requests to starve). Still synchronous, left for a follow-up: `docker compose down`
+in `stopContainer`/`removeWorktree`.
 
 ## Container mode (the default since 2026-08-10, sticky per worktree since the same day)
 
