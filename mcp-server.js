@@ -151,6 +151,14 @@ function registerTools(server) {
     return text(unwrap(deps.stopWorktree(repo, name)));
   });
 
+  server.registerTool('sync_worktree', {
+    title: 'Sync worktree with base branch',
+    description: 'Merge the worktree\'s resolved base branch (staging, or the repo\'s default) into it. Clean merges only: a would-be conflict is attempted, detected, and aborted (worktree left unchanged), never left mid-conflict -- resolving a real conflict is still the caller\'s job. Fails if the worktree has uncommitted changes.',
+    inputSchema: { repo: z.string(), name: z.string() },
+  }, async ({ repo, name }) => {
+    return text(unwrap(deps.syncWorktree(repo, name)));
+  });
+
   server.registerTool('remove_worktree', {
     title: 'Remove worktree',
     description: 'Stop the dev server and permanently remove a worktree\'s directory, port, and domain. The git branch itself is NOT deleted. For a container-backed worktree this also removes its node_modules volume.',

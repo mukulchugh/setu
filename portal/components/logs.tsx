@@ -69,20 +69,27 @@ export function useLogStream(repo: string, name: string, type: string): { lines:
   return { lines, preRef };
 }
 
-export function LogModal({ repo, name, initialType, onClose }: { repo: string; name: string; initialType?: string; onClose: () => void }) {
+// Custom sidecars (sidecars.json) are per-worktree, not a fixed known set
+// like the rest of LOG_TABS -- extraTabs lets a caller that already knows
+// this worktree's configured sidecar names (app.tsx has the worktrees list
+// in state either way) fold them into the same tab strip, dynamically,
+// instead of a sidecar log only being reachable via initialType with no way
+// to switch to a different one or discover it existed at all.
+export function LogModal({ repo, name, initialType, extraTabs, onClose }: { repo: string; name: string; initialType?: string; extraTabs?: string[]; onClose: () => void }) {
   const [type, setType] = useState(initialType ?? 'dev');
   const { lines, preRef } = useLogStream(repo, name, type);
   const text = lines === null ? 'Loading…' : lines.length ? lines.join('\n') : '(no log yet — start the dev server first)';
+  const tabs = [...LOG_TABS, ...(extraTabs ?? []).map(n => `sidecar-${n}`)];
 
   return (
     <Modal onClose={onClose} position="bottom">
-      <div class="bg-white border-t border-zinc-200 shadow-2xl w-full" style="height:60vh; display:flex; flex-direction:column;">
-        <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 shrink-0">
-          <div class="flex gap-1 bg-zinc-100 rounded-none p-0.5">
-            {LOG_TABS.map(t => (
+      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl border-t border-zinc-200 dark:border-zinc-800 shadow-2xl w-full" style="height:60vh; display:flex; flex-direction:column;">
+        <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 dark:border-zinc-800 shrink-0">
+          <div class="flex gap-1 bg-zinc-100 dark:bg-zinc-800 rounded-none p-0.5 overflow-x-auto">
+            {tabs.map(t => (
               <button key={t} onClick={() => setType(t)}
-                class={`text-xs font-medium px-3 py-1 rounded-none transition-all duration-150 ${type === t ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}>
-                {t === 'dev' ? 'Dev server' : t === 'pr-review' ? 'PR review' : t[0].toUpperCase() + t.slice(1)}
+                class={`text-xs font-medium px-3 py-1 rounded-none transition-all duration-150 shrink-0 ${type === t ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}>
+                {t === 'dev' ? 'Dev server' : t === 'pr-review' ? 'PR review' : t.startsWith('sidecar-') ? t.slice(8) : t[0].toUpperCase() + t.slice(1)}
               </button>
             ))}
           </div>
@@ -92,7 +99,7 @@ export function LogModal({ repo, name, initialType, onClose }: { repo: string; n
           </IconButton>
           <CloseBtn onClick={onClose} />
         </div>
-        <pre ref={preRef} class="flex-1 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 bg-zinc-50 px-5 py-4 whitespace-pre-wrap break-all">{text}</pre>
+        <pre ref={preRef} class="flex-1 overflow-auto text-[11px] leading-relaxed font-mono text-zinc-600 dark:text-zinc-400 bg-zinc-50/80 dark:bg-black/20 px-5 py-4 whitespace-pre-wrap break-all">{text}</pre>
       </div>
     </Modal>
   );

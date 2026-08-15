@@ -45,7 +45,7 @@ export function RepoPrsModal({ repo, label, worktrees, loaded, onClose, onOpenWo
 
   return (
     <Modal onClose={onClose} position="bottom">
-      <div class="bg-white dark:bg-zinc-900 border-t border-zinc-200 dark:border-white/10 shadow-2xl w-full" style="height:70vh; display:flex; flex-direction:column;">
+      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl border-t border-zinc-200 dark:border-white/10 shadow-2xl w-full" style="height:70vh; display:flex; flex-direction:column;">
         <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 dark:border-white/10 shrink-0">
           <span class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 flex-1">Open PRs — {label}</span>
           <IconButton tone="zinc" tip="Refresh" onClick={load} disabled={loading}>

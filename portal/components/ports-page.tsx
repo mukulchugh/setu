@@ -22,7 +22,8 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
     return () => clearInterval(t);
   }, [load]);
 
-  async function kill(port: number) {
+  async function kill(port: number, cmd: string) {
+    if (!confirm(`Kill the process on port ${port} (${cmd})? This isn't scoped to Setu — anything listening in 3000–3999 gets signaled, registered or not.`)) return;
     await post('/api/ports/kill', { port });
     load();
   }
@@ -42,7 +43,7 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
               <span class="font-mono font-medium text-zinc-900 dark:text-zinc-100 w-14">{p.port}</span>
               <span class="text-zinc-400 w-20">PID {p.pid}</span>
               <span class="text-zinc-500 dark:text-zinc-400 flex-1 truncate">{p.cmd}{p.worktree && <span class="text-zinc-400"> · {p.worktree}</span>}</span>
-              <button onClick={() => kill(p.port)}
+              <button onClick={() => kill(p.port, p.cmd)}
                 class="text-red-500 hover:text-white hover:bg-red-500 transition-colors duration-150 px-3 py-1.5 rounded-none font-medium border border-red-200 dark:border-red-900">Kill</button>
             </div>
           ))}

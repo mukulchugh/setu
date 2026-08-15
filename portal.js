@@ -626,6 +626,14 @@ async function getWorktrees() {
         convexConfigured: cachedConvexDir(repo, name, wtDir) !== null,
         convexActive:     convexDevProcs.has(key),
         convexDeploy:     convexDeployStatus(repo, name),
+        // Configured custom sidecars (sidecars.json, repo-scoped) and
+        // whether each is actually running for THIS worktree right now --
+        // previously tracked correctly in sidecarProcs but never surfaced
+        // to any client, so there was no way to see one was alive short of
+        // reading its raw log file.
+        sidecars: loadSidecars(WORKSPACE, repo).map(s => ({
+          name: s.name, active: sidecarProcs.has(`${key}/${s.name}`),
+        })),
         lastCommitAt:  gm.lastCommitAt,
         ahead:         gm.ahead,
         behind:        gm.behind,
@@ -820,6 +828,11 @@ function stopWorktreeByName(repo, name) {
   if (!port) return { ok: false };
   stopWorktree(repo, name, port);
   return { ok: true };
+}
+
+// Shared by /api/sync and mcp-server.js's sync_worktree tool.
+function syncWorktreeByName(repo, name) {
+  return syncWithBase(wtPath(repo, name), repoPath(repo));
 }
 
 // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
@@ -1921,9 +1934,7 @@ async function worktreeRoutes(req, pathname, method, server) {
       return Response.json(stopWorktreeByName(repo, name));
     }
     if (pathname === '/api/sync') {
-      const wtDir = wtPath(repo, name);
-      const repoDir = repoPath(repo);
-      return jsonTry(() => syncWithBase(wtDir, repoDir));
+      return jsonTry(() => syncWorktreeByName(repo, name));
     }
     if (pathname === '/api/tunnel/enable') {
       const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
@@ -2336,6 +2347,7 @@ function close(ws) {
 initMcpServer({
   getWorktrees, createWorktree, removeWorktree,
   startWorktree: startWorktreeByName, stopWorktree: stopWorktreeByName,
+  syncWorktree: syncWorktreeByName,
   computeDiff, tailLog,
   listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,
   fetchRepoPRs, prReviewStatus, prReviewRun,

@@ -101,6 +101,7 @@ switch (cmd) {
   case 'portal':  await cmdPortal(); break;
   case 'mcp':     await cmdMcp(); break;
   case 'tunnel':  await cmdTunnel(); break;
+  case 'sync':    await cmdSync(); break;
   case 'trigger': await cmdTrigger(); break;
   case 'fetch':   await cmdFetch(); break;
   case 'path':    await cmdPath(); break;
@@ -660,6 +661,21 @@ async function cmdTunnel() {
   ok(`Public → https://${publicDomain(c)}  (now pointing at ${repo}/${name})`);
 }
 
+// ── setu sync <repo> <branch> ─────────────────────────────────────────────────
+// Merges the worktree's resolved base branch in via the portal (syncWithBase,
+// lib.js) -- same action the web UI's "Sync with staging" button and the
+// Raycast sync tool already call, just missing from the CLI until now.
+
+async function cmdSync() {
+  const [repo, name] = args;
+  if (!repo || !name) die('Usage: setu sync <repo> <branch>');
+  const c = cfg();
+  if (!getPort(c.workspace, repo, name)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
+  await ensurePortal(c);
+  const res = await portalCall('/api/sync', { repo, name }, 'sync failed');
+  ok(`Synced ${repo}/${name} with ${res.base}`);
+}
+
 // ── setu trigger <repo> <branch> [stop] ──────────────────────────────────────
 // Runs `trigger dev` for a worktree as a detached background process, so
 // multiple worktrees of the same repo can each run their own without
@@ -1082,6 +1098,8 @@ function cmdHelp() {
     setu fetch <repo>                git fetch --all
     setu tunnel <repo> <branch>      Point the public URL at this worktree
     setu tunnel <repo> <branch> stop      Release it
+    setu sync   <repo> <branch>      Merge the resolved base branch in (clean merges only —
+                                      aborts and reports what would conflict, never leaves it mid-merge)
     setu trigger <repo> <branch>     Run trigger.dev dev (background, per worktree)
     setu trigger <repo> <branch> stop     Stop it
 

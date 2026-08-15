@@ -33,6 +33,8 @@ setu path <repo> <branch>            # prints worktree path
 setu cd <repo> <branch>              # cd into worktree (shell wrapper; from scripts use: cd "$(setu path r b)")
 setu init <gh-org>/<repo> [label]    # bare-clone + register + main worktree
 setu tunnel <repo> <branch> [stop]   # point the shared public URL at this worktree
+setu sync <repo> <branch>            # merge the resolved base branch in — clean merges only,
+                                      # aborts + reports conflicts rather than leaving it mid-merge
 setu trigger <repo> <branch> [stop]  # trigger.dev dev server per worktree — delegates to the portal
                                       # (/api/trigger/start|stop) when one is running, falls back to a
                                       # standalone detached process (own PID file) only when it isn't
@@ -80,9 +82,9 @@ just `ok`, to know if a dev server is actually running.
 ## MCP server (localhost:2999/mcp) — let an agent drive Setu directly
 
 Same portal, same backend functions, a fourth front door (web UI / CLI / Raycast / MCP, in
-that order of age) — `mcp-server.js`'s 12 tools (`list_worktrees`, `create_worktree`,
-`start_worktree`, `stop_worktree`, `remove_worktree`, `get_diff`, `get_logs`, `list_ports`,
-`list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`) call straight into
+that order of age) — `mcp-server.js`'s tools (`list_worktrees`, `create_worktree`,
+`start_worktree`, `stop_worktree`, `sync_worktree`, `remove_worktree`, `get_diff`, `get_logs`,
+`list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`) call straight into
 portal.js's own functions in-process, not over HTTP — no self-fetch loopback. Streamable
 HTTP, stateless (fresh `McpServer` per request), DNS-rebinding protection on, no CORS.
 

@@ -46,6 +46,7 @@ export type Worktree = {
   // Inngest/Trigger (assumed available everywhere), Convex only applies to
   // worktrees that actually have it set up.
   convexConfigured: boolean; convexActive: boolean; convexDeploy: ConvexDeployStatus;
+  sidecars: { name: string; active: boolean }[];
   queued?: boolean; queuePosition?: number | null;
   lastCommitAt: number | null; ahead: number; behind: number; dirty: number; memMb: number | null;
   createdAt: number | null;
@@ -194,9 +195,9 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
 
   return (
     <Modal onClose={onClose}>
-      <div class="bg-white rounded-none border border-zinc-200 shadow-2xl p-6 w-full max-w-sm mx-4">
+      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl p-6 w-full max-w-sm mx-4">
         <div class="flex items-center justify-between mb-5">
-          <h2 class="text-base font-semibold text-zinc-900">New worktree</h2>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">New worktree</h2>
           <CloseBtn onClick={onClose} />
         </div>
         <div class="flex flex-col gap-4">
@@ -256,10 +257,10 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
 
   return (
     <Modal onClose={onClose}>
-      <div class="bg-white rounded-none border border-zinc-200 shadow-2xl p-6 w-full max-w-sm mx-4">
+      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl p-6 w-full max-w-sm mx-4">
         <div class="flex items-center justify-between mb-5">
           <div>
-            <h2 class="text-base font-semibold text-zinc-900">Add project</h2>
+            <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Add project</h2>
             <p class="text-xs text-zinc-400 mt-0.5">Register a new or existing repo</p>
           </div>
           <CloseBtn onClick={onClose} />
@@ -732,6 +733,12 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
               <ConvexIcon class="w-3 h-3" />convex
             </button>
           )}
+          {w.sidecars.some(s => s.active) && (
+            <span title={w.sidecars.filter(s => s.active).map(s => s.name).join(', ')}
+              class="flex items-center gap-1.5 shrink-0">
+              <StatusDot tone="emerald" />{w.sidecars.filter(s => s.active).length === 1 ? w.sidecars.find(s => s.active)!.name : `${w.sidecars.filter(s => s.active).length} sidecars`}
+            </span>
+          )}
           {w.branchUrl && (
             <a href={w.branchUrl} target="_blank" class="flex items-center gap-1 hover:text-zinc-600 transition-colors duration-150 shrink-0">
               <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm3-8.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z" /></svg>branch
@@ -1077,6 +1084,16 @@ function WorktreePage({ w, loaded, agents, onAct, onStart, onDeploy, onConvexDep
               {w.tunnelOn ? 'disable' : 'enable'}
             </button>
           </div>
+          {/* Custom sidecars (sidecars.json) don't have their own start/stop
+              route -- they're bundled into the worktree's own start/stop, so
+              this is status-only, same as it actually is on the backend. */}
+          {w.sidecars.map(s => (
+            <div key={s.name} class="flex items-center gap-2">
+              <StatusDot tone={s.active ? 'emerald' : 'zinc'} />
+              <span>{s.name}</span>
+              {s.active && <button onClick={() => onOpenLogs(w.repo, w.name, `sidecar-${s.name}`)} class="text-xs text-zinc-500 hover:underline">log</button>}
+            </div>
+          ))}
         </div>
       </Section>
 
@@ -1644,7 +1661,9 @@ function App() {
     return <>
       <WorktreePage w={w} loaded={loaded} agents={agents} onAct={act} onStart={start} onDeploy={deploy} onConvexDeploy={convexDeploy}
         onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool} onRemove={remove} toast={toast} />
-      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type} onClose={() => setLogView(null)} />}
+      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type}
+        extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
+        onClose={() => setLogView(null)} />}
       {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </>;
@@ -1825,7 +1844,9 @@ function App() {
           onClose={() => { setCreateOpen(false); setRecreatePrefill(null); }} onCreated={refresh} />
       )}
       {addProjectOpen && <AddProjectModal onClose={() => setAddProjectOpen(false)} onAdded={loadProjects} />}
-      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type} onClose={() => setLogView(null)} />}
+      {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type}
+        extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
+        onClose={() => setLogView(null)} />}
       {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
       {prsRepo && (
         <RepoPrsModal repo={prsRepo} label={projects.find(p => p.name === prsRepo)?.label ?? prsRepo}

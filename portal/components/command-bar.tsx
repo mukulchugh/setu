@@ -36,7 +36,7 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
 
   return (
     <Modal onClose={onClose}>
-      <div class="bg-white dark:bg-zinc-900 rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl w-full max-w-md mx-4" onKeyDown={onKeyDown}>
+      <div class="bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl rounded-none border border-zinc-200 dark:border-zinc-800 shadow-2xl w-full max-w-md mx-4" onKeyDown={onKeyDown}>
         <div class="flex items-center gap-2.5 px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
           <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
           <input ref={inputRef} value={q} onInput={(e: any) => { setQ(e.target.value); setSel(0); }}
