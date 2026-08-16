@@ -2456,6 +2456,7 @@ initMcpServer({
   computeDiff, tailLog,
   listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,
   fetchRepoPRs, prReviewStatus, prReviewRun,
+  createPr, setPrReady,
 });
 
 const server = Bun.serve({

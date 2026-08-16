@@ -248,10 +248,52 @@ function registerTools(server) {
   }, async ({ repo, name, skill }) => {
     return text(await deps.prReviewRun(repo, name, skill));
   });
+
+  server.registerTool('create_pr', {
+    title: 'Create a pull request',
+    description: 'Push the worktree\'s branch and open a GitHub PR for it (gh pr create --fill, title/body autofilled from commits). Fails clearly if the repo has no GitHub remote, the branch has no commits ahead of its base, or a PR already exists -- call list_worktrees or get_diff first if unsure. Never valid for a worktree named "main" (Setu\'s fixed slot for a project\'s primary line, never itself a PR candidate).',
+    inputSchema: { repo: z.string(), name: z.string() },
+  }, async ({ repo, name }) => {
+    return text(unwrap(await deps.createPr(repo, name)));
+  });
+
+  server.registerTool('pr_ready', {
+    title: 'Toggle a PR between draft and ready for review',
+    description: 'Mark an existing open PR as ready for review, or convert it back to draft. Requires a PR to already exist on the worktree (see list_worktrees\'s pr field, or list_repo_prs) -- use create_pr first if there isn\'t one yet.',
+    inputSchema: { repo: z.string(), name: z.string(), ready: z.boolean().describe('true to mark ready for review, false to convert to draft') },
+  }, async ({ repo, name, ready }) => {
+    return text(unwrap(await deps.setPrReady(repo, name, ready)));
+  });
 }
 
+// Shown once to the connecting client at initialize time (MCP's own
+// `instructions` field on InitializeResult, confirmed by reading
+// node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js directly:
+// Server stores options.instructions and includes it in every initialize
+// response verbatim) -- not a tool, not per-call, the one place to brief an
+// agent on how this whole server fits together before it starts picking
+// tools one at a time from titles/descriptions alone.
+const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.quivly.local\` domain). This server is a full front door onto it — the same backend the web UI and CLI use, no capability gap.
+
+TOOL GROUPS
+- Discovery (read-only, cheap, call these first): list_projects, list_worktrees, list_repo_prs, list_ports.
+- Lifecycle: create_worktree -> start_worktree -> ... -> stop_worktree / remove_worktree.
+- Debugging: get_logs, get_diff, list_ports, get_pr_review_status / run_pr_review.
+- GitHub: create_pr, pr_ready, list_repo_prs.
+
+EFFICIENT USE
+- Always call list_worktrees before create_worktree. A branch that already has a worktree just needs start_worktree, not a duplicate create -- create_worktree is safe to call again for an existing worktree (no-ops onto it) but wastes a round trip and can mask that you're not looking at the worktree you think you are.
+- To debug "why isn't this worktree behaving as expected", in order: (1) list_worktrees for its current state (active/dirty/ahead-behind/container mode), (2) get_logs (type defaults to "dev") for the dev server's actual recent output, (3) get_diff to see what's really changed vs. its base branch rather than assuming, (4) list_ports if the dev server seems unreachable — a stale/crashed process can still hold the port.
+- get_diff defaults to stats + filenames only (LLM-sized, not the UI's full hunks) — pass verbose:true only when you actually need line-by-line detail, capped at 20 files even then.
+- A worktree literally named "main" is Setu's fixed slot for a project's primary line, not a real branch name — it never has a PR (create_pr will refuse it) and syncing/diffing it means "against its own history," not "against a feature branch."
+- sync_worktree only ever performs a clean merge. A real conflict is detected and the merge is aborted automatically, worktree left exactly as it was — it does not attempt any conflict resolution, that's still your job afterward.
+- Omit the \`container\` param on start_worktree unless you specifically need to force a mode — omitting it uses the sticky per-worktree default (a worktree's own history, not a global setting), which is almost always what's wanted.
+- remove_worktree is destructive (uncommitted work is gone, and a container-backed worktree's node_modules volume too) but never deletes the git branch itself — the branch can always be recovered by creating a new worktree from it.
+- run_pr_review is fire-and-forget and spends real API budget on the user's own account over several minutes — confirm that's actually wanted before calling it, then poll get_pr_review_status separately rather than blocking on it.
+- The portal daemon must already be running for any of this to work; there's no auto-start on a failed connection.`;
+
 function buildServer() {
-  const server = new McpServer({ name: 'setu', version: '1.0.0' });
+  const server = new McpServer({ name: 'setu', version: '1.0.0' }, { instructions: INSTRUCTIONS });
   registerTools(server);
   return server;
 }
