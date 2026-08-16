@@ -18,7 +18,14 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } fr
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from './ui/dropdown-menu';
 import { ToastStack, type ToastItem } from './ui/toast';
 import { inputCls, PageHeader, Section } from './ui';
-import { ToolIcon, SidecarIcon, MUKUL_LOGO_URI, VercelIcon, NetlifyIcon, ConvexIcon } from './components/icons';
+import {
+  ToolIcon, SidecarIcon, MUKUL_LOGO_URI, VercelIcon, NetlifyIcon, ConvexIcon,
+  tablerRefresh, tablerPlayerPlayFilled, tablerCaretDownFilled, tablerExternalLink,
+  tablerTerminal2, tablerCheck, tablerCopy, tablerWorld, tablerTrash, tablerPlayerStopFilled,
+  tablerClock, tablerDotsVerticalFilled, tablerFileText, tablerSearch, tablerCircle,
+  tablerArrowUp, tablerMenu2, tablerLayoutGrid, tablerSun, tablerMoonFilled, tablerPlug,
+  tablerArchive, tablerSettings,
+} from './components/icons';
 import { TriviaCard } from './components/trivia-card';
 import { LogModal, LiveLog } from './components/logs';
 import { post, postOrToast } from './api';
@@ -370,7 +377,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   if (pending) {
     return (
       <IconButton tone="emerald" tip="Starting…" disabled>
-        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>
       </IconButton>
     );
   }
@@ -390,7 +397,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
       <DropdownMenu>
         <DropdownMenuTrigger data-tip="This worktree has always run bare — migrate to a container?"
           class="tip icon-btn transition-all duration-200 ease-out text-signal-green hover:bg-current/10">
-          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
+          <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerPlayerPlayFilled.path} /></svg>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
           <DropdownMenuItem onClick={() => onStart(w, 'container')}>Migrate to container</DropdownMenuItem>
@@ -402,12 +409,12 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
   return (
     <div class="flex items-center">
       <IconButton tone="emerald" tip={`Start — will run ${w.nextStartMode}`} onClick={() => onStart(w)}>
-        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4v16a1 1 0 0 0 1.524 .852l13 -8a1 1 0 0 0 0 -1.704l-13 -8a1 1 0 0 0 -1.524 .852z" /></svg>
+        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerPlayerPlayFilled.path} /></svg>
       </IconButton>
       <DropdownMenu>
         <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Force a mode"
           class="tip w-4 h-6 flex items-center justify-center text-zinc-300 hover:text-zinc-500 transition-colors duration-150 -ml-1">
-          <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M18 9c.852 0 1.297 .986 .783 1.623l-.076 .084l-6 6a1 1 0 0 1 -1.32 .083l-.094 -.083l-6 -6l-.083 -.094l-.054 -.077l-.054 -.096l-.017 -.036l-.027 -.067l-.032 -.108l-.01 -.053l-.01 -.06l-.004 -.057v-.118l.005 -.058l.009 -.06l.01 -.052l.032 -.108l.027 -.067l.07 -.132l.065 -.09l.073 -.081l.094 -.083l.077 -.054l.096 -.054l.036 -.017l.067 -.027l.108 -.032l.053 -.01l.06 -.01l.057 -.004l12.059 -.002z" /></svg>
+          <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d={tablerCaretDownFilled.path} /></svg>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
           <DropdownMenuItem onClick={() => onStart(w, 'bare')}>Force bare (no cap)</DropdownMenuItem>
@@ -448,7 +455,7 @@ function DeployMenu({ w, provider, deploy, onDeploy }: {
   if (deploy?.deploying) {
     return (
       <IconButton tone="amber" tip={`Deploying to ${label} (${deploy.target})…`} disabled>
-        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>
       </IconButton>
     );
   }
@@ -730,7 +737,7 @@ function ConvexDeployMenu({ w, deploy, onConvexDeploy }: {
   if (deploy?.deploying) {
     return (
       <IconButton tone="amber" tip={`Deploying to Convex (${deploy.target})…`} disabled>
-        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+        <svg class="w-4 h-4 spin" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>
       </IconButton>
     );
   }
@@ -914,7 +921,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
       <div class={`flex items-center gap-0.5 shrink-0 flex-wrap transition-opacity duration-150 ${
         gridMode ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 has-[[data-popup-open]]:opacity-100'}`}>
         <IconButton tone="zinc" tip="Open in browser" disabled={!w.active} href={`http://${w.domain}`} target="_blank">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" /><path d="M11 13l9 -9" /><path d="M15 4h5v5" /></svg>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerExternalLink.path} /></svg>
         </IconButton>
         {/* One dropdown for every detected CLI agent, not one icon button
             each -- with most of the 8 registered tools installed this row
@@ -924,7 +931,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
           <DropdownMenu>
             <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Open in tool"
               class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M8 9l3 3l-3 3" /><path d="M13 15l3 0" /><path d="M3 4m0 2a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z" /></svg>
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerTerminal2.path} /></svg>
             </DropdownMenuTrigger>
             <DropdownMenuContent>
               {agents.map((a: { id: string; label: string }) => (
@@ -937,13 +944,13 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
         )}
         <IconButton tone="zinc" tip="Copy cd command" onClick={copyCD}>
           {copied
-            ? <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M5 12l5 5l10 -10" /></svg>
-            : <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M7 9.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667l0 -8.666" /><path d="M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1" /></svg>}
+            ? <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerCheck.path} /></svg>
+            : <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerCopy.path} /></svg>}
         </IconButton>
         <IconButton tone={w.tunnelRunning ? 'emerald' : 'zinc'}
           tip={w.tunnelRunning ? 'Tunnel live — click to disable' : w.tunnelOn ? 'Tunnel configured, not running' : 'Enable tunnel'}
           onClick={() => onAct(w.tunnelOn ? '/api/tunnel/disable' : '/api/tunnel/enable', w)}>
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M3.6 9h16.8" /><path d="M3.6 15h16.8" /><path d="M11.5 3a17 17 0 0 0 0 18" /><path d="M12.5 3a17 17 0 0 1 0 18" /></svg>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerWorld.path} /></svg>
         </IconButton>
         <DeployMenu w={w} provider="vercel" deploy={w.vercelDeploy} onDeploy={onDeploy} />
         <DeployMenu w={w} provider="netlify" deploy={w.netlifyDeploy} onDeploy={onDeploy} />
@@ -955,7 +962,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
             exactly what makes it safe. */}
         {w.pr?.state === 'merged' && (
           <IconButton tone="emerald" tip="PR merged, clean up worktree" onClick={() => onRemove(w, 'merged')}>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerTrash.path} /></svg>
           </IconButton>
         )}
       </div>
@@ -964,11 +971,11 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
       <div class="flex items-center gap-1 shrink-0">
         {w.active ? (
           <IconButton tone="red" tip="Stop server" onClick={() => onAct('/api/stop', w)}>
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M17 4h-10a3 3 0 0 0 -3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3 -3v-10a3 3 0 0 0 -3 -3z" /></svg>
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerPlayerStopFilled.path} /></svg>
           </IconButton>
         ) : w.queued ? (
           <IconButton tone="amber" tip={`Queued #${w.queuePosition} — click to cancel`} onClick={() => onAct('/api/stop', w)}>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M12 7v5l3 3" /></svg>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerClock.path} /></svg>
           </IconButton>
         ) : (
           <StartControl w={w} pending={pending} onStart={onStart} />
@@ -977,11 +984,11 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
         <DropdownMenu>
           <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="More actions"
             class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M14 12a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 19a2 2 0 1 1 -4 0q 0 -.052 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /><path d="M14 5a2 2 0 1 1 -4 0q 0 -.053 .005 -.102a1.996 1.996 0 0 1 1.995 -1.898a2 2 0 0 1 2 2" /></svg>
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerDotsVerticalFilled.path} /></svg>
           </DropdownMenuTrigger>
           <DropdownMenuContent>
             <DropdownMenuItem onClick={() => onOpenLogs(w.repo, w.name, 'dev')}
-              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4" /><path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /><path d="M9 9l1 0" /><path d="M9 13l6 0" /><path d="M9 17l6 0" /></svg>}>
+              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerFileText.path} /></svg>}>
               View logs
             </DropdownMenuItem>
             {!showInngestInline && (
@@ -1016,12 +1023,12 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
             )}
             <DropdownMenuSeparator />
             <DropdownMenuItem onClick={() => onAct('/api/sync', w)}
-              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>}>
+              icon={<svg class="w-3 h-3 shrink-0 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>}>
               Sync with staging
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem tone="red" onClick={() => onRemove(w)}
-              icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 7l16 0" /><path d="M10 11l0 6" /><path d="M14 11l0 6" /><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" /><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" /></svg>}>
+              icon={<svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerTrash.path} /></svg>}>
               Remove worktree
             </DropdownMenuItem>
           </DropdownMenuContent>
@@ -2109,7 +2116,7 @@ function App() {
           ones on other pages, and jumps straight to one. Two different jobs,
           not a duplicate of each other. */}
       <div class="relative mb-4">
-        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 dark:text-zinc-400 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 dark:text-zinc-400 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSearch.path} /></svg>
         <input value={search} onInput={(e: any) => setSearch(e.target.value)}
           placeholder="Search worktrees by name, repo, or label…" autocomplete="off"
           class="w-full text-sm bg-white/60 dark:bg-white/5 backdrop-blur-md border border-white/75 dark:border-white/10 shadow-sm rounded-none pl-9 pr-3 py-2.5 text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-500 transition-colors duration-150" />
@@ -2163,10 +2170,10 @@ function App() {
         </select>
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
         <SidebarButton onClick={() => setOnlyDirty(!onlyDirty)} active={onlyDirty} activeClass="bg-signal-amber border-signal-amber text-white"
-          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0" /></svg>}
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerCircle.path} /></svg>}
           label="Uncommitted changes" />
         <SidebarButton onClick={() => setOnlyAhead(!onlyAhead)} active={onlyAhead} activeClass="bg-signal-green border-signal-green text-white"
-          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M12 5l0 14" /><path d="M18 11l-6 -6" /><path d="M6 11l6 -6" /></svg>}
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerArrowUp.path} /></svg>}
           label="Ahead of base" />
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
         {(['list', 'grid'] as const).map(v => (
@@ -2174,22 +2181,22 @@ function App() {
             class={`flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
               view === v ? 'bg-accent border-accent text-white' : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`}>
             {v === 'list'
-              ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 6l16 0" /><path d="M4 12l16 0" /><path d="M4 18l16 0" /></svg>
-              : <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M14 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M4 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /><path d="M14 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" /></svg>}
+              ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerMenu2.path} /></svg>
+              : <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerLayoutGrid.path} /></svg>}
             <span class="text-xs text-left">{v === 'list' ? 'List view' : 'Grid view'}</span>
           </button>
         ))}
         <div class="h-px bg-zinc-200 dark:bg-white/10 my-1" />
         <SidebarButton onClick={() => setDark(!dark)} label={dark ? 'Light mode' : 'Dark mode'}
           icon={dark
-            ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0" /><path d="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7" /></svg>
-            : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 1.992a10 10 0 1 0 9.236 13.838c.341 -.82 -.476 -1.644 -1.298 -1.31a6.5 6.5 0 0 1 -6.864 -10.787l.077 -.08c.551 -.63 .113 -1.653 -.758 -1.653h-.266l-.068 -.006l-.06 -.002z" /></svg>} />
+            ? <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSun.path} /></svg>
+            : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d={tablerMoonFilled.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/ports')} label="Active ports"
-          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M9.785 6l8.215 8.215l-2.054 2.054a5.81 5.81 0 1 1 -8.215 -8.215l2.054 -2.054" /><path d="M4 20l3.5 -3.5" /><path d="M15 4l-3.5 3.5" /><path d="M20 9l-3.5 3.5" /></svg>} />
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerPlug.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/archived')} label="Archived"
-          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2" /><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-10" /><path d="M10 12l4 0" /></svg>} />
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerArchive.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/settings')} label="Settings"
-          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065" /><path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /></svg>} />
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSettings.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/settings')} label="Raycast"
           tip={raycastRunning ? 'Raycast dev mode is running' : 'Set up the Raycast extension'}
           icon={<StatusDot tone={raycastRunning ? 'emerald' : 'zinc'} />}

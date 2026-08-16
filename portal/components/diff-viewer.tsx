@@ -5,6 +5,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { Badge } from '../ui/badge';
 import { IconButton } from '../ui/button';
+import { tablerRefresh, tablerChevronRight } from './icons';
 
 type DiffLine = { type: 'add' | 'remove' | 'context'; content: string; oldLine?: number; newLine?: number };
 type DiffHunk = { header: string; lines: DiffLine[] };
@@ -16,19 +17,14 @@ type DiffResponse = { base: string; baseResolved: boolean; committed: DiffGroup;
 // elsewhere in app.tsx: one icon meaning "reload this," not a second one.
 function RefreshIcon({ spinning }: { spinning: boolean }) {
   return (
-    <svg class={`w-4 h-4 ${spinning ? 'spin' : ''}`} fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-      <path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" />
-      <path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" />
-    </svg>
+    <svg class={`w-4 h-4 ${spinning ? 'spin' : ''}`} fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>
   );
 }
 
 function Chevron({ open }: { open: boolean }) {
   return (
     <svg class={`w-3 h-3 shrink-0 text-zinc-400 transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
-      fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-      <path d="M9 6l6 6l-6 6" />
-    </svg>
+      fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerChevronRight.path} /></svg>
   );
 }
 

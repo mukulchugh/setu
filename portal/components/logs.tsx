@@ -7,6 +7,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { Dialog, DialogContent, DialogClose } from '../ui/dialog';
 import { IconButton } from '../ui/button';
 import { getWs } from '../ws';
+import { tablerCopy } from './icons';
 
 export const LOG_TABS = ['dev', 'tunnel', 'inngest', 'trigger', 'convex', 'vercel', 'netlify', 'setup', 'pr-review'] as const;
 
@@ -96,7 +97,7 @@ export function LogModal({ repo, name, initialType, extraTabs, onClose }: { repo
           </div>
           <span class="text-xs text-zinc-400 flex-1">{repo}/{name} • {type}.log</span>
           <IconButton tip="Copy all" onClick={() => navigator.clipboard.writeText(text).catch(() => {})}>
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M7 9.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667l0 -8.666" /><path d="M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1" /></svg>
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerCopy.path} /></svg>
           </IconButton>
           <DialogClose class="w-7 h-7 flex items-center justify-center rounded-lg text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors duration-200">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>

@@ -9,6 +9,7 @@
 import { useState, useRef } from 'preact/hooks';
 import { Dialog, DialogContent } from '../ui/dialog';
 import { StatusDot } from '../ui/badge';
+import { tablerSearch } from './icons';
 import type { Worktree } from '../app';
 
 export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktree[]; onSelect: (w: Worktree) => void; onClose: () => void }) {
@@ -46,7 +47,7 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
           it explicitly stops that from being an accident of DOM order. */}
       <DialogContent class="p-0 sm:max-w-md" initialFocus={inputRef} onKeyDown={onKeyDown}>
         <div class="flex items-center gap-2.5 px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
-          <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 10a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" /><path d="M21 21l-6 -6" /></svg>
+          <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSearch.path} /></svg>
           <input ref={inputRef} value={q} onInput={(e: any) => { setQ(e.target.value); setSel(0); }}
             placeholder="Jump to a worktree…" autocomplete="off"
             class="flex-1 text-sm bg-transparent outline-none placeholder-zinc-400 text-zinc-900 dark:text-zinc-100" />
