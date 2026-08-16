@@ -20,12 +20,12 @@ import { cn } from './utils';
 // change — only what color that maps to changed, not the semantic vocabulary.
 export type Tone = 'emerald' | 'amber' | 'red' | 'zinc';
 
-const TONE_TEXT: Record<Tone, string> = {
-  emerald: 'text-signal-green', amber: 'text-signal-amber', red: 'text-signal-red',
+const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber', 
+  emerald: 'text-signal-green', red: 'text-signal-red',
   zinc: 'text-zinc-500 dark:text-zinc-400',
 };
-const TONE_DOT: Record<Tone, string> = {
-  emerald: 'bg-signal-green', amber: 'bg-signal-amber', red: 'bg-signal-red',
+const TONE_DOT: Record<Tone, string> = {amber: 'bg-signal-amber', 
+  emerald: 'bg-signal-green', red: 'bg-signal-red',
   zinc: 'bg-zinc-300 dark:bg-zinc-600',
 };
 
@@ -60,10 +60,11 @@ export function StatusFlap({ text, tone }: { text: string; tone: Tone }) {
 const badgeVariants = cva(
   'tip board-mono text-[9px] font-bold px-1.5 py-0.5 rounded-none shrink-0 transition-colors duration-200',
   {
+    defaultVariants: { tone: 'zinc' },
     variants: {
       tone: {
-        emerald: 'bg-signal-green/10 text-signal-green dark:bg-signal-green/15',
         amber: 'bg-signal-amber/10 text-signal-amber dark:bg-signal-amber/15',
+        emerald: 'bg-signal-green/10 text-signal-green dark:bg-signal-green/15',
         red: 'bg-signal-red/10 text-signal-red dark:bg-signal-red/15',
         // The one tone the old Badge left without a dark: pair — bg-zinc-100/
         // text-zinc-500 is a light-surface color, unreadable washed onto a
@@ -72,7 +73,6 @@ const badgeVariants = cva(
         zinc: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
       },
     },
-    defaultVariants: { tone: 'zinc' },
   },
 );
 
@@ -91,12 +91,12 @@ export function Badge({ tone = 'zinc', tip, class: cls, render, children }: {
 }) {
   return useRender({
     defaultTagName: 'span',
-    render,
-    state: { tone },
     props: {
-      className: cn(badgeVariants({ tone }), cls),
       children,
+      className: cn(badgeVariants({ tone }), cls),
       ...(tip ? { 'data-tip': tip } : {}),
     },
+    render,
+    state: { tone },
   });
 }

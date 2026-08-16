@@ -140,7 +140,7 @@ function raycastLogPath() {
 
 function startRaycastDev() {
   if (raycastDev) return { ok: true };
-  if (!existsSync(RAYCAST_DIR)) return { ok: false, error: 'raycast/ not found in the setu repo' };
+  if (!existsSync(RAYCAST_DIR)) return { error: 'raycast/ not found in the setu repo', ok: false };
   const path = raycastLogPath();
   rotateLog(path);
   appendFileSync(path, `\n[${new Date().toISOString()}] ── raycast dev start ──\n`);
@@ -153,8 +153,8 @@ function startRaycastDev() {
   writeFileSync(script,
     `#!/bin/zsh\ncd "${RAYCAST_DIR}"\n[ -d node_modules ] || npm install\nexec npx ray develop\n`,
     { mode: 0o755 });
-  const proc = Bun.spawn(['/bin/zsh', script], { cwd: RAYCAST_DIR, stdout: fd, stderr: fd, detached: true });
-  raycastDev = { proc, pid: proc.pid };
+  const proc = Bun.spawn(['/bin/zsh', script], { cwd: RAYCAST_DIR, detached: true, stderr: fd, stdout: fd });
+  raycastDev = { pid: proc.pid, proc };
   proc.exited.then(() => { if (raycastDev?.proc === proc) raycastDev = null; });
   return { ok: true };
 }
@@ -189,7 +189,7 @@ function repoGitMeta(repo) {
     branchMeta = branchMetadata(repoDir);
     pathToBranch = worktreeBranchMap(repoDir);
   } catch {}
-  const entry = { branchMeta, pathToBranch, fetchedAt: Date.now() };
+  const entry = { branchMeta, fetchedAt: Date.now(), pathToBranch };
   gitMetaCache.set(repo, entry);
   return entry;
 }
@@ -284,10 +284,10 @@ async function fetchPR(repo, name) {
     const state = raw2.state === 'MERGED' ? 'merged'
       : raw2.state === 'CLOSED' ? 'closed'
       : raw2.isDraft ? 'draft' : 'open';
-    const entry = {
-      number: raw2.number, title: raw2.title, url: raw2.url,
-      state, checks: summarizeChecks(raw2.statusCheckRollup),
+    const entry = {checks: summarizeChecks(raw2.statusCheckRollup),
       fetchedAt: Date.now(),
+      number: raw2.number, 
+      state, title: raw2.title, url: raw2.url,
     };
     prCache.set(key, entry);
     return entry;
@@ -314,7 +314,7 @@ const repoPrsCache = new Map();
 
 async function fetchRepoPRs(repo) {
   const slug = REPO_META[repo]?.slug;
-  if (!slug) return { prs: [], error: 'no GitHub repo configured for this project' };
+  if (!slug) return { error: 'no GitHub repo configured for this project', prs: [] };
   const cached = repoPrsCache.get(repo);
   if (cached && Date.now() - cached.fetchedAt < PR_TTL) return cached;
   // spawnText swallows a bad binary/non-zero exit/timeout into an empty
@@ -330,17 +330,17 @@ async function fetchRepoPRs(repo) {
   let list;
   try { list = JSON.parse(raw); }
   catch {
-    const entry = { prs: [], error: `gh pr list failed for ${slug} -- check "gh auth status" and that the repo is reachable`, fetchedAt: Date.now() };
+    const entry = { error: `gh pr list failed for ${slug} -- check "gh auth status" and that the repo is reachable`, fetchedAt: Date.now(), prs: [] };
     repoPrsCache.set(repo, entry);
     return entry;
   }
   const entry = {
-    prs: list.map(p => ({
-      number: p.number, title: p.title, url: p.url, branch: p.headRefName,
-      isDraft: p.isDraft, checks: summarizeChecks(p.statusCheckRollup),
-      updatedAt: p.updatedAt, author: p.author?.login ?? null,
-    })),
     error: null, fetchedAt: Date.now(),
+    prs: list.map(p => ({author: p.author?.login ?? null,branch: p.headRefName,checks: summarizeChecks(p.statusCheckRollup),
+      isDraft: p.isDraft, 
+      number: p.number, title: p.title, 
+      updatedAt: p.updatedAt, url: p.url, 
+    })),
   };
   repoPrsCache.set(repo, entry);
   return entry;
@@ -355,7 +355,7 @@ async function fetchRepoPRs(repo) {
 // PR already exists, gh not authenticated) needs to surface as a message,
 // not silently look like nothing happened.
 async function spawnRun(cwd, args) {
-  const proc = Bun.spawn(args, { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+  const proc = Bun.spawn(args, { cwd, stderr: 'pipe', stdin: 'ignore', stdout: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -438,8 +438,8 @@ function parseUnifiedDiff(raw) {
       // " b/", which is correct for the common case (identical paths, or a
       // path that doesn't itself contain the literal substring " b/").
       const m = line.slice('diff --git '.length).match(/^a\/(.*) b\/(.*)$/);
-      cur = {
-        file: m ? m[2] : line.slice('diff --git '.length), additions: 0, deletions: 0, hunks: [], sawHunk: false,
+      cur = {additions: 0, deletions: 0, 
+        file: m ? m[2] : line.slice('diff --git '.length), hunks: [], sawHunk: false,
         // A file past DIFF_MAX_FILES gets sliced out of the response by
         // summarizeDiff regardless, so reuse the same skip-building path an
         // individually oversized file already takes below: count its real
@@ -486,12 +486,12 @@ function parseUnifiedDiff(raw) {
     // per-line array stops growing.
     if (line.startsWith('+')) {
       cur.additions++;
-      if (!cur.tooLarge) hunk.lines.push({ type: 'add', content: line.slice(1), newLine: newLine++ }); else newLine++;
+      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), newLine: newLine++, type: 'add' }); else newLine++;
     } else if (line.startsWith('-')) {
       cur.deletions++;
-      if (!cur.tooLarge) hunk.lines.push({ type: 'remove', content: line.slice(1), oldLine: oldLine++ }); else oldLine++;
+      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), oldLine: oldLine++, type: 'remove' }); else oldLine++;
     } else if (line.startsWith(' ')) {
-      if (!cur.tooLarge) hunk.lines.push({ type: 'context', content: line.slice(1), oldLine: oldLine++, newLine: newLine++ });
+      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), newLine: newLine++, oldLine: oldLine++, type: 'context' });
       else { oldLine++; newLine++; }
     }
     // A "\ No newline at end of file" marker matches none of the above and is dropped, as intended.
@@ -513,8 +513,8 @@ function summarizeDiff(raw) {
   let additions = 0, deletions = 0;
   for (const f of all) { additions += f.additions; deletions += f.deletions; }
   return {
-    files: all.slice(0, DIFF_MAX_FILES),
     additions, deletions,
+    files: all.slice(0, DIFF_MAX_FILES),
     totalFiles: all.length,
     truncatedFileCount: Math.max(0, all.length - DIFF_MAX_FILES),
   };
@@ -590,9 +590,9 @@ async function killPort(port) {
     return { ok: true };
   }
   const pid = await activePidAsync(port);
-  if (!pid) return { ok: false, error: 'nothing on that port' };
+  if (!pid) return { error: 'nothing on that port', ok: false };
   try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
-  catch (e) { return { ok: false, error: String(e) }; }
+  catch (e) { return { error: String(e), ok: false }; }
 }
 
 // Resource usage — only ever called for `active` worktrees (no point
@@ -621,7 +621,7 @@ async function getWorktrees() {
       const domain   = localDomain(repo, name);
       const wtDir    = wtPath(repo, name);
       const tunnelOn = tunnelEnabled(wtDir, _cfg);
-      const meta     = REPO_META[repo] ?? { label: repo, github: null };
+      const meta     = REPO_META[repo] ?? { github: null, label: repo };
       const branchUrl = meta.github ? `${meta.github}/tree/${name}` : null;
       const pr        = name !== 'main' ? await fetchPR(repo, name) : null;
       const iPort = inngestPort(port);
@@ -634,58 +634,58 @@ async function getWorktrees() {
       // where this bit us).
       const { branchMeta, pathToBranch } = repoGitMeta(repo);
       const branch = pathToBranch.get(resolve(wtDir)) ?? name;
-      const gm = branchMeta.get(branch) ?? { lastCommitAt: null, ahead: 0, behind: 0 };
+      const gm = branchMeta.get(branch) ?? { ahead: 0, behind: 0, lastCommitAt: null };
       const [dirty, memMb] = await Promise.all([
         fetchDirty(repo, name),
         active ? activeMemMb(procEntry) : Promise.resolve(null),
       ]);
 
       return {
-        key, repo, name, slug, port, domain, pubDomain: publicDomain(_cfg), tunnelOn,
         active,
-        container:     procEntry?.container ?? null,
-        // What a plain Start (no explicit --container/--bare) would resolve
-        // to right now — lets the UI show this *before* the click instead of
-        // the user finding out after, which is the exact blind spot that let
-        // an established worktree get silently switched to a container.
-        nextStartMode: defaultContainerMode(WORKSPACE, repo, name) ? 'container' : 'bare',
-        needsMigrationPrompt: needsMigrationPrompt(WORKSPACE, repo, name),
-        queued:        queuePosition(key) !== null,
-        queuePosition: queuePosition(key),
-        tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
-        label:         meta.label,
+        ahead:         gm.ahead,
+        behind:        gm.behind,
         branch,
         branchUrl,
-        pr:            pr?.url ? { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: pr.checks } : null,
-        vercelDeploy:  vercelStatus(repo, name),
-        netlifyDeploy: netlifyStatus(repo, name),
-        inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
-        inngestPort:   iPort,
-        triggerActive: triggerProcs.has(key),
+        container:     procEntry?.container ?? null,
+        convexActive:     convexDevProcs.has(key),
         // Gate for whether the Convex section renders at all -- unlike
         // Inngest/Trigger (assumed available to every worktree), Convex is
         // only relevant to worktrees that actually have it configured.
         convexConfigured: cachedConvexDir(repo, name, wtDir) !== null,
-        convexActive:     convexDevProcs.has(key),
         convexDeploy:     convexDeployStatus(repo, name),
-        // Configured custom sidecars (sidecars.json, repo-scoped) and
-        // whether each is actually running for THIS worktree right now --
-        // previously tracked correctly in sidecarProcs but never surfaced
-        // to any client, so there was no way to see one was alive short of
-        // reading its raw log file.
-        sidecars: loadSidecars(WORKSPACE, repo).map(s => ({
-          name: s.name, active: sidecarProcs.has(`${key}/${s.name}`),
-        })),
-        lastCommitAt:  gm.lastCommitAt,
-        ahead:         gm.ahead,
-        behind:        gm.behind,
-        dirty,
-        memMb,
         // Directory birthtime, not a subprocess — statSync is essentially
         // free (no spawn) and APFS supports real birthtime. This is
         // creation time, not last-activity — don't conflate the two in the
         // UI (lastCommitAt is the "worked on" signal).
         createdAt: (() => { try { return Math.floor(statSync(wtDir).birthtimeMs / 1000); } catch { return null; } })(),
+        dirty,domain, 
+        inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
+        inngestPort:   iPort,
+        key, 
+        label:         meta.label,
+        lastCommitAt:  gm.lastCommitAt,
+        memMb,name, 
+        needsMigrationPrompt: needsMigrationPrompt(WORKSPACE, repo, name),
+        netlifyDeploy: netlifyStatus(repo, name),
+        // What a plain Start (no explicit --container/--bare) would resolve
+        // to right now — lets the UI show this *before* the click instead of
+        // the user finding out after, which is the exact blind spot that let
+        // an established worktree get silently switched to a container.
+        nextStartMode: defaultContainerMode(WORKSPACE, repo, name) ? 'container' : 'bare',port, 
+        pr:            pr?.url ? { checks: pr.checks, number: pr.number, state: pr.state, title: pr.title, url: pr.url } : null,pubDomain: publicDomain(_cfg), 
+        queued:        queuePosition(key) !== null,
+        queuePosition: queuePosition(key),repo, 
+        // Configured custom sidecars (sidecars.json, repo-scoped) and
+        // whether each is actually running for THIS worktree right now --
+        // previously tracked correctly in sidecarProcs but never surfaced
+        // to any client, so there was no way to see one was alive short of
+        // reading its raw log file.
+        sidecars: loadSidecars(WORKSPACE, repo).map(s => ({active: sidecarProcs.has(`${key}/${s.name}`),
+          name: s.name, 
+        })),slug, 
+        triggerActive: triggerProcs.has(key),tunnelOn,
+        tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
+        vercelDeploy:  vercelStatus(repo, name),
       };
     })
   );
@@ -723,7 +723,7 @@ function spawnWorktree(repo, name, port) {
   const wtDir = wtPath(repo, name);
   const env  = { ...process.env, PORT: String(port), ...parseEnvFile(join(wtDir, '.envrc')) };
   const fd   = openLogFd(repo, name, 'dev');
-  const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stdout: fd, stderr: fd });
+  const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stderr: fd, stdout: fd });
   const entry = wrapProc(proc);
   procs.set(key, entry);
   lastSeenAt.set(key, Date.now()); // idle-timeout baseline: clock starts at spawn, not at zero
@@ -745,7 +745,7 @@ function spawnContainer(repo, name, port) {
   const fd = openLogFd(repo, name, 'dev');
   const proc = Bun.spawn(
     ['docker', 'compose', '-p', project, '-f', dockerComposePath(wtDir), 'up', '-d', '--build'],
-    { cwd: wtDir, stdout: fd, stderr: fd });
+    { cwd: wtDir, stderr: fd, stdout: fd });
   const entry = wrapContainer(project);
   procs.set(key, entry);
   proc.exited.then((code) => {
@@ -797,22 +797,22 @@ function reconcileDevServers() {
 
 function startWorktree(repo, name, port, container = true) {
   const key = `${repo}/${name}`;
-  if (procs.has(key)) return { ok: false, error: 'already running' };
-  if (queuePosition(key)) return { ok: true, queued: true, position: queuePosition(key) };
+  if (procs.has(key)) return { error: 'already running', ok: false };
+  if (queuePosition(key)) return { ok: true, position: queuePosition(key), queued: true };
   if (container) {
     const rt = containerRuntimeAvailable();
     // Fail loud, not silently downgrade to bare — a caller expecting a hard
     // memory/CPU cap getting a silently-uncapped process instead would defeat
     // the entire point. Explicit --bare is the escape hatch, not a fallback
     // this function reaches for on its own.
-    if (!rt.available) return { ok: false, error: 'no Docker-compatible daemon reachable (docker info failed) — start OrbStack/Docker Desktop, or pass --bare to run natively instead' };
+    if (!rt.available) return { error: 'no Docker-compatible daemon reachable (docker info failed) — start OrbStack/Docker Desktop, or pass --bare to run natively instead', ok: false };
   }
   if (procs.size >= MAX_CONCURRENT_DEV) {
-    startQueue.push({ key, repo, name, port, container });
-    return { ok: true, queued: true, position: startQueue.length, container };
+    startQueue.push({ container, key, name, port, repo });
+    return { container, ok: true, position: startQueue.length, queued: true };
   }
   const spawned = container ? spawnContainer(repo, name, port) : spawnWorktree(repo, name, port);
-  const result = { ok: true, container };
+  const result = { container, ok: true };
   // Only present when something was actually skipped. Every other caller
   // of /api/start keeps getting the exact response shape it already handles.
   if (spawned?.skippedSidecars?.length) result.skippedSidecars = spawned.skippedSidecars;
@@ -901,7 +901,7 @@ function startSidecars(repo, name, port) {
     if (!isSidecarApproved(WORKSPACE, repo, s)) { if (s.name) skipped.push(s.name); continue; }
     const fd  = openLogFd(repo, name, `sidecar-${s.name}`);
     const env = { ...process.env, PORT: String(port), ...s.env };
-    const proc = Bun.spawn([s.command, ...(s.args ?? [])], { cwd: wtDir, env, stdout: fd, stderr: fd, detached: true });
+    const proc = Bun.spawn([s.command, ...(s.args ?? [])], { cwd: wtDir, detached: true, env, stderr: fd, stdout: fd });
     const entry = wrapProc(proc);
     sidecarProcs.set(key, entry);
     proc.exited.then(() => { if (sidecarProcs.get(key) === entry) sidecarProcs.delete(key); });
@@ -920,25 +920,25 @@ async function stopSidecars(repo, name) {
 // (discovered-at-startup, PID only) sidecar entries — lets stop paths kill either
 // the same way, and lets a portal restart re-adopt a still-live sidecar instead of
 // losing track of it (inngestProcs/triggerProcs start as empty Maps every restart).
-function wrapProc(proc) { return { pid: proc.pid, native: proc }; }
-function wrapPid(pid)   { return { pid, native: null }; }
+function wrapProc(proc) { return { native: proc, pid: proc.pid }; }
+function wrapPid(pid)   { return { native: null, pid }; }
 // Container-backed entries have no OS pid Setu owns directly (the tracked
 // process is `docker compose up -d`, which exits once containers are
 // created) — `container` holds the compose project name instead, and
 // stop/reconcile paths branch on its presence.
-function wrapContainer(project) { return { pid: null, native: null, container: project }; }
+function wrapContainer(project) { return { container: project, native: null, pid: null }; }
 
 // ── inngest dev server ────────────────────────────────────────────────────────
 
 async function startInngest(repo, name, port) {
   const key   = `${repo}/${name}`;
-  if (inngestProcs.has(key)) return { ok: false, error: 'already running' };
+  if (inngestProcs.has(key)) return { error: 'already running', ok: false };
   const iPort = inngestPort(port);
-  if (await activePidAsync(iPort)) return { ok: false, error: `port ${iPort} already in use (untracked process)` };
+  if (await activePidAsync(iPort)) return { error: `port ${iPort} already in use (untracked process)`, ok: false };
   const fd    = openLogFd(repo, name, 'inngest');
   const proc  = Bun.spawn(
     [INNGEST_CLI, 'dev', '-p', String(iPort), '-u', `http://localhost:${port}/api/inngest`, '--no-discovery'],
-    { stdout: fd, stderr: fd, detached: true }
+    { detached: true, stderr: fd, stdout: fd }
   );
   const entry = wrapProc(proc);
   inngestProcs.set(key, entry);
@@ -956,7 +956,7 @@ async function stopInngest(repo, name, port) {
   const iPort = port != null ? inngestPort(port) : null;
   const pid   = iPort ? await activePidAsync(iPort) : null;
   if (pid) await killGroupAsync(pid);
-  if (!entry && !pid) return { ok: false, error: 'not running' };
+  if (!entry && !pid) return { error: 'not running', ok: false };
   return { ok: true };
 }
 
@@ -970,14 +970,14 @@ const TRIGGER_MAX_CONCURRENT_RUNS = 2;
 
 function startTrigger(repo, name) {
   const key = `${repo}/${name}`;
-  if (triggerProcs.has(key)) return { ok: false, error: 'already running' };
+  if (triggerProcs.has(key)) return { error: 'already running', ok: false };
   const wtDir = wtPath(repo, name);
   const fd    = openLogFd(repo, name, 'trigger');
   // trigger tasks import Supabase keys etc. from the shared .env.local at load time
   const env   = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
   const proc  = Bun.spawn(
     ['bunx', `trigger.dev@${pinnedTriggerVersion(wtDir)}`, 'dev', '--max-concurrent-runs', String(TRIGGER_MAX_CONCURRENT_RUNS)],
-    { cwd: wtDir, env, stdout: fd, stderr: fd, detached: true });
+    { cwd: wtDir, detached: true, env, stderr: fd, stdout: fd });
   const entry = wrapProc(proc);
   triggerProcs.set(key, entry);
   proc.exited.then(() => { if (triggerProcs.get(key) === entry) triggerProcs.delete(key); });
@@ -987,7 +987,7 @@ function startTrigger(repo, name) {
 async function stopTrigger(repo, name) {
   const key   = `${repo}/${name}`;
   const entry = triggerProcs.get(key);
-  if (!entry) return { ok: false, error: 'not running' };
+  if (!entry) return { error: 'not running', ok: false };
   // group-kill, not entry.native?.kill() — trigger.dev v4.5.3's own SIGTERM handler
   // races ahead of and defeats the code path that would dispose its esbuild child
   // (source-verified), so signal the whole process group directly instead
@@ -1059,13 +1059,13 @@ function convexDevAlreadyRunning(dir) {
 
 function startConvexDev(repo, name) {
   const key = `${repo}/${name}`;
-  if (convexDevProcs.has(key)) return { ok: false, error: 'already running' };
+  if (convexDevProcs.has(key)) return { error: 'already running', ok: false };
   const wtDir = wtPath(repo, name);
   const dir = convexDir(repo, wtDir);
-  if (!dir) return { ok: false, error: 'Convex is not configured in this worktree' };
-  if (!commandExists('npx')) return { ok: false, error: 'npx not found on PATH' };
+  if (!dir) return { error: 'Convex is not configured in this worktree', ok: false };
+  if (!commandExists('npx')) return { error: 'npx not found on PATH', ok: false };
   if (convexDevAlreadyRunning(dir)) {
-    return { ok: false, error: `a convex dev process already appears to be running in ${dir} (untracked, likely from before a portal restart)` };
+    return { error: `a convex dev process already appears to be running in ${dir} (untracked, likely from before a portal restart)`, ok: false };
   }
   const fd = openLogFd(repo, name, 'convex');
   // stdin: 'ignore', not inherited -- detection only proves convex/ or
@@ -1076,7 +1076,7 @@ function startConvexDev(repo, name) {
   // convexActive stuck true and an empty log, instead of failing the prompt
   // and exiting so the log actually explains what happened.
   const proc = Bun.spawn(['npx', 'convex', 'dev'],
-    { cwd: dir, stdout: fd, stderr: fd, stdin: 'ignore', detached: true });
+    { cwd: dir, detached: true, stderr: fd, stdin: 'ignore', stdout: fd });
   const entry = wrapProc(proc);
   convexDevProcs.set(key, entry);
   proc.exited.then(() => { if (convexDevProcs.get(key) === entry) convexDevProcs.delete(key); });
@@ -1086,7 +1086,7 @@ function startConvexDev(repo, name) {
 async function stopConvexDev(repo, name) {
   const key   = `${repo}/${name}`;
   const entry = convexDevProcs.get(key);
-  if (!entry) return { ok: false, error: 'not running' };
+  if (!entry) return { error: 'not running', ok: false };
   await killGroupAsync(entry.pid);
   convexDevProcs.delete(key);
   return { ok: true };
@@ -1110,20 +1110,20 @@ function deployToConvex(repo, name, target) {
   // a typo like 'staging' would silently run (and store) a preview deploy
   // under the wrong label instead of failing loudly.
   if (target !== 'preview' && target !== 'production') {
-    return { ok: false, error: "target must be 'preview' or 'production'" };
+    return { error: "target must be 'preview' or 'production'", ok: false };
   }
   const key = `${repo}/${name}`;
-  if (convexDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
+  if (convexDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
   const wtDir = wtPath(repo, name);
   const dir = convexDir(repo, wtDir);
-  if (!dir) return { ok: false, error: 'Convex is not configured in this worktree' };
-  if (!commandExists('npx')) return { ok: false, error: 'npx not found on PATH' };
+  if (!dir) return { error: 'Convex is not configured in this worktree', ok: false };
+  if (!commandExists('npx')) return { error: 'npx not found on PATH', ok: false };
 
   const { pathToBranch } = repoGitMeta(repo);
   const branch = pathToBranch.get(resolve(wtDir)) ?? name;
   const args = target === 'production' ? ['deploy'] : ['deploy', '--preview-create', slugify(branch)];
 
-  convexDeploys.set(key, { deploying: true, ok: false, error: null, target, startedAt: Date.now() });
+  convexDeploys.set(key, { deploying: true, error: null, ok: false, startedAt: Date.now(), target });
   // Piped, not the shared 'convex' log fd directly: startConvexDev above may
   // already hold that fd open for the persistent dev process, and
   // openLogFd's own rotateLog call (past 5MB) renames the log path out from
@@ -1135,7 +1135,7 @@ function deployToConvex(repo, name, target) {
   // acceptable for an occasional, normally-short action, unlike the dev
   // process's own log.
   const proc = Bun.spawn(['npx', 'convex', ...args],
-    { cwd: dir, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', timeout: 15 * 60 * 1000 });
+    { cwd: dir, stderr: 'pipe', stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
 
   (async () => {
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -1144,14 +1144,14 @@ function deployToConvex(repo, name, target) {
     const combined = `${out}${err}`.trim();
     appendFileSync(logPath(repo, name, 'convex'), `\n[deploy ${target}]\n${combined}\n`);
     if (code === 0) {
-      convexDeploys.set(key, { deploying: false, ok: true, error: null, target, startedAt: finishedAt });
+      convexDeploys.set(key, { deploying: false, error: null, ok: true, startedAt: finishedAt, target });
     } else {
       const reason = combined.split('\n').filter(l => l.trim()).at(-1) ?? `convex deploy exited ${code}`;
-      convexDeploys.set(key, { deploying: false, ok: false, error: reason, target, startedAt: finishedAt });
+      convexDeploys.set(key, { deploying: false, error: reason, ok: false, startedAt: finishedAt, target });
     }
   })();
 
-  return { ok: true, deploying: true, target };
+  return { deploying: true, ok: true, target };
 }
 
 // ── vercel deploy (per worktree, one-shot, not long-running like a dev
@@ -1177,15 +1177,15 @@ function vercelArgs(target) {
 
 function deployToVercel(repo, name, target) {
   const key = `${repo}/${name}`;
-  if (vercelDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
-  if (!commandExists('vercel')) return { ok: false, error: 'vercel CLI not found on PATH, install it first' };
+  if (vercelDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
+  if (!commandExists('vercel')) return { error: 'vercel CLI not found on PATH, install it first', ok: false };
   const wtDir = wtPath(repo, name);
   if (!existsSync(join(wtDir, '.vercel', 'project.json'))) {
-    return { ok: false, error: `this worktree isn't linked to a Vercel project, run "vercel link" in ${wtDir} first` };
+    return { error: `this worktree isn't linked to a Vercel project, run "vercel link" in ${wtDir} first`, ok: false };
   }
 
   const fd = openLogFd(repo, name, 'vercel');
-  vercelDeploys.set(key, { deploying: true, url: null, error: null, target, startedAt: Date.now() });
+  vercelDeploys.set(key, { deploying: true, error: null, startedAt: Date.now(), target, url: null });
   // stdin: 'ignore', not inherited: --yes skips vercel's own prompts, but a
   // stale/expired auth token can still make it prompt anyway. Inherited
   // stdin would then block forever with no terminal attached, wedging
@@ -1194,7 +1194,7 @@ function deployToVercel(repo, name, target) {
   // backstop for a different failure mode (a genuinely hung network call),
   // not the only guard against this one.
   const proc = Bun.spawn(['vercel', ...vercelArgs(target)],
-    { cwd: wtDir, stdout: 'pipe', stderr: fd, stdin: 'ignore', timeout: 15 * 60 * 1000 });
+    { cwd: wtDir, stderr: fd, stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
 
   (async () => {
     const url = (await new Response(proc.stdout).text()).trim();
@@ -1202,18 +1202,18 @@ function deployToVercel(repo, name, target) {
     const finishedAt = vercelDeploys.get(key)?.startedAt ?? Date.now();
     if (code === 0 && url) {
       appendFileSync(logPath(repo, name, 'vercel'), `\n${url}\n`);
-      vercelDeploys.set(key, { deploying: false, url, error: null, target, startedAt: finishedAt });
+      vercelDeploys.set(key, { deploying: false, error: null, startedAt: finishedAt, target, url });
     } else {
       // The real reason (bad auth, project mismatch, build failure) went to
       // the log fd above, not to stdout, which is why this reads it back
       // instead of settling for a bare exit code.
       const reason = tailLog(repo, name, 'vercel', 20).lines.filter(l => l.trim()).at(-1) ?? `vercel exited ${code}`;
       appendFileSync(logPath(repo, name, 'vercel'), `\n[deploy failed] ${reason}\n`);
-      vercelDeploys.set(key, { deploying: false, url: null, error: reason, target, startedAt: finishedAt });
+      vercelDeploys.set(key, { deploying: false, error: reason, startedAt: finishedAt, target, url: null });
     }
   })();
 
-  return { ok: true, deploying: true, target };
+  return { deploying: true, ok: true, target };
 }
 
 // ── netlify deploy (per worktree, one-shot, mirrors the vercel block above)
@@ -1252,8 +1252,8 @@ function parseNetlifyJson(text) {
 
 function deployToNetlify(repo, name, target) {
   const key = `${repo}/${name}`;
-  if (netlifyDeploys.get(key)?.deploying) return { ok: false, error: 'a deploy is already running for this worktree' };
-  if (!commandExists('netlify')) return { ok: false, error: 'netlify CLI not found on PATH, install it first' };
+  if (netlifyDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
+  if (!commandExists('netlify')) return { error: 'netlify CLI not found on PATH, install it first', ok: false };
   const wtDir = wtPath(repo, name);
   // .netlify/state.json is netlify link's output, same role .vercel/project.json
   // plays above -- but its mere existence only proves this worktree was linked
@@ -1266,11 +1266,11 @@ function deployToNetlify(repo, name, target) {
   let linkedSiteId = null;
   try { linkedSiteId = JSON.parse(readFileSync(join(wtDir, '.netlify', 'state.json'), 'utf8')).siteId ?? null; } catch {}
   if (!linkedSiteId) {
-    return { ok: false, error: `this worktree isn't linked to a Netlify site, run "netlify link" in ${wtDir} first` };
+    return { error: `this worktree isn't linked to a Netlify site, run "netlify link" in ${wtDir} first`, ok: false };
   }
 
   const fd = openLogFd(repo, name, 'netlify');
-  netlifyDeploys.set(key, { deploying: true, url: null, error: null, target, startedAt: Date.now() });
+  netlifyDeploys.set(key, { deploying: true, error: null, startedAt: Date.now(), target, url: null });
   // stdin: 'ignore', not inherited: with no --yes/--auto flag to lean on, the
   // thing standing between this and a wedged prompt is netlify-cli's own
   // isInteractive() gate (checked directly in its source), which requires
@@ -1281,7 +1281,7 @@ function deployToNetlify(repo, name, target) {
   // terminal attached. The timeout below is a backstop for a different
   // failure mode (a genuinely hung network call or local build step).
   const proc = Bun.spawn(['netlify', ...netlifyArgs(target)],
-    { cwd: wtDir, stdout: 'pipe', stderr: fd, stdin: 'ignore', timeout: 15 * 60 * 1000 });
+    { cwd: wtDir, stderr: fd, stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
 
   (async () => {
     const out = await new Response(proc.stdout).text();
@@ -1296,7 +1296,7 @@ function deployToNetlify(repo, name, target) {
 
     if (ok && url) {
       appendFileSync(logPath(repo, name, 'netlify'), `\n${url}\n`);
-      netlifyDeploys.set(key, { deploying: false, url, error: null, target, startedAt: finishedAt });
+      netlifyDeploys.set(key, { deploying: false, error: null, startedAt: finishedAt, target, url });
       return;
     }
 
@@ -1317,10 +1317,10 @@ function deployToNetlify(repo, name, target) {
       reason = tailLog(repo, name, 'netlify', 20).lines.filter(l => l.trim()).at(-1) ?? `netlify exited ${code}`;
       appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] ${reason}\n`);
     }
-    netlifyDeploys.set(key, { deploying: false, url: null, error: reason, target, startedAt: finishedAt });
+    netlifyDeploys.set(key, { deploying: false, error: reason, startedAt: finishedAt, target, url: null });
   })();
 
-  return { ok: true, deploying: true, target };
+  return { deploying: true, ok: true, target };
 }
 
 // ── single cloudflared process with merged ingress ────────────────────────────
@@ -1358,13 +1358,13 @@ function restartTunnel() {
   const fd = openTunnelLog();
   tunnelProc = Bun.spawn(
     [CLOUDFLARED_BIN, '--config', MERGED_CONF, 'tunnel', 'run', TUNNEL_NAME],
-    { stdout: fd, stderr: fd }
+    { stderr: fd, stdout: fd }
   );
   tunnelProc.exited.then(() => { tunnelProc = null; });
 }
 
 function addTunnelRoute(repo, name, pubDom, port) {
-  activeTunnelMap.set(`${repo}/${name}`, { pubDom, port });
+  activeTunnelMap.set(`${repo}/${name}`, { port, pubDom });
   restartTunnel();
   return { ok: true };
 }
@@ -1431,9 +1431,9 @@ async function createWorktree(repo, name, tunnel) {
   // mise trust + bun install (background — takes a while)
   const setupFd = openLogFd(repo, name, 'setup');
   Bun.spawn(['zsh', '-c', `mise trust "${res.wtDir}" 2>/dev/null; cd "${res.wtDir}" && bun install`],
-    { stdout: setupFd, stderr: setupFd });
+    { stderr: setupFd, stdout: setupFd });
 
-  return { ok: true, port: res.port, domain: res.localDom };
+  return { domain: res.localDom, ok: true, port: res.port };
 }
 
 async function removeWorktree(repo, name, reason = 'manual') {
@@ -1465,16 +1465,16 @@ async function removeWorktree(repo, name, reason = 'manual') {
   // worktree remove` never leaves a phantom archive entry for a worktree
   // that's still there.
   const archiveRecord = {
-    repo, name,
-    label:  REPO_META[repo]?.label ?? repo,
     branch: repoGitMeta(repo).pathToBranch.get(resolve(wtDir)) ?? name,
+    label:  REPO_META[repo]?.label ?? repo,name,
     prUrl:  prCache.get(`${repo}/${name}`)?.url ?? null,
-    removedAt: Math.floor(Date.now() / 1000),
     reason: reason === 'merged' ? 'merged' : 'manual',
+    removedAt: Math.floor(Date.now() / 1000),
+    repo, 
   };
 
   try { libRemoveWorktree(_cfg, repo, name); }
-  catch (e) { return { ok: false, error: String(e) }; }
+  catch (e) { return { error: String(e), ok: false }; }
 
   appendArchivedWorktree(WORKSPACE, archiveRecord);
   prCache.delete(`${repo}/${name}`);
@@ -1492,13 +1492,13 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
     .replace(/\.git$/, '');
 
   const name  = (nameArg.trim() || slug.split('/').at(-1) || '').replace(/[^a-zA-Z0-9._-]/g, '-');
-  if (!name) return { ok: false, error: 'repo name required' };
+  if (!name) return { error: 'repo name required', ok: false };
 
   const label_ = label.trim() || name;
   const repoDir = repoPath(name);
 
   if (loadProjects(WORKSPACE)[name]) {
-    return { ok: false, error: `${name} is already registered` };
+    return { error: `${name} is already registered`, ok: false };
   }
 
   // Bare clone (existing) or bare init (new)
@@ -1512,10 +1512,10 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
     execFileSync('git', ['-C', repoDir, 'init', '--bare']);
   }
 
-  const base = registerProject(WORKSPACE, { name, slug, label: label_ });
+  const base = registerProject(WORKSPACE, { label: label_, name, slug });
   REPO_META = loadProjects(WORKSPACE);
 
-  return { ok: true, name, base, slug: slug || null, label: label_ };
+  return { base, label: label_, name, ok: true, slug: slug || null };
 }
 
 // ── open in Ghostty ───────────────────────────────────────────────────────────
@@ -1526,7 +1526,7 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
 function openInGhostty(wtDir, tool) {
   const cmd = AGENT_CLIS[tool]?.bin
     ?? loadCustomAgents(WORKSPACE).find(a => a.id === tool)?.command;
-  if (!cmd) return { ok: false, error: 'unknown tool' };
+  if (!cmd) return { error: 'unknown tool', ok: false };
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
   writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
   // Not a raw `ghostty` spawn — Ghostty's own --help is explicit that launching
@@ -1547,12 +1547,12 @@ function openInGhostty(wtDir, tool) {
 // no-op, so this works uniformly for both.
 async function jsonTry(fn) {
   try { return Response.json(await fn()); }
-  catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
+  catch (e) { return Response.json({ error: String(e), ok: false }, { status: 500 }); }
 }
 
 // Shared by /api/projects and mcp-server.js's list_projects tool.
 function listProjectsSummary() {
-  return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ name, label: m.label, github: m.github }));
+  return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ github: m.github, label: m.label, name }));
 }
 
 // Each domain router below returns a Response for a route it owns, or null
@@ -1590,13 +1590,13 @@ async function projectRoutes(req, pathname, method, server) {
   if (method === 'POST' && pathname === '/api/sweep/import') {
     const body = await req.json().catch(() => ({}));
     const { name, remoteUrl, label } = body;
-    if (!name || !remoteUrl) return Response.json({ ok: false, error: 'name and remoteUrl required' });
+    if (!name || !remoteUrl) return Response.json({ error: 'name and remoteUrl required', ok: false });
     // Same guard addProject() already uses — a conflicting candidate should
     // never reach here (the UI disables those rows), but importRepo() itself
     // would otherwise silently no-op against the wrong existing project.
-    if (loadProjects(WORKSPACE)[name]) return Response.json({ ok: false, error: `${name} is already registered` });
+    if (loadProjects(WORKSPACE)[name]) return Response.json({ error: `${name} is already registered`, ok: false });
     return jsonTry(async () => {
-      await importRepo(_cfg, { name, remoteUrl, label });
+      await importRepo(_cfg, { label, name, remoteUrl });
       REPO_META = loadProjects(WORKSPACE);
       return { ok: true };
     });
@@ -1615,11 +1615,11 @@ async function settingsRoutes(req, pathname, method) {
   if (pathname === '/api/settings') {
     if (method === 'GET') {
       return Response.json({
-        maxConcurrentDevServers: MAX_CONCURRENT_DEV,
-        containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
         containerCpuLimit: _cfg.containerCpuLimit ?? 2,
-        mac: macCapacity(),
+        containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
         docker: engineCapacity(),
+        mac: macCapacity(),
+        maxConcurrentDevServers: MAX_CONCURRENT_DEV,
       });
     }
     if (method === 'POST') {
@@ -1721,7 +1721,7 @@ async function mcpRoutes(req, pathname, method) {
   if (pathname === '/api/mcp-servers') {
     if (method === 'GET') {
       const statuses = mcpStatuses();
-      return Response.json(loadMcpServers(WORKSPACE).map(s => ({ ...s, ...(statuses[s.id] ?? { status: 'disconnected', tools: [], stderrTail: [], error: null }) })));
+      return Response.json(loadMcpServers(WORKSPACE).map(s => ({ ...s, ...(statuses[s.id] ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] }) })));
     }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
@@ -1737,7 +1737,7 @@ async function mcpRoutes(req, pathname, method) {
   if (pathname === '/api/mcp/connect' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
     const server = loadMcpServers(WORKSPACE).find(s => s.id === body.id);
-    if (!server) return Response.json({ ok: false, error: 'server not found' }, { status: 404 });
+    if (!server) return Response.json({ error: 'server not found', ok: false }, { status: 404 });
     connectMcpServer(server, WORKSPACE).catch(() => {}); // internal errors are already caught and recorded in mcp.js's own status map
     return Response.json({ ok: true });
   }
@@ -1772,7 +1772,7 @@ async function mcpRoutes(req, pathname, method) {
 
 async function raycastRoutes(req, pathname, method) {
   if (pathname === '/api/raycast/status') {
-    return Response.json({ running: !!raycastDev, dirExists: existsSync(RAYCAST_DIR) });
+    return Response.json({ dirExists: existsSync(RAYCAST_DIR), running: !!raycastDev });
   }
   if (pathname === '/api/raycast/log') {
     const n = Number(new URL(req.url).searchParams.get('n') ?? 150);
@@ -1800,25 +1800,25 @@ async function prReviewStatus(repo, name) {
   const wtDir = wtPath(repo, name);
   const pluginInstalled = detectPrWalkthroughPlugin(wtDir);
   const pr = await fetchPR(repo, name);
-  if (!pr.number) return { pluginInstalled, pr: null, run: null, artifacts: {} };
+  if (!pr.number) return { artifacts: {}, pluginInstalled, pr: null, run: null };
   const slug = REPO_META[repo]?.slug ?? repo;
   const headSha = (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
   const artifacts = {};
   for (const skill of PR_REVIEW_SKILLS) artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
-  return { pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name), artifacts };
+  return { artifacts, pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name) };
 }
 
 // Shared by /api/pr-review/run and mcp-server.js's run_pr_review tool.
 async function prReviewRun(repo, name, skill) {
   if (!PR_REVIEW_SKILLS.has(skill)) throw new Error('unknown skill');
   const pr = await fetchPR(repo, name);
-  if (!pr.number) return { ok: false, error: 'no pull request associated with this worktree' };
+  if (!pr.number) return { error: 'no pull request associated with this worktree', ok: false };
   const slug = REPO_META[repo]?.slug ?? repo;
   touchLastSeen(repo, name);
   const fd = openLogFd(repo, name, 'pr-review');
   return runDeepReview(repo, name, skill, {
-    wtDir: wtPath(repo, name), slug, prNumber: pr.number,
-    logFd: fd, logPath: logPath(repo, name, 'pr-review'), spawnText,
+    logFd: fd, logPath: logPath(repo, name, 'pr-review'), prNumber: pr.number,slug, spawnText,
+    wtDir: wtPath(repo, name), 
   });
 }
 
@@ -1828,15 +1828,15 @@ async function prReviewRoutes(req, pathname, method) {
   if (pathname === '/api/pr-review/status' && method === 'GET') {
     const p = new URL(req.url).searchParams;
     const repo = p.get('repo'), name = p.get('name');
-    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
     return jsonTry(() => prReviewStatus(repo, name));
   }
 
   if (pathname === '/api/pr-review/run' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
     const { repo, name, skill } = body;
-    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
-    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ ok: false, error: 'unknown skill' }, { status: 400 });
+    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
+    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ error: 'unknown skill', ok: false }, { status: 400 });
     return jsonTry(() => prReviewRun(repo, name, skill));
   }
 
@@ -1846,8 +1846,8 @@ async function prReviewRoutes(req, pathname, method) {
   if (pathname === '/api/pr-review/artifact' && method === 'GET') {
     const p = new URL(req.url).searchParams;
     const repo = p.get('repo'), name = p.get('name'), skill = p.get('skill');
-    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
-    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ ok: false, error: 'unknown skill' }, { status: 400 });
+    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
+    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ error: 'unknown skill', ok: false }, { status: 400 });
     const pr = await fetchPR(repo, name);
     if (!pr.number) return new Response('No pull request for this worktree', { status: 404 });
     const slug = REPO_META[repo]?.slug ?? repo;
@@ -1927,7 +1927,7 @@ async function worktreeRoutes(req, pathname, method, server) {
   if (pathname === '/api/diff') {
     const p    = new URL(req.url).searchParams;
     const repo = p.get('repo'), name = p.get('name');
-    if (!repo || !name) return Response.json({ ok: false, error: 'repo and name required' }, { status: 400 });
+    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
     touchLastSeen(repo, name);
     return jsonTry(() => computeDiff(repo, name));
   }
@@ -1939,7 +1939,7 @@ async function worktreeRoutes(req, pathname, method, server) {
   // comment above) -- a GET never reads req.json().
   if (pathname === '/api/repo-prs') {
     const repo = new URL(req.url).searchParams.get('repo');
-    if (!repo) return Response.json({ ok: false, error: 'repo required' }, { status: 400 });
+    if (!repo) return Response.json({ error: 'repo required', ok: false }, { status: 400 });
     return jsonTry(() => fetchRepoPRs(repo));
   }
 
@@ -2012,15 +2012,15 @@ async function worktreeRoutes(req, pathname, method, server) {
       return Response.json(await stopConvexDev(repo, name));
     }
     if (pathname === '/api/convex/deploy') {
-      if (!target) return Response.json({ ok: false, error: 'target required' });
+      if (!target) return Response.json({ error: 'target required', ok: false });
       return jsonTry(() => deployToConvex(repo, name, target));
     }
     if (pathname === '/api/vercel/deploy') {
-      if (!target) return Response.json({ ok: false, error: 'target required' });
+      if (!target) return Response.json({ error: 'target required', ok: false });
       return jsonTry(() => deployToVercel(repo, name, target));
     }
     if (pathname === '/api/netlify/deploy') {
-      if (!target) return Response.json({ ok: false, error: 'target required' });
+      if (!target) return Response.json({ error: 'target required', ok: false });
       return jsonTry(() => deployToNetlify(repo, name, target));
     }
     if (pathname === '/api/open') {
@@ -2054,11 +2054,11 @@ const ACTIONS_LOG = `${LOGS}/actions.log`;
 function logAction(pathname, body, ok, error) {
   rotateLog(ACTIONS_LOG);
   const entry = {
-    ts: new Date().toISOString(),
-    route: pathname,
-    repo: body?.repo ?? null,
     name: body?.name ?? null,
     ok,
+    repo: body?.repo ?? null,
+    route: pathname,
+    ts: new Date().toISOString(),
     ...(error ? { error: String(error).slice(0, 500) } : {}),
   };
   try { appendFileSync(ACTIONS_LOG, JSON.stringify(entry) + '\n'); } catch {}
@@ -2277,7 +2277,7 @@ setInterval(checkIdleTimeouts, IDLE_CHECK_INTERVAL);
   reconcileTriggerSidecars();
   const wts = await getWorktrees().catch(() => []);
   for (const w of wts) {
-    if (w.tunnelOn) activeTunnelMap.set(w.key, { pubDom: w.pubDomain, port: w.port });
+    if (w.tunnelOn) activeTunnelMap.set(w.key, { port: w.port, pubDom: w.pubDomain });
   }
   if (activeTunnelMap.size > 0) restartTunnel();
 })();
@@ -2304,9 +2304,9 @@ function computeStatus() {
   return {
     concurrency: { active: procs.size, max: MAX_CONCURRENT_DEV, queued: startQueue.length },
     container: {
-      engineAvailable: rt.available, engine: rt.engine,
+      cpuLimit: _cfg.containerCpuLimit ?? 2,engine: rt.engine,
+      engineAvailable: rt.available, 
       memoryLimit: _cfg.containerMemoryLimit ?? '4g',
-      cpuLimit: _cfg.containerCpuLimit ?? 2,
     },
   };
 }
@@ -2320,11 +2320,11 @@ async function wsTickWorktrees() {
   // used to.
   const worktrees = await getWorktrees().catch(() => null);
   if (!worktrees) return;
-  const payload = { worktrees, status: computeStatus() };
+  const payload = { status: computeStatus(), worktrees };
   const json = JSON.stringify(payload);
   if (json === entry.lastBroadcast) return;
   entry.lastBroadcast = json;
-  server.publish('worktrees', JSON.stringify({ topic: 'worktrees', data: payload }));
+  server.publish('worktrees', JSON.stringify({ data: payload, topic: 'worktrees' }));
 }
 
 // repo never contains a slash (same assumption splitKey in lib.js makes for
@@ -2337,8 +2337,8 @@ function splitLogTopic(topic) {
   const lastSlash = rest.lastIndexOf('/');
   if (firstSlash === -1 || firstSlash === lastSlash) return null; // not repo/name/type shaped
   return {
-    repo: rest.slice(0, firstSlash),
     name: rest.slice(firstSlash + 1, lastSlash),
+    repo: rest.slice(0, firstSlash),
     type: rest.slice(lastSlash + 1),
   };
 }
@@ -2352,7 +2352,7 @@ function wsTickLog(topic, repo, name, type) {
   const delta = total - entry.lastTotal;
   const newLines = rotated || delta > lines.length ? lines : lines.slice(-delta);
   entry.lastTotal = total;
-  server.publish(topic, JSON.stringify({ topic, data: newLines }));
+  server.publish(topic, JSON.stringify({ data: newLines, topic }));
 }
 
 function wsSubscribeLog(ws, topic) {
@@ -2364,7 +2364,7 @@ function wsSubscribeLog(ws, topic) {
   ws.data.add(topic);
   let entry = wsTopics.get(topic);
   if (!entry) {
-    entry = { interval: null, subscriberCount: 0, lastBroadcast: null, lastTotal: null };
+    entry = { interval: null, lastBroadcast: null, lastTotal: null, subscriberCount: 0 };
     wsTopics.set(topic, entry);
   }
   entry.subscriberCount++;
@@ -2376,7 +2376,7 @@ function wsSubscribeLog(ws, topic) {
     // catch-up is the whole window tailLog just returned.
     entry.lastTotal = total;
     entry.interval = setInterval(() => wsTickLog(topic, repo, name, type), 1000);
-    ws.send(JSON.stringify({ topic, data: lines }));
+    ws.send(JSON.stringify({ data: lines, topic }));
   } else {
     // A later subscriber joining an already-ticking topic. Lines beyond the
     // shared entry.lastTotal baseline are about to go out to everyone (this
@@ -2386,7 +2386,7 @@ function wsSubscribeLog(ws, topic) {
     // here and once from that tick's publish.
     const pending = total - entry.lastTotal;
     const catchUp = pending > 0 ? lines.slice(0, lines.length - pending) : lines;
-    ws.send(JSON.stringify({ topic, data: catchUp }));
+    ws.send(JSON.stringify({ data: catchUp, topic }));
   }
 }
 
@@ -2411,7 +2411,7 @@ async function open(ws) {
   ws.subscribe('worktrees');
   let entry = wsTopics.get('worktrees');
   if (!entry) {
-    entry = { interval: null, subscriberCount: 0, lastBroadcast: null, lastTotal: null };
+    entry = { interval: null, lastBroadcast: null, lastTotal: null, subscriberCount: 0 };
     wsTopics.set('worktrees', entry);
   }
   entry.subscriberCount++;
@@ -2423,7 +2423,7 @@ async function open(ws) {
   // actually changes -- the diff-guard exists to skip redundant broadcasts
   // to already-synced connections, not to gate a brand new one's first sync.
   const worktrees = await getWorktrees().catch(() => null);
-  if (worktrees) ws.send(JSON.stringify({ topic: 'worktrees', data: { worktrees, status: computeStatus() } }));
+  if (worktrees) ws.send(JSON.stringify({ data: { status: computeStatus(), worktrees }, topic: 'worktrees' }));
 }
 
 function message(ws, raw) {
@@ -2450,24 +2450,24 @@ function close(ws) {
 // back into this same server. Function declarations are hoisted, so every
 // name here is already defined despite most living further up the file.
 initMcpServer({
-  getWorktrees, createWorktree, removeWorktree,
+  computeDiff, 
+  createPr, createWorktree, 
+  fetchRepoPRs, 
+  getWorktrees, 
+  listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,prReviewRun,prReviewStatus, removeWorktree,setPrReady,
   startWorktree: startWorktreeByName, stopWorktree: stopWorktreeByName,
-  syncWorktree: syncWorktreeByName,
-  computeDiff, tailLog,
-  listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,
-  fetchRepoPRs, prReviewStatus, prReviewRun,
-  createPr, setPrReady,
+  syncWorktree: syncWorktreeByName,tailLog,
 });
 
 const server = Bun.serve({
+  development: false,
+  fetch: handle,
   port: PORT,
   // Both routes serve the identical SPA shell — the client-side router (app.tsx)
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/worktree/:repo/:name': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/help': indexPage, '/ports': indexPage, '/archived': indexPage },
-  fetch: handle,
-  websocket: { open, message, close },
-  development: false,
+  routes: { '/': indexPage, '/archived': indexPage, '/help': indexPage, '/ports': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/worktree/:repo/:name': indexPage },
+  websocket: { close, message, open },
 });
 console.log(`Portal → http://quivly.local  (localhost:${PORT})`);

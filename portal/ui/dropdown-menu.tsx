@@ -148,6 +148,7 @@ const dropdownMenuItemVariants = cva(
   // here can rely on UA button cursor/focus-ring defaults.
   'flex w-full cursor-default select-none items-center gap-2 whitespace-nowrap rounded-none px-3 py-1.5 text-xs outline-none transition-colors duration-150 data-disabled:pointer-events-none data-disabled:opacity-50',
   {
+    defaultVariants: { tone: 'zinc' },
     variants: {
       // data-highlighted (not hover:/focus:) is the one selector that covers
       // both pointer and keyboard highlighting in a single rule — Menu.Root's
@@ -158,11 +159,10 @@ const dropdownMenuItemVariants = cva(
       // primary actions only; every menu item glowing green would break that
       // reservation, not honor the "vibrant" rule.
       tone: {
-        zinc: 'text-zinc-700 dark:text-zinc-300 data-highlighted:bg-zinc-50 dark:data-highlighted:bg-white/10',
         red: 'text-signal-red data-highlighted:bg-signal-red/10 dark:data-highlighted:bg-signal-red/15',
+        zinc: 'text-zinc-700 dark:text-zinc-300 data-highlighted:bg-zinc-50 dark:data-highlighted:bg-white/10',
       },
     },
-    defaultVariants: { tone: 'zinc' },
   },
 );
 

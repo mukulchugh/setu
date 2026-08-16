@@ -112,7 +112,7 @@ function parseRoute(pathname: string): Route {
   if (pathname === '/ports') return { page: 'ports' };
   if (pathname === '/archived') return { page: 'archived' };
   const wt = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
-  if (wt) return { page: 'detail', repo: decodeURIComponent(wt[1]), name: decodeURIComponent(wt[2]) };
+  if (wt) return { name: decodeURIComponent(wt[2]), page: 'detail', repo: decodeURIComponent(wt[1]) };
   const repo = pathname.match(/^\/repo\/([^/]+)$/);
   if (repo) return { page: 'repo', repo: decodeURIComponent(repo[1]) };
   return { page: 'list' };
@@ -138,7 +138,7 @@ function useRoute(): Route {
 function worktreeStatus(w: Worktree): { tone: Tone; text: string } {
   const tone: Tone = w.active ? 'emerald' : w.queued ? 'amber' : 'zinc';
   const text = w.active ? 'running' : w.queued ? `queued #${w.queuePosition}` : 'stopped';
-  return { tone, text };
+  return { text, tone };
 }
 
 // Shared by WorktreeCard and WorktreePage, same deploying/error/url/idle
@@ -222,7 +222,7 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
     if (!name.trim()) return;
     setBusy(true);
     setStatus('Setting up worktree and running bun install in background…');
-    const res = await post('/api/create', { repo, name: name.trim(), tunnel });
+    const res = await post('/api/create', { name: name.trim(), repo, tunnel });
     if (res.ok) {
       setStatus(`✓ Created on port ${res.port}`);
       onCreated();
@@ -302,7 +302,7 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
     if (tab === 'existing' ? !gh : !name) return;
     setBusy(true);
     setStatus(tab === 'existing' ? 'Cloning repo…' : 'Initializing repo…');
-    const res = await post('/api/project/add', { github: gh, name, label: label.trim() });
+    const res = await post('/api/project/add', { github: gh, label: label.trim(), name });
     if (res.ok) {
       setStatus(`✓ Added ${res.name} (port band ${res.base}–${res.base + 99})`);
       onAdded();
@@ -436,8 +436,8 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
 // worktree card on the page is exactly the kind of thing Preact expects a
 // component (mounted fresh per call site) to handle instead.
 const DEPLOY_PROVIDER: Record<DeployProvider, { label: string; Icon: (props: { class?: string }) => JSX.Element; customPrompt: string }> = {
-  vercel:  { label: 'Vercel',  Icon: VercelIcon,  customPrompt: 'Custom environment name (e.g. staging):' },
-  netlify: { label: 'Netlify', Icon: NetlifyIcon, customPrompt: 'Branch name for the deploy context (e.g. staging):' },
+  netlify: { customPrompt: 'Branch name for the deploy context (e.g. staging):', Icon: NetlifyIcon, label: 'Netlify' },
+  vercel:  { customPrompt: 'Custom environment name (e.g. staging):', Icon: VercelIcon,  label: 'Vercel'  },
 };
 
 // Same "icon button opens a picker" shape as StartControl's force-mode menu
@@ -528,7 +528,7 @@ type PrReviewStatus = {
 };
 
 const PR_REVIEW_SKILLS = ['pr-walkthrough', 'pr-brief'] as const;
-const PR_REVIEW_LABEL: Record<typeof PR_REVIEW_SKILLS[number], string> = { 'pr-walkthrough': 'Deep review', 'pr-brief': 'Brief' };
+const PR_REVIEW_LABEL: Record<typeof PR_REVIEW_SKILLS[number], string> = { 'pr-brief': 'Brief', 'pr-walkthrough': 'Deep review' };
 
 // Tier 2 of PR review -- shells out to the installed pr-walkthrough/pr-brief
 // Claude Code plugin (see pr-review.js). Self-contained, same "owns its own
@@ -551,7 +551,7 @@ function PrReviewSection({ w, toast, onOpenLogs }: {
   }, [load]);
 
   async function run(skill: string) {
-    const res = await postOrToast('/api/pr-review/run', { repo: w.repo, name: w.name, skill }, toast, 'pr-review failed to start');
+    const res = await postOrToast('/api/pr-review/run', { name: w.name, repo: w.repo, skill }, toast, 'pr-review failed to start');
     if (res?.ok) load();
   }
 
@@ -627,14 +627,14 @@ function GithubActionsSection({ w, toast, onRefresh }: {
 
   async function createPr() {
     setBusy('create');
-    const res = await postOrToast('/api/pr/create', { repo: w.repo, name: w.name }, toast, 'create PR failed');
+    const res = await postOrToast('/api/pr/create', { name: w.name, repo: w.repo }, toast, 'create PR failed');
     setBusy(null);
     if (res?.ok) { toast(`PR created`, 'emerald'); onRefresh(); }
   }
 
   async function toggleReady(ready: boolean) {
     setBusy('ready');
-    const res = await postOrToast('/api/pr/ready', { repo: w.repo, name: w.name, ready }, toast, `mark ${ready ? 'ready' : 'draft'} failed`);
+    const res = await postOrToast('/api/pr/ready', { name: w.name, ready, repo: w.repo }, toast, `mark ${ready ? 'ready' : 'draft'} failed`);
     setBusy(null);
     if (res?.ok) onRefresh();
   }
@@ -1424,7 +1424,7 @@ function RepoPage({ repo, label, github, worktrees, agents, pendingStart, onAct,
   const [fileSyncGlobs, setFileSyncGlobs] = useState<string[] | null>(null);
 
   const loadPrs = useCallback(async () => {
-    setPrs(await fetch(`/api/repo-prs?repo=${encodeURIComponent(repo)}`).then(r => r.json()).catch(() => ({ prs: [], error: 'request failed' })));
+    setPrs(await fetch(`/api/repo-prs?repo=${encodeURIComponent(repo)}`).then(r => r.json()).catch(() => ({ error: 'request failed', prs: [] })));
   }, [repo]);
   useEffect(() => { loadPrs(); }, [loadPrs]);
 
@@ -1610,7 +1610,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
   }
 
   async function approveSidecarRow(name: string) {
-    await postOrToast('/api/sidecar-approvals/approve', { repo: sidecarRepo, name }, toast, 'approve failed');
+    await postOrToast('/api/sidecar-approvals/approve', { name, repo: sidecarRepo }, toast, 'approve failed');
     loadSidecarsList();
   }
 
@@ -1619,7 +1619,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
   async function saveFileSyncGlobsList() {
     const globs = fileSyncText.split(/[,\n]/).map(g => g.trim()).filter(Boolean);
     setFileSyncSaving(true);
-    await postOrToast('/api/file-sync-globs', { repo: fileSyncRepo, globs }, toast, 'save failed');
+    await postOrToast('/api/file-sync-globs', { globs, repo: fileSyncRepo }, toast, 'save failed');
     setFileSyncSaving(false);
   }
 
@@ -1701,7 +1701,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
                 onApprove={() => approveSidecarRow(s.name)} />
             ))}
             <div class="flex items-center gap-3 pt-2">
-              <Button variant="secondary" onClick={() => setSidecars(list => [...list, { name: '', command: '', args: [], enabled: true }])}>+ Add sidecar</Button>
+              <Button variant="secondary" onClick={() => setSidecars(list => [...list, { args: [], command: '', enabled: true, name: '' }])}>+ Add sidecar</Button>
               <Button variant="primary" onClick={() => saveSidecarsList(sidecars)} disabled={sidecarsSaving}>{sidecarsSaving ? 'Saving…' : 'Save sidecars'}</Button>
             </div>
             <p class="text-[11px] text-zinc-400 mt-1">Runs alongside the dev server on Start — for anything that isn't Inngest/trigger.dev/tunnel, which already have first-class controls on each worktree's page.</p>
@@ -1737,7 +1737,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
               onRemove={() => saveCustomAgentsList(customAgents.filter((_, j) => j !== i))} />
           ))}
           <div class="flex items-center gap-3 pt-2">
-            <Button variant="secondary" onClick={() => setCustomAgents(list => [...list, { id: '', label: '', command: '' }])}>+ Add custom agent</Button>
+            <Button variant="secondary" onClick={() => setCustomAgents(list => [...list, { command: '', id: '', label: '' }])}>+ Add custom agent</Button>
             <Button variant="primary" onClick={() => saveCustomAgentsList(customAgents)} disabled={customAgentsSaving}>{customAgentsSaving ? 'Saving…' : 'Save custom agents'}</Button>
           </div>
           <p class="text-[11px] text-zinc-400 mt-1">Shows up in every worktree's "Open in" row alongside Claude/Cursor/etc. Not <span class="font-mono">which</span>-checked — make sure the command actually runs.</p>
@@ -1777,16 +1777,16 @@ function SidebarButton({ icon, label, active = false, activeClass, tip, onClick,
 // Matches the wording already used for the same action elsewhere (menu
 // items, section buttons) instead of echoing the raw url path fragment.
 const ACT_LABEL: Record<string, string> = {
-  '/api/stop': 'Stop server',
-  '/api/sync': 'Sync with staging',
-  '/api/inngest/start': 'Start Inngest',
-  '/api/inngest/stop': 'Stop Inngest',
-  '/api/trigger/start': 'Start trigger.dev',
-  '/api/trigger/stop': 'Stop trigger.dev',
   '/api/convex/start': 'Start Convex dev',
   '/api/convex/stop': 'Stop Convex dev',
-  '/api/tunnel/enable': 'Enable tunnel',
+  '/api/inngest/start': 'Start Inngest',
+  '/api/inngest/stop': 'Stop Inngest',
+  '/api/stop': 'Stop server',
+  '/api/sync': 'Sync with staging',
+  '/api/trigger/start': 'Start trigger.dev',
+  '/api/trigger/stop': 'Stop trigger.dev',
   '/api/tunnel/disable': 'Disable tunnel',
+  '/api/tunnel/enable': 'Enable tunnel',
 };
 
 function App() {
@@ -1842,7 +1842,7 @@ function App() {
   // route.page === 'repo' dispatch below), so both callbacks navigate to
   // the list page first, same as ArchivedPage's onRecreate does.
   const onCreateFromPr = (repo: string, branch: string) => {
-    setRecreatePrefill({ repo, name: branch });
+    setRecreatePrefill({ name: branch, repo });
     navigate('/');
   };
 
@@ -1918,7 +1918,7 @@ function App() {
   }, []);
 
   async function act(url: string, w: Worktree) {
-    await postOrToast(url, { repo: w.repo, name: w.name }, toast, `${ACT_LABEL[url] ?? url.replace('/api/', '')} failed`);
+    await postOrToast(url, { name: w.name, repo: w.repo }, toast, `${ACT_LABEL[url] ?? url.replace('/api/', '')} failed`);
     refresh();
   }
 
@@ -1930,13 +1930,13 @@ function App() {
   // still isn't proof of a visible window), but it at least surfaces the
   // failure mode this endpoint CAN detect, matching how act()/start() already behave.
   async function openTool(w: Worktree, tool: string) {
-    await postOrToast('/api/open', { repo: w.repo, name: w.name, tool }, toast, 'open failed');
+    await postOrToast('/api/open', { name: w.name, repo: w.repo, tool }, toast, 'open failed');
   }
 
   async function start(w: Worktree, force?: 'container' | 'bare') {
     pendingStart.current.add(w.key);
     setWorktrees([...worktrees]);
-    const body: { repo: string; name: string; container?: boolean } = { repo: w.repo, name: w.name };
+    const body: { repo: string; name: string; container?: boolean } = { name: w.name, repo: w.repo };
     if (force) body.container = force === 'container';
     const res = await postOrToast('/api/start', body, toast, 'start failed');
     if (!res?.ok) pendingStart.current.delete(w.key);
@@ -1950,7 +1950,7 @@ function App() {
 
   async function remove(w: Worktree, reason: 'manual' | 'merged' = 'manual') {
     if (!confirm(`Remove worktree "${w.name}"? The branch will not be deleted.`)) return;
-    await postOrToast('/api/remove', { repo: w.repo, name: w.name, reason }, toast, 'remove failed');
+    await postOrToast('/api/remove', { name: w.name, reason, repo: w.repo }, toast, 'remove failed');
     refresh();
   }
 
@@ -1963,7 +1963,7 @@ function App() {
   // deployToVercel and deployToNetlify on the server take the same
   // (repo, name, target) shape.
   async function deploy(w: Worktree, provider: DeployProvider, target: string) {
-    await postOrToast(`/api/${provider}/deploy`, { repo: w.repo, name: w.name, target }, toast, 'deploy failed');
+    await postOrToast(`/api/${provider}/deploy`, { name: w.name, repo: w.repo, target }, toast, 'deploy failed');
     refresh();
   }
 
@@ -1975,14 +1975,14 @@ function App() {
   // accept for a custom target, so sharing one function would just widen the
   // type back out for no real benefit.
   async function convexDeploy(w: Worktree, target: 'preview' | 'production') {
-    await postOrToast('/api/convex/deploy', { repo: w.repo, name: w.name, target }, toast, 'convex deploy failed');
+    await postOrToast('/api/convex/deploy', { name: w.name, repo: w.repo, target }, toast, 'convex deploy failed');
     refresh();
   }
 
   const SORTERS: Record<typeof sortKey, (a: Worktree, b: Worktree) => number> = {
-    recent:  (a, b) => (b.lastCommitAt ?? 0) - (a.lastCommitAt ?? 0),
-    name:    (a, b) => a.name.localeCompare(b.name),
     created: (a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0),
+    name:    (a, b) => a.name.localeCompare(b.name),
+    recent:  (a, b) => (b.lastCommitAt ?? 0) - (a.lastCommitAt ?? 0),
   };
 
   // Running (and queued) worktrees float to the top regardless of sort key or
@@ -2010,7 +2010,7 @@ function App() {
     const w = worktrees.find(x => x.repo === route.repo && x.name === route.name);
     return <>
       <WorktreePage w={w} loaded={loaded} agents={agents} onAct={act} onStart={start} onDeploy={deploy} onConvexDeploy={convexDeploy}
-        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool} onRemove={remove} onRefresh={refresh} toast={toast} />
+        onOpenLogs={(repo, name, type) => setLogView({ name, repo, type })} onOpenTool={openTool} onRemove={remove} onRefresh={refresh} toast={toast} />
       {logView && <LogModal repo={logView.repo} name={logView.name} initialType={logView.type}
         extraTabs={worktrees.find(x => x.repo === logView.repo && x.name === logView.name)?.sidecars.map(s => s.name)}
         onClose={() => setLogView(null)} />}
@@ -2049,7 +2049,7 @@ function App() {
       <RepoPage repo={route.repo} label={proj?.label ?? route.repo} github={proj?.github}
         worktrees={worktrees} agents={agents} pendingStart={pendingStart.current}
         onAct={act} onStart={start} onDeploy={deploy} onRemove={remove} toast={toast}
-        onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })} onOpenTool={openTool}
+        onOpenLogs={(repo, name, type) => setLogView({ name, repo, type })} onOpenTool={openTool}
         onBack={() => navigate('/')}
         onCreateWorktree={() => { setRecreatePrefill({ repo: route.repo }); navigate('/'); }}
         onCreateFromPr={onCreateFromPr} />
@@ -2066,7 +2066,7 @@ function App() {
     // rather than duplicating the create flow here, so navigate there first
     // to make sure it's actually visible.
     const onRecreate = (a: ArchivedWorktree) => {
-      setRecreatePrefill({ repo: a.repo, name: a.branch || a.name });
+      setRecreatePrefill({ name: a.branch || a.name, repo: a.repo });
       navigate('/');
     };
     return <>
@@ -2101,7 +2101,7 @@ function App() {
             Now running <span class="text-zinc-300">({running.length})</span>
           </h2>
           <WorktreeList items={running} gridMode={view === 'grid'} onAct={act} onStart={start} onDeploy={deploy} onRemove={remove}
-            toast={toast} onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })}
+            toast={toast} onOpenLogs={(repo, name, type) => setLogView({ name, repo, type })}
             onOpenTool={openTool} pendingStart={pendingStart.current} agents={agents} />
           <div class="rail-divider mt-8 mb-8" />
         </div>
@@ -2123,7 +2123,7 @@ function App() {
           class="w-full text-sm bg-white/60 dark:bg-white/5 backdrop-blur-md border border-white/75 dark:border-white/10 shadow-sm rounded-none pl-9 pr-3 py-2.5 text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-500 transition-colors duration-150" />
       </div>
       <WorktreeList items={filtered} gridMode={view === 'grid'} onAct={act} onStart={start} onDeploy={deploy} onRemove={remove}
-        toast={toast} onOpenLogs={(repo, name, type) => setLogView({ repo, name, type })}
+        toast={toast} onOpenLogs={(repo, name, type) => setLogView({ name, repo, type })}
         onOpenTool={openTool} pendingStart={pendingStart.current} agents={agents}
         emptyMessage={rest.length ? 'No worktrees on this page.' :
           (onlyDirty || onlyAhead || needle) ? 'No worktrees match the active filters.' :

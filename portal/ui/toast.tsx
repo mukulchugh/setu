@@ -125,9 +125,9 @@ function useOwnToastManager() {
 // pair — bg-signal-red/95 reads the same, correctly, in both themes
 // (confirmed: this is exactly what the old ToastStack already shipped).
 const TOAST_BG: Record<Tone, string> = {
-  red: 'bg-signal-red/95 border-signal-red',
-  emerald: 'bg-signal-green/95 border-signal-green',
   amber: 'bg-signal-amber/95 border-signal-amber',
+  emerald: 'bg-signal-green/95 border-signal-green',
+  red: 'bg-signal-red/95 border-signal-red',
   zinc: 'bg-zinc-900/95 border-zinc-800',
 };
 
@@ -235,17 +235,17 @@ export function ToastStack({ toasts, onDismiss }: { toasts: ToastItem[]; onDismi
       if (mirroredIds.current.has(t.id)) continue;
       mirroredIds.current.add(t.id);
       manager.add({
-        id: String(t.id),
         description: t.msg,
-        type: t.tone,
-        // app.tsx's own setTimeout(..., 5000) already owns dismiss timing;
-        // a second competing timer here would race it.
-        timeout: 0,
+        id: String(t.id),
         // The single place `onDismiss` ever gets called (see ToastList's
         // onClick comment above) — fires on swipe-dismiss, on manager.close()
         // from the remove-loop below, and on ToastList's click-to-dismiss,
         // exactly once per toast regardless of which path triggered it.
         onClose: () => onDismiss(t.id),
+        // app.tsx's own setTimeout(..., 5000) already owns dismiss timing;
+        // a second competing timer here would race it.
+        timeout: 0,
+        type: t.tone,
       });
     }
 

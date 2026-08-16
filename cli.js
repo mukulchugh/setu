@@ -150,7 +150,7 @@ function sudoTee(content, dest, mode) {
 // Not every call site wants this: some warn and continue instead of dying,
 // so those stay on portalRequest directly.
 async function portalCall(path, body, failMsg) {
-  const res = await portalRequest(path, body).catch(e => ({ ok: false, error: String(e) }));
+  const res = await portalRequest(path, body).catch(e => ({ error: String(e), ok: false }));
   if (!res.ok) die(res.error ?? failMsg);
   return res;
 }
@@ -161,7 +161,7 @@ async function ensurePortal(c) {
   if (!existsSync(portalJs)) die(`portal.js not found at ${portalJs}`);
   // cwd = package dir so bunfig.toml (tailwind plugin) and node_modules resolve
   const child = spawn('bun', ['run', portalJs], {
-    cwd: PKG_DIR, detached: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env, HOME },
+    cwd: PKG_DIR, detached: true, env: { ...process.env, HOME },stdio: ['ignore', 'ignore', 'ignore'], 
   });
   child.unref();
   for (let i = 0; i < 40; i++) {
@@ -210,7 +210,7 @@ async function cmdSetup() {
     } finally { rl.close(); }
   }
   if (!name) die('Name is required — pass --name <you> (non-interactive) or run in a terminal.');
-  const input = { name, workspace, zone, tunnel: `dev-${name}`, domain: `dev-${name}.${zone}` };
+  const input = { domain: `dev-${name}.${zone}`, name, tunnel: `dev-${name}`, workspace, zone };
   ok(`${input.tunnel} → ${input.domain}, workspace ${workspace}`);
   console.log();
 
@@ -303,7 +303,7 @@ async function cmdSetup() {
   // 6. config + shell
   step(6, 8, 'Shell & config');
   spin('~/.setu.json');
-  saveConfig({ workspace: input.workspace, tunnel: input.tunnel, domain: input.domain, cfCredentials });
+  saveConfig({ cfCredentials, domain: input.domain, tunnel: input.tunnel, workspace: input.workspace });
   done();
 
   spin('~/.zshrc');
@@ -368,14 +368,14 @@ async function cmdNew() {
   let started = false;
   if (flags.start) {
     await ensurePortal(c);
-    const startBody = { repo, name };
+    const startBody = { name, repo };
     if (flags.container) startBody.container = true;
     else if (flags.bare) startBody.container = false;
     // Neither flag: a brand-new worktree has no prior history either way, so
     // the portal's sticky default naturally resolves to the intended global
     // default (container) here — same call shape as `setu start`, not a
     // special case.
-    const startRes = await portalRequest('/api/start', startBody).catch(e => ({ ok: false, error: String(e) }));
+    const startRes = await portalRequest('/api/start', startBody).catch(e => ({ error: String(e), ok: false }));
     started = !!startRes.ok;
     if (!started) fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
   }
@@ -397,7 +397,7 @@ async function cmdRm() {
   const c = cfg();
   // Portal owns dev-server/tunnel processes — let it stop them + clean up
   if (portalPid()) {
-    await portalCall('/api/remove', { repo, name }, 'remove failed');
+    await portalCall('/api/remove', { name, repo }, 'remove failed');
   } else {
     try { removeWorktree(c, repo, name); } catch (e) { die(e.message); }
   }
@@ -422,7 +422,7 @@ async function cmdStart() {
   // blindly forcing one — found live: a flat "container unless --bare" default
   // silently switched an established, always-bare worktree into a container
   // the moment it needed a restart with no explicit choice from anyone.
-  const body = { repo, name };
+  const body = { name, repo };
   if (flags.container) body.container = true;
   else if (flags.bare) body.container = false;
   const res = await portalCall('/api/start', body, 'start failed');
@@ -433,7 +433,7 @@ async function cmdStop() {
   const [repo, name] = args;
   if (!repo || !name) die('Usage: setu stop <repo> <branch>');
   if (!portalPid()) { console.log('Portal not running — nothing to stop.'); return; }
-  await portalCall('/api/stop', { repo, name }, 'stop failed');
+  await portalCall('/api/stop', { name, repo }, 'stop failed');
   ok(`stopped ${repo}/${name}`);
 }
 
@@ -480,10 +480,10 @@ async function cmdLs() {
 
   const rows = entries.map(e => ({
     ...e,
-    running: !!activePid(e.port),
-    wtDir: join(c.workspace, e.repo, e.name),
     localDomain: localDomain(e.repo, e.name),
+    running: !!activePid(e.port),
     tunnel: tunnelEnabled(join(c.workspace, e.repo, e.name), c),
+    wtDir: join(c.workspace, e.repo, e.name),
   }));
 
   if (asJson) { console.log(JSON.stringify(rows, null, 2)); return; }
@@ -502,7 +502,7 @@ async function cmdInit() {
   const repo = slug.split('/').pop();
 
   if (!existsSync(join(c.workspace, `${repo}.git`))) console.log(`  Cloning ${slug}...`);
-  try { await importRepo(c, { name: repo, remoteUrl: `git@github.com:${slug}.git`, label }); }
+  try { await importRepo(c, { label, name: repo, remoteUrl: `git@github.com:${slug}.git` }); }
   catch (e) { die(e.message); }
 
   args.length = 0; args.push(repo, 'main');
@@ -548,7 +548,7 @@ async function cmdSweep() {
   if (cand.status === 'no-remote') die(`'${name}' has no remote, nothing to clone from.`);
 
   console.log(`  Importing ${name} from ${cand.remoteUrl}...`);
-  try { await importRepo(c, { name: cand.name, remoteUrl: cand.remoteUrl, label: cand.name }); }
+  try { await importRepo(c, { label: cand.name, name: cand.name, remoteUrl: cand.remoteUrl }); }
   catch (e) { die(e.message); }
   ok(`imported ${name} into ${c.workspace}/${name}.git, worktree main ready`);
 }
@@ -641,7 +641,7 @@ async function cmdMcp() {
 
 async function ensureTunnel(c, repo, name) {
   await ensurePortal(c);
-  await portalCall('/api/tunnel/enable', { repo, name }, 'tunnel enable failed');
+  await portalCall('/api/tunnel/enable', { name, repo }, 'tunnel enable failed');
 }
 
 async function cmdTunnel() {
@@ -652,7 +652,7 @@ async function cmdTunnel() {
 
   if (action === 'stop') {
     if (!portalPid()) { console.log('Portal not running — tunnel already down.'); return; }
-    await portalCall('/api/tunnel/disable', { repo, name }, 'tunnel disable failed');
+    await portalCall('/api/tunnel/disable', { name, repo }, 'tunnel disable failed');
     ok(`tunnel disabled for ${repo}/${name}`);
     return;
   }
@@ -672,7 +672,7 @@ async function cmdSync() {
   const c = cfg();
   if (!getPort(c.workspace, repo, name)) die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
   await ensurePortal(c);
-  const res = await portalCall('/api/sync', { repo, name }, 'sync failed');
+  const res = await portalCall('/api/sync', { name, repo }, 'sync failed');
   ok(`Synced ${repo}/${name} with ${res.base}`);
 }
 
@@ -684,8 +684,8 @@ async function cmdSync() {
 function triggerLogPaths(workspace, repo, name) {
   const slug = name.replace(/\//g, '-');
   return {
-    pidFile: join(workspace, 'logs', `trigger-${repo}-${slug}.pid`),
     logFile: join(workspace, 'logs', `trigger-${repo}-${slug}.log`),
+    pidFile: join(workspace, 'logs', `trigger-${repo}-${slug}.pid`),
   };
 }
 
@@ -710,10 +710,10 @@ async function cmdTrigger() {
   // see each other and nothing stops both from running at once.
   if (portalPid()) {
     if (action === 'stop') {
-      await portalCall('/api/trigger/stop', { repo, name }, 'stop failed');
+      await portalCall('/api/trigger/stop', { name, repo }, 'stop failed');
       ok(`stopped trigger dev for ${repo}/${name}`);
     } else {
-      await portalCall('/api/trigger/start', { repo, name }, 'start failed');
+      await portalCall('/api/trigger/start', { name, repo }, 'start failed');
       ok(`Trigger dev started for ${repo}/${name} (via portal)`);
     }
     return;
@@ -748,8 +748,8 @@ async function cmdTrigger() {
   const child = spawn('bunx', [`trigger.dev@${version}`, 'dev'], {
     cwd: wtDir,
     detached: true,
-    stdio: ['ignore', out, out],
     env,
+    stdio: ['ignore', out, out],
   });
   writeFileSync(pidFile, String(child.pid));
   child.unref();
@@ -886,11 +886,11 @@ function cmdVersion() {
 // that shape onto every caller.
 async function spawnTextCode(cmd, args) {
   try {
-    const proc = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'ignore' });
+    const proc = Bun.spawn([cmd, ...args], { stderr: 'ignore', stdout: 'pipe' });
     const text = await new Response(proc.stdout).text();
     await proc.exited;
-    return { text: text.trim(), code: proc.exitCode };
-  } catch { return { text: '', code: 1 }; }
+    return { code: proc.exitCode, text: text.trim() };
+  } catch { return { code: 1, text: '' }; }
 }
 
 async function cmdDoctor() {
@@ -912,26 +912,26 @@ async function cmdDoctor() {
 
   const checkThunks = [
     ...['caddy', 'cloudflared', 'dnsmasq', 'direnv'].map(pkg => async () => (
-      { name: `brew: ${pkg}`, ok: brewInstalled(pkg), fix: `brew install ${pkg}` }
+      { fix: `brew install ${pkg}`, name: `brew: ${pkg}`, ok: brewInstalled(pkg) }
     )),
-    async () => ({ name: 'config ~/.setu.json', ok: !!(c.workspace && c.domain && c.tunnel), fix: 'setu setup' }),
+    async () => ({ fix: 'setu setup', name: 'config ~/.setu.json', ok: !!(c.workspace && c.domain && c.tunnel) }),
     // Optional, not in the brewInstall() hard-fail list above — createWorktree
     // already treats mise as best-effort (`mise trust ... 2>/dev/null`), so a
     // missing binary shouldn't block `setu setup`, just show up here.
     async () => ({
+      fix: 'brew install mise',
       name: 'mise (optional — auto-trusts a managed project\'s own mise config)',
       ok: commandExists('mise'),
-      fix: 'brew install mise',
     }),
     async () => ({
+      fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
       name: 'dnsmasq service',
       ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
-      fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
     }),
-    async () => ({ name: 'dnsmasq resolves *.quivly.local', ok: digText.includes('127.0.0.1'), fix: 'sudo brew services restart dnsmasq (then re-check)' }),
-    async () => ({ name: '/etc/resolver/quivly.local', ok: existsSync('/etc/resolver/quivly.local'), fix: 'setu setup' }),
-    async () => ({ name: 'caddy service', ok: /^caddy\s+started/m.test(services), fix: 'brew services restart caddy' }),
-    async () => ({ name: 'caddy admin API (:2019)', ok: caddyAdmin, fix: 'brew services restart caddy' }),
+    async () => ({ fix: 'sudo brew services restart dnsmasq (then re-check)', name: 'dnsmasq resolves *.quivly.local', ok: digText.includes('127.0.0.1') }),
+    async () => ({ fix: 'setu setup', name: '/etc/resolver/quivly.local', ok: existsSync('/etc/resolver/quivly.local') }),
+    async () => ({ fix: 'brew services restart caddy', name: 'caddy service', ok: /^caddy\s+started/m.test(services) }),
+    async () => ({ fix: 'brew services restart caddy', name: 'caddy admin API (:2019)', ok: caddyAdmin }),
     // `setu start` containerizes by default now (real memory/CPU cap) — a
     // missing runtime isn't merely informational, it means plain `setu start`
     // will fail until either the engine is running or `--bare` is passed.
@@ -939,8 +939,8 @@ async function cmdDoctor() {
     // without requiring one specifically — see the containerization plan.
     async () => {
       const rt = containerRuntimeAvailable();
-      return { name: 'container runtime (setu start uses it by default)', ok: rt.available,
-        fix: rt.available ? undefined : 'start OrbStack/Docker Desktop — or use `setu start --bare` until then' };
+      return { 
+        fix: rt.available ? undefined : 'start OrbStack/Docker Desktop — or use `setu start --bare` until then', name: 'container runtime (setu start uses it by default)', ok: rt.available};
     },
     // engineCapacity() clamps each INDIVIDUAL container's limit to what the
     // engine has — that alone doesn't stop 3 containers, each individually
@@ -956,33 +956,33 @@ async function cmdDoctor() {
       const maxDev = c.maxConcurrentDevServers ?? 3;
       const totalMb = memLimitMb * maxDev;
       const ok = totalMb <= cap.memMb;
-      return { name: 'container memory budget fits engine capacity', ok,
-        fix: ok ? undefined : `maxConcurrentDevServers(${maxDev}) × containerMemoryLimit(${memLimitMb}MB) = ${totalMb}MB exceeds the engine's ${cap.memMb}MB — lower one in ~/.setu.json` };
+      return { 
+        fix: ok ? undefined : `maxConcurrentDevServers(${maxDev}) × containerMemoryLimit(${memLimitMb}MB) = ${totalMb}MB exceeds the engine's ${cap.memMb}MB — lower one in ~/.setu.json`, name: 'container memory budget fits engine capacity', ok};
     },
     async () => ({
+      fix: 'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)',
       name: 'sudoers: caddy reload',
       ok: !!workspace && await sudoOk([CADDY_BIN, 'reload', '--config', join(workspace, 'Caddyfile')]),
-      fix: 'setu setup (rewrites /etc/sudoers.d/caddy-setu-*)',
     }),
-    async () => ({ name: 'sudoers: hosts sync', ok: await sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']), fix: 'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)' }),
-    async () => ({ name: '/etc/hosts quivly block', ok: readFileSync('/etc/hosts', 'utf8').includes(HOSTS_START), fix: 'setu new <repo> <branch> (or any command that syncs hosts)' }),
-    async () => ({ name: 'cloudflared cert', ok: existsSync(join(HOME, '.cloudflared', 'cert.pem')), fix: 'cloudflared tunnel login' }),
+    async () => ({ fix: 'setu setup (rewrites /etc/sudoers.d/setu-hosts-*)', name: 'sudoers: hosts sync', ok: await sudoOk(['/bin/cp', HOSTS_TMP, '/etc/hosts']) }),
+    async () => ({ fix: 'setu new <repo> <branch> (or any command that syncs hosts)', name: '/etc/hosts quivly block', ok: readFileSync('/etc/hosts', 'utf8').includes(HOSTS_START) }),
+    async () => ({ fix: 'cloudflared tunnel login', name: 'cloudflared cert', ok: existsSync(join(HOME, '.cloudflared', 'cert.pem')) }),
   ];
 
   if (c.tunnel) {
     checkThunks.push(async () => {
       const tl = await spawnText([CLOUDFLARED_BIN, 'tunnel', 'list']);
-      return { name: `tunnel ${c.tunnel} exists`, ok: tl.split('\n').some(l => l.includes(` ${c.tunnel} `)), fix: `cloudflared tunnel create ${c.tunnel}` };
+      return { fix: `cloudflared tunnel create ${c.tunnel}`, name: `tunnel ${c.tunnel} exists`, ok: tl.split('\n').some(l => l.includes(` ${c.tunnel} `)) };
     });
   }
 
   // setu repo hygiene
   if (existsSync(join(SETU_DIR, '.git'))) {
-    checkThunks.push(async () => ({ name: '~/.setu clean', ok: setuGit(['status', '--porcelain']).trim() === '', fix: 'git -C ~/.setu status — commit or stash local edits' }));
+    checkThunks.push(async () => ({ fix: 'git -C ~/.setu status — commit or stash local edits', name: '~/.setu clean', ok: setuGit(['status', '--porcelain']).trim() === '' }));
     checkThunks.push(async () => {
       let behind = 0;
       try { behind = parseInt(setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(), 10); } catch {}
-      return { name: 'setu up to date', ok: behind === 0, fix: 'setu update' };
+      return { fix: 'setu update', name: 'setu up to date', ok: behind === 0 };
     });
   }
 
@@ -999,8 +999,8 @@ async function cmdDoctor() {
     checkThunks.push(async () => {
       const known = new Set(entries.map(e => e.port));
       const orphanProcs = active.filter(p => !known.has(p.port));
-      return { name: 'no unregistered dev-server processes', ok: orphanProcs.length === 0,
-        fix: orphanProcs.length ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map(p => `pid ${p.pid} :${p.port}`).join(', ')})` : undefined };
+      return { 
+        fix: orphanProcs.length ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map(p => `pid ${p.pid} :${p.port}`).join(', ')})` : undefined, name: 'no unregistered dev-server processes', ok: orphanProcs.length === 0};
     });
 
     checkThunks.push(async () => {
@@ -1015,7 +1015,7 @@ async function cmdDoctor() {
         if (cwd && resolve(cwd) !== expected && !resolve(cwd).startsWith(expected + '/'))
           mismatches.push(`${e.key} :${e.port} is actually serving ${cwd}`);
       }
-      return { name: 'registered ports match their worktree', ok: mismatches.length === 0, fix: mismatches.join('; ') || undefined };
+      return { fix: mismatches.join('; ') || undefined, name: 'registered ports match their worktree', ok: mismatches.length === 0 };
     });
 
     checkThunks.push(async () => {
@@ -1033,8 +1033,8 @@ async function cmdDoctor() {
         } catch {}
       }
       const unregistered = [...gitWorktreeDirs].filter(d => !registeredDirs.has(d));
-      return { name: 'all git worktrees are registered with setu', ok: unregistered.length === 0,
-        fix: unregistered.length ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)` : undefined };
+      return { 
+        fix: unregistered.length ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)` : undefined, name: 'all git worktrees are registered with setu', ok: unregistered.length === 0};
     });
 
     // mirror case: registry entries for worktrees removed via raw `git worktree
@@ -1042,15 +1042,15 @@ async function cmdDoctor() {
     // directory it pointed at.
     checkThunks.push(async () => {
       const stale = entries.filter(e => !existsSync(join(workspace, e.repo, e.name)));
-      return { name: 'no registry entries for missing worktrees', ok: stale.length === 0,
-        fix: stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined };
+      return { 
+        fix: stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined, name: 'no registry entries for missing worktrees', ok: stale.length === 0};
     });
   }
 
   checkThunks.push(async () => ({
+    fix: 'setu portal',
     name: 'portal (:2999)',
     ok: await portalRequest('/api/worktrees').then(() => true).catch(() => false),
-    fix: 'setu portal',
   }));
 
   const checks = (await Promise.all(checkThunks.map(fn => fn()))).map(r => ({ ...r, ok: !!r.ok }));

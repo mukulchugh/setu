@@ -113,8 +113,8 @@ export function DiscoverProjectsSection({ toast, onImported }: { toast: (msg: st
     let ok = 0;
     for (const c of queue) {
       setImportingPath(c.path);
-      const res = await post('/api/sweep/import', { path: c.path, name: c.name, remoteUrl: c.remoteUrl });
-      setResults(r => ({ ...r, [c.path]: res?.ok ? { ok: true } : { ok: false, error: res?.error ?? 'unknown error' } }));
+      const res = await post('/api/sweep/import', { name: c.name, path: c.path, remoteUrl: c.remoteUrl });
+      setResults(r => ({ ...r, [c.path]: res?.ok ? { ok: true } : { error: res?.error ?? 'unknown error', ok: false } }));
       if (res?.ok) ok++;
     }
     setImportingPath(null);
@@ -185,11 +185,11 @@ type McpServer = {
   tools: McpTool[]; stderrTail: string[]; error: string | null;
 };
 
-const MCP_TONE: Record<McpServer['status'], Tone> = {
-  disconnected: 'zinc', connecting: 'amber', 'awaiting-auth': 'amber', connected: 'emerald', error: 'red',
+const MCP_TONE: Record<McpServer['status'], Tone> = {'awaiting-auth': 'amber', connected: 'emerald', connecting: 'amber', 
+  disconnected: 'zinc', error: 'red',
 };
-const MCP_LABEL: Record<McpServer['status'], string> = {
-  disconnected: 'Disconnected', connecting: 'Connecting…', 'awaiting-auth': 'Waiting for authorization in your browser…', connected: 'Connected', error: 'Error',
+const MCP_LABEL: Record<McpServer['status'], string> = {'awaiting-auth': 'Waiting for authorization in your browser…', connected: 'Connected', connecting: 'Connecting…', 
+  disconnected: 'Disconnected', error: 'Error',
 };
 
 // One "key: value" line -> a single-entry headers object. Deliberately just
@@ -219,10 +219,10 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
   const [loaded, setLoaded] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
-  const [form, setForm] = useState({
+  const [form, setForm] = useState({args: '',
+    command: '', headerLine: '',httpAuthMode: 'headers' as 'headers' | 'oauth', 
     name: '', transport: 'stdio' as 'stdio' | 'http',
-    command: '', args: '',
-    url: '', httpAuthMode: 'headers' as 'headers' | 'oauth', headerLine: '',
+    url: '', 
   });
 
   const load = useCallback(async () => {
@@ -248,13 +248,13 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
     if (!form.name.trim()) return;
     const base = { id: '', name: form.name.trim(), transport: form.transport };
     const entry = form.transport === 'stdio'
-      ? { ...base, command: form.command.trim(), args: form.args.trim() ? form.args.trim().split(/\s+/) : undefined }
+      ? { ...base, args: form.args.trim() ? form.args.trim().split(/\s+/) : undefined, command: form.command.trim() }
       : {
-        ...base, url: form.url.trim(), httpAuthMode: form.httpAuthMode,
-        headers: form.httpAuthMode === 'headers' ? parseHeaderLine(form.headerLine) : undefined,
+        ...base, 
+        headers: form.httpAuthMode === 'headers' ? parseHeaderLine(form.headerLine) : undefined,httpAuthMode: form.httpAuthMode,url: form.url.trim(), 
       };
     saveList([...servers.map(({ status, tools, stderrTail, error, ...s }) => s), entry]);
-    setForm({ name: '', transport: 'stdio', command: '', args: '', url: '', httpAuthMode: 'headers', headerLine: '' });
+    setForm({ args: '', command: '', headerLine: '', httpAuthMode: 'headers', name: '', transport: 'stdio', url: '' });
     setAdding(false);
   }
 

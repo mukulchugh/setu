@@ -42,13 +42,6 @@ const overlayCls = 'fixed inset-0 z-50 bg-black/40 backdrop-blur-sm transition-o
 
 const panelBase = 'bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl shadow-2xl rounded-none z-50 transition-all duration-200 ease-out';
 const panelPosition: Record<'center' | 'bottom', string> = {
-  // No mx-4 gutter here: unlike the old Modal (a flex child, where a margin was a real gutter),
-  // this box is `fixed` + transform-centered, and a margin shifts the transform-origin math off
-  // true center (left:50% + margin-left:1rem, then -translate-x-1/2 only pulls back half the
-  // *border-box* width, landing 1rem right of center) and can overflow below ~26rem viewports.
-  // max-w-[calc(100%-2rem)] gives the same "never touches the edge" behavior with none of that —
-  // same fix the registry source already uses for this exact box.
-  center: 'border border-zinc-200 dark:border-zinc-800 fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-[calc(100%-2rem)] sm:max-w-sm p-6 data-closed:opacity-0 data-closed:scale-95',
   // Bottom sheets (LogModal etc.) own their own internal padding/height/flex layout per call
   // site — same as the old Modal, which never imposed padding on a position="bottom" child
   // either. Slide-from-below on close instead of the center variant's scale, matching a sheet
@@ -57,6 +50,13 @@ const panelPosition: Record<'center' | 'bottom', string> = {
   // "undo" on top of panelBase's border, since tailwind-merge doesn't treat a later `border-b-0`
   // as canceling an earlier bare `border` (same footgun ui.tsx's own `compact` variant documents).
   bottom: 'border-t border-zinc-200 dark:border-zinc-800 fixed inset-x-0 bottom-0 w-full data-closed:opacity-0 data-closed:translate-y-4',
+  // No mx-4 gutter here: unlike the old Modal (a flex child, where a margin was a real gutter),
+  // this box is `fixed` + transform-centered, and a margin shifts the transform-origin math off
+  // true center (left:50% + margin-left:1rem, then -translate-x-1/2 only pulls back half the
+  // *border-box* width, landing 1rem right of center) and can overflow below ~26rem viewports.
+  // max-w-[calc(100%-2rem)] gives the same "never touches the edge" behavior with none of that —
+  // same fix the registry source already uses for this exact box.
+  center: 'border border-zinc-200 dark:border-zinc-800 fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-[calc(100%-2rem)] sm:max-w-sm p-6 data-closed:opacity-0 data-closed:scale-95',
 };
 
 // Same X-mark path as ui.tsx's CloseIcon (a plain two-stroke glyph, not a sourced brand mark —

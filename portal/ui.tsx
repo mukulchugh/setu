@@ -13,14 +13,14 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 // change — only what color that maps to changed, not the semantic vocabulary.
 export type Tone = 'emerald' | 'amber' | 'red' | 'zinc';
 
-const TONE_TEXT: Record<Tone, string> = {
-  emerald: 'text-signal-green', amber: 'text-signal-amber', red: 'text-signal-red', zinc: 'text-zinc-400',
+const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber', 
+  emerald: 'text-signal-green', red: 'text-signal-red', zinc: 'text-zinc-400',
 };
-const TONE_DOT: Record<Tone, string> = {
-  emerald: 'bg-signal-green', amber: 'bg-signal-amber', red: 'bg-signal-red', zinc: 'bg-zinc-300',
+const TONE_DOT: Record<Tone, string> = {amber: 'bg-signal-amber', 
+  emerald: 'bg-signal-green', red: 'bg-signal-red', zinc: 'bg-zinc-300',
 };
-const TONE_SOFT: Record<Tone, string> = {
-  emerald: 'bg-signal-green/10 text-signal-green', amber: 'bg-signal-amber/10 text-signal-amber',
+const TONE_SOFT: Record<Tone, string> = {amber: 'bg-signal-amber/10 text-signal-amber',
+  emerald: 'bg-signal-green/10 text-signal-green', 
   red: 'bg-signal-red/10 text-signal-red', zinc: 'bg-zinc-100 text-zinc-500',
 };
 
@@ -100,8 +100,8 @@ export function SecondaryButton({ onClick, disabled, children, class: cls = '', 
 export type ToastItem = { id: number; msg: string; tone: Tone };
 
 const TOAST_BG: Record<Tone, string> = {
-  red: 'bg-signal-red/95 border-signal-red', emerald: 'bg-signal-green/95 border-signal-green',
-  amber: 'bg-signal-amber/95 border-signal-amber', zinc: 'bg-zinc-900/95 border-zinc-800',
+  amber: 'bg-signal-amber/95 border-signal-amber', emerald: 'bg-signal-green/95 border-signal-green',
+  red: 'bg-signal-red/95 border-signal-red', zinc: 'bg-zinc-900/95 border-zinc-800',
 };
 
 export function ToastStack({ toasts, onDismiss }: { toasts: ToastItem[]; onDismiss: (id: number) => void }) {

@@ -22,8 +22,8 @@ import { cn } from './utils';
 // styles.css), same vocabulary every existing call site already uses.
 export type Tone = 'emerald' | 'amber' | 'red' | 'zinc';
 
-const TONE_TEXT: Record<Tone, string> = {
-  emerald: 'text-signal-green', amber: 'text-signal-amber', red: 'text-signal-red', zinc: 'text-zinc-400',
+const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber', 
+  emerald: 'text-signal-green', red: 'text-signal-red', zinc: 'text-zinc-400',
 };
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,17 @@ const TONE_TEXT: Record<Tone, string> = {
 const buttonVariants = cva(
   'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px',
   {
+    defaultVariants: { compact: false, variant: 'primary' },
     variants: {
+      // A variant, not a suffix class appended after the base string:
+      // tailwind-merge (via `cn`) resolves the px-*/py-* conflict
+      // deterministically regardless of order, but keeping padding as its
+      // own cva axis (rather than folded into `variant`) is what lets a
+      // call-site `class="px-6"` still cleanly override on top.
+      compact: {
+        false: 'px-4 py-2.5',
+        true: 'px-3 py-1.5',
+      },
       variant: {
         // Glass + tactile: frosted translucency with a hard offset shadow
         // that collapses on press. Accent (Quivly forest green) reserved
@@ -54,17 +64,7 @@ const buttonVariants = cva(
         // before trusting the dark-mode half.
         secondary: 'bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10 aria-expanded:bg-white/85',
       },
-      // A variant, not a suffix class appended after the base string:
-      // tailwind-merge (via `cn`) resolves the px-*/py-* conflict
-      // deterministically regardless of order, but keeping padding as its
-      // own cva axis (rather than folded into `variant`) is what lets a
-      // call-site `class="px-6"` still cleanly override on top.
-      compact: {
-        true: 'px-3 py-1.5',
-        false: 'px-4 py-2.5',
-      },
     },
-    defaultVariants: { variant: 'primary', compact: false },
   },
 );
 
@@ -77,7 +77,7 @@ export interface ButtonProps extends VariantProps<typeof buttonVariants> {
 
 export function Button({ variant, compact, onClick, disabled, children, class: cls }: ButtonProps) {
   return (
-    <ButtonPrimitive onClick={onClick} disabled={disabled} className={cn(buttonVariants({ variant, compact }), cls)}>
+    <ButtonPrimitive onClick={onClick} disabled={disabled} className={cn(buttonVariants({ compact, variant }), cls)}>
       {children}
     </ButtonPrimitive>
   );

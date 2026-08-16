@@ -195,7 +195,7 @@ export function portsRaw(workspace) {
 // itself contain '/' (e.g. a branch like "feat/x"), the repo name can't.
 export function splitKey(key) {
   const si = key.indexOf('/');
-  return { repo: key.slice(0, si), name: key.slice(si + 1) };
+  return { name: key.slice(si + 1), repo: key.slice(0, si) };
 }
 
 export function portEntries(workspace) {
@@ -234,13 +234,13 @@ export async function activePidAsync(port) {
 export function listActivePorts() {
   const res = spawnSync('lsof',
     ['-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
-    { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   const out = res.stdout ?? '';
   const results = []; let cur = {};
   for (const line of out.split('\n')) {
     if (line.startsWith('p')) cur = { pid: line.slice(1) };
     else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ port: +m[1], pid: cur.pid, cmd: cur.cmd }); }
+    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] }); }
   }
   return results;
 }
@@ -254,7 +254,7 @@ export async function listActivePortsAsync() {
   for (const line of out.split('\n')) {
     if (line.startsWith('p')) cur = { pid: line.slice(1) };
     else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ port: +m[1], pid: cur.pid, cmd: cur.cmd }); }
+    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] }); }
   }
   return results;
 }
@@ -276,14 +276,14 @@ export function processCwd(pid) {
 // project's preferred 4 tools. Detected live (not cached) so installing a new
 // CLI doesn't need a portal restart to be picked up.
 export const AGENT_CLIS = {
+  aider:       { bin: 'aider',           label: 'Aider' },
+  amp:         { bin: 'amp',             label: 'Amp' },
+  antigravity: { bin: 'antigravity-ide', label: 'Antigravity' },
   claude:      { bin: 'claude',          label: 'Claude' },
   codex:       { bin: 'codex',           label: 'Codex' },
   cursor:      { bin: 'cursor-agent',    label: 'Cursor' },
-  aider:       { bin: 'aider',           label: 'Aider' },
-  opencode:    { bin: 'opencode',        label: 'opencode' },
-  amp:         { bin: 'amp',             label: 'Amp' },
-  antigravity: { bin: 'antigravity-ide', label: 'Antigravity' },
   grok:        { bin: 'grok',            label: 'Grok' },
+  opencode:    { bin: 'opencode',        label: 'opencode' },
 };
 
 export function commandExists(bin) {
@@ -319,7 +319,7 @@ export async function killGroupAsync(pid, signal = 'TERM') {
   if (out) pgid = parseInt(out, 10);
   const target = pgid === pid ? `-${pgid}` : String(pid);
   try {
-    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], { stdout: 'ignore', stderr: 'ignore' });
+    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], { stderr: 'ignore', stdout: 'ignore' });
     return (await proc.exited) === 0;
   } catch { return false; }
 }
@@ -361,10 +361,10 @@ export function loadProjects(workspace) {
         .map(l => {
           const [name, base, slug, label] = l.split(':');
           return [name, {
+            base: +base,
+            github: slug ? `https://github.com/${slug}` : null,
             label: label?.trim() || name,
             slug:  slug || null,
-            github: slug ? `https://github.com/${slug}` : null,
-            base: +base,
           }];
         })
     );
@@ -461,7 +461,7 @@ export function isSidecarApproved(workspace, repo, sidecar) {
 
 export function approveSidecar(workspace, repo, sidecarName, command, args) {
   const approvals = loadSidecarApprovals(workspace, repo);
-  approvals[sidecarName] = sidecarSignature({ command, args });
+  approvals[sidecarName] = sidecarSignature({ args, command });
   saveSidecarApprovals(workspace, repo, approvals);
 }
 
@@ -552,7 +552,7 @@ export function saveCustomAgents(workspace, agents) {
       while (used.has(id)) id = `${base}-${n++}`;
     }
     used.add(id);
-    return { id, label: a.label, command: a.command };
+    return { command: a.command, id, label: a.label };
   });
   writeFileSync(join(workspace, 'custom-agents.json'), JSON.stringify(out, null, 2) + '\n');
 }
@@ -871,7 +871,7 @@ export function git(repoDir, args, opts = {}) {
 // spawnText, which silently returns '') -- both callers rely on a failed
 // fetch aborting rather than silently proceeding against a stale base.
 async function gitFetchAsync(dir, args) {
-  const proc = Bun.spawn(['git', '-C', dir, ...args], { stdout: 'pipe', stderr: 'pipe' });
+  const proc = Bun.spawn(['git', '-C', dir, ...args], { stderr: 'pipe', stdout: 'pipe' });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -939,11 +939,11 @@ export async function syncWithBase(wtDir, repoDir) {
   await gitFetchAsync(wtDir, ['fetch', 'origin', branchName]);
 
   const dirty = git(wtDir, ['status', '--porcelain']).trim();
-  if (dirty) return { ok: false, error: 'Worktree has uncommitted changes — commit or stash first.' };
+  if (dirty) return { error: 'Worktree has uncommitted changes — commit or stash first.', ok: false };
 
   try {
     git(wtDir, ['merge', base, '--no-edit']);
-    return { ok: true, base };
+    return { base, ok: true };
   } catch (mergeErr) {
     const status = git(wtDir, ['status', '--porcelain']);
     const conflicts = status.split('\n')
@@ -958,8 +958,8 @@ export async function syncWithBase(wtDir, repoDir) {
     // worktrees/<name>/ dir, which only `git` itself resolves correctly.
     const mergeHeadPath = resolve(wtDir, git(wtDir, ['rev-parse', '--git-path', 'MERGE_HEAD']).trim());
     if (existsSync(mergeHeadPath)) git(wtDir, ['merge', '--abort']);
-    if (!conflicts.length) return { ok: false, error: `Merge failed: ${mergeErr.stderr || mergeErr.message}` };
-    return { ok: false, conflicts, error: `Would conflict in ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} — merge aborted, worktree unchanged.` };
+    if (!conflicts.length) return { error: `Merge failed: ${mergeErr.stderr || mergeErr.message}`, ok: false };
+    return { conflicts, error: `Would conflict in ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} — merge aborted, worktree unchanged.`, ok: false };
   }
 }
 
@@ -986,7 +986,7 @@ export function branchMetadata(repoDir) {
     if (!line) continue;
     const [branch, at, ab] = line.split('\t');
     const [ahead, behind] = (ab ?? '').trim().split(/\s+/).map(n => parseInt(n, 10) || 0);
-    map.set(branch, { lastCommitAt: parseInt(at, 10) || null, ahead: ahead ?? 0, behind: behind ?? 0 });
+    map.set(branch, { ahead: ahead ?? 0, behind: behind ?? 0, lastCommitAt: parseInt(at, 10) || null });
   }
   return map;
 }
@@ -1066,7 +1066,7 @@ export async function createWorktree(c, repo, name, { tunnel = false } = {}) {
   syncHosts(c.workspace);
   reloadCaddy(c.workspace);
 
-  return { wtDir, port, localDom: localDomain(repo, name), pubDom: tunnel ? publicDomain(c) : null };
+  return { localDom: localDomain(repo, name), port, pubDom: tunnel ? publicDomain(c) : null, wtDir };
 }
 
 // Removes worktree + registry entries + caddy snippet + hosts. Stopping dev
@@ -1125,8 +1125,8 @@ function deriveSweepName(remoteUrl, dirName) {
 // Returns null for "drop entirely" (same remote already registered).
 function classifySweepCandidate({ path, name, remoteUrl, dirty }, projects, registeredRemotes) {
   if (remoteUrl && registeredRemotes.has(remoteUrl)) return null;
-  if (projects[name]) return { path, name, remoteUrl, dirty, status: 'conflict', conflictWith: name };
-  return { path, name, remoteUrl, dirty, status: remoteUrl ? 'importable' : 'no-remote', conflictWith: null };
+  if (projects[name]) return { conflictWith: name, dirty, name, path, remoteUrl, status: 'conflict' };
+  return { conflictWith: null, dirty, name, path, remoteUrl, status: remoteUrl ? 'importable' : 'no-remote' };
 }
 
 // Per-candidate git probes only (not the find walk, and not git() calls
@@ -1185,7 +1185,7 @@ export function discoverRepos(homeDir) {
     const timedOut = Date.now() - t0 >= SWEEP_GIT_TIMEOUT_MS - 50;
     const dirty  = timedOut ? false : readDirty(dir);
     const name   = deriveSweepName(remoteUrl, dir.split('/').pop());
-    const shaped = classifySweepCandidate({ path: dir, name, remoteUrl, dirty }, projects, registeredRemotes);
+    const shaped = classifySweepCandidate({ dirty, name, path: dir, remoteUrl }, projects, registeredRemotes);
     if (shaped) out.push(shaped);
   }
   return out;
@@ -1214,7 +1214,7 @@ async function batchMap(items, size, fn) {
 // which can legitimately take multiple seconds over a full $HOME).
 export async function spawnText(args, { timeoutMs } = {}) {
   try {
-    const opts = { stdout: 'pipe', stderr: 'ignore' };
+    const opts = { stderr: 'ignore', stdout: 'pipe' };
     if (timeoutMs) opts.timeout = timeoutMs;
     const proc = Bun.spawn(args, opts);
     const text = await new Response(proc.stdout).text();
@@ -1255,7 +1255,7 @@ export async function discoverReposAsync(homeDir) {
   const shaped = await batchMap(dirs, 8, async dir => {
     const [remoteUrl, dirty] = await Promise.all([readOriginUrlAsync(dir), readDirtyAsync(dir)]);
     const name = deriveSweepName(remoteUrl, dir.split('/').pop());
-    return classifySweepCandidate({ path: dir, name, remoteUrl, dirty }, projects, registeredRemotes);
+    return classifySweepCandidate({ dirty, name, path: dir, remoteUrl }, projects, registeredRemotes);
   });
   return shaped.filter(Boolean);
 }
@@ -1306,7 +1306,7 @@ export function importRepo(c, { name, remoteUrl, label = '' }) {
     cloneBareRepo(repoDir, remoteUrl, ghSlug);
   }
 
-  registerProject(c.workspace, { name, slug: ghSlug, label });
+  registerProject(c.workspace, { label, name, slug: ghSlug });
   return createWorktree(c, name, 'main');
 }
 
@@ -1327,8 +1327,8 @@ export function portalPid() {
 export async function portalRequest(path, body) {
   const res = await fetch(`http://localhost:${PORTAL_PORT}${path}`, body === undefined
     ? { signal: AbortSignal.timeout(5000) }
-    : { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
+    : { 
+        body: JSON.stringify(body), headers: { 'content-type': 'application/json' },method: 'POST', signal: AbortSignal.timeout(30000) });
   const data = await res.json();
   if (data && typeof data === 'object' && !Array.isArray(data) && data.ok === false) {
     throw new Error(data.error ?? `${path} failed`);

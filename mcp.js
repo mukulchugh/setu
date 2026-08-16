@@ -41,12 +41,12 @@ const activeClients = new Map();
 const pendingAuth = new Map();
 
 function setStatus(serverId, patch) {
-  const prev = serverStatus.get(serverId) ?? { status: 'disconnected', tools: [], stderrTail: [], error: null };
+  const prev = serverStatus.get(serverId) ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] };
   serverStatus.set(serverId, { ...prev, ...patch });
 }
 
 export function mcpStatus(serverId) {
-  return serverStatus.get(serverId) ?? { status: 'disconnected', tools: [], stderrTail: [], error: null };
+  return serverStatus.get(serverId) ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] };
 }
 
 export function mcpStatuses() {
@@ -79,8 +79,8 @@ class SetuOAuthProvider {
   get clientMetadata() {
     return {
       client_name: 'Setu',
-      redirect_uris: [this.redirectUrl],
       grant_types: ['authorization_code', 'refresh_token'],
+      redirect_uris: [this.redirectUrl],
       response_types: ['code'],
       // Setu is a local desktop tool -- it cannot keep a client secret
       // confidential, so it registers as a public client, not the
@@ -134,11 +134,11 @@ class SetuOAuthProvider {
 // ---- stdio ----
 
 async function connectStdioServer(server) {
-  setStatus(server.id, { status: 'connecting', error: null, stderrTail: [] });
+  setStatus(server.id, { error: null, status: 'connecting', stderrTail: [] });
   try {
     const transport = new StdioClientTransport({
-      command: server.command,
       args: server.args ?? [],
+      command: server.command,
       env: server.env,
       stderr: 'pipe', // default is 'inherit' (parent process's own stderr) -- 'pipe' is required for the .stderr getter below to return a real stream
     });
@@ -149,23 +149,23 @@ async function connectStdioServer(server) {
     };
     transport.onerror = err => {
       activeClients.delete(server.id);
-      setStatus(server.id, { status: 'error', error: String(err?.message ?? err) });
+      setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
     };
 
     const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
     await client.connect(transport);
     const { tools } = await client.listTools();
     activeClients.set(server.id, { client, transport });
-    setStatus(server.id, { status: 'connected', tools, error: null });
+    setStatus(server.id, { error: null, status: 'connected', tools });
   } catch (e) {
-    setStatus(server.id, { status: 'error', error: String(e?.message ?? e) });
+    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }
 
 // ---- http ----
 
 async function connectHttpServer(server, workspace) {
-  setStatus(server.id, { status: 'connecting', error: null });
+  setStatus(server.id, { error: null, status: 'connecting' });
   try {
     if (server.httpAuthMode === 'oauth') {
       // Resolve the issuer before constructing the provider -- see
@@ -183,16 +183,16 @@ async function connectHttpServer(server, workspace) {
       };
       transport.onerror = err => {
         activeClients.delete(server.id);
-        setStatus(server.id, { status: 'error', error: String(err?.message ?? err) });
+        setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
       };
       const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
       await client.connect(transport);
       const { tools } = await client.listTools();
       activeClients.set(server.id, { client, transport });
-      setStatus(server.id, { status: 'connected', tools, error: null });
+      setStatus(server.id, { error: null, status: 'connected', tools });
     }
   } catch (e) {
-    setStatus(server.id, { status: 'error', error: String(e?.message ?? e) });
+    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }
 
@@ -210,7 +210,7 @@ async function attemptOAuthConnect(server, provider) {
   };
   transport.onerror = err => {
     activeClients.delete(server.id);
-    setStatus(server.id, { status: 'error', error: String(err?.message ?? err) });
+    setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
   };
 
   const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
@@ -219,7 +219,7 @@ async function attemptOAuthConnect(server, provider) {
     const { tools } = await client.listTools();
     activeClients.set(server.id, { client, transport });
     pendingAuth.delete(server.id);
-    setStatus(server.id, { status: 'connected', tools, error: null });
+    setStatus(server.id, { error: null, status: 'connected', tools });
   } catch (e) {
     if (e instanceof UnauthorizedError) {
       // redirectToAuthorization(url) already fired by this point -- the
@@ -227,8 +227,8 @@ async function attemptOAuthConnect(server, provider) {
       // this exact transport/provider pair so the callback route can finish
       // the flow on the SAME transport instance the SDK requires, then
       // reconnect on a fresh one.
-      pendingAuth.set(server.id, { state: provider.lastState, transport, provider });
-      setStatus(server.id, { status: 'awaiting-auth', error: null });
+      pendingAuth.set(server.id, { provider, state: provider.lastState, transport });
+      setStatus(server.id, { error: null, status: 'awaiting-auth' });
       return;
     }
     // Any other failure here means this was the post-finishAuth reconnect
@@ -236,7 +236,7 @@ async function attemptOAuthConnect(server, provider) {
     // begin with) -- clear it so a stale, already-consumed transport doesn't
     // linger in the map past its one legitimate use.
     pendingAuth.delete(server.id);
-    setStatus(server.id, { status: 'error', error: String(e?.message ?? e) });
+    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }
 
@@ -253,17 +253,17 @@ export async function connectMcpServer(server, workspace) {
 // the route (needed for server.url on the reconnect below).
 export async function finishMcpAuth(server, code, state) {
   const pending = pendingAuth.get(server.id);
-  if (!pending) return { ok: false, error: 'No pending authorization for this server (expired, or already completed).' };
+  if (!pending) return { error: 'No pending authorization for this server (expired, or already completed).', ok: false };
   if (pending.state !== state) {
     pendingAuth.delete(server.id);
-    return { ok: false, error: 'State mismatch -- possible CSRF, aborting.' };
+    return { error: 'State mismatch -- possible CSRF, aborting.', ok: false };
   }
   try {
     await pending.transport.finishAuth(code);
   } catch (e) {
     pendingAuth.delete(server.id);
-    setStatus(server.id, { status: 'error', error: String(e?.message ?? e) });
-    return { ok: false, error: String(e?.message ?? e) };
+    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
+    return { error: String(e?.message ?? e), ok: false };
   }
   // Reconnect on a fresh transport instance, reusing the same provider (its
   // saved tokens now satisfy the connection) -- attemptOAuthConnect clears
@@ -279,5 +279,5 @@ export function disconnectMcpServer(serverId) {
     activeClients.delete(serverId);
   }
   pendingAuth.delete(serverId);
-  setStatus(serverId, { status: 'disconnected', tools: [], error: null, stderrTail: [] });
+  setStatus(serverId, { error: null, status: 'disconnected', stderrTail: [], tools: [] });
 }

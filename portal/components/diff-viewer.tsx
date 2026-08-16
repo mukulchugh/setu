@@ -30,10 +30,10 @@ function Chevron({ open }: { open: boolean }) {
 
 const LINE_BG: Record<DiffLine['type'], string> = {
   add: 'bg-signal-green/10 dark:bg-signal-green/15 text-signal-green',
-  remove: 'bg-signal-red/10 dark:bg-signal-red/15 text-signal-red',
   context: 'text-zinc-600 dark:text-zinc-400',
+  remove: 'bg-signal-red/10 dark:bg-signal-red/15 text-signal-red',
 };
-const LINE_PREFIX: Record<DiffLine['type'], string> = { add: '+', remove: '-', context: ' ' };
+const LINE_PREFIX: Record<DiffLine['type'], string> = { add: '+', context: ' ', remove: '-' };
 
 function HunkBlock({ hunk }: { hunk: DiffHunk }) {
   return (

@@ -1,27 +1,6 @@
 {
-  "name": "@quivly/setu",
-  "version": "0.2.0",
-  "description": "Workspace bridge — git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
-  "type": "module",
   "bin": {
     "setu": "./cli.js"
-  },
-  "files": [
-    "cli.js",
-    "lib.js",
-    "portal.js",
-    "portal",
-    "bunfig.toml",
-    "tsconfig.json",
-    "install.sh"
-  ],
-  "scripts": {
-    "check": "ultracite check",
-    "fix": "ultracite fix"
-  },
-  "overrides": {
-    "react": "npm:@preact/compat@^18.3.2",
-    "react-dom": "npm:@preact/compat@^18.3.2"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
@@ -38,11 +17,32 @@
     "tailwindcss": "^4.3.2",
     "zod": "^4.4.3"
   },
+  "description": "Workspace bridge — git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
     "ultracite": "7.10.5"
   },
   "engines": {
     "bun": ">=1.0.0"
-  }
+  },
+  "files": [
+    "cli.js",
+    "lib.js",
+    "portal.js",
+    "portal",
+    "bunfig.toml",
+    "tsconfig.json",
+    "install.sh"
+  ],
+  "name": "@quivly/setu",
+  "overrides": {
+    "react": "npm:@preact/compat@^18.3.2",
+    "react-dom": "npm:@preact/compat@^18.3.2"
+  },
+  "scripts": {
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "type": "module",
+  "version": "0.2.0"
 }

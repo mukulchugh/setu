@@ -5,9 +5,9 @@ import type { Tone } from './ui';
 
 export async function post(url: string, body: unknown) {
   try {
-    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await fetch(url, { body: JSON.stringify(body), headers: { 'content-type': 'application/json' }, method: 'POST' });
     return await r.json();
-  } catch (e) { return { ok: false, error: String(e) }; }
+  } catch (e) { return { error: String(e), ok: false }; }
 }
 
 // Every route this hits always returns an explicit ok boolean (verified

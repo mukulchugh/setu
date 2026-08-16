@@ -43,7 +43,7 @@ export function detectPrWalkthroughPlugin(wtDir) {
 
 // ── artifact lookup ──────────────────────────────────────────────────────────
 
-const SKILL_DIR = { 'pr-walkthrough': 'reviews', 'pr-brief': 'briefs' };
+const SKILL_DIR = { 'pr-brief': 'briefs', 'pr-walkthrough': 'reviews' };
 const DATA_ROOT = `${HOME}/.local/share/pr-walkthrough`;
 
 // slug is "owner/repo" (same format REPO_META[repo].slug already uses).
@@ -67,11 +67,11 @@ export function findLatestArtifact(slug, prNumber, skill, currentHeadSha) {
   catch { return null; }
 
   return {
-    snapshot: latest.snapshot,
+    findings: manifest.stats?.findings ?? null,
     generatedAt: latest.generated_at,
     headSha: latest.head_sha,
     htmlFile: manifest.artifacts?.html ?? null,
-    findings: manifest.stats?.findings ?? null,
+    snapshot: latest.snapshot,
     stale: !!currentHeadSha && currentHeadSha !== latest.head_sha,
   };
 }
@@ -164,9 +164,9 @@ function parseResult(logText) {
 // values, not portal.js internals).
 export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd, logPath, spawnText }) {
   const key = `${repo}/${name}`;
-  if (runs.get(key)?.running) return { ok: false, error: 'a pr-review run is already in flight for this worktree' };
+  if (runs.get(key)?.running) return { error: 'a pr-review run is already in flight for this worktree', ok: false };
 
-  runs.set(key, { running: true, skill, startedAt: Date.now(), exitCode: null, costUsd: null, error: null, dirtyAfter: null });
+  runs.set(key, { costUsd: null, dirtyAfter: null, error: null, exitCode: null, running: true, skill, startedAt: Date.now() });
 
   (async () => {
     // --untracked-files=no: the worktree's own dev server (Next.js .next/,
@@ -182,7 +182,7 @@ export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd,
 
     const before = await snapshot();
     const proc = Bun.spawn(['claude', ...claudeArgs(skill, slug, prNumber)], {
-      cwd: wtDir, stdout: logFd, stderr: logFd, stdin: 'ignore', timeout: RUN_TIMEOUT_MS,
+      cwd: wtDir, stderr: logFd, stdin: 'ignore', stdout: logFd, timeout: RUN_TIMEOUT_MS,
     });
     await proc.exited;
     const timedOut = proc.signalCode === 'SIGTERM';
@@ -190,17 +190,17 @@ export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd,
     const dirtyAfter = !setsEqual(before, after);
 
     if (timedOut) {
-      runs.set(key, { running: false, skill, startedAt: runs.get(key).startedAt, exitCode: 'timeout', costUsd: null, error: 'timed out after 20 minutes', dirtyAfter });
+      runs.set(key, { costUsd: null, dirtyAfter, error: 'timed out after 20 minutes', exitCode: 'timeout', running: false, skill, startedAt: runs.get(key).startedAt });
       return;
     }
     let text = '';
     try { text = readFileSync(logPath, 'utf8'); } catch {}
     const { costUsd, isError, subtype } = parseResult(text);
-    runs.set(key, {
-      running: false, skill, startedAt: runs.get(key).startedAt,
-      exitCode: isError ? 'error' : 'success', costUsd,
-      error: isError ? (subtype ?? 'run failed') : null,
+    runs.set(key, {costUsd,
       dirtyAfter,
+      error: isError ? (subtype ?? 'run failed') : null,
+      exitCode: isError ? 'error' : 'success', 
+      running: false, skill, startedAt: runs.get(key).startedAt,
     });
   })();
 
