@@ -1,12 +1,7 @@
 import { Tool } from "@raycast/api";
-import { startWorktree } from "../lib/api";
+import { WorktreeRef, startWorktree } from "../lib/api";
 
-type Input = {
-  /** The repo/project the worktree belongs to, e.g. "quivly-app". */
-  repo: string;
-  /** The worktree's name — usually its branch name. */
-  name: string;
-};
+type Input = WorktreeRef;
 
 /**
  * Starts a worktree's dev server, in whichever mode (bare or container)

@@ -1,12 +1,7 @@
 import { Tool } from "@raycast/api";
-import { syncWorktree } from "../lib/api";
+import { WorktreeRef, syncWorktree } from "../lib/api";
 
-type Input = {
-  /** The repo/project the worktree belongs to, e.g. "quivly-app". */
-  repo: string;
-  /** The worktree's name — usually its branch name. */
-  name: string;
-};
+type Input = WorktreeRef;
 
 /**
  * Merges a worktree's resolved base branch (staging, or the project's

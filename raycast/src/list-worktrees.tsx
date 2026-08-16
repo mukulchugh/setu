@@ -12,13 +12,16 @@ import {
   Keyboard,
 } from "@raycast/api";
 import { useCachedPromise } from "@raycast/utils";
+import { PortalDownEmptyView } from "./components";
 import {
+  ActionResult,
   Agent,
   PortalUnreachableError,
   Worktree,
   listAgents,
   listWorktrees,
   openTool,
+  portalWebUrl,
   removeWorktree,
   startWorktree,
   stopWorktree,
@@ -46,7 +49,7 @@ function sortWorktrees(worktrees: Worktree[]): Worktree[] {
 
 async function runAction(
   label: string,
-  action: () => Promise<{ ok: boolean; error?: string; conflicts?: string[] }>,
+  action: () => Promise<ActionResult>,
   revalidate: () => void,
 ) {
   const toast = await showToast({
@@ -119,7 +122,7 @@ function WorktreeActions({
         />
         <Action.OpenInBrowser
           title="Open in Setu Portal"
-          url={`http://quivly.local/worktree/${w.repo}/${encodeURIComponent(w.name)}`}
+          url={portalWebUrl(w)}
           icon={Icon.Globe}
         />
         {agents.length > 0 && (
@@ -193,24 +196,7 @@ export default function Command() {
       searchBarPlaceholder="Filter by name, repo, or branch…"
     >
       {portalDown ? (
-        <List.EmptyView
-          icon={Icon.WifiDisabled}
-          title="Setu portal isn't running"
-          description="Start it, then reopen this command."
-          actions={
-            <ActionPanel>
-              <Action.CopyToClipboard
-                title="Copy 'Setu Portal'"
-                content="setu portal"
-              />
-              <Action
-                title="Retry"
-                icon={Icon.ArrowClockwise}
-                onAction={revalidate}
-              />
-            </ActionPanel>
-          }
-        />
+        <PortalDownEmptyView onRetry={revalidate} />
       ) : (
         sorted.map((w) => {
           const status = statusOf(w);

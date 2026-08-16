@@ -1,12 +1,7 @@
 import { Tool } from "@raycast/api";
-import { stopWorktree } from "../lib/api";
+import { WorktreeRef, stopWorktree } from "../lib/api";
 
-type Input = {
-  /** The repo/project the worktree belongs to, e.g. "quivly-app". */
-  repo: string;
-  /** The worktree's name — usually its branch name. */
-  name: string;
-};
+type Input = WorktreeRef;
 
 /**
  * Stops a worktree's running dev server.

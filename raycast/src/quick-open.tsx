@@ -9,7 +9,13 @@ import {
   open,
 } from "@raycast/api";
 import { useCachedPromise } from "@raycast/utils";
-import { PortalUnreachableError, Worktree, listWorktrees } from "./lib/api";
+import { PortalDownEmptyView } from "./components";
+import {
+  PortalUnreachableError,
+  Worktree,
+  listWorktrees,
+  portalWebUrl,
+} from "./lib/api";
 
 // The Raycast-native equivalent of the portal's own ⌘K command bar — type a
 // name, jump straight to the worktree's local domain, no list-browsing UI.
@@ -21,9 +27,11 @@ function matches(w: Worktree, needle: string): boolean {
 export default function Command(
   props: LaunchProps<{ arguments: Arguments.QuickOpen }>,
 ) {
-  const { data, isLoading, error } = useCachedPromise(listWorktrees, [], {
-    keepPreviousData: true,
-  });
+  const { data, isLoading, error, revalidate } = useCachedPromise(
+    listWorktrees,
+    [],
+    { keepPreviousData: true },
+  );
   const query = props.arguments.query ?? "";
 
   const results = useMemo(() => {
@@ -37,11 +45,7 @@ export default function Command(
   if (error instanceof PortalUnreachableError) {
     return (
       <List>
-        <List.EmptyView
-          icon={Icon.WifiDisabled}
-          title="Setu portal isn't running"
-          description="Start it with `setu portal`, then try again."
-        />
+        <PortalDownEmptyView onRetry={revalidate} />
       </List>
     );
   }
@@ -70,7 +74,7 @@ export default function Command(
               />
               <Action.OpenInBrowser
                 title="Open in Setu Portal"
-                url={`http://quivly.local/worktree/${w.repo}/${encodeURIComponent(w.name)}`}
+                url={portalWebUrl(w)}
               />
             </ActionPanel>
           }
