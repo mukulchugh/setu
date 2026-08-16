@@ -915,6 +915,14 @@ async function cmdDoctor() {
       { name: `brew: ${pkg}`, ok: brewInstalled(pkg), fix: `brew install ${pkg}` }
     )),
     async () => ({ name: 'config ~/.setu.json', ok: !!(c.workspace && c.domain && c.tunnel), fix: 'setu setup' }),
+    // Optional, not in the brewInstall() hard-fail list above — createWorktree
+    // already treats mise as best-effort (`mise trust ... 2>/dev/null`), so a
+    // missing binary shouldn't block `setu setup`, just show up here.
+    async () => ({
+      name: 'mise (optional — auto-trusts a managed project\'s own mise config)',
+      ok: commandExists('mise'),
+      fix: 'brew install mise',
+    }),
     async () => ({
       name: 'dnsmasq service',
       ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),

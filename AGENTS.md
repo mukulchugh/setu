@@ -212,6 +212,7 @@ would leak forever with nothing left pointing at it.
 
 ## Conventions
 
+- `mise.toml` pins this repo's own `bun` version (`mise trust` once per clone to activate). Unrelated to `createWorktree`'s own `mise trust ...` call, which best-effort-trusts a *managed project's* own mise config on worktree creation — that's a different repo's config, not this one's. `setu doctor` reports whether `mise` itself is installed (optional, not a hard `setu setup` dependency).
 - New branches fork from `origin/staging`.
 - `.env.local` is symlinked from the repo's `main` worktree (for `quivly-app`: `apps/quivly-app/.env.local`).
 - The non-tunnel `.envrc` (`NEXT_PUBLIC_APP_BASE_URL`/`NEXT_PUBLIC_WORKOS_REDIRECT_URI`) both point at the worktree's own `<branch>.quivly.local` domain, not `localhost` — if you ever see a `localhost:<port>` redirect after login, that's an env mismatch, not a Caddy problem (verified: Caddy always forwards the correct `Host`/`X-Forwarded-Host`).

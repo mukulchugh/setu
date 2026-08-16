@@ -1,0 +1,6 @@
+[tools]
+# Pinned to the exact version this repo has been built/tested against all
+# session, not a floating range — `mise install` gets everyone (and every
+# CI run) the same bun, rather than "whatever happened to be on PATH."
+# Bump deliberately, not silently, when there's a real reason to.
+bun = "1.3.4"
