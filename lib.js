@@ -778,6 +778,29 @@ export function composeProjectAlive(project) {
 // (@next/swc-darwin-arm64 etc.) that can't run in the Linux container; only the
 // source tree bind-mounts from the host. The resolved (symlink-followed)
 // .env.local is bind-mounted at the same in-container path the app expects it.
+// One directory, shared by every containerized worktree of every project —
+// not a Docker named volume (those get project-prefixed by Compose unless
+// marked `external: true`, which then requires the volume to already exist
+// before `up`, real ceremony for no benefit here). A plain host bind mount
+// works because unlike node_modules (real compiled/native binaries that
+// can't cross the macOS-host/Linux-container boundary), bun's cache is just
+// downloaded registry tarballs — genuinely portable, safe to share. Bun's
+// own cache is tarball-level and keyed by name@version regardless of which
+// project asked for it (confirmed against bun.sh/docs/install/cache), so
+// two worktrees — even of different repos — installing the same version of
+// the same package both hit this cache instead of both re-fetching.
+// Concurrent `bun install`s from different containers writing here at once:
+// the one documented race (oven-sh/bun#28062) is explicitly Windows-only in
+// its own root-cause (a #[cfg(windows)] code path) — not proven safe on
+// Linux by the docs, but no equivalent Linux corruption report exists
+// either, and Setu's own concurrency cap keeps simultaneous container
+// starts small regardless.
+function bunCacheDir(workspace) {
+  const dir = join(workspace, '.bun-cache');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 export function writeDockerCompose(c, repo, name, port) {
   const wtDir = join(c.workspace, repo, name);
   const project = composeProjectName(repo, name);
@@ -786,13 +809,14 @@ export function writeDockerCompose(c, repo, name, port) {
   // (writeEnvrc always writes it first), so a plain array would emit PORT
   // twice and Docker's YAML parser rejects the resulting duplicate mapping
   // key outright (`docker compose up` fails before anything starts).
-  const env = new Map([['PORT', String(port)]]);
+  const env = new Map([['PORT', String(port)], ['BUN_INSTALL_CACHE_DIR', '/bun-cache']]);
   for (const [k, v] of Object.entries(parseEnvFile(join(wtDir, '.envrc')))) env.set(k, v);
   const envLines = [...env].map(([k, v]) => `      ${k}: ${JSON.stringify(v)}`).join('\n');
 
   const volumes = [
     `      - ${wtDir}:/workspace`,
     `      - node_modules:/workspace/node_modules`,
+    `      - ${bunCacheDir(c.workspace)}:/bun-cache`,
   ];
   const hostEnvLocal = envLocalPath(repo, wtDir);
   try {

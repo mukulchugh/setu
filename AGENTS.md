@@ -74,19 +74,39 @@ refuses connection.
 | GET `/api/pr-review/status?repo=&name=` | — | pr-walkthrough plugin install status (scope-checked against this worktree), current deep-review run state, and artifact info (findings count, staleness vs. current HEAD) for `pr-walkthrough`/`pr-brief` if either has been run against this PR |
 | POST `/api/pr-review/run` | `{repo, name, skill}` | fire-and-forget: headlessly invokes the installed `pr-walkthrough`/`pr-brief` Claude Code plugin (`skill` must be one of those two) against this worktree's PR via `claude -p`, single-flight per worktree (both skills share one slot and one log). See `pr-review.js` for the invocation/security model |
 | GET `/api/pr-review/artifact?repo=&name=&skill=` | — | serves the most recent run's self-contained report HTML directly |
+| POST `/api/pr/create` | `{repo, name}` | push the branch and open a GitHub PR (`gh pr create --fill`) — fails clearly if there's no GitHub remote, no commits ahead of base, or a PR already exists |
+| POST `/api/pr/ready` | `{repo, name, ready}` | flip an existing PR between draft and ready for review (`gh pr ready` / `--undo`) |
 
 All POSTs return `{ok: boolean, error?: string, ...}`. A `queued: true` response means the
 action was accepted but not yet performed — poll `/api/worktrees` and check `active`, not
 just `ok`, to know if a dev server is actually running.
 
+## Action log
+
+Every mutating `POST /api/*` request appends one JSON line to `~/workspace/logs/actions.log`
+(same rotation as every other log here — 5MB, `.old` backup): `{ts, route, repo, name, ok,
+error?}`. GET routes aren't logged (reads, not actions — the list/status polls alone run at
+800ms-3s intervals and would drown out everything else). Built specifically to close a real
+gap: a prior incident (a worktree silently switched from bare to a container mid-use) took
+correlating three separate external log sources by hand to root-cause, because portal.js
+logged nothing about its own requests anywhere retrievable. **`/mcp` is deliberately excluded**
+— it's a JSON-RPC envelope (repo/name live under `params.arguments`, not top-level) and a
+stateless response can be SSE-framed rather than plain JSON, so blindly extending the same
+wrapper would silently mis-log every MCP-driven action as successful regardless of its real
+outcome. An MCP-driven `create_worktree`/`remove_worktree`/etc. call today leaves no trace in
+this log — real, tracked gap, not yet solved.
+
 ## MCP server (localhost:2999/mcp) — let an agent drive Setu directly
 
 Same portal, same backend functions, a fourth front door (web UI / CLI / Raycast / MCP, in
-that order of age) — `mcp-server.js`'s tools (`list_worktrees`, `create_worktree`,
+that order of age) — `mcp-server.js`'s 15 tools (`list_worktrees`, `create_worktree`,
 `start_worktree`, `stop_worktree`, `sync_worktree`, `remove_worktree`, `get_diff`, `get_logs`,
-`list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`) call straight into
-portal.js's own functions in-process, not over HTTP — no self-fetch loopback. Streamable
-HTTP, stateless (fresh `McpServer` per request), DNS-rebinding protection on, no CORS.
+`list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`,
+`create_pr`, `pr_ready`) call straight into portal.js's own functions in-process, not over
+HTTP — no self-fetch loopback. Streamable HTTP, stateless (fresh `McpServer` per request),
+DNS-rebinding protection on, no CORS. The server also sends a real `instructions` string on
+connect (MCP's own `InitializeResult.instructions` field) — architecture overview, tool
+groupings, and a concrete debugging workflow, not just per-tool descriptions in isolation.
 
 Register it with whatever's connecting:
 - **Claude Code**: `claude --plugin-dir <setu>/claude-plugin` (a real packaged plugin — `.mcp.json` at its root, not inside `.claude-plugin/`).
@@ -126,7 +146,9 @@ something (the memory-ceiling watchdog, or a portal-UI Start click on an untrack
 worktree) tried to bring it back up with no explicit choice made by anyone. Root-caused via
 OrbStack's own log (`~/.orbstack/log/vmgr.log`) and Caddy's access log (`/opt/homebrew/var/log/caddy.log`,
 JSON lines with epoch `ts` — filter by timestamp, not string-matching a human-readable time) —
-both keep real historical evidence portal.js itself doesn't log anywhere retrievable.
+both keep real historical evidence portal.js itself didn't log anywhere retrievable at the time.
+That gap is closed now: every mutating `POST /api/*` request appends to
+`~/workspace/logs/actions.log` (route, repo/name, ok/error) — see "Action log" below.
 
 **Only the dev server process is containerized.** The portal, Caddy, dnsmasq, and git all
 stay native on the host — this default governs how one process runs, not the rest of the
