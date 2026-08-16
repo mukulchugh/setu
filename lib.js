@@ -1278,6 +1278,49 @@ export function cloneBareRepo(repoDir, remoteUrl, ghSlug, { stdio = 'inherit' } 
   git(repoDir, ['fetch', '--all', '--prune']);
 }
 
+// So an agent (or human) working inside a Setu-managed project's own
+// worktree knows dev servers/ports/domains are Setu's job, not npm
+// run dev — without that context nothing tells them Setu even exists.
+// Deliberately project-level only (repo name, portal URL, CLI reference),
+// never a specific worktree's port/domain: these two files are meant to be
+// committed once to the project's default branch and inherited by every
+// future worktree via git, so baking in THIS worktree's own assigned port
+// would already be stale for the next one. Idempotent (safe to call again
+// on an already-marked repo) and non-destructive to an existing AGENTS.md —
+// appends one clearly delimited section instead of overwriting, matching
+// how gstack's own skill-routing install appends to CLAUDE.md rather than
+// replacing it. Written and staged, never committed here: committing to a
+// project this tool doesn't own is the user's call, not an automatic one.
+const SETU_AGENTS_SECTION_MARKER = '## Managed by Setu';
+
+function setuAgentsSection(repo) {
+  return `${SETU_AGENTS_SECTION_MARKER}\n\n` +
+    `This project's git worktrees, local dev domains, and dev servers are managed by [Setu](https://github.com/quivly/setu) — don't run \`npm run dev\`/\`bun dev\` directly, use Setu so the portal keeps tracking the process.\n\n` +
+    `**If \`setu\` isn't installed:**\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash\nsetu setup\n\`\`\`\n\n` +
+    `**Common commands** (run from anywhere):\n\`\`\`\nsetu ls ${repo}                    List this project's worktrees + running state\nsetu new ${repo} <branch>          Create a new worktree\nsetu start ${repo} <branch>        Start a worktree's dev server\nsetu stop  ${repo} <branch>        Stop it\nsetu cd    ${repo} <branch>        cd into the worktree\n\`\`\`\n\n` +
+    `Live state (ports, domains, running status): \`setu ls ${repo} --json\`, or the portal API at \`http://localhost:${PORTAL_PORT}/api/worktrees\`.\n`;
+}
+
+function writeSetuAgentMarkers(repo, wtDir) {
+  const markerPath = join(wtDir, '.setu.json');
+  if (!existsSync(markerPath)) {
+    writeFileSync(markerPath, JSON.stringify({
+      managedBy: 'setu', repo, portal: `http://localhost:${PORTAL_PORT}`,
+      install: 'curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash',
+      docs: 'https://github.com/quivly/setu',
+    }, null, 2) + '\n');
+  }
+
+  const agentsPath = join(wtDir, 'AGENTS.md');
+  const existing = existsSync(agentsPath) ? readFileSync(agentsPath, 'utf8') : '';
+  if (!existing.includes(SETU_AGENTS_SECTION_MARKER)) {
+    const trimmed = existing.replace(/\s*$/, '');
+    writeFileSync(agentsPath, (trimmed ? trimmed + '\n\n' : '') + setuAgentsSection(repo));
+  }
+
+  try { git(wtDir, ['add', '.setu.json', 'AGENTS.md']); } catch {}
+}
+
 // Extracted from cmdInit's clone->register->create-main-worktree sequence so
 // `setu init` (a github slug) and sweep --import (an already-discovered
 // clone's exact origin URL) share one implementation instead of two that can
@@ -1285,7 +1328,7 @@ export function cloneBareRepo(repoDir, remoteUrl, ghSlug, { stdio = 'inherit' } 
 // createWorktree needs it — same convention createWorktree/removeWorktree
 // above already use. Never touches whatever directory the caller discovered
 // remoteUrl from: this always clones fresh into workspace/<name>.git.
-export function importRepo(c, { name, remoteUrl, label = '' }) {
+export async function importRepo(c, { name, remoteUrl, label = '' }) {
   const repoDir = join(c.workspace, `${name}.git`);
   const ghSlug  = remoteUrl?.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? '';
 
@@ -1307,7 +1350,9 @@ export function importRepo(c, { name, remoteUrl, label = '' }) {
   }
 
   registerProject(c.workspace, { label, name, slug: ghSlug });
-  return createWorktree(c, name, 'main');
+  const result = await createWorktree(c, name, 'main');
+  writeSetuAgentMarkers(name, result.wtDir);
+  return result;
 }
 
 // ── portal client (used by CLI to talk to the running portal) ────────────────
