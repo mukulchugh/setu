@@ -15,8 +15,9 @@
     "tsconfig.json",
     "install.sh"
   ],
-  "engines": {
-    "bun": ">=1.0.0"
+  "scripts": {
+    "check": "ultracite check",
+    "fix": "ultracite fix"
   },
   "overrides": {
     "react": "npm:@preact/compat@^18.3.2",
@@ -36,5 +37,12 @@
     "tailwind-merge": "latest",
     "tailwindcss": "^4.3.2",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "ultracite": "7.10.5"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
   }
 }

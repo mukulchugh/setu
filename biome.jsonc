@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": ["ultracite/biome/core"],
+  // raycast/ is a separate, self-contained sub-project with its own required
+  // toolchain (@raycast/eslint-config + Prettier, run via `ray lint` — a
+  // Raycast Store submission requirement, not something this repo can swap
+  // out for Biome). Excluded here rather than fought over: two formatters
+  // disagreeing on the same files is worse than one tool per subtree.
+  "files": {
+    "includes": ["**", "!raycast/**"]
+  },
+  // ultracite/biome/core defaults to double quotes; this codebase has used
+  // single quotes throughout since before Biome existed here — matching the
+  // existing convention, not reformatting every file in the repo to switch.
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single"
+    },
+    // Biome only recognizes browser/Node globals by default; this is a Bun
+    // project (portal.js/cli.js/lib.js all use Bun.serve/Bun.spawn/Bun.file
+    // directly), so without this every one of those reads as an undeclared
+    // variable to lint/correctness/noUndeclaredVariables.
+    "globals": ["Bun"]
+  }
+}
