@@ -3,7 +3,7 @@
 // settings-sections) don't have to import from app.tsx itself.
 import type { Tone } from './ui';
 
-export async function post(url: string, body: any) {
+export async function post(url: string, body: unknown) {
   try {
     const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     return await r.json();
@@ -15,7 +15,7 @@ export async function post(url: string, body: any) {
 // styles (res && res.ok === false / res?.ok === false / !res.ok) call sites
 // had drifted into. Returns res either way so a caller can still branch on
 // success for its own side effects.
-export async function postOrToast(url: string, body: any, toast: (msg: string, tone?: Tone) => void, failMsg: string) {
+export async function postOrToast(url: string, body: unknown, toast: (msg: string, tone?: Tone) => void, failMsg: string) {
   const res = await post(url, body);
   if (!res?.ok) toast(`✗ ${failMsg}: ${res?.error ?? 'unknown error'}`);
   return res;

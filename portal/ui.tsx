@@ -2,6 +2,7 @@
 // the same badge/button/status-dot styling inline at every call site. Kept
 // as plain functions, not a component library package: this is a ~500-line
 // single-page tool, not a design system with multiple consumers.
+import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 // Signal colors, not generic Tailwind brights — railway/aviation "clear /
@@ -49,7 +50,7 @@ export function StatusFlap({ text, tone }: { text: string; tone: Tone }) {
 // Board-style label plaque — status labels, mode hints, resource badges.
 // Uppercase, tracked, bold: signage, not a soft SaaS pill. `tip` renders the
 // existing hover-tooltip CSS (styles.css's .tip::after) rather than a new mechanism.
-export function Badge({ tone, tip, children }: { tone: Tone; tip?: string; children: any }) {
+export function Badge({ tone, tip, children }: { tone: Tone; tip?: string; children: ComponentChildren }) {
   return (
     <span {...(tip ? { 'data-tip': tip } : {})}
       class={`tip board-mono text-[9px] font-bold px-1.5 py-0.5 rounded-none shrink-0 transition-colors duration-200 ${TONE_SOFT[tone]}`}>
@@ -62,7 +63,7 @@ export function Badge({ tone, tip, children }: { tone: Tone; tip?: string; child
 // shares one hover/disabled/transition definition instead of restating
 // `tip icon-btn text-X hover:bg-Y transition-colors` at 15+ call sites.
 export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target, children }: {
-  tone?: Tone; tip: string; onClick?: (e: any) => void; disabled?: boolean; href?: string; target?: string; children: any;
+  tone?: Tone; tip: string; onClick?: () => void; disabled?: boolean; href?: string; target?: string; children: ComponentChildren;
 }) {
   const cls = `tip icon-btn transition-all duration-200 ease-out ${
     disabled ? 'text-zinc-300 pointer-events-none' : `${TONE_TEXT[tone]} hover:bg-current/10`
@@ -86,10 +87,10 @@ export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target
 // trying to override px-4/py-2.5 via an appended class (the same footgun
 // documented on flex-1 above).
 const buttonBase = 'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px';
-export function PrimaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: any; class?: string; compact?: boolean }) {
+export function PrimaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: ComponentChildren; class?: string; compact?: boolean }) {
   return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none`}>{children}</button>;
 }
-export function SecondaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: any; class?: string; compact?: boolean }) {
+export function SecondaryButton({ onClick, disabled, children, class: cls = '', compact = false }: { onClick?: () => void; disabled?: boolean; children: ComponentChildren; class?: string; compact?: boolean }) {
   return <button onClick={onClick} disabled={disabled} class={`${buttonBase} ${compact ? 'px-3 py-1.5' : 'px-4 py-2.5'} ${cls} bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10`}>{children}</button>;
 }
 
@@ -118,10 +119,10 @@ export function ToastStack({ toasts, onDismiss }: { toasts: ToastItem[]; onDismi
   );
 }
 
-export function Modal({ onClose, children, position = 'center' }: { onClose: () => void; children: any; position?: 'center' | 'bottom' }) {
+export function Modal({ onClose, children, position = 'center' }: { onClose: () => void; children: ComponentChildren; position?: 'center' | 'bottom' }) {
   return (
     <div class={`fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex transition-opacity duration-200 ${position === 'bottom' ? 'items-end justify-stretch' : 'items-center justify-center'}`}
-      onClick={(e: any) => { if (e.target === e.currentTarget) onClose(); }}>
+      onClick={(e: MouseEvent) => { if (e.target === e.currentTarget) onClose(); }}>
       {children}
     </div>
   );
@@ -144,7 +145,7 @@ export function CloseBtn({ onClick }: { onClick: () => void }) {
 // Click-outside-to-close menu — the one interaction pattern app.tsx needed in
 // three places (worktree "more" menu, start-mode menu). One implementation,
 // not three copies of the same document-listener effect.
-export function Menu({ trigger, children, align = 'right' }: { trigger: (toggle: () => void) => any; children: any; align?: 'left' | 'right' }) {
+export function Menu({ trigger, children, align = 'right' }: { trigger: (toggle: () => void) => ComponentChildren; children: ComponentChildren; align?: 'left' | 'right' }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -165,7 +166,7 @@ export function Menu({ trigger, children, align = 'right' }: { trigger: (toggle:
   );
 }
 
-export function MenuItem({ onClick, tone = 'zinc', icon, children }: { onClick: () => void; tone?: 'zinc' | 'red'; icon?: any; children: any }) {
+export function MenuItem({ onClick, tone = 'zinc', icon, children }: { onClick: () => void; tone?: 'zinc' | 'red'; icon?: ComponentChildren; children: ComponentChildren }) {
   return (
     <button onClick={onClick}
       class={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 whitespace-nowrap transition-colors duration-150 ${
@@ -178,7 +179,7 @@ export function MenuItem({ onClick, tone = 'zinc', icon, children }: { onClick: 
 export const inputCls = 'bg-white border border-zinc-200 text-zinc-800 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-zinc-400 placeholder-zinc-400 transition-colors duration-150';
 
 // Semantic <kbd> for shortcut badges (⌘K etc.) instead of a plain styled span.
-export function Kbd({ children }: { children: any }) {
+export function Kbd({ children }: { children: ComponentChildren }) {
   return (
     <kbd class="board-mono text-[9px] font-bold text-zinc-500 dark:text-zinc-400 border border-zinc-300 dark:border-zinc-700 rounded-none px-1.5 py-0.5">
       {children}
@@ -188,7 +189,7 @@ export function Kbd({ children }: { children: any }) {
 
 // Two real call sites (the list view's header, the worktree detail page) is
 // enough to know the right shape — not built ahead of a second consumer.
-export function PageHeader({ back, title, subtitle, actions }: { back?: { label: string; onClick: () => void }; title: any; subtitle?: any; actions?: any }) {
+export function PageHeader({ back, title, subtitle, actions }: { back?: { label: string; onClick: () => void }; title: ComponentChildren; subtitle?: ComponentChildren; actions?: ComponentChildren }) {
   // Transparent at rest — the glass/blur backdrop only appears once content
   // has actually scrolled underneath (position:sticky has no stable CSS way
   // to select "currently stuck", so this is tracked directly). Stuck state
@@ -230,7 +231,7 @@ export function PageHeader({ back, title, subtitle, actions }: { back?: { label:
 }
 
 // Labeled content block — the detail page's info/actions/metrics groups.
-export function Section({ title, children, actions }: { title: string; children: any; actions?: any }) {
+export function Section({ title, children, actions }: { title: string; children: ComponentChildren; actions?: ComponentChildren }) {
   return (
     <div class="mb-8">
       <div class="flex items-center justify-between mb-3">

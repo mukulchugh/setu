@@ -281,7 +281,7 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
       <div class="flex flex-col gap-3">
         {adding && (
           <div class="flex flex-col gap-2 p-3 border border-zinc-200 dark:border-zinc-800 rounded-lg">
-            <input value={form.name} onInput={(e: any) => setForm(f => ({ ...f, name: e.target.value }))}
+            <input value={form.name} onInput={(e) => setForm(f => ({ ...f, name: e.currentTarget.value }))}
               placeholder="Name" class={`${inputCls} text-xs py-1.5`} />
             <div class="flex gap-4 text-xs text-zinc-600 dark:text-zinc-400">
               <label class="flex items-center gap-1.5"><input type="radio" checked={form.transport === 'stdio'} onChange={() => setForm(f => ({ ...f, transport: 'stdio' }))} /> Local command</label>
@@ -289,21 +289,21 @@ export function McpSection({ toast }: { toast: (msg: string, tone?: Tone) => voi
             </div>
             {form.transport === 'stdio' ? (
               <>
-                <input value={form.command} onInput={(e: any) => setForm(f => ({ ...f, command: e.target.value }))}
+                <input value={form.command} onInput={(e) => setForm(f => ({ ...f, command: e.currentTarget.value }))}
                   placeholder="Command" class={`${inputCls} text-xs py-1.5 font-mono`} />
-                <input value={form.args} onInput={(e: any) => setForm(f => ({ ...f, args: e.target.value }))}
+                <input value={form.args} onInput={(e) => setForm(f => ({ ...f, args: e.currentTarget.value }))}
                   placeholder="Args (space-separated)" class={`${inputCls} text-xs py-1.5 font-mono`} />
               </>
             ) : (
               <>
-                <input value={form.url} onInput={(e: any) => setForm(f => ({ ...f, url: e.target.value }))}
+                <input value={form.url} onInput={(e) => setForm(f => ({ ...f, url: e.currentTarget.value }))}
                   placeholder="https://…" class={`${inputCls} text-xs py-1.5 font-mono`} />
                 <div class="flex gap-4 text-xs text-zinc-600 dark:text-zinc-400">
                   <label class="flex items-center gap-1.5"><input type="radio" checked={form.httpAuthMode === 'headers'} onChange={() => setForm(f => ({ ...f, httpAuthMode: 'headers' }))} /> Static header</label>
                   <label class="flex items-center gap-1.5"><input type="radio" checked={form.httpAuthMode === 'oauth'} onChange={() => setForm(f => ({ ...f, httpAuthMode: 'oauth' }))} /> OAuth</label>
                 </div>
                 {form.httpAuthMode === 'headers' && (
-                  <input value={form.headerLine} onInput={(e: any) => setForm(f => ({ ...f, headerLine: e.target.value }))}
+                  <input value={form.headerLine} onInput={(e) => setForm(f => ({ ...f, headerLine: e.currentTarget.value }))}
                     placeholder="Authorization: Bearer …" class={`${inputCls} text-xs py-1.5 font-mono`} />
                 )}
               </>

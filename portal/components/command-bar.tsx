@@ -33,7 +33,7 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
   // would just double-fire onClose redundantly. ArrowUp/ArrowDown/Enter stay
   // hand-rolled: they drive this component's own result-list selection, a
   // concern Base UI's Dialog has no opinion on.
-  function onKeyDown(e: any) {
+  function onKeyDown(e: KeyboardEvent) {
     if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(s + 1, results.length - 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(s - 1, 0)); }
     else if (e.key === 'Enter' && results[sel]) go(results[sel]);
@@ -48,7 +48,7 @@ export function CommandBar({ worktrees, onSelect, onClose }: { worktrees: Worktr
       <DialogContent class="p-0 sm:max-w-md" initialFocus={inputRef} onKeyDown={onKeyDown}>
         <div class="flex items-center gap-2.5 px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
           <svg class="w-4 h-4 text-zinc-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSearch.path} /></svg>
-          <input ref={inputRef} value={q} onInput={(e: any) => { setQ(e.target.value); setSel(0); }}
+          <input ref={inputRef} value={q} onInput={(e) => { setQ(e.currentTarget.value); setSel(0); }}
             placeholder="Jump to a worktree…" autocomplete="off"
             class="flex-1 text-sm bg-transparent outline-none placeholder-zinc-400 text-zinc-900 dark:text-zinc-100" />
           <span class="board-mono text-[10px] text-zinc-300 shrink-0">ESC</span>

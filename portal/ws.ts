@@ -10,7 +10,7 @@
 //   client -> server: {"sub": "<topic>"} / {"unsub": "<topic>"} JSON frames
 //   server -> client: {"topic": "<topic>", "data": <payload>} JSON frames
 
-type Listener = (data: any) => void;
+type Listener = (data: unknown) => void;
 type ResyncListener = () => void;
 
 const INITIAL_BACKOFF_MS = 500;

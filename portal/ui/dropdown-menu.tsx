@@ -33,6 +33,7 @@
 // Group/Label/Shortcut are deliberately NOT ported (YAGNI) — pull them from
 // the same registry JSON if a real consumer ever needs them.
 import { Menu as MenuPrimitive } from '@base-ui/react/menu';
+import type { ComponentChildren } from 'preact';
 import { cva } from 'class-variance-authority';
 import { cn } from './utils';
 
@@ -171,7 +172,7 @@ export function DropdownMenuItem({
   icon,
   children,
   ...props
-}: MenuPrimitive.Item.Props & { class?: string; tone?: DropdownMenuItemTone; icon?: any }) {
+}: MenuPrimitive.Item.Props & { class?: string; tone?: DropdownMenuItemTone; icon?: ComponentChildren }) {
   return (
     <MenuPrimitive.Item className={cn(dropdownMenuItemVariants({ tone }), cls)} {...props}>
       {icon}

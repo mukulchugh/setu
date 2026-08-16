@@ -197,7 +197,7 @@ function ToastList() {
             // per ARIA precedence).
             aria-label="Dismiss notification"
             onClick={() => close(t.id)}
-            onKeyDown={(e: any) => {
+            onKeyDown={(e: KeyboardEvent) => {
               if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); close(t.id); }
             }}
           >

@@ -1,5 +1,6 @@
 // setu portal UI — Preact, bundled by Bun.serve at runtime (see portal.js)
 import { render } from 'preact';
+import type { ComponentChildren, JSX } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 // PageHeader/Section/inputCls stay on the old hand-rolled kit -- no shadcn
 // equivalent needed, ui.tsx keeps exporting them untouched. Everything else
@@ -256,18 +257,18 @@ function CreateModal({ projects, initialRepo, initialName, onClose, onCreated }:
         <div class="flex flex-col gap-4">
           <div class="flex flex-col gap-1.5">
             <label class="text-xs text-zinc-500">Repo</label>
-            <select value={repo} onChange={(e: any) => setRepo(e.target.value)} class={inputCls}>
+            <select value={repo} onChange={(e) => setRepo(e.currentTarget.value)} class={inputCls}>
               {projects.map((p: Project) => <option key={p.name} value={p.name}>{p.label}</option>)}
             </select>
           </div>
           <div class="flex flex-col gap-1.5">
             <label class="text-xs text-zinc-500">Branch name</label>
-            <input ref={nameInputRef} value={name} onInput={(e: any) => setName(e.target.value)} placeholder="feat-my-feature"
+            <input ref={nameInputRef} value={name} onInput={(e) => setName(e.currentTarget.value)} placeholder="feat-my-feature"
               autocomplete="off" class={inputCls}
-              onKeyDown={(e: any) => { if (e.key === 'Enter') create(); }} />
+              onKeyDown={(e: KeyboardEvent) => { if (e.key === 'Enter') create(); }} />
           </div>
           <div class="flex items-center gap-2">
-            <input type="checkbox" id="create-tunnel" checked={tunnel} onChange={(e: any) => setTunnel(e.target.checked)} class="accent-sky-500" />
+            <input type="checkbox" id="create-tunnel" checked={tunnel} onChange={(e) => setTunnel(e.currentTarget.checked)} class="accent-sky-500" />
             <label for="create-tunnel" class="text-xs text-zinc-500">Enable tunnel</label>
           </div>
           {status && <p class="text-xs text-zinc-500">{status}</p>}
@@ -337,13 +338,13 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
           {tab === 'existing' ? (
             <div class="flex flex-col gap-1.5">
               <label class="text-xs text-zinc-500">GitHub URL or slug</label>
-              <input ref={tabInputRef} value={github} onInput={(e: any) => setGithub(e.target.value)}
+              <input ref={tabInputRef} value={github} onInput={(e) => setGithub(e.currentTarget.value)}
                 placeholder="org/repo or https://github.com/org/repo" autocomplete="off" class={inputCls} />
             </div>
           ) : (
             <div class="flex flex-col gap-1.5">
               <label class="text-xs text-zinc-500">Repo name</label>
-              <input ref={tabInputRef} value={newName} onInput={(e: any) => setNewName(e.target.value)}
+              <input ref={tabInputRef} value={newName} onInput={(e) => setNewName(e.currentTarget.value)}
                 placeholder="my-new-project" autocomplete="off" class={inputCls} />
               <p class="text-[11px] text-zinc-400">Creates a bare local repo at ~/workspace/&lt;name&gt;.git — push a remote later.</p>
             </div>
@@ -351,7 +352,7 @@ function AddProjectModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
 
           <div class="flex flex-col gap-1.5">
             <label class="text-xs text-zinc-500">Label <span class="text-zinc-300">(optional)</span></label>
-            <input value={label} onInput={(e: any) => setLabel(e.target.value)} placeholder="My App" autocomplete="off" class={inputCls} />
+            <input value={label} onInput={(e) => setLabel(e.currentTarget.value)} placeholder="My App" autocomplete="off" class={inputCls} />
           </div>
 
           {status && <p class="text-xs text-zinc-500">{status}</p>}
@@ -412,7 +413,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
         <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerPlayerPlayFilled.path} /></svg>
       </IconButton>
       <DropdownMenu>
-        <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Force a mode"
+        <DropdownMenuTrigger onClick={(e: MouseEvent) => e.stopPropagation()} data-tip="Force a mode"
           class="tip w-4 h-6 flex items-center justify-center text-zinc-300 hover:text-zinc-500 transition-colors duration-150 -ml-1">
           <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d={tablerCaretDownFilled.path} /></svg>
         </DropdownMenuTrigger>
@@ -434,7 +435,7 @@ function StartControl({ w, pending, onStart }: { w: Worktree; pending: boolean; 
 // pre-built element -- reusing the same vnode instance across every
 // worktree card on the page is exactly the kind of thing Preact expects a
 // component (mounted fresh per call site) to handle instead.
-const DEPLOY_PROVIDER: Record<DeployProvider, { label: string; Icon: (props: { class?: string }) => any; customPrompt: string }> = {
+const DEPLOY_PROVIDER: Record<DeployProvider, { label: string; Icon: (props: { class?: string }) => JSX.Element; customPrompt: string }> = {
   vercel:  { label: 'Vercel',  Icon: VercelIcon,  customPrompt: 'Custom environment name (e.g. staging):' },
   netlify: { label: 'Netlify', Icon: NetlifyIcon, customPrompt: 'Branch name for the deploy context (e.g. staging):' },
 };
@@ -463,7 +464,7 @@ function DeployMenu({ w, provider, deploy, onDeploy }: {
     // tone="zinc" IconButton chrome reproduced on the trigger directly --
     // see StartControl's needsMigrationPrompt branch above for why.
     <DropdownMenu>
-      <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip={`Deploy to ${label}`}
+      <DropdownMenuTrigger onClick={(e: MouseEvent) => e.stopPropagation()} data-tip={`Deploy to ${label}`}
         class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
         <Icon class="w-4 h-4" />
       </DropdownMenuTrigger>
@@ -743,7 +744,7 @@ function ConvexDeployMenu({ w, deploy, onConvexDeploy }: {
   }
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Deploy to Convex"
+      <DropdownMenuTrigger onClick={(e: MouseEvent) => e.stopPropagation()} data-tip="Deploy to Convex"
         class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
         <ConvexIcon class="w-4 h-4" />
       </DropdownMenuTrigger>
@@ -929,7 +930,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
             in list view. */}
         {agents.length > 0 && (
           <DropdownMenu>
-            <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="Open in tool"
+            <DropdownMenuTrigger onClick={(e: MouseEvent) => e.stopPropagation()} data-tip="Open in tool"
               class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerTerminal2.path} /></svg>
             </DropdownMenuTrigger>
@@ -982,7 +983,7 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
         )}
 
         <DropdownMenu>
-          <DropdownMenuTrigger onClick={(e: any) => e.stopPropagation()} data-tip="More actions"
+          <DropdownMenuTrigger onClick={(e: MouseEvent) => e.stopPropagation()} data-tip="More actions"
             class="tip icon-btn transition-all duration-200 ease-out text-zinc-400 hover:bg-current/10">
             <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d={tablerDotsVerticalFilled.path} /></svg>
           </DropdownMenuTrigger>
@@ -1356,13 +1357,13 @@ function SidecarRow({ s, onChange, onRemove, onApprove }: { s: Sidecar; onChange
   const needsApproval = s.approved === false && s.enabled !== false && !!s.command;
   return (
     <div class="flex items-center gap-2 py-2 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <input type="checkbox" checked={s.enabled !== false} onChange={(e: any) => onChange({ ...s, enabled: e.target.checked })}
+      <input type="checkbox" checked={s.enabled !== false} onChange={(e) => onChange({ ...s, enabled: e.currentTarget.checked })}
         class="accent-current" style={{ accentColor: 'var(--color-accent)' }} />
-      <input value={s.name} onInput={(e: any) => onChange({ ...s, name: e.target.value })} placeholder="name"
+      <input value={s.name} onInput={(e) => onChange({ ...s, name: e.currentTarget.value })} placeholder="name"
         class={`${inputCls} w-28 text-xs py-1`} />
-      <input value={s.command} onInput={(e: any) => onChange({ ...s, command: e.target.value })} placeholder="command"
+      <input value={s.command} onInput={(e) => onChange({ ...s, command: e.currentTarget.value })} placeholder="command"
         class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
-      <input value={(s.args ?? []).join(' ')} onInput={(e: any) => onChange({ ...s, args: e.target.value.split(' ').filter(Boolean) })}
+      <input value={(s.args ?? []).join(' ')} onInput={(e) => onChange({ ...s, args: e.currentTarget.value.split(' ').filter(Boolean) })}
         placeholder="args (space-separated)" class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
       {needsApproval && (
         <>
@@ -1386,9 +1387,9 @@ function SidecarRow({ s, onChange, onRemove, onApprove }: { s: Sidecar; onChange
 function CustomAgentRow({ a, onChange, onRemove }: { a: CustomAgent; onChange: (a: CustomAgent) => void; onRemove: () => void }) {
   return (
     <div class="flex items-center gap-2 py-2 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <input value={a.label} onInput={(e: any) => onChange({ ...a, label: e.target.value })} placeholder="label"
+      <input value={a.label} onInput={(e) => onChange({ ...a, label: e.currentTarget.value })} placeholder="label"
         class={`${inputCls} w-28 text-xs py-1`} />
-      <input value={a.command} onInput={(e: any) => onChange({ ...a, command: e.target.value })} placeholder="mytool --flag"
+      <input value={a.command} onInput={(e) => onChange({ ...a, command: e.currentTarget.value })} placeholder="mytool --flag"
         class={`${inputCls} flex-1 text-xs py-1 font-mono`} />
       <IconButton tone="red" tip="Remove custom agent" onClick={onRemove}>
         <CloseIcon class="w-3.5 h-3.5" />
@@ -1499,7 +1500,7 @@ function RepoPage({ repo, label, github, worktrees, agents, pendingStart, onAct,
       <div class="rail-divider my-8" />
 
       <Section title="Sidecars & file sync" actions={
-        <a href="/settings" onClick={(e: any) => { e.preventDefault(); navigate('/settings'); }}
+        <a href="/settings" onClick={(e: MouseEvent) => { e.preventDefault(); navigate('/settings'); }}
           class="text-xs text-accent hover:opacity-80 transition-opacity duration-150">Edit in Settings →</a>
       }>
         {sidecars === null || fileSyncGlobs === null ? (
@@ -1643,7 +1644,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
                 <span class="text-zinc-400">Mac: {settings.mac.cpus ?? '?'} cores, {fmtGb(settings.mac.memMb)} RAM</span>
               </label>
               <input type="number" min={1} max={Math.max(20, (settings.mac.cpus ?? 10) * 2)} value={settings.maxConcurrentDevServers}
-                onChange={(e: any) => saveSettings({ maxConcurrentDevServers: Number(e.target.value) || 1 })}
+                onChange={(e) => saveSettings({ maxConcurrentDevServers: Number(e.currentTarget.value) || 1 })}
                 class={`${inputCls} w-24`} />
             </div>
             <div>
@@ -1652,15 +1653,15 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
                 <span class="text-zinc-400">Docker engine: {settings.docker.cpus ?? '?'} cores, {fmtGb(settings.docker.memMb)} available</span>
               </label>
               <input value={settings.containerMemoryLimit} placeholder="4g"
-                onBlur={(e: any) => saveSettings({ containerMemoryLimit: e.target.value })}
-                onInput={(e: any) => setSettings(s => s && { ...s, containerMemoryLimit: e.target.value })}
+                onBlur={(e) => saveSettings({ containerMemoryLimit: e.currentTarget.value })}
+                onInput={(e) => setSettings(s => s && { ...s, containerMemoryLimit: e.currentTarget.value })}
                 class={`${inputCls} w-24`} />
               <p class="text-[11px] text-zinc-400 mt-1">A limit above what Docker's engine actually has gets silently clamped when a container starts.</p>
             </div>
             <div>
               <label class="text-xs text-zinc-500 mb-1 block">Container CPU limit</label>
               <input type="number" min={1} max={settings.docker.cpus ?? 16} value={settings.containerCpuLimit}
-                onChange={(e: any) => saveSettings({ containerCpuLimit: Number(e.target.value) || 1 })}
+                onChange={(e) => saveSettings({ containerCpuLimit: Number(e.currentTarget.value) || 1 })}
                 class={`${inputCls} w-24`} />
             </div>
             {saving && <p class="text-xs text-zinc-400">Saving…</p>}
@@ -1686,7 +1687,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
 
       <Section title="Sidecars" actions={
         projects.length > 1 && (
-          <select value={sidecarRepo} onChange={(e: any) => setSidecarRepo(e.target.value)} class={`${inputCls} text-xs py-1`}>
+          <select value={sidecarRepo} onChange={(e) => setSidecarRepo(e.currentTarget.value)} class={`${inputCls} text-xs py-1`}>
             {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
           </select>
         )
@@ -1710,14 +1711,14 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
 
       <Section title="File Sync" actions={
         projects.length > 1 && (
-          <select value={fileSyncRepo} onChange={(e: any) => setFileSyncRepo(e.target.value)} class={`${inputCls} text-xs py-1`}>
+          <select value={fileSyncRepo} onChange={(e) => setFileSyncRepo(e.currentTarget.value)} class={`${inputCls} text-xs py-1`}>
             {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
           </select>
         )
       }>
         {!projects.length ? <p class="text-sm text-zinc-400">Add a project first.</p> : (
           <div class="flex flex-col gap-2">
-            <textarea value={fileSyncText} onInput={(e: any) => setFileSyncText(e.target.value)}
+            <textarea value={fileSyncText} onInput={(e) => setFileSyncText(e.currentTarget.value)}
               placeholder="*.local.json&#10;config/local.json" rows={3}
               class={`${inputCls} w-full text-xs py-1 font-mono`} />
             <div class="flex items-center gap-3 pt-2">
@@ -1758,7 +1759,7 @@ function SettingsPage({ toast }: { toast: (msg: string, tone?: Tone) => void }) 
 // passed in per call site rather than baked into one scheme. `right` covers
 // Raycast's trailing status text, the one button here with extra content.
 function SidebarButton({ icon, label, active = false, activeClass, tip, onClick, right }: {
-  icon: any; label: any; active?: boolean; activeClass?: string; tip?: string; onClick: () => void; right?: any;
+  icon: ComponentChildren; label: ComponentChildren; active?: boolean; activeClass?: string; tip?: string; onClick: () => void; right?: ComponentChildren;
 }) {
   const cls = `flex items-center gap-2.5 h-9 px-2 rounded-none border transition-all duration-150 ${
     active ? activeClass : 'bg-white/70 dark:bg-white/5 border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-white dark:hover:bg-white/10'}`;
@@ -1796,7 +1797,7 @@ function App() {
   const [agents, setAgents] = useState<{ id: string; label: string }[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
   const [filter, setFilter] = useState(() => localStorage.getItem('setu-filter') || 'all');
-  const [view, setView] = useState<'list' | 'grid'>(() => (localStorage.getItem('setu-view') as any) || 'grid');
+  const [view, setView] = useState<'list' | 'grid'>(() => (localStorage.getItem('setu-view') as 'list' | 'grid' | null) || 'grid');
   const [dark, setDark] = useState(() => localStorage.getItem('setu-theme') === 'dark');
 
   // View preferences — localStorage, not a client-side database. The actual
@@ -1805,7 +1806,7 @@ function App() {
   // values (sort key, quick-filters, page). A "Dexie-like" local DB would add
   // a real client-vs-server staleness problem for zero benefit over this.
   const [sortKey, setSortKey] = useState<'recent' | 'name' | 'created'>(
-    () => (localStorage.getItem('setu-sort') as any) || 'recent');
+    () => (localStorage.getItem('setu-sort') as 'recent' | 'name' | 'created' | null) || 'recent');
   const [search, setSearch] = useState('');
   const [onlyDirty, setOnlyDirty] = useState(() => localStorage.getItem('setu-filter-dirty') === '1');
   const [onlyAhead, setOnlyAhead] = useState(() => localStorage.getItem('setu-filter-ahead') === '1');
@@ -1935,7 +1936,7 @@ function App() {
   async function start(w: Worktree, force?: 'container' | 'bare') {
     pendingStart.current.add(w.key);
     setWorktrees([...worktrees]);
-    const body: any = { repo: w.repo, name: w.name };
+    const body: { repo: string; name: string; container?: boolean } = { repo: w.repo, name: w.name };
     if (force) body.container = force === 'container';
     const res = await postOrToast('/api/start', body, toast, 'start failed');
     if (!res?.ok) pendingStart.current.delete(w.key);
@@ -2117,7 +2118,7 @@ function App() {
           not a duplicate of each other. */}
       <div class="relative mb-4">
         <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 dark:text-zinc-400 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerSearch.path} /></svg>
-        <input value={search} onInput={(e: any) => setSearch(e.target.value)}
+        <input value={search} onInput={(e) => setSearch(e.currentTarget.value)}
           placeholder="Search worktrees by name, repo, or label…" autocomplete="off"
           class="w-full text-sm bg-white/60 dark:bg-white/5 backdrop-blur-md border border-white/75 dark:border-white/10 shadow-sm rounded-none pl-9 pr-3 py-2.5 text-zinc-800 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-500 transition-colors duration-150" />
       </div>
@@ -2139,7 +2140,7 @@ function App() {
           Created by Mukul Chugh
         </a>
         <div class="flex items-center gap-4">
-          <a href="/help" onClick={(e: any) => { e.preventDefault(); navigate('/help'); }}
+          <a href="/help" onClick={(e: MouseEvent) => { e.preventDefault(); navigate('/help'); }}
             class="hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors duration-150">Help &amp; guide</a>
           <a href="https://github.com/quivly/setu" target="_blank"
             class="hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors duration-150">Contribute on GitHub</a>
@@ -2149,7 +2150,7 @@ function App() {
 
       <div class="w-52 shrink-0 sticky top-28 z-20 flex flex-col gap-4">
       <div class="flex flex-col gap-1 backdrop-blur-md bg-white/70 dark:bg-white/10 border border-white/75 dark:border-white/10 shadow-lg rounded-none p-2">
-        <select value={filter} onChange={(e: any) => setFilter(e.target.value)}
+        <select value={filter} onChange={(e) => setFilter(e.currentTarget.value)}
           class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
           <option value="all">All projects</option>
           {projects.map(p => <option key={p.name} value={p.name}>{p.label}</option>)}
@@ -2162,7 +2163,7 @@ function App() {
             </svg>}
             label="Repo overview" />
         )}
-        <select value={sortKey} onChange={(e: any) => setSortKey(e.target.value)}
+        <select value={sortKey} onChange={(e) => setSortKey(e.currentTarget.value as typeof sortKey)}
           class="bg-white/70 dark:bg-white/5 border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs rounded-none px-2 py-2 mb-1 focus:outline-none focus:border-zinc-400 transition-colors duration-150">
           <option value="recent">Recently active</option>
           <option value="name">Name</option>

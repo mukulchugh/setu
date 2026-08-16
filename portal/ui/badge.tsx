@@ -7,6 +7,7 @@
 // isValidElement + a useMergedRefs hook, no useSyncExternalStore), the same
 // render path every Dialog/Menu part the spike drove goes through.
 import { useRender } from '@base-ui/react/use-render';
+import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { cva } from 'class-variance-authority';
 import { cn } from './utils';
@@ -86,7 +87,7 @@ export function Badge({ tone = 'zinc', tip, class: cls, render, children }: {
   tip?: string;
   class?: string;
   render?: useRender.RenderProp<{ tone: Tone }>;
-  children?: any;
+  children?: ComponentChildren;
 }) {
   return useRender({
     defaultTagName: 'span',

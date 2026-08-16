@@ -1,9 +1,10 @@
 // Static help/guide content — no state, no fetches, only a back-navigation
 // callback from the caller (the router itself stays in app.tsx).
+import type { ComponentChildren } from 'preact';
 import { PageHeader, Section, Kbd } from '../ui';
 import { Button } from '../ui/button';
 
-function HelpTopic({ title, children }: { title: string; children: any }) {
+function HelpTopic({ title, children }: { title: string; children: ComponentChildren }) {
   return (
     <div class="mb-5 last:mb-0">
       <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-1">{title}</h3>
