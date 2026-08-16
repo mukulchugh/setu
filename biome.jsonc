@@ -21,5 +21,18 @@
     // directly), so without this every one of those reads as an undeclared
     // variable to lint/correctness/noUndeclaredVariables.
     "globals": ["Bun"]
+  },
+  "linter": {
+    "rules": {
+      "performance": {
+        // Only protects against unnecessary rerenders of children wrapped in
+        // memo() — this codebase uses memo() nowhere (verified: zero call
+        // sites), so every inline JSX handler already rerenders its child
+        // regardless of identity. Wrapping ~226 call sites in useCallback for
+        // that would add bulk and dependency-array risk for no measurable
+        // gain. Revisit if a real memo() boundary is ever introduced.
+        "noJsxPropsBind": "off"
+      }
+    }
   }
 }
