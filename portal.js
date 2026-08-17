@@ -28,6 +28,7 @@ import {
 import { connectMcpServer, finishMcpAuth, disconnectMcpServer, mcpStatuses } from './mcp.js';
 import { detectPrWalkthroughPlugin, findLatestArtifact, artifactHtmlPath, reviewRunStatus, runDeepReview } from './pr-review.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
+import { getCostsSummary } from './costs.js';
 
 let _cfg;
 try { _cfg = requireConfig(); }
@@ -1605,8 +1606,16 @@ async function projectRoutes(req, pathname, method, server) {
   return null;
 }
 
-async function settingsRoutes(req, pathname, method) {
+async function settingsRoutes(req, pathname, method, server) {
   if (pathname === '/api/agents') return Response.json(detectAgentClis(WORKSPACE));
+
+  // Anthropic/OpenAI cost_report calls are real external network round
+  // trips (2 providers, each potentially paginated) — same idleTimeout
+  // override /api/sweep documents, for the same reason.
+  if (pathname === '/api/costs' && method === 'GET') {
+    server?.timeout(req, 0);
+    return jsonTry(() => getCostsSummary());
+  }
 
   // Both GET (read current values + real hardware/Docker capacity for the
   // settings UI's ranges) and POST (persist a change) live on one path.
@@ -2467,7 +2476,7 @@ const server = Bun.serve({
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/archived': indexPage, '/help': indexPage, '/ports': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/worktree/:repo/:name': indexPage },
+  routes: { '/': indexPage, '/archived': indexPage, '/costs': indexPage, '/help': indexPage, '/ports': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/worktree/:repo/:name': indexPage },
   websocket: { close, message, open },
 });
 console.log(`Portal → http://quivly.local  (localhost:${PORT})`);

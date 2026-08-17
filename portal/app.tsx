@@ -25,12 +25,13 @@ import {
   tablerTerminal2, tablerCheck, tablerCopy, tablerWorld, tablerTrash, tablerPlayerStopFilled,
   tablerClock, tablerDotsVerticalFilled, tablerFileText, tablerSearch, tablerCircle,
   tablerArrowUp, tablerMenu2, tablerLayoutGrid, tablerSun, tablerMoonFilled, tablerPlug,
-  tablerArchive, tablerSettings,
+  tablerArchive, tablerSettings, tablerCurrencyDollar,
 } from './components/icons';
 import { TriviaCard } from './components/trivia-card';
 import { LogModal, LiveLog } from './components/logs';
 import { post, postOrToast } from './api';
 import { PortsPage } from './components/ports-page';
+import { CostsPage } from './components/costs-page';
 import { DiffViewer } from './components/diff-viewer';
 import { CommandBar } from './components/command-bar';
 import { HelpPage } from './components/help-page';
@@ -104,13 +105,14 @@ type Status = {
 // Minimal router — one detail view alongside the existing list/grid doesn't
 // justify a router dependency; history.pushState + popstate is the native
 // platform feature that already does exactly this.
-type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'repo'; repo: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' } | { page: 'archived' };
+type Route = { page: 'list' } | { page: 'detail'; repo: string; name: string } | { page: 'repo'; repo: string } | { page: 'settings' } | { page: 'help' } | { page: 'ports' } | { page: 'archived' } | { page: 'costs' };
 
 function parseRoute(pathname: string): Route {
   if (pathname === '/settings') return { page: 'settings' };
   if (pathname === '/help') return { page: 'help' };
   if (pathname === '/ports') return { page: 'ports' };
   if (pathname === '/archived') return { page: 'archived' };
+  if (pathname === '/costs') return { page: 'costs' };
   const wt = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
   if (wt) return { name: decodeURIComponent(wt[2]), page: 'detail', repo: decodeURIComponent(wt[1]) };
   const repo = pathname.match(/^\/repo\/([^/]+)$/);
@@ -2043,6 +2045,14 @@ function App() {
     </>;
   }
 
+  if (route.page === 'costs') {
+    return <>
+      <CostsPage onBack={() => navigate('/')} />
+      {commandOpen && <CommandBar worktrees={worktrees} onSelect={(w) => navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)} onClose={() => setCommandOpen(false)} />}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+    </>;
+  }
+
   if (route.page === 'repo') {
     const proj = projects.find(p => p.name === route.repo);
     return <>
@@ -2194,6 +2204,8 @@ function App() {
             : <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d={tablerMoonFilled.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/ports')} label="Active ports"
           icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerPlug.path} /></svg>} />
+        <SidebarButton onClick={() => navigate('/costs')} label="Costs"
+          icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerCurrencyDollar.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/archived')} label="Archived"
           icon={<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerArchive.path} /></svg>} />
         <SidebarButton onClick={() => navigate('/settings')} label="Settings"

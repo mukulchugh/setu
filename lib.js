@@ -13,6 +13,15 @@ import { createHash } from 'crypto';
 
 export const HOME        = homedir();
 export const CFG_PATH    = join(HOME, '.setu.json');
+// Deliberately separate from CFG_PATH, not a section inside it: this holds
+// org-admin-scope API keys (Anthropic/OpenAI usage & cost reporting), a
+// materially bigger blast radius than the rest of ~/.setu.json, and the
+// user writes it by hand (never through the portal, which binds 0.0.0.0 —
+// LAN-reachable, see AGENTS.md's MCP section) so a key is never typed into
+// a form this tool could echo back. Unrelated to the committed .setu.json
+// writeSetuAgentMarkers drops into MANAGED PROJECTS below — same filename
+// stem, opposite commit semantics; see AGENTS.md's Conventions section.
+export const COSTS_CFG_PATH = join(HOME, '.setu-costs.json');
 export const SETU_DIR    = join(HOME, '.setu');
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
@@ -41,6 +50,13 @@ export function requireConfig() {
   const c = loadConfig();
   if (!c.workspace || !c.domain) throw new Error('Not configured — run `setu setup` first.');
   return c;
+}
+
+// Never written by this tool — see COSTS_CFG_PATH's own comment. Read-only,
+// same try/empty-object shape as loadConfig, so a missing/malformed file
+// just reads as "nothing configured" rather than a crash.
+export function loadCostsConfig() {
+  try { return JSON.parse(readFileSync(COSTS_CFG_PATH, 'utf8')); } catch { return {}; }
 }
 
 // ── domains ───────────────────────────────────────────────────────────────────
