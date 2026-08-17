@@ -13,8 +13,13 @@ sequentially — don't assume output order reflects check duration.
 ## CLI (machine-friendly)
 
 ```
-setu setup --name <you> [--workspace ~/workspace] [--zone getquivly.ai] --yes
-                                     # non-interactive onboarding (needs sudo TTY once)
+setu setup --name <you> [--workspace ~/workspace] [--zone getquivly.ai] [--engine orbstack|docker|colima|skip] --yes
+                                     # non-interactive onboarding (needs sudo TTY once). Installs
+                                     # Homebrew itself if missing (then asks for one re-run — see
+                                     # Conventions), brew deps incl. gh (+ gh auth login if needed),
+                                     # and a container engine if none is running — --engine defaults
+                                     # to colima under --yes (the only headless-installable option;
+                                     # orbstack/docker need one manual app launch either way)
 setu doctor --json                   # layer-by-layer health, exit 1 if any check fails
 setu ls [repo] --json                # [{key, repo, name, port, running, wtDir, localDomain, tunnel}]
 setu new <repo> <branch> [--tunnel] [--start] [--bare] --json
@@ -214,6 +219,7 @@ would leak forever with nothing left pointing at it.
 ## Conventions
 
 - `mise.toml` pins this repo's own `bun` version (`mise trust` once per clone to activate). Unrelated to `createWorktree`'s own `mise trust ...` call, which best-effort-trusts a *managed project's* own mise config on worktree creation — that's a different repo's config, not this one's. `setu doctor` reports whether `mise` itself is installed (optional, not a hard `setu setup` dependency).
+- `cmdSetup` (`cli.js`) installing Homebrew itself, when missing, exits after the install and asks the user to re-run the exact same command rather than continuing in-process. Not laziness: `BREW_PREFIX`/`CADDY_BIN`/`CLOUDFLARED_BIN` (`lib.js`) are computed once at module load, before `cmdSetup` runs — with brew missing at that point they're already frozen to a fallback (wrong on Intel Macs, merely unverified on Apple Silicon) that a mid-process `PATH` patch can't fix, since they're already-evaluated constants, not lazy lookups. A fresh process re-evaluates them correctly.
 - New branches fork from `origin/staging`.
 - `importRepo` (`lib.js`, `writeSetuAgentMarkers`) writes `.setu.json` + a `## Managed by Setu` AGENTS.md section into a brand-new project's `main` worktree — so an agent working in a *managed* project (quivly-app, etc.) knows Setu owns its dev servers/worktrees, without having to already know Setu exists. Project-level only (repo name, portal URL, CLI reference, install one-liner) — never a specific worktree's port/domain, since these files are meant to be committed once to the project's default branch and inherited by every future worktree via git; baking in one worktree's assigned port would be stale for the next. Non-destructive to an existing AGENTS.md (appends, idempotent — checks for the marker heading before writing again) and never auto-committed, only `git add`-staged: committing into a project this tool doesn't own is the user's call. Only runs on first registration (`setu init`/sweep `--import`), not on every subsequent `setu new` — once committed, later worktrees inherit the files via normal git checkout.
   - Don't confuse this with `~/.setu-costs.json` (`COSTS_CFG_PATH` in `lib.js`) below — same filename stem, opposite everything else: that one lives in `$HOME` (not a managed project's repo), is never written by this tool at all (the user hand-writes it), and is never committed anywhere.

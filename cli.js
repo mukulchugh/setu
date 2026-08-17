@@ -183,24 +183,107 @@ function autoInstall(wtDir) {
 
 async function cmdSetup() {
   box('setu setup');
+  const interactive = process.stdin.isTTY && !flags.yes;
 
   // 1. deps
-  step(1, 8, 'Dependencies');
-  if (!commandExists('brew')) die('Homebrew not found — install from https://brew.sh');
+  step(1, 9, 'Dependencies');
+  if (!commandExists('brew')) {
+    spin('Homebrew');
+    try {
+      // The exact one-liner brew.sh itself publishes — `bash -c` parses its
+      // own argument as a real command line, so the $(...) inside undergoes
+      // command substitution the same way it would typed at a prompt.
+      execFileSync('/bin/bash', ['-c', '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)'], { stdio: 'inherit' });
+      done();
+    } catch { die('Homebrew install failed — install manually from https://brew.sh, then re-run setu setup.'); }
+    // BREW_PREFIX/CADDY_BIN/CLOUDFLARED_BIN (lib.js) are computed once at
+    // module load, before this function ever runs — with brew missing at
+    // that point they're already frozen to a fallback that's wrong on Intel
+    // Macs (and merely stale, not re-verified, on Apple Silicon). Patching
+    // process.env.PATH here would fix `brew`/`gh` lookups for the rest of
+    // this process but not those already-baked constants — cleanest correct
+    // fix is a fresh process, not a partial in-place patch.
+    console.log(`\n  ${G}✓${R} Homebrew installed. Re-run this exact command to continue:\n`);
+    console.log(`  ${GR}${['setu', 'setup', ...rest].join(' ')}${R}\n`);
+    process.exit(0);
+  }
   ok('homebrew');
   if (!commandExists('bun')) die('bun not found');
   ok('bun');
-  for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv']) brewInstall(pkg);
+  for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv', 'gh']) brewInstall(pkg);
+  if (spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status !== 0) {
+    console.log(`  ${GR}○${R} gh not authenticated — logging in...`);
+    try { execFileSync('gh', ['auth', 'login'], { stdio: 'inherit' }); ok('gh authenticated'); }
+    catch { fail('gh auth failed — run manually: gh auth login'); }
+  } else {
+    ok('gh authenticated');
+  }
   console.log();
 
-  // 2. configure — flags first, prompts only for what's missing (agents pass flags)
-  step(2, 8, 'Configuration');
+  // 2. container engine — `setu start` containerizes by default (real
+  // memory/CPU caps); `setu start --bare` works with no engine at all, so
+  // this is offered, never a hard requirement. OrbStack and Docker Desktop
+  // both need one manual app launch to finish first-run setup (accept
+  // terms, grant a network-extension permission) — confirmed via `brew info
+  // --cask orbstack`'s own Caveats ("Open the OrbStack app to finish
+  // setup"), not assumed, so this doesn't pretend to fully automate those
+  // two. Colima is the only genuinely headless option (brew services, no
+  // GUI at all) — what a non-interactive `--yes` run defaults to absent an
+  // explicit --engine flag.
+  step(2, 9, 'Container engine');
+  const rt = containerRuntimeAvailable();
+  if (rt.available) {
+    ok(`${rt.engine} already running`);
+  } else {
+    let engine = (flags.engine ?? '').toLowerCase();
+    if (interactive && !engine) {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      console.log(`  No container engine detected. setu start containerizes by default —`);
+      console.log(`  setu start --bare skips this entirely if you'd rather not install one.`);
+      console.log(`  ${GR}1${R}) OrbStack (recommended, lightweight)   ${GR}2${R}) Docker Desktop   ${GR}3${R}) Colima (CLI-only, no GUI)   ${GR}4${R}) Skip`);
+      try {
+        let choice = '';
+        while (!['1', '2', '3', '4', 'orbstack', 'docker', 'colima', 'skip'].includes(choice)) {
+          choice = (await ask(rl, 'Choice', '1')).toLowerCase();
+        }
+        engine = { '1': 'orbstack', '2': 'docker', '3': 'colima', '4': 'skip' }[choice] ?? choice;
+      } finally { rl.close(); }
+    } else if (!engine) {
+      engine = 'colima'; // non-interactive default — the only fully headless option
+    }
+
+    if (engine === 'skip') {
+      console.log(`  ${GR}○${R} skipped — use \`setu start --bare\` until an engine is set up`);
+    } else if (engine === 'colima') {
+      spin('colima');
+      try {
+        execFileSync('brew', ['install', 'colima', 'docker'], { stdio: 'ignore' });
+        execFileSync('brew', ['services', 'start', 'colima'], { stdio: 'ignore' });
+        done();
+      } catch { fail('colima install/start failed — run manually: brew install colima docker && brew services start colima'); }
+    } else if (engine === 'orbstack' || engine === 'docker') {
+      const cask = engine === 'orbstack' ? 'orbstack' : 'docker-desktop';
+      const appName = engine === 'orbstack' ? 'OrbStack' : 'Docker';
+      spin(cask);
+      try {
+        execFileSync('brew', ['install', '--cask', cask], { stdio: 'ignore' });
+        execFileSync('open', ['-a', appName], { stdio: 'ignore' });
+        done();
+        console.log(`  ${GR}○${R} ${appName} needs one manual first launch to finish setup — it should now be opening. Run \`setu doctor\` after to confirm.`);
+      } catch { fail(`${appName} install failed — run manually: brew install --cask ${cask}`); }
+    } else {
+      fail(`unknown engine '${engine}' — pass --engine orbstack|docker|colima|skip`);
+    }
+  }
+  console.log();
+
+  // 3. configure — flags first, prompts only for what's missing (agents pass flags)
+  step(3, 9, 'Configuration');
   const existing = loadConfig();
   let name      = flags.name ?? (existing.tunnel ? existing.tunnel.replace(/^dev-/, '') : '');
   let workspace = resolvePath(flags.workspace ?? existing.workspace ?? join(HOME, 'workspace'));
   let zone      = flags.zone ?? existing.domain?.split('.').slice(1).join('.') ?? 'getquivly.ai';
 
-  const interactive = process.stdin.isTTY && !flags.yes;
   if (interactive) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -215,7 +298,7 @@ async function cmdSetup() {
   console.log();
 
   // 3. Cloudflare
-  step(3, 8, 'Cloudflare tunnel');
+  step(4, 9, 'Cloudflare tunnel');
   if (!existsSync(join(HOME, '.cloudflared', 'cert.pem'))) {
     process.stdout.write(`  ${GR}○${R} Logging in to Cloudflare...  `);
     execFileSync(CLOUDFLARED_BIN, ['tunnel', 'login'], { stdio: 'inherit' });
@@ -251,7 +334,7 @@ async function cmdSetup() {
   console.log();
 
   // 4. DNS & proxy
-  step(4, 8, 'DNS & proxy');
+  step(5, 9, 'DNS & proxy');
   spin('dnsmasq');
   const dnsConf = join(BREW_PREFIX, 'etc', 'dnsmasq.conf');
   const dnsText = existsSync(dnsConf) ? readFileSync(dnsConf, 'utf8') : '';
@@ -287,7 +370,7 @@ async function cmdSetup() {
   console.log();
 
   // 5. Passwordless sudo — rules must match EXACTLY what lib.js runs
-  step(5, 8, 'Passwordless sudo');
+  step(6, 9, 'Passwordless sudo');
   const user = execFileSync('whoami', { encoding: 'utf8' }).trim();
   spin('caddy reload');
   const caddyRule = `${user} ALL=(ALL) NOPASSWD: ${CADDY_BIN} reload --config ${input.workspace}/Caddyfile`;
@@ -301,7 +384,7 @@ async function cmdSetup() {
   console.log();
 
   // 6. config + shell
-  step(6, 8, 'Shell & config');
+  step(7, 9, 'Shell & config');
   spin('~/.setu.json');
   saveConfig({ cfCredentials, domain: input.domain, tunnel: input.tunnel, workspace: input.workspace });
   done();
@@ -324,7 +407,7 @@ async function cmdSetup() {
   console.log();
 
   // 7. first hosts sync
-  step(7, 8, 'Verify');
+  step(8, 9, 'Verify');
   syncHosts(input.workspace) ? ok('/etc/hosts synced') : fail('/etc/hosts sync');
   console.log();
 
@@ -332,7 +415,7 @@ async function cmdSetup() {
   // installed. There's no headless way to register a local extension with
   // Raycast (it goes through the app's own Import/Develop flow), so this
   // only ever prints the one manual step rather than pretending to automate it.
-  step(8, 8, 'Raycast extension');
+  step(9, 9, 'Raycast extension');
   if (existsSync('/Applications/Raycast.app') || existsSync('/Applications/Raycast Beta.app')) {
     ok('Raycast detected');
     console.log(`  ${GR}run: cd ${SETU_DIR}/raycast && npm install && npx ray develop${R}`);

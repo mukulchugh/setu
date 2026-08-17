@@ -6,14 +6,16 @@ Workspace bridge for Quivly engineers — git worktrees, local `.quivly.local` d
 
 ## Install
 
-Requires `gh` (authenticated) and `bun`. `setu start` containerizes dev servers by default (real memory/CPU caps) and needs a Docker-compatible engine running for that — [OrbStack](https://orbstack.dev/) works well on macOS, or Docker Desktop/Colima. No engine running? Pass `--bare` to run dev servers natively instead, same as before container mode existed.
+Only real prerequisite is [Homebrew](https://brew.sh) — `setu setup` installs everything else itself: `bun` (via `install.sh`, if missing), `caddy`/`cloudflared`/`dnsmasq`/`direnv`/`gh`, authenticates `gh` if needed, and offers to install a container engine if none is running (`setu start` containerizes by default — real memory/CPU caps). Missing Homebrew too? `setu setup` installs that first, then asks you to re-run the same command once (a fresh process is needed to pick up its own new PATH correctly).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash
 setu setup
 ```
 
-Non-interactive (agents / scripts): `setu setup --name <you> --yes`
+**Container engine choice** (only asked if none is already running): OrbStack (recommended) or Docker Desktop both need one manual first launch to finish their own setup — this isn't skippable, it's how those apps work. Colima is the only fully headless option (`brew services`, no GUI at all). Skip entirely and pass `--bare` to `setu start` if you'd rather not install one.
+
+Non-interactive (agents / scripts): `setu setup --name <you> --yes` — defaults to Colima if no engine is running and `--engine` isn't given, since it's the only one of the three that doesn't need a human to click through a GUI app's first launch. Override with `--engine orbstack|docker|colima|skip`.
 
 ## Update
 
