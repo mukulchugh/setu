@@ -826,7 +826,11 @@ function WorktreeCard({ w, pending, agents, onAct, onStart, onDeploy, onOpenLogs
             class="text-zinc-900 dark:text-zinc-100 font-medium text-[15px] truncate hover:text-accent transition-colors duration-150 text-left">
             {w.name}
           </button>
-          <span class="board-mono text-[10px] text-zinc-300 font-bold shrink-0">{w.label}</span>
+          <button onClick={() => navigate(`/repo/${w.repo}`)}
+            data-tip={`Isolate to ${w.repo}`}
+            class="tip board-mono text-[10px] text-zinc-300 hover:text-accent font-bold shrink-0 transition-colors duration-150">
+            {w.label}
+          </button>
           <span class="flex items-center gap-1.5 shrink-0">
             <StatusDot tone={statusTone} pulse={w.active} />
             <StatusFlap text={statusText} tone={statusTone} />
