@@ -52,6 +52,15 @@ async function fetchAllPages(baseUrl, params, headers) {
   return buckets;
 }
 
+// Trailing totals, not calendar-aligned ones -- "last 7 days" as of the
+// moment of the request, not "since Monday". daily is already oldest-first
+// from fetchAllPages, so the trailing N days is just the last N entries;
+// no extra API calls, this is derived from the same 30-day fetch summarize()
+// already does.
+function windowTotal(daily, days) {
+  return round2(daily.slice(-days).reduce((sum, d) => sum + d.costUsd, 0));
+}
+
 function summarize(provider, buckets, dateOf, resultsOf, amountOf, labelOf) {
   const byModel = new Map();
   const daily = [];
@@ -73,6 +82,9 @@ function summarize(provider, buckets, dateOf, resultsOf, amountOf, labelOf) {
       .sort((a, b) => b.costUsd - a.costUsd),
     configured: true,
     daily,
+    last1d: windowTotal(daily, 1),
+    last7d: windowTotal(daily, 7),
+    last30d: windowTotal(daily, 30),
     provider,
     totalCostUsd: round2(totalCostUsd),
     windowDays: WINDOW_DAYS,
@@ -139,19 +151,60 @@ function geminiStatus(cfg) {
   };
 }
 
+// ── budgets ──────────────────────────────────────────────────────────────
+// Combined across whatever providers actually returned real numbers this
+// request -- a provider that's unconfigured or errored just contributes 0,
+// it doesn't block the other two from being budgeted. Thresholds are opt-in
+// per period (~/.setu-costs.json's "budgets": {daily,weekly,monthly}); a
+// period with no configured limit is simply omitted from the response, not
+// shown as some default. "warning" at 80% of limit, "over" at 100%+ --
+// tokentop's own "visual warnings" framing, not an arbitrary threshold.
+function budgetStatus(spent, limit) {
+  if (spent >= limit) return 'over';
+  if (spent >= limit * 0.8) return 'warning';
+  return 'ok';
+}
+
+function computeBudgets(cfg, providers) {
+  const b = cfg.budgets;
+  if (!b) return null;
+  const spent = { last1d: 0, last7d: 0, last30d: 0 };
+  for (const p of providers) {
+    if (!p.configured || p.error) continue;
+    spent.last1d += p.last1d ?? 0;
+    spent.last7d += p.last7d ?? 0;
+    spent.last30d += p.last30d ?? 0;
+  }
+  const periods = { daily: ['last1d', b.daily], weekly: ['last7d', b.weekly], monthly: ['last30d', b.monthly] };
+  const out = {};
+  for (const [period, [key, limit]] of Object.entries(periods)) {
+    if (limit == null) continue;
+    const s = round2(spent[key]);
+    out[period] = { limit, spent: s, status: budgetStatus(s, limit) };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // ── orchestration ────────────────────────────────────────────────────────
 
 export async function getCostsSummary() {
   const cfg = loadCostsConfig();
+  // ~/.setu-costs.json is still the primary source (see COSTS_CFG_PATH's
+  // comment in lib.js on why this is never portal-writable) -- env vars are
+  // a same-machine, already-trusted fallback for whichever key isn't in the
+  // file, not a new input surface. Nothing here ever reads from the request
+  // itself, so this doesn't reopen the LAN-exposed-portal concern.
+  const anthropicKey = cfg.anthropicAdminKey || process.env.ANTHROPIC_ADMIN_KEY;
+  const openaiKey = cfg.openaiAdminKey || process.env.OPENAI_ADMIN_KEY;
 
   const [anthropic, openai] = await Promise.all([
-    cfg.anthropicAdminKey
-      ? anthropicCosts(cfg.anthropicAdminKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'anthropic' }))
-      : Promise.resolve({ configured: false, provider: 'anthropic', reason: 'anthropicAdminKey not set in ~/.setu-costs.json' }),
-    cfg.openaiAdminKey
-      ? openaiCosts(cfg.openaiAdminKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'openai' }))
-      : Promise.resolve({ configured: false, provider: 'openai', reason: 'openaiAdminKey not set in ~/.setu-costs.json' }),
+    anthropicKey
+      ? anthropicCosts(anthropicKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'anthropic' }))
+      : Promise.resolve({ configured: false, provider: 'anthropic', reason: 'anthropicAdminKey not set in ~/.setu-costs.json (or $ANTHROPIC_ADMIN_KEY)' }),
+    openaiKey
+      ? openaiCosts(openaiKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'openai' }))
+      : Promise.resolve({ configured: false, provider: 'openai', reason: 'openaiAdminKey not set in ~/.setu-costs.json (or $OPENAI_ADMIN_KEY)' }),
   ]);
 
-  return { anthropic, gemini: geminiStatus(cfg), openai };
+  return { anthropic, budgets: computeBudgets(cfg, [anthropic, openai]), gemini: geminiStatus(cfg), openai };
 }

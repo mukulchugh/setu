@@ -12,12 +12,17 @@ type ProviderCosts = {
   byModel?: { costUsd: number; model: string }[];
   configured: boolean;
   error?: string;
+  last1d?: number;
+  last7d?: number;
+  last30d?: number;
   provider: string;
   reason?: string;
   totalCostUsd?: number;
   windowDays?: number;
 };
-type CostsSummary = { anthropic: ProviderCosts; gemini: ProviderCosts; openai: ProviderCosts };
+type BudgetPeriod = { limit: number; spent: number; status: 'ok' | 'warning' | 'over' };
+type Budgets = { daily?: BudgetPeriod; weekly?: BudgetPeriod; monthly?: BudgetPeriod };
+type CostsSummary = { anthropic: ProviderCosts; budgets: Budgets | null; gemini: ProviderCosts; openai: ProviderCosts };
 
 const PROVIDER_LABEL: Record<string, string> = {
   anthropic: 'Anthropic (Claude)',
@@ -27,6 +32,29 @@ const PROVIDER_LABEL: Record<string, string> = {
 
 function fmtUsd(n: number) {
   return n.toLocaleString('en-US', { currency: 'USD', style: 'currency' });
+}
+
+const BUDGET_TONE = { ok: 'emerald', over: 'red', warning: 'amber' } as const;
+const BUDGET_LABEL = { daily: 'Daily', monthly: 'Monthly (30d)', weekly: 'Weekly (7d)' } as const;
+
+function BudgetBar({ budgets }: { budgets: Budgets }) {
+  const periods = (Object.keys(budgets) as (keyof Budgets)[]).filter((k) => budgets[k]);
+  if (!periods.length) return null;
+  return (
+    <div class="flex flex-wrap items-center gap-3 mb-4 backdrop-blur-md bg-white/70 dark:bg-white/5 border border-white/75 dark:border-white/10 shadow-sm rounded-none px-5 py-3">
+      {periods.map((period) => {
+        const p = budgets[period]!;
+        return (
+          <div key={period} class="flex items-center gap-2 text-xs">
+            <StatusDot tone={BUDGET_TONE[p.status]} />
+            <span class="text-zinc-500 dark:text-zinc-400">{BUDGET_LABEL[period]}</span>
+            <span class="font-mono tabular-nums text-zinc-900 dark:text-zinc-100 font-semibold">{fmtUsd(p.spent)}</span>
+            <span class="text-zinc-300 dark:text-zinc-600">/ {fmtUsd(p.limit)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function ProviderCard({ data }: { data: ProviderCosts }) {
@@ -81,15 +109,18 @@ export function CostsPage({ onBack }: { onBack: () => void }) {
       ) : !data ? (
         <p class="text-zinc-400 text-center py-12">Couldn't reach the portal.</p>
       ) : (
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <ProviderCard data={data.anthropic} />
-          <ProviderCard data={data.openai} />
-          <ProviderCard data={data.gemini} />
-        </div>
+        <>
+          {data.budgets && <BudgetBar budgets={data.budgets} />}
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <ProviderCard data={data.anthropic} />
+            <ProviderCard data={data.openai} />
+            <ProviderCard data={data.gemini} />
+          </div>
+        </>
       )}
 
       <p class="text-[11px] text-zinc-400 mt-6">
-        Configure via <code class="font-mono">~/.setu-costs.json</code> — never through this page, the portal isn't authenticated so credentials aren't accepted here. See AGENTS.md for the exact shape.
+        Configure via <code class="font-mono">~/.setu-costs.json</code> — never through this page, the portal isn't authenticated so credentials aren't accepted here. Admin keys can also come from <code class="font-mono">$ANTHROPIC_ADMIN_KEY</code>/<code class="font-mono">$OPENAI_ADMIN_KEY</code> if already exported. See AGENTS.md for the exact shape, including optional daily/weekly/monthly budget alerts.
       </p>
     </div>
   );
