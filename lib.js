@@ -252,11 +252,23 @@ export function listActivePorts() {
     ['-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   const out = res.stdout ?? '';
-  const results = []; let cur = {};
+  const results = []; const seen = new Set(); let cur = {};
   for (const line of out.split('\n')) {
     if (line.startsWith('p')) cur = { pid: line.slice(1) };
     else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] }); }
+    else if (line.startsWith('n')) {
+      const m = line.match(/:(\d+)$/);
+      if (!m) continue;
+      // A process listening on both IPv4 and IPv6 for the same port (e.g.
+      // OrbStack's port-forwarding helper, confirmed live: two separate fds
+      // both bound to `*:<port>`) prints one 'n' line per socket under the
+      // same 'p' block — without this, that's a duplicate row per extra
+      // protocol, not one row per actually-distinct listener.
+      const key = `${cur.pid}:${m[1]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] });
+    }
   }
   return results;
 }
@@ -266,11 +278,19 @@ export function listActivePorts() {
 // throwing). portal.js's hot paths use this; cli.js keeps the sync version.
 export async function listActivePortsAsync() {
   const out = await spawnText(['lsof', '-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn']);
-  const results = []; let cur = {};
+  const results = []; const seen = new Set(); let cur = {};
   for (const line of out.split('\n')) {
     if (line.startsWith('p')) cur = { pid: line.slice(1) };
     else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) { const m = line.match(/:(\d+)$/); if (m) results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] }); }
+    else if (line.startsWith('n')) {
+      const m = line.match(/:(\d+)$/);
+      if (!m) continue;
+      // Same IPv4/IPv6 dual-socket dedup as listActivePorts above.
+      const key = `${cur.pid}:${m[1]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] });
+    }
   }
   return results;
 }
