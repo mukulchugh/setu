@@ -19,7 +19,7 @@ import {
   loadCustomAgents, saveCustomAgents, loadFileSyncGlobs, saveFileSyncGlobs,
   isSidecarApproved, approveSidecar, seedSidecarApprovalsIfMissing,
   loadArchivedWorktrees, appendArchivedWorktree,
-  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, writeDockerCompose,
+  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, composeDownAsync, writeDockerCompose,
   defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
   worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
   spawnText, splitKey, baseBranchRef,
@@ -585,7 +585,7 @@ async function killPort(port) {
   const owner = portEntries(WORKSPACE).find(e => e.port === port);
   const entry = owner && procs.get(owner.key);
   if (entry?.container) {
-    stopContainer(owner.repo, owner.name, entry.container);
+    await stopContainer(owner.repo, owner.name, entry.container);
     if (procs.get(owner.key) === entry) procs.delete(owner.key);
     drainQueue();
     return { ok: true };
@@ -759,12 +759,11 @@ function spawnContainer(repo, name, port) {
   return { skippedSidecars: startSidecars(repo, name, port) };
 }
 
-function stopContainer(repo, name, project) {
+async function stopContainer(repo, name, project) {
   const wtDir = wtPath(repo, name);
   // No -v: the node_modules named volume survives, so the next `up` skips
   // `bun install` unless the compose file's volume was ever pruned separately.
-  try { execFileSync('docker', ['compose', '-p', project, '-f', dockerComposePath(wtDir), 'down'], { stdio: 'ignore' }); }
-  catch {}
+  await composeDownAsync(project, dockerComposePath(wtDir));
 }
 
 // Boot-time only: procs starts empty on every portal restart, same blind spot
@@ -837,7 +836,7 @@ async function stopWorktree(repo, name, port, { drain = true } = {}) {
   const entry = procs.get(key);
   procs.delete(key);
   if (entry?.container) {
-    stopContainer(repo, name, entry.container);
+    await stopContainer(repo, name, entry.container);
   } else {
     // Raw single-pid kill, not killGroup() (lib.js): spawnWorktree() below
     // spawns the dev server without detached:true, so it shares this portal
@@ -1452,11 +1451,7 @@ async function removeWorktree(repo, name, reason = 'manual') {
   // file with it) below.
   const wtDir = wtPath(repo, name);
   if (existsSync(dockerComposePath(wtDir))) {
-    try {
-      execFileSync('docker',
-        ['compose', '-p', composeProjectName(repo, name), '-f', dockerComposePath(wtDir), 'down', '-v'],
-        { stdio: 'ignore' });
-    } catch {}
+    await composeDownAsync(composeProjectName(repo, name), dockerComposePath(wtDir), ['-v']);
   }
 
   // Read everything the archive record needs while the worktree (and its PR

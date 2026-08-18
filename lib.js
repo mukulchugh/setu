@@ -785,6 +785,21 @@ export function composeProjectAlive(project) {
   return res.stdout.trim().split('\n').some(s => s === 'running' || s === 'restarting');
 }
 
+// Async, spawnText-based `docker compose ... down` — portal.js's stopContainer
+// and removeWorktree used to call execFileSync('docker', ['compose', ..., 'down'])
+// directly, blocking Bun's single JS thread for however long the teardown takes
+// and stalling every other in-flight request (same class of bug fetchPR hit, and
+// the same reason activePidAsync/listActivePortsAsync/killGroupAsync exist above).
+// extraArgs lets callers pass `-v` (removeWorktree, permanently deleting the
+// worktree) vs nothing (stopContainer, which deliberately keeps the node_modules
+// volume around for a later start). Silently swallows errors, same as the
+// execFileSync call sites it replaces — neither ever surfaced a compose failure
+// to its caller, and this preserves that.
+export async function composeDownAsync(project, composeFile, extraArgs = []) {
+  try { await spawnText(['docker', 'compose', '-p', project, '-f', composeFile, 'down', ...extraArgs]); }
+  catch {}
+}
+
 // Caddy's reverse_proxy target never changes between bare and containerized —
 // always `localhost:<port>` (same port Setu's own registry already allocated).
 // The container publishes that port to the host with a plain `-p port:port`,
