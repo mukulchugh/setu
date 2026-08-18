@@ -6,7 +6,8 @@ single shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) that one worktre
 
 **Debugging anything setu-related? Start with `setu doctor --json`.** It checks every layer
 (brew deps, dnsmasq, resolver, caddy, sudoers, cloudflared, git sync, worktree-registry
-hygiene, container runtime reachability, container memory budget vs. engine capacity, portal)
+hygiene, container runtime reachability, container memory budget vs. engine capacity, portal,
+container-mode worktrees whose container died without Setu stopping it — see Conventions)
 and returns `[{name, ok, fix}]`. Exit code 0 = all healthy. Checks run concurrently, not
 sequentially — don't assume output order reflects check duration.
 
@@ -218,6 +219,7 @@ would leak forever with nothing left pointing at it.
 
 ## Conventions
 
+- Every container Setu itself stops goes through `composeDownAsync` (`stopContainer`/`removeWorktree` in portal.js), which `docker compose down`s — that *removes* the container entirely. So a compose-project container still *present* in `docker ps -a` but not `running`/`restarting` can only have gotten that way some other way: an OOM kill, a dev process that crash-looped past its `restart: on-failure` retry cap, or the container engine's own VM restarting and taking every container down with it (confirmed live: an OrbStack restart SIGKILLed a container mid-boot with nothing surfacing it — `reconcileDevServers` only adopts still-alive containers at portal boot, it never flags ones that died). `setu doctor`'s dead-container check (`composeProjectStates` in cli.js) exists for exactly this — one `docker ps -a` call bucketed by the `com.docker.compose.project` label, zero false positives by construction since Setu's own teardown never leaves a container in this state.
 - `mise.toml` pins this repo's own `bun` version (`mise trust` once per clone to activate). Unrelated to `createWorktree`'s own `mise trust ...` call, which best-effort-trusts a *managed project's* own mise config on worktree creation — that's a different repo's config, not this one's. `setu doctor` reports whether `mise` itself is installed (optional, not a hard `setu setup` dependency).
 - `cmdSetup` (`cli.js`) installing Homebrew itself, when missing, exits after the install and asks the user to re-run the exact same command rather than continuing in-process. Not laziness: `BREW_PREFIX`/`CADDY_BIN`/`CLOUDFLARED_BIN` (`lib.js`) are computed once at module load, before `cmdSetup` runs — with brew missing at that point they're already frozen to a fallback (wrong on Intel Macs, merely unverified on Apple Silicon) that a mid-process `PATH` patch can't fix, since they're already-evaluated constants, not lazy lookups. A fresh process re-evaluates them correctly.
 - New branches fork from `origin/staging`.

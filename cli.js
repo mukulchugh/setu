@@ -19,7 +19,7 @@ import {
   git, createWorktree, removeWorktree,
   discoverRepos, importRepo,
   portalPid, portalRequest, commandExists, killGroup, containerRuntimeAvailable,
-  engineCapacity, parseMemToMb, spawnText,
+  engineCapacity, parseMemToMb, spawnText, composeProjectName, dockerComposePath,
 } from './lib.js';
 
 const PKG_DIR = new URL('.', import.meta.url).pathname;
@@ -976,6 +976,28 @@ async function spawnTextCode(cmd, args) {
   } catch { return { code: 1, text: '' }; }
 }
 
+// `docker ps -a --format '{{.Label "com.docker.compose.project"}}\t{{.State}}'`
+// output -> project -> 'running' | 'dead'. A project can own more than one
+// container; 'running' wins if any line for that project says so, otherwise
+// it's 'dead' the moment a non-running line for it is seen. Pulled out of the
+// dead-container doctor check below so that check itself stays simple enough
+// to read in one pass.
+function composeProjectStates(rawPsOutput) {
+  const projectState = new Map();
+  for (const line of rawPsOutput.trim().split('\n')) {
+    const [project, state] = line.split('\t');
+    if (!project) {
+      continue;
+    }
+    if (state === 'running' || state === 'restarting') {
+      projectState.set(project, 'running');
+    } else if (!projectState.has(project)) {
+      projectState.set(project, 'dead');
+    }
+  }
+  return projectState;
+}
+
 async function cmdDoctor() {
   const c = loadConfig();
   const workspace = c.workspace ?? '';
@@ -1127,6 +1149,52 @@ async function cmdDoctor() {
       const stale = entries.filter(e => !existsSync(join(workspace, e.repo, e.name)));
       return { 
         fix: stale.length ? `stale: ${stale.map(e => e.key).join(', ')}  — releasePort() or setu rm each` : undefined, name: 'no registry entries for missing worktrees', ok: stale.length === 0};
+    });
+
+    // A container Setu itself stops always goes through `compose down`
+    // (composeDownAsync — confirmed the only teardown path: every stop
+    // route, bare or containerized, funnels through stopWorktree, and its
+    // container branch always calls stopContainer/composeDownAsync; cmdPrune
+    // never touches a registered worktree's port, only unregistered orphans),
+    // which REMOVES the container entirely — so any compose-project
+    // container still *present* in `docker ps -a` but not running/
+    // restarting can only have gotten that way some other way Setu didn't
+    // do: an OOM kill, a dev process that crashed past its `restart:
+    // on-failure` retry cap, or the container engine's own VM restarting
+    // and taking every container down with it (seen live: an OrbStack
+    // restart SIGKILLed a container mid-boot, and it sat there as
+    // Exited(137) with nothing to surface it — reconcileDevServers only
+    // adopts still-alive containers on portal boot, it never flags ones
+    // that died silently). Container-mode-history worktrees only (a
+    // compose file on disk); anything never containerized is skipped.
+    //
+    // One `docker ps -a` call for every project at once, not one `docker
+    // compose ps` per worktree — keeps this check O(1) docker spawns
+    // instead of O(worktrees), matching why every other check here uses
+    // spawnText + Promise.all instead of execFileSync in the first place.
+    // Compose stamps the `com.docker.compose.project` label on every
+    // container it creates, so one pass over `docker ps -a` output already
+    // has everything needed to bucket by project.
+    checkThunks.push(async () => {
+      const containerWorktrees = entries
+        .filter(e => existsSync(dockerComposePath(join(workspace, e.repo, e.name))))
+        .map(e => ({ ...e, project: composeProjectName(e.repo, e.name) }));
+      if (!containerWorktrees.length) {
+        return { name: 'no container-mode worktrees with a dead container', ok: true };
+      }
+
+      const raw = await spawnText(['docker', 'ps', '-a', '--format', '{{.Label "com.docker.compose.project"}}\t{{.State}}']);
+      const projectState = composeProjectStates(raw);
+      const dead = containerWorktrees.filter(e => projectState.get(e.project) === 'dead').map(e => e.key);
+      return {
+        // `setu start` only fixes the "engine restarted underneath it" case —
+        // a crash-looped app (e.g. exhausted `on-failure:3` on a real error)
+        // will just fail again, so point at logs first rather than implying
+        // a restart is the fix for both causes.
+        fix: dead.length ? `dead container(s) setu didn't stop: ${dead.join(', ')}  — check \`docker logs <container>\` for why, then \`setu start\` once resolved` : undefined,
+        name: 'no container-mode worktrees with a dead container',
+        ok: dead.length === 0,
+      };
     });
   }
 
