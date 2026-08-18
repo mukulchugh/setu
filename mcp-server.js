@@ -139,7 +139,7 @@ function registerTools(server) {
     },
     title: 'Start dev server',
   }, async ({ repo, name, container }) => {
-    return text(unwrap(deps.startWorktree(repo, name, container)));
+    return text(unwrap(await deps.startWorktree(repo, name, container)));
   });
 
   server.registerTool('stop_worktree', {

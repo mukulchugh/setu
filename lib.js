@@ -805,6 +805,22 @@ export function composeProjectAlive(project) {
   return res.stdout.trim().split('\n').some(s => s === 'running' || s === 'restarting');
 }
 
+// Async sibling of composeProjectAlive — same "running"/"restarting" check,
+// sourced from spawnText (which discards stderr and never throws, so a
+// nonzero-exit/no-such-project case naturally falls through to an empty
+// string that matches neither state, same effective result as the sync
+// version's explicit `res.status !== 0` early return). Used by
+// startWorktree so a stale procs entry — a container that already died but
+// hasn't yet hit checkMemoryCeilings' 2-consecutive-miss threshold (up to
+// ~2 minutes, see MEM_CHECK_INTERVAL in portal.js) — doesn't block a real
+// restart with a false "already running": confirmed live tonight, a dead
+// pulse/main sat in procs long enough that /api/start rejected a genuine
+// retry attempt.
+export async function composeProjectAliveAsync(project) {
+  const out = await spawnText(['docker', 'compose', '-p', project, 'ps', '-a', '--format', '{{.State}}']);
+  return out.trim().split('\n').some(s => s === 'running' || s === 'restarting');
+}
+
 // Async, spawnText-based `docker compose ... down` — portal.js's stopContainer
 // and removeWorktree used to call execFileSync('docker', ['compose', ..., 'down'])
 // directly, blocking Bun's single JS thread for however long the teardown takes

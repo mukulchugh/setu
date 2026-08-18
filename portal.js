@@ -19,7 +19,7 @@ import {
   loadCustomAgents, saveCustomAgents, loadFileSyncGlobs, saveFileSyncGlobs,
   isSidecarApproved, approveSidecar, seedSidecarApprovalsIfMissing,
   loadArchivedWorktrees, appendArchivedWorktree,
-  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, composeDownAsync, writeDockerCompose,
+  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, composeProjectAliveAsync, composeDownAsync, writeDockerCompose,
   defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
   worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
   spawnText, splitKey, baseBranchRef,
@@ -795,9 +795,23 @@ function reconcileDevServers() {
   }
 }
 
-function startWorktree(repo, name, port, container = true) {
+async function startWorktree(repo, name, port, container = true) {
   const key = `${repo}/${name}`;
-  if (procs.has(key)) return { error: 'already running', ok: false };
+  const existing = procs.get(key);
+  if (existing) {
+    // A procs entry isn't proof of life — its container/process can have
+    // already died without checkMemoryCeilings noticing yet (it requires 2
+    // consecutive misses a minute apart before freeing the slot, so up to
+    // ~2 minutes of staleness). Blindly trusting the Map here rejected a
+    // genuine restart with a false "already running" — confirmed live.
+    // Verify directly instead of trusting the Map alone; a stale hit clears
+    // itself and falls through to a real start rather than staying stuck.
+    const alive = existing.container
+      ? await composeProjectAliveAsync(existing.container)
+      : !!(await activePidAsync(port));
+    if (alive) return { error: 'already running', ok: false };
+    procs.delete(key);
+  }
   if (queuePosition(key)) return { ok: true, position: queuePosition(key), queued: true };
   if (container) {
     const rt = containerRuntimeAvailable();
@@ -859,7 +873,7 @@ async function stopWorktree(repo, name, port, { drain = true } = {}) {
 // Port + container-mode resolution wrapped around startWorktree/stopWorktree
 // so /api/start, /api/stop, and mcp-server.js's start_worktree/stop_worktree
 // tools share one implementation instead of three copies of this logic.
-function startWorktreeByName(repo, name, container) {
+async function startWorktreeByName(repo, name, container) {
   const port = getPort(WORKSPACE, repo, name);
   if (!port) return { ok: false };
   const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
@@ -1974,7 +1988,7 @@ async function worktreeRoutes(req, pathname, method, server) {
       // one having asked for that. Native stays for the tooling around it
       // (portal, Caddy, dnsmasq, git) regardless — this only governs how the
       // dev server process itself runs.
-      return Response.json(startWorktreeByName(repo, name, container));
+      return Response.json(await startWorktreeByName(repo, name, container));
     }
     if (pathname === '/api/stop') {
       return Response.json(await stopWorktreeByName(repo, name));
