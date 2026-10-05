@@ -1,4 +1,8 @@
 import { expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readPortalStatus } from './portal-status.js';
 import {
   cloneBareRepository,
@@ -173,6 +177,20 @@ test('manifest selection stays shared by CLI and portal dependency installation'
   }
 });
 
+test('inline dependency installation forwards its stdio choice', async () => {
+  let options;
+  await installWorktreeDependencies('/fixture', {
+    assertStorage: async () => {},
+    exists: (path) => path.endsWith('package.json'),
+    run: (_command, _args, runOptions) => {
+      options = runOptions;
+      return { status: 0 };
+    },
+    stdio: ['ignore', 2, 2],
+  });
+  expect(options.stdio).toEqual(['ignore', 2, 2]);
+});
+
 test('package setup retains admission through install and confirmed process-group exit', async () => {
   const f = setupFixture('package.json');
   let entered, finishGroup;
@@ -305,6 +323,56 @@ test('checkout creation awaits the async Git add', async () => {
   expect(calls.some((args) => args.includes('add'))).toBe(true);
   finish({ code: 0, stdout: '' });
   await creation;
+});
+
+test('existing checkout path must be a linked worktree, not a plain parent directory', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-worktree-checkout-'));
+  try {
+    const source = join(root, 'source');
+    const repoDir = join(root, 'repo.git');
+    execFileSync('git', ['init', '-b', 'main', source]);
+    execFileSync('git', [
+      '-C',
+      source,
+      'config',
+      'user.email',
+      'test@example.com',
+    ]);
+    execFileSync('git', ['-C', source, 'config', 'user.name', 'Test']);
+    writeFileSync(join(source, 'README.md'), 'seed');
+    execFileSync('git', ['-C', source, 'add', '.']);
+    execFileSync('git', ['-C', source, 'commit', '-m', 'seed']);
+    execFileSync('git', ['clone', '--bare', source, repoDir]);
+    const wtDir = join(root, 'repo', 'feat');
+    mkdirSync(join(wtDir, 'x'), { recursive: true });
+    const run = async (args) => {
+      try {
+        return {
+          code: 0,
+          stderr: '',
+          stdout: execFileSync(args[0], args.slice(1), { encoding: 'utf8' }),
+          timedOut: false,
+          truncated: false,
+        };
+      } catch (error) {
+        return {
+          code: error.status ?? 1,
+          stderr: String(error.stderr ?? ''),
+          stdout: String(error.stdout ?? ''),
+          timedOut: false,
+          truncated: false,
+        };
+      }
+    };
+    await expect(
+      prepareWorktreeCheckout(
+        { exists: true, name: 'feat', repoDir, wtDir },
+        { run }
+      )
+    ).rejects.toThrow('not a linked worktree');
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 });
 
 for (const kind of ['clone', 'checkout']) {

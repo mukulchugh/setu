@@ -1,3 +1,5 @@
+import { isConnectionRefused } from './connection-refused.js';
+
 export async function requestPortalMutation(
   body,
   { url, fetch: send = globalThis.fetch }
@@ -7,7 +9,7 @@ export async function requestPortalMutation(
     headers: { 'content-type': 'application/json' },
     method: 'POST',
     redirect: 'error',
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(5 * 60_000),
   });
   let result;
   try {
@@ -83,9 +85,7 @@ export async function runRemoveCommand(
     }
     return finish(result, 0);
   } catch (error) {
-    const refused = ['ECONNREFUSED', 'ConnectionRefused'].includes(
-      error?.code ?? error?.cause?.code
-    );
+    const refused = isConnectionRefused(error);
     const result = {
       code: refused ? 'PORTAL_REQUIRED' : 'REMOVAL_OUTCOME_UNKNOWN',
       ok: false,
@@ -93,7 +93,7 @@ export async function runRemoveCommand(
       ...(operationId === undefined ? {} : { operationId }),
       error: refused
         ? 'No files were removed. Start the Setu portal, then retry.'
-        : 'Removal outcome is unknown. Inspect worktree status before retrying.',
+        : `Removal outcome is unknown. Check GET /api/status for pendingRemovals, then retry only this operation with setu rm ${repo} ${name}${operationId ? ` --operation-id ${operationId}` : ' --operation-id <id>'}.`,
     };
     io.stderr(result.error);
     return finish(result, 1);

@@ -16,7 +16,7 @@ import {
 } from 'node:fs';
 import identityFs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { agentStatus } from './agent.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { getCostsSummary } from './costs.js';
@@ -107,7 +107,7 @@ import {
   mcpStatuses,
 } from './mcp.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
-import { watchOwnedProcessExit } from './owned-process-map.js';
+import { pruneDeadEntries, watchOwnedProcessExit } from './owned-process-map.js';
 // Bun bundles + transpiles the Preact UI referenced by this page at serve time
 import indexPage from './portal/index.html';
 import { readPortalStatus } from './portal-status.js';
@@ -131,7 +131,7 @@ import {
 import { startWorktreeSetupInstall } from './workspace-setup.js';
 import { dependencySharingForTarget } from './dependency-sharing.js';
 import { createWorkspaceInventory } from './workspace-inventory.js';
-import { safeStateCauseCode } from './workspace-state.js';
+import { releaseHeldLocks, safeStateCauseCode } from './workspace-state.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 import {
   createRemovalController,
@@ -268,8 +268,12 @@ function trimLog(path, keep = LOG_MAX_BYTES / 2) {
 }
 
 const logRetentionTimer = setInterval(() => {
-  for (const path of openLogPaths) {
-    trimLog(path);
+  try {
+    for (const path of openLogPaths) {
+      trimLog(path);
+    }
+  } catch (error) {
+    console.error('Log retention failed:', error);
   }
 }, 5000);
 logRetentionTimer.unref();
@@ -443,8 +447,12 @@ const dirtyQueue = [];
 function drainDirtyQueue() {
   while (dirtyChecks < 4 && dirtyQueue.length) {
     dirtyChecks += 1;
-    void dirtyQueue
-      .shift()()
+    const task = dirtyQueue.shift();
+    void Promise.resolve()
+      .then(task)
+      .catch((error) => {
+        console.error('Dirty metadata refresh failed:', error);
+      })
       .finally(() => {
         dirtyChecks -= 1;
         drainDirtyQueue();
@@ -465,11 +473,15 @@ async function fetchDirty(repo, name) {
   dirtyCache.set(key, record);
   // Dirty badges are background metadata. Fresh deletion checks never use this cache.
   dirtyQueue.push(() =>
-    spawnRun(
-      wtPath(repo, name),
-      ['git', '--no-optional-locks', 'status', '--porcelain'],
-      5000
-    )
+    Promise.resolve()
+      .then(() => wtPath(repo, name))
+      .then((path) =>
+        spawnRun(
+          path,
+          ['git', '--no-optional-locks', 'status', '--porcelain'],
+          5000
+        )
+      )
       .then((raw) => {
         record.count = raw.trim() ? raw.trim().split('\n').length : 0;
       })
@@ -720,6 +732,32 @@ async function createPr(repo, name) {
     }
     const wtDir = wtPath(repo, name);
     const branch = await worktreeBranch(repo, name, true);
+    const base = baseBranchRef(repoPath(repo));
+    const ahead = Number.parseInt(
+      await spawnRun(wtDir, ['git', 'rev-list', '--count', `${base}..HEAD`]),
+      10
+    );
+    if (!Number.isFinite(ahead) || ahead < 1) {
+      throw new Error(`no commits ahead of ${base} to open as a pull request`);
+    }
+    const existing = JSON.parse(
+      await spawnRun(wtDir, [
+        'gh',
+        'pr',
+        'list',
+        '--repo',
+        slug,
+        '--head',
+        branch,
+        '--json',
+        'url',
+        '--limit',
+        '1',
+      ])
+    );
+    if (Array.isArray(existing) && existing.length) {
+      throw new Error(`a pull request already exists for ${branch}`);
+    }
     // gh pr create prompts interactively when the branch isn't fully pushed
     // yet -- with stdin ignored that would just hang, so push explicitly
     // first rather than relying on gh's own interactive fallback.
@@ -733,6 +771,8 @@ async function createPr(repo, name) {
       slug,
       '--head',
       branch,
+      '--base',
+      base.replace(/^origin\//, ''),
     ]);
     prCache.delete(`${repo}/${branch}`);
     return { ok: true, url };
@@ -1001,18 +1041,22 @@ async function computeDiff(repo, name) {
     base,
   ]));
 
-  const [committedRaw, uncommittedRaw] = await Promise.all([
+  const [committedRaw, uncommittedRaw, untrackedRaw] = await Promise.all([
     baseResolved
       ? spawnText(['git', '-C', wtDir, 'diff', `${base}...HEAD`])
       : Promise.resolve(''),
     spawnText(['git', '-C', wtDir, 'diff', 'HEAD']),
+    spawnText(['git', '-C', wtDir, 'ls-files', '--others', '--exclude-standard']),
   ]);
 
   return {
     base,
     baseResolved,
     committed: summarizeDiff(committedRaw),
-    uncommitted: summarizeDiff(uncommittedRaw),
+    uncommitted: {
+      ...summarizeDiff(uncommittedRaw),
+      untracked: untrackedRaw.split('\n').filter(Boolean),
+    },
   };
 }
 
@@ -1044,7 +1088,23 @@ async function listPortsWithWorktree() {
   return ports.map((p) => ({ ...p, worktree: registry[p.port] ?? null }));
 }
 
-async function killPort(port) {
+async function killPort(port, expectedPid) {
+  if (
+    !Number.isInteger(port) ||
+    !((port >= 3000 && port <= 3999) || (port >= 8288 && port <= 9287))
+  ) {
+    return { error: 'port must be in 3000-3999 or 8288-9287', ok: false };
+  }
+  // lsof prints one pid per line when several processes hold the socket.
+  const pids = (await activePidAsync(port)).split(/\s+/).filter(Boolean);
+  const expected = expectedPid === undefined ? null : String(expectedPid);
+  if (expected !== null && pids.length && !pids.includes(expected)) {
+    return {
+      code: 'PORT_OWNER_CHANGED',
+      error: `port ${port} is now held by process ${pids.join(', ')}`,
+      ok: false,
+    };
+  }
   // A container-published port's host-side "process" is the engine's own
   // port-forwarding helper, not the dev server itself — signaling it directly
   // isn't scoped to one container (reconcileDevServers hits this exact hazard
@@ -1054,15 +1114,28 @@ async function killPort(port) {
   // genuinely-unregistered ports (setu prune's orphan-killing case).
   const owner = portEntries(WORKSPACE).find((e) => e.port === port);
   if (owner) {
-    return stopWorktree(owner.repo, owner.name, port);
+    const stopped = await stopWorktree(owner.repo, owner.name, port);
+    // Stop can fail because Setu cannot tie the listener to this worktree. The
+    // caller named the exact process it saw, so signal that one process, but
+    // never while a container may be publishing the port: that listener is the
+    // engine's forwarding helper.
+    if (
+      stopped?.ok !== false ||
+      expected === null ||
+      !pids.includes(expected) ||
+      (await containerState(composeProjectName(owner.repo, owner.name))) !==
+        'dead'
+    ) {
+      return stopped;
+    }
   }
-  const pid = await activePidAsync(port);
+  const pid = expected ?? pids[0];
   if (!pid) {
     return { error: 'nothing on that port', ok: false };
   }
   try {
     process.kill(Number.parseInt(pid, 10), 'SIGTERM');
-    return { ok: true };
+    return { ok: true, pid: Number.parseInt(pid, 10) };
   } catch (e) {
     return { error: String(e), ok: false };
   }
@@ -1239,7 +1312,11 @@ async function computeWorktrees() {
         pubDomain: publicDomain(_cfg),
         queued: queuePosition(key) !== null,
         queuePosition: queuePosition(key),
+        queueReason:
+          lifecycle.queueSnapshot().find((item) => item.key === key)?.reason ??
+          null,
         repo,
+        wtDir,
         // Configured custom sidecars (sidecars.json, repo-scoped) and
         // whether each is actually running for THIS worktree right now --
         // previously tracked correctly in sidecarProcs but never surfaced
@@ -1276,6 +1353,19 @@ function worktreeTarget(
     repo,
     repoDir: repoPath(repo),
     wtDir: managedWorktreePath(WORKSPACE, repo, name, { registered }),
+  });
+}
+
+function projectSetupTarget(name) {
+  validateWorktreeNames(name, 'main');
+  return Object.freeze({
+    key: `${name}/main`,
+    name: 'main',
+    port: null,
+    project: composeProjectName(name, 'main'),
+    repo: name,
+    repoDir: repoPath(name),
+    wtDir: join(WORKSPACE, name, 'main'),
   });
 }
 
@@ -1355,10 +1445,30 @@ async function containerState(project) {
   }
 }
 
+function worktreeContains(root, candidate) {
+  const pathRelative = relative(root, candidate);
+  return !(
+    pathRelative === '..' ||
+    pathRelative.startsWith(`..${sep}`) ||
+    isAbsolute(pathRelative)
+  );
+}
+
 async function discoverDevRuntime(target) {
   if (existsSync(dockerComposePath(target.wtDir))) {
     const state = await containerState(target.project);
-    if (state !== 'dead') {
+    if (state === 'alive') {
+      return {
+        handle: {
+          container: target.project,
+          observedState: state,
+          ownedGroup: false,
+          pid: null,
+        },
+        state,
+      };
+    }
+    if (state === 'unknown' && (await activePidAsync(target.port))) {
       return {
         handle: {
           container: target.project,
@@ -1402,18 +1512,17 @@ async function discoverDevRuntime(target) {
       .split('\n')
       .find((cwdLine) => cwdLine.startsWith('n'))
       ?.slice(1);
-    if (
-      cwd.code !== 0 ||
-      !directory ||
-      (await identityFs.realpath(directory)) !==
-        (await identityFs.realpath(target.wtDir))
-    ) {
+    const root = await identityFs.realpath(target.wtDir);
+    const listenerDir = directory && (await identityFs.realpath(directory));
+    if (cwd.code !== 0 || !listenerDir || !worktreeContains(root, listenerDir)) {
       return { state: 'unknown' };
     }
     const evidence = await processEvidence(pid);
+    const evidenceDir = evidence?.cwd && (await identityFs.realpath(evidence.cwd));
     if (
       !evidence ||
-      evidence.cwd !== (await identityFs.realpath(target.wtDir))
+      !evidenceDir ||
+      !worktreeContains(root, evidenceDir)
     ) {
       return { state: 'unknown' };
     }
@@ -1471,6 +1580,27 @@ const devRuntime = createDevRuntime({
     }
   },
 });
+
+async function observeSidecarEntry(entry) {
+  if (!entry?.pid || entry.ownedGroup) {
+    return devRuntime.observe(null, entry);
+  }
+  try {
+    process.kill(entry.pid, 0);
+  } catch (error) {
+    if (error.code === 'ESRCH') {
+      return 'dead';
+    }
+    return 'unknown';
+  }
+  if (entry.evidence) {
+    const current = await processEvidence(entry.pid);
+    if (current && JSON.stringify(current) !== JSON.stringify(entry.evidence)) {
+      return 'dead';
+    }
+  }
+  return devRuntime.observe(null, entry);
+}
 
 const lifecycle = createWorktreeLifecycle({
   assertStorage: () => assertStorageHeadroom(WORKSPACE, readHostHealth),
@@ -1715,6 +1845,18 @@ async function stopSidecars(repo, name) {
   const results = await Promise.allSettled(
     keys.map(async (key) => {
       const entry = sidecarProcs.get(key);
+      if (!entry.ownedGroup) {
+        if ((await devRuntime.observe(null, entry)) === 'dead') {
+          sidecarProcs.delete(key);
+          return;
+        }
+        throw Object.assign(
+          new Error(
+            'Sidecar ownership is unconfirmed; stop it through its original owner, then retry Stop.'
+          ),
+          { code: 'SUPPORTING_PROCESS_UNOWNED' }
+        );
+      }
       await devRuntime.stopProcess(entry);
       if (sidecarProcs.get(key) === entry) {
         sidecarProcs.delete(key);
@@ -1777,7 +1919,20 @@ async function stopInngest(repo, name, port) {
   const key = `${repo}/${name}`;
   const entry = inngestProcs.get(key);
   if (entry) {
-    await devRuntime.stopProcess(entry);
+    if (!entry.ownedGroup) {
+      if ((await devRuntime.observe(null, entry)) === 'dead') {
+        inngestProcs.delete(key);
+      } else {
+        throw Object.assign(
+          new Error(
+            'Inngest ownership is unconfirmed; stop it through its original owner, then retry Stop.'
+          ),
+          { code: 'SUPPORTING_PROCESS_UNOWNED' }
+        );
+      }
+    } else {
+      await devRuntime.stopProcess(entry);
+    }
   }
   if (inngestProcs.get(key) === entry) {
     inngestProcs.delete(key);
@@ -1788,7 +1943,7 @@ async function stopInngest(repo, name, port) {
   const pid = iPort ? await activePidAsync(iPort) : null;
   if (pid) {
     throw new Error(
-      'Inngest listener ownership is unconfirmed; refusing to signal an untracked PID'
+      'Inngest listener ownership is unconfirmed; stop it through its original owner, then retry Stop.'
     );
   }
   if (!(entry || pid)) {
@@ -1841,9 +1996,15 @@ async function stopTrigger(repo, name) {
     return { error: 'not running', ok: false };
   }
   if (!entry.ownedGroup) {
+    if ((await devRuntime.observe(null, entry)) === 'dead') {
+      if (triggerProcs.get(key) === entry) {
+        triggerProcs.delete(key);
+      }
+      return { ok: true };
+    }
     throw Object.assign(
       new Error(
-        'Legacy Trigger process group ownership is unconfirmed; stop it through its original owner and diagnose remaining children before removal'
+        'Trigger ownership is unconfirmed; stop it through its original owner, then retry Stop.'
       ),
       { code: 'SUPPORTING_PROCESS_UNOWNED' }
     );
@@ -2028,12 +2189,24 @@ async function stopConvexDev(repo, name) {
     if (dir && (await convexDevAlreadyRunning(dir))) {
       throw Object.assign(
         new Error(
-          'An untracked Convex process still uses this worktree; removal requires confirmed teardown'
+          'An untracked Convex process still uses this worktree; stop it through its original owner, then retry Stop.'
         ),
         { code: 'SUPPORTING_PROCESS_UNOWNED' }
       );
     }
     return { error: 'not running', ok: false };
+  }
+  if (!entry.ownedGroup) {
+    if ((await devRuntime.observe(null, entry)) === 'dead') {
+      convexDevProcs.delete(key);
+      return { ok: true };
+    }
+    throw Object.assign(
+      new Error(
+        'Convex ownership is unconfirmed; stop it through its original owner, then retry Stop.'
+      ),
+      { code: 'SUPPORTING_PROCESS_UNOWNED' }
+    );
   }
   await devRuntime.stopProcess(entry);
   if (convexDevProcs.get(key) === entry) {
@@ -2559,7 +2732,7 @@ async function addProject({ github = '', name: nameArg = '', label = '' }) {
   const repoDir = repoPath(name);
 
   return lifecycle.runOperation(
-    worktreeTarget(name, 'main', null, { registered: false }),
+    projectSetupTarget(name),
     'project-setup',
     async () => {
       if (loadProjects(WORKSPACE)[name]) {
@@ -2760,7 +2933,7 @@ async function projectRoutes(req, pathname, method, server) {
     }
     return jsonTry(() =>
       lifecycle.runOperation(
-        worktreeTarget(name, 'main', null, { registered: false }),
+        projectSetupTarget(name),
         'project-setup',
         async () => {
           if (loadProjects(WORKSPACE)[name]) {
@@ -2906,15 +3079,21 @@ async function settingsRoutes(req, pathname, method, server) {
   // stale client can't approve a command it no longer matches.
   if (pathname === '/api/sidecar-approvals/approve' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
+    if (typeof body.command !== 'string') {
+      return Response.json({
+        error: 'Sidecar command is required for approval',
+        ok: false,
+      });
+    }
     return jsonTry(async () => {
-      const s = loadAllSidecars(WORKSPACE, body.repo).find(
-        (x) => x.name === body.name
-      );
-      if (!s) {
-        throw new Error(`sidecar '${body.name}' not found for ${body.repo}`);
-      }
       return persistedAction(
-        await approveSidecar(WORKSPACE, body.repo, s.name, s.command, s.args)
+        await approveSidecar(
+          WORKSPACE,
+          body.repo,
+          body.name,
+          body.command,
+          body.args
+        )
       );
     });
   }
@@ -2956,9 +3135,22 @@ async function settingsRoutes(req, pathname, method, server) {
 }
 
 function mcpCallbackHtml(title, body) {
+  const escape = (value) =>
+    String(value).replace(/[&<>'"]/g, (char) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[
+        char
+      ]
+    );
   return new Response(
-    `<!doctype html><html><head><title>${title}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${title}</h2><p>${body}</p></body></html>`,
-    { headers: { 'content-type': 'text/html' } }
+    `<!doctype html><html><head><title>${escape(title)}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${escape(title)}</h2><p>${escape(body)}</p></body></html>`,
+    {
+      headers: {
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
+        'content-type': 'text/html',
+        'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+      },
+    }
   );
 }
 
@@ -3388,6 +3580,9 @@ async function worktreeRoutes(req, pathname, method, server) {
         )
       );
     }
+    if (pathname === '/api/remove/cancel') {
+      return Response.json(await removals.cancel(body.operationId));
+    }
     if (pathname === '/api/start') {
       // Container is the default for dev servers, not opt-in — but ONLY when
       // nobody expressed a preference. `container` explicitly true/false
@@ -3508,8 +3703,8 @@ async function worktreeRoutes(req, pathname, method, server) {
       return Response.json(openInGhostty(wtPath(repo, name), tool));
     }
     if (pathname === '/api/ports/kill') {
-      const { port } = body;
-      return Response.json(await killPort(port));
+      const { pid, port } = body;
+      return Response.json(await killPort(port, pid));
     }
   }
 
@@ -3557,6 +3752,10 @@ async function handle(req, server) {
   const { pathname } = new URL(req.url);
   const method = req.method;
 
+  if (method === 'POST' && pathname.startsWith('/api/')) {
+    server?.timeout(req, 0);
+  }
+
   // OAuth's redirect is a GET, but its callback exchanges and persists tokens.
   if (method === 'GET' && pathname.startsWith('/api/mcp/oauth/callback/')) {
     const result = await updateControl.mutate(() =>
@@ -3585,21 +3784,28 @@ async function handle(req, server) {
   // already does its own req.json() internally -- clone before routing so
   // this wrapper can independently read the same body for the log entry.
   const bodyClone = req.clone();
-  const routed = pathname.startsWith('/api/update/')
-    ? await routeRequest(req, server, pathname, method)
-    : await updateControl.mutate(
-        () => routeRequest(req, server, pathname, method),
-        {
-          recovery: [
-            '/api/stop',
-            '/api/inngest/stop',
-            '/api/trigger/stop',
-            '/api/convex/stop',
-            '/api/raycast/stop',
-            '/api/mcp/disconnect',
-          ].includes(pathname),
-        }
-      );
+  let routed;
+  try {
+    routed = pathname.startsWith('/api/update/')
+      ? await routeRequest(req, server, pathname, method)
+      : await updateControl.mutate(
+          () => routeRequest(req, server, pathname, method),
+          {
+            recovery: [
+              '/api/stop',
+              '/api/inngest/stop',
+              '/api/trigger/stop',
+              '/api/convex/stop',
+              '/api/raycast/stop',
+              '/api/mcp/disconnect',
+            ].includes(pathname),
+          }
+        );
+  } catch (error) {
+    const body = await bodyClone.json().catch(() => null);
+    logAction(pathname, body, false, error);
+    return Response.json({ error: String(error), ok: false }, { status: 500 });
+  }
   const res =
     routed instanceof Response
       ? routed
@@ -3611,7 +3817,12 @@ async function handle(req, server) {
       .json()
       .catch(() => null),
   ]);
-  logAction(pathname, body, resBody?.ok !== false, resBody?.error);
+  logAction(
+    pathname,
+    body,
+    res.status < 400 && resBody?.ok !== false,
+    resBody?.error
+  );
   return res;
 }
 
@@ -3745,6 +3956,16 @@ async function worktreeProcessTree(key, entry) {
 }
 
 async function checkMemoryCeilings() {
+  await Promise.all(
+    [inngestProcs, triggerProcs, convexDevProcs, sidecarProcs].map((map) =>
+      pruneDeadEntries(map, observeSidecarEntry)
+    )
+  );
+  for (const entry of lifecycle.snapshots()) {
+    if (entry.phase === 'unknown' && !entry.reserved) {
+      await lifecycle.reconcile(entry.key, entry.generation);
+    }
+  }
   const sidecarKeys = new Set([
     ...inngestProcs.keys(),
     ...triggerProcs.keys(),
@@ -3839,18 +4060,22 @@ async function checkMemoryCeilings() {
 }
 
 let memoryCheckRunning = false;
-const memoryCheckTimer = setInterval(async () => {
-  if (memoryCheckRunning || updateControl.stopping()) {
-    return;
-  }
-  memoryCheckRunning = true;
-  try {
-    await checkMemoryCeilings();
-  } catch (error) {
-    console.error(error);
-  } finally {
-    memoryCheckRunning = false;
-  }
+const memoryCheckTimer = setInterval(() => {
+  void (async () => {
+    if (memoryCheckRunning) {
+      return;
+    }
+    memoryCheckRunning = true;
+    try {
+      if (!updateControl.stopping()) {
+        await checkMemoryCeilings();
+      }
+    } catch (error) {
+      console.error('Memory ceiling check failed:', error);
+    } finally {
+      memoryCheckRunning = false;
+    }
+  })();
 }, MEM_CHECK_INTERVAL);
 
 // ── idle-timeout auto-stop ───────────────────────────────────────────────────
@@ -3940,8 +4165,12 @@ function checkIdleTimeouts() {
 }
 
 const idleCheckTimer = setInterval(() => {
-  if (!updateControl.stopping()) {
-    checkIdleTimeouts();
+  try {
+    if (!updateControl.stopping()) {
+      checkIdleTimeouts();
+    }
+  } catch (error) {
+    console.error('Idle timeout check failed:', error);
   }
 }, IDLE_CHECK_INTERVAL);
 
@@ -4079,7 +4308,13 @@ function wsSubscribeLog(ws, topic) {
     };
     wsTopics.set(topic, entry);
     entry.interval = setInterval(
-      () => wsTickLog(topic, repo, name, type),
+      () => {
+        try {
+          wsTickLog(topic, repo, name, type);
+        } catch (error) {
+          console.error('Log stream tick failed:', error);
+        }
+      },
       1000
     );
   }
@@ -4187,4 +4422,16 @@ const server = Bun.serve({
   },
   websocket: { close, message, open },
 });
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error);
+});
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+});
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    releaseHeldLocks();
+    process.exit(0);
+  });
+}
 console.log(`Portal → http://quivly.local  (localhost:${PORT})`);

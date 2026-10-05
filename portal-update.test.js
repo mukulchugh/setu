@@ -176,3 +176,30 @@ test('already-admitted lifecycle work blocks cutover and new direct backend work
   expect(f.control.prepareStop(owner).ok).toBe(true);
   expect((await f.control.reopen({ ...owner, coherent: true })).ok).toBe(false);
 });
+
+test('a dead quiesce owner is reopened before a new owner is admitted', async () => {
+  const lifecycle = createWorktreeLifecycle({
+    capacity: {},
+    clock: { clearTimeout, now: () => 0, setTimeout },
+    runtime: {},
+    settings: {},
+    validateTarget: () => Promise.resolve(),
+  });
+  let sequence = 0;
+  const control = createPortalUpdateControl({
+    lifecycle,
+    ownerProcessAlive: (pid) => pid !== 123,
+    processIdentity: identity,
+    randomId: () => `owner-${++sequence}`,
+  });
+  const first = control.quiesce({
+    ...control.capabilities(),
+    ownerProcessId: 123,
+  });
+  expect(first.ok).toBe(true);
+  const second = control.quiesce({
+    ...control.capabilities(),
+    ownerProcessId: 456,
+  });
+  expect(second).toMatchObject({ ok: true, token: 'owner-3' });
+});

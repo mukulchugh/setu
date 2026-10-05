@@ -1,6 +1,10 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { renderDockerCompose } from './dev-runtime.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
+import { createWorkspaceState } from './workspace-state.js';
 
 function deferred() {
   let resolve, reject;
@@ -23,8 +27,9 @@ const target = (name) => ({
 function fixture(options = {}) {
   const running = new Map();
   const launches = [];
+  const stops = [];
   const runtime = {
-    async launch(t, spec, register) {
+    async launch(t, spec, register, options) {
       const exit = deferred();
       const handle = {
         exit,
@@ -33,7 +38,7 @@ function fixture(options = {}) {
         pid: 100 + launches.length,
         state: 'alive',
       };
-      launches.push({ handle, spec, target: t });
+      launches.push({ handle, options, spec, target: t });
       running.set(t.key, handle);
       register(handle);
       return { skippedSidecars: [] };
@@ -41,7 +46,8 @@ function fixture(options = {}) {
     async observe(_target, handle) {
       return handle?.state ?? 'dead';
     },
-    async stop(t, handle) {
+    async stop(t, handle, options) {
+      stops.push({ handle, options, target: t });
       if (handle) {
         handle.state = 'dead';
         handle.exit?.resolve(0);
@@ -95,6 +101,7 @@ function fixture(options = {}) {
     lifecycle,
     running,
     runtime,
+    stops,
     timers,
   };
 }
@@ -311,21 +318,88 @@ test('failure after spawn retains the registered handle and a failed Stop keeps 
   expect(f.running.has('repo/b')).toBe(true);
 });
 
+test('a main Stop confirmed dead releases the slot despite sidecar warnings', async () => {
+  const f = fixture({
+    runtime: {
+      async stop(t, handle) {
+        handle.state = 'dead';
+        handle.exit.resolve(0);
+        f.running.delete(t.key);
+        return { warnings: ['Inngest could not stop'] };
+      },
+    },
+  });
+  await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.start(target('b'), false);
+  await expect(f.lifecycle.stop(target('a'))).resolves.toEqual({
+    ok: true,
+    warnings: ['Inngest could not stop'],
+  });
+  expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
+    phase: 'stopped',
+    reserved: false,
+  });
+  expect(f.running.has('repo/b')).toBe(true);
+});
+
+test('restart validation failure restores the running phase without Stop', async () => {
+  const f = fixture({
+    controller: {
+      validateTarget: async (_target, { kind }) => {
+        if (kind === 'restart') {
+          throw new Error('target changed');
+        }
+      },
+    },
+  });
+  await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.reconcile(
+    'repo/a',
+    f.lifecycle.snapshot('repo/a').generation
+  );
+  const handle = f.running.get('repo/a');
+  await expect(f.lifecycle.restart(target('a'))).resolves.toMatchObject({
+    code: 'RESTART_FAILED',
+    ok: false,
+  });
+  expect(f.running.get('repo/a')).toBe(handle);
+  expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
+    phase: 'running',
+    reserved: true,
+  });
+});
+
+test('restart leaves sidecars alone while ordinary starts retain sidecar behavior', async () => {
+  const f = fixture();
+  await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.restart(target('a'));
+  expect(f.stops[0].options).toEqual({ sidecars: false });
+  expect(f.launches[0].options).toBeUndefined();
+  expect(f.launches[1].options).toEqual({ sidecars: false });
+});
+
 test('a failed restart update releases confirmed-dead ownership and launches the FIFO waiter', async () => {
   const f = fixture();
   await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.reconcile(
+    'repo/a',
+    f.lifecycle.snapshot('repo/a').generation
+  );
   await f.lifecycle.start(target('b'), false);
   const result = await f.lifecycle.restart(target('a'), () => {
     return Promise.reject(new Error('environment write failed'));
   });
   expect(result).toMatchObject({ code: 'RESTART_FAILED', ok: false });
   expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
-    phase: 'stopped',
-    reserved: false,
+    phase: 'running',
+    reserved: true,
   });
-  expect(f.running.has('repo/b')).toBe(true);
-  expect(f.launches.map((item) => item.target.name)).toEqual(['a', 'b']);
-  expect((await f.lifecycle.start(target('a'), false)).queued).toBe(true);
+  expect(f.running.has('repo/a')).toBe(true);
+  expect(f.running.has('repo/b')).toBe(false);
+  expect(f.launches.map((item) => item.target.name)).toEqual(['a']);
+  expect((await f.lifecycle.start(target('a'), false)).code).toBe(
+    'ALREADY_RUNNING'
+  );
 });
 
 test('restart retains admitted limits in both resource ledger and rendered Compose after settings change', async () => {
@@ -374,6 +448,47 @@ test('queued container capacity recovers with zero readers and no timer after th
   expect(f.running.has('repo/b')).toBe(true);
   expect(f.timers.size).toBe(0);
   expect(probes).toBe(3);
+});
+
+test('a container waiting for capacity does not block a later admissible bare start', async () => {
+  let cpus = 2;
+  const f = fixture({
+    capacity: { refresh: async () => ({ available: true, cpus, memMb: 8192 }) },
+    settings: { maxConcurrentDevServers: 3 },
+  });
+  await f.lifecycle.start(target('a'), true);
+  cpus = 1;
+  const waiting = await f.lifecycle.start(target('b'), true);
+  expect(waiting).toMatchObject({
+    ok: true,
+    queued: true,
+    reason: 'container-capacity',
+  });
+  expect(f.lifecycle.queueSnapshot()[0]).toMatchObject({
+    key: 'repo/b',
+    reason: 'container-capacity',
+  });
+  const started = await f.lifecycle.start(target('c'), false);
+  expect(started.ok).toBe(true);
+  expect(started.queued).toBeUndefined();
+  expect(f.launches.map((item) => item.target.name)).toEqual(['a', 'c']);
+});
+
+test('drain skips an unadmittable queued container for a later queued bare start', async () => {
+  let available = true;
+  const f = fixture({
+    capacity: {
+      refresh: async () => ({ available, cpus: 4, memMb: 8192 }),
+    },
+  });
+  await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.start(target('b'), true);
+  await f.lifecycle.start(target('c'), false);
+  available = false;
+  await f.advance(30_000);
+  await f.lifecycle.stop(target('a'));
+  expect(f.launches.map((item) => item.target.name)).toEqual(['a', 'c']);
+  expect(f.lifecycle.queueSnapshot()[0].key).toBe('repo/b');
 });
 
 test('unknown container exit retains ownership until two confirmed dead observations', async () => {
@@ -588,4 +703,93 @@ test('an asynchronous storage refusal releases admission to a queued checkout wi
   );
   expect((await starting).code).toBe('STORAGE_UNKNOWN');
   expect(f.launches.map((row) => row.target.name)).toEqual(['b']);
+});
+
+test('exit watchers and queue timers drain from a clean real workspace lock context', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-lifecycle-als-'));
+  const state = createWorkspaceState({ workspaceRoot: root });
+  const makeTarget = (name) => ({
+    key: `repo/${name}`,
+    name,
+    port: 3400,
+    project: `repo-${name}`,
+    repo: 'repo',
+    wtDir: join(root, 'repo', name),
+  });
+  async function exitsDrain(first, second) {
+    const exits = new Map(),
+      dead = new Set(),
+      launched = [];
+    const lifecycle = createWorktreeLifecycle({
+      capacity: {
+        refresh: async () => ({ available: true, cpus: 4, memMb: 8192 }),
+      },
+      clock: { now: Date.now, setTimeout, clearTimeout },
+      runtime: {
+        async launch(t, _spec, register) {
+          let resolve;
+          const exited = new Promise((done) => {
+            resolve = done;
+          });
+          exits.set(t.key, resolve);
+          launched.push(t.key);
+          register({ exited, ownedGroup: true, pid: 1000 + launched.length });
+        },
+        async observe(t) {
+          return dead.has(t.key) ? 'dead' : 'alive';
+        },
+        async stop() {},
+      },
+      settings: { maxConcurrentDevServers: 1 },
+      validateTarget: async () => {},
+      withTarget: (t, task) => state.withTargets([t], task),
+    });
+    await lifecycle.start(makeTarget(first), false);
+    await lifecycle.start(makeTarget(second), false);
+    dead.add(`repo/${first}`);
+    exits.get(`repo/${first}`)(0);
+    for (let count = 0; count < 20 && launched.length < 2; count += 1) {
+      await Bun.sleep(10);
+    }
+    expect(launched).toEqual([`repo/${first}`, `repo/${second}`]);
+  }
+  await exitsDrain('zeta', 'alpha');
+  await exitsDrain('alpha2', 'zeta2');
+
+  let capacity = { cpus: 4, memMb: 4096 };
+  let tick = 0;
+  const launched = [];
+  const lifecycle = createWorktreeLifecycle({
+    capacity: { refresh: async () => ({ available: true, ...capacity }) },
+    clock: {
+      now: () => (tick += 31_000),
+      setTimeout: (task) => setTimeout(task, 10),
+      clearTimeout,
+    },
+    runtime: {
+      async launch(t, _spec, register) {
+        launched.push(t.key);
+        register({ ownedGroup: true, pid: 2000 + launched.length });
+      },
+      async observe() {
+        return 'alive';
+      },
+      async stop() {},
+    },
+    settings: {
+      containerCpuLimit: 1,
+      containerMemoryLimit: '4g',
+      maxConcurrentDevServers: 3,
+    },
+    validateTarget: async () => {},
+    withTarget: (t, task) => state.withTargets([t], task),
+  });
+  await lifecycle.start(makeTarget('timer-a'), true);
+  await lifecycle.start(makeTarget('timer-b'), true);
+  capacity = { cpus: 4, memMb: 16384 };
+  for (let count = 0; count < 20 && launched.length < 2; count += 1) {
+    await Bun.sleep(10);
+  }
+  expect(launched).toEqual(['repo/timer-a', 'repo/timer-b']);
+  lifecycle.dispose();
 });

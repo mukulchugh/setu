@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setu — install
-# curl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash
+# gh api repos/mukulchugh/setu/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
 set -e
 
 SETU_DIR="${SETU_INSTALL_DIR:-$HOME/.setu}"

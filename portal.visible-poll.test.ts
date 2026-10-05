@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { createVisiblePoll } from './portal/visible-poll';
 
-function fixture(immediate = true, intervalMs: number | null = 3000) {
+function fixture(
+  immediate = true,
+  intervalMs: number | null = 3000,
+  refreshOnVisible = true
+) {
   let visible = true,
     listener = () => {
       /* No side effect is needed in this fixture. */
@@ -20,6 +24,7 @@ function fixture(immediate = true, intervalMs: number | null = 3000) {
     cancel: (key) => timers.delete(key),
     immediate,
     intervalMs,
+    refreshOnVisible,
     onVisibility(cb) {
       listener = cb;
       return () => {
@@ -161,6 +166,17 @@ describe('visible read lifecycle', () => {
     expect(f.reads).toHaveLength(0);
     f.tick();
     expect(f.reads).toHaveLength(1);
+    f.poll.stop();
+  });
+  test('one-shot diff reads do not refetch when the tab becomes visible', async () => {
+    const f = fixture(true, null, false);
+    f.reads[0].resolve('saved diff');
+    await flush();
+    f.visibility(false);
+    f.visibility(true);
+    expect(f.reads).toHaveLength(1);
+    f.poll.refresh();
+    expect(f.reads).toHaveLength(2);
     f.poll.stop();
   });
 });

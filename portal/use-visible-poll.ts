@@ -27,7 +27,8 @@ export function useVisiblePoll<T>(
   key: string | null,
   intervalMs: number | null,
   read: (signal: AbortSignal) => Promise<T>,
-  immediate = true
+  immediate = true,
+  refreshOnVisible = true
 ) {
   const reader = useRef(read);
   reader.current = read;
@@ -49,6 +50,7 @@ export function useVisiblePoll<T>(
       cancel: (timer) => clearTimeout(timer),
       immediate,
       intervalMs,
+      refreshOnVisible,
       onVisibility(callback) {
         document.addEventListener('visibilitychange', callback);
         return () => document.removeEventListener('visibilitychange', callback);
@@ -65,7 +67,7 @@ export function useVisiblePoll<T>(
         poll.current = null;
       }
     };
-  }, [key, intervalMs, immediate]);
+  }, [key, intervalMs, immediate, refreshOnVisible]);
   const refresh = useCallback(() => poll.current?.refresh(), []);
   return {
     ...(snapshot.key === key

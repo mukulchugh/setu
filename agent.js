@@ -24,13 +24,6 @@
 //      per-arg limit). Forget `docker exec -i` and the agent blocks on a stdin
 //      that never closes, surfacing as an opaque 600s idle timeout.
 
-import {
-  claudeCode,
-  codex,
-  createBindMountSandboxProvider,
-  opencode,
-  run,
-} from '@ai-hero/sandcastle';
 import { HOME } from './lib.js';
 
 // Matches writeDockerCompose's `working_dir: /workspace` — the agent container
@@ -73,7 +66,6 @@ const DEFAULT_MAX_BUDGET_USD = 2.0;
 // no code path here ever wants access to the host keychain.
 export const AGENT_ADAPTERS = {
   claude: {
-    agent: (model, opts) => claudeCode(model ?? 'claude-opus-4-8', opts),
     credential: {
       key: 'CLAUDE_CODE_OAUTH_TOKEN',
       kind: 'env',
@@ -82,7 +74,6 @@ export const AGENT_ADAPTERS = {
     label: 'Claude Code',
   },
   codex: {
-    agent: (model, opts) => codex(model ?? 'gpt-5.4', opts),
     credential: {
       hostPath: `${HOME}/.codex/auth.json`,
       kind: 'file',
@@ -92,7 +83,6 @@ export const AGENT_ADAPTERS = {
     label: 'Codex',
   },
   opencode: {
-    agent: (model, opts) => opencode(model ?? 'claude-opus-4-8', opts),
     credential: {
       hostPath: `${HOME}/.local/share/opencode/auth.json`,
       kind: 'file',
@@ -102,6 +92,20 @@ export const AGENT_ADAPTERS = {
     label: 'opencode',
   },
 };
+
+async function sandcastle() {
+  return import('@ai-hero/sandcastle');
+}
+
+function agentProvider(agentId, model, sandcastleModule) {
+  if (agentId === 'claude') {
+    return sandcastleModule.claudeCode(model ?? 'claude-opus-4-8');
+  }
+  if (agentId === 'codex') {
+    return sandcastleModule.codex(model ?? 'gpt-5.4');
+  }
+  return sandcastleModule.opencode(model ?? 'claude-opus-4-8');
+}
 
 // Interactive-only agents, with the reason — surfaced by the portal so the UI
 // can explain *why* a tool it can otherwise launch isn't offered for AFK runs,
@@ -313,7 +317,7 @@ export async function dockerExec(container, command, options = {}) {
   // Both pumps must run concurrently with `exited`: a process that fills the
   // stderr pipe while nobody drains it deadlocks, and awaiting `exited` first
   // would never let the drain start.
-  await Promise.all([
+  const [, , exitCode] = await Promise.all([
     pumpLines(proc.stdout, (line) => {
       outTail.push(`${line}\n`);
       onLine?.(line);
@@ -322,8 +326,13 @@ export async function dockerExec(container, command, options = {}) {
     proc.exited,
   ]);
 
+  if (proc.signalCode) {
+    throw new Error(
+      `Agent command was terminated by signal ${proc.signalCode}`
+    );
+  }
   return {
-    exitCode: proc.exitCode ?? 0,
+    exitCode,
     stderr: errTail.toString(),
     stdout: outTail.toString(),
   };
@@ -337,7 +346,12 @@ export async function dockerExec(container, command, options = {}) {
 // without cancelling the underlying process, so a no-op close() would leave the
 // agent running inside a container nobody is reading from — burning subscription
 // budget with no output consumer, which is the worst of both worlds.
-export function setuSandbox({ container, env = {}, stopContainer }) {
+export function setuSandbox({
+  container,
+  createBindMountSandboxProvider,
+  env = {},
+  stopContainer,
+}) {
   return createBindMountSandboxProvider({
     create: async () => ({
       close: async () => {
@@ -474,15 +488,19 @@ export async function runAgent({
   if (!adapter) {
     throw new Error(`no headless adapter for agent "${agentId}"`);
   }
+  if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) {
+    throw new Error('maxBudgetUsd must be a finite positive number');
+  }
 
   const cred = resolveCredential(agentId);
   if (cred.error) {
     throw new Error(cred.error);
   }
 
+  const sandcastleModule = await sandcastle();
   const { guarded: budgetGuarded, provider } = applyBudgetGuard(
     agentId,
-    adapter.agent(model),
+    agentProvider(agentId, model, sandcastleModule),
     maxBudgetUsd
   );
 
@@ -493,35 +511,60 @@ export async function runAgent({
   });
 
   try {
-    const result = await run({
-      agent: provider,
-      branchStrategy: { type: 'head' },
-      cwd,
-      idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
-      // Sandcastle's default writes .sandcastle/logs/<branch>.log *inside* the
-      // repo — which here is a live worktree with a dev server watching it. Always
-      // pass an explicit path under Setu's own log tree.
-      logging: {
-        onAgentStreamEvent: onStreamEvent,
-        path: logPath,
-        type: 'file',
-      },
-      maxIterations,
-      name,
-      prompt,
-      promptArgs,
-      promptFile,
-      resumeSession,
-      // Credential env rides the provider channel rather than a .sandcastle/.env
-      // file scattered into every worktree. EnvResolver only forwards keys named
-      // in that file and silently yields nothing when it's absent, which would
-      // look exactly like a broken token.
-      sandbox: setuSandbox({ container, env: cred.env, stopContainer }),
-      signal,
-      timeouts: { commitCollectionMs: 60_000, gitSetupMs: 30_000 },
-    });
-    agentRunFinish(repo, name);
-    return result;
+    const timeout = AbortSignal.timeout(RUN_TIMEOUT_MS);
+    const runSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    let timeoutId;
+    try {
+      const timeoutResult = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          void Promise.resolve(stopContainer()).catch(() => {});
+          reject(
+            new Error(`Agent run exceeded ${RUN_TIMEOUT_MS}ms wall-clock limit`)
+          );
+        }, RUN_TIMEOUT_MS);
+      });
+      const result = await Promise.race([
+        (async () =>
+          sandcastleModule.run({
+            agent: provider,
+            branchStrategy: { type: 'head' },
+            cwd,
+            idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
+            // Sandcastle's default writes .sandcastle/logs/<branch>.log *inside* the
+            // repo — which here is a live worktree with a dev server watching it. Always
+            // pass an explicit path under Setu's own log tree.
+            logging: {
+              onAgentStreamEvent: onStreamEvent,
+              path: logPath,
+              type: 'file',
+            },
+            maxIterations,
+            name,
+            prompt,
+            promptArgs,
+            promptFile,
+            resumeSession,
+            // Credential env rides the provider channel rather than a .sandcastle/.env
+            // file scattered into every worktree. EnvResolver only forwards keys named
+            // in that file and silently yields nothing when it's absent, which would
+            // look exactly like a broken token.
+            sandbox: setuSandbox({
+              container,
+              createBindMountSandboxProvider:
+                sandcastleModule.createBindMountSandboxProvider,
+              env: cred.env,
+              stopContainer,
+            }),
+            signal: runSignal,
+            timeouts: { commitCollectionMs: 60_000, gitSetupMs: 30_000 },
+          }))(),
+        timeoutResult,
+      ]);
+      agentRunFinish(repo, name);
+      return result;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   } catch (e) {
     // The chip has to show the failure, not silently revert to "no run" -- a
     // vanished chip reads as "nothing happened" when something did. `e` here

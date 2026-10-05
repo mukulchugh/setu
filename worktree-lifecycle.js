@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 export function parseMemToMb(value) {
   const match = String(value)
     .trim()
@@ -62,6 +64,7 @@ export function createWorktreeLifecycle({
   hasSupportingWork = () => false,
   onChange = () => undefined,
 }) {
+  const cleanAsyncContext = AsyncLocalStorage.snapshot();
   const records = new Map();
   const queued = [];
   const operations = new Map();
@@ -127,19 +130,25 @@ export function createWorktreeLifecycle({
       project: record.target.project,
     });
   }
-  function canAdmit(spec, excluding = null) {
+  function admissionReason(spec, excluding = null) {
     const used = usage(excluding);
     if (used.count >= policy.maxConcurrentDevServers) {
-      return false;
+      return 'concurrency';
     }
-    return (
-      !spec.container ||
-      (capacityValue.available &&
-        capacityValue.cpus > 0 &&
-        capacityValue.memMb > 0 &&
-        used.cpus + spec.limits.cpus <= capacityValue.cpus + 1e-9 &&
-        used.memMb + spec.limits.memMb <= Math.floor(capacityValue.memMb * 0.9))
-    );
+    if (
+      spec.container &&
+      (!capacityValue.available ||
+        capacityValue.cpus <= 0 ||
+        capacityValue.memMb <= 0 ||
+        used.cpus + spec.limits.cpus > capacityValue.cpus + 1e-9 ||
+        used.memMb + spec.limits.memMb > Math.floor(capacityValue.memMb * 0.9))
+    ) {
+      return 'container-capacity';
+    }
+    return null;
+  }
+  function canAdmit(spec, excluding = null) {
+    return admissionReason(spec, excluding) === null;
   }
   async function readCapacity(force = false) {
     if (capacityInFlight) {
@@ -179,12 +188,13 @@ export function createWorktreeLifecycle({
     }
     if (needsRefresh && queueTimer === null) {
       queueTimer = clock.setTimeout(
-        async () => {
-          queueTimer = null;
-          await readCapacity(true);
-          await drain();
-          armQueueTimer();
-        },
+        () =>
+          cleanAsyncContext(async () => {
+            queueTimer = null;
+            await readCapacity(true);
+            await drain();
+            armQueueTimer();
+          }),
         Math.max(1, 30_000 - (clock.now() - capacityCheckedAt))
       );
     }
@@ -203,6 +213,7 @@ export function createWorktreeLifecycle({
           ownedGroup: record.handle?.ownedGroup === true,
           phase: record.phase,
           pid: record.handle?.pid ?? null,
+          reason: record.queueReason ?? null,
           reserved: record.reserved,
           startedAt: record.startedAt ?? null,
           stopping:
@@ -224,6 +235,7 @@ export function createWorktreeLifecycle({
       handle: null,
       operation: null,
       phase: 'admitting',
+      queueReason: null,
       reserved: false,
       spec: null,
       stopIntent: false,
@@ -250,8 +262,9 @@ export function createWorktreeLifecycle({
     record.operation = promise;
     return promise;
   }
-  async function launch(record) {
+  async function launch(record, options) {
     record.reserved = true;
+    record.queueReason = null;
     await assertStorage(record.target);
     if (record.stopIntent) {
       return { ok: true, stopped: true };
@@ -270,7 +283,8 @@ export function createWorktreeLifecycle({
         }
         record.handle = handle;
         watchExit(record, handle);
-      }
+      },
+      options
     );
     publish();
     return {
@@ -286,26 +300,29 @@ export function createWorktreeLifecycle({
       return;
     }
     const capturedGeneration = record.generation;
-    Promise.resolve(handle.exited)
-      .catch(() => undefined)
-      .then(async () => {
-        if (record.operation) {
-          await record.operation;
-        }
-        await reconcile(record.target.key, capturedGeneration);
-      })
-      .catch(() => {
-        /* A failed observation never discards ownership. */
-      });
+    cleanAsyncContext(() => {
+      Promise.resolve(handle.exited)
+        .catch(() => undefined)
+        .then(async () => {
+          if (record.operation) {
+            await record.operation;
+          }
+          await reconcile(record.target.key, capturedGeneration);
+        })
+        .catch(() => {
+          /* A failed observation never discards ownership. */
+        });
+    });
   }
   async function reconcile(key, expectedGeneration) {
     const record = records.get(key);
     if (
       !record ||
       record.generation !== expectedGeneration ||
-      !record.reserved ||
       record.operation ||
-      record.stopPromise
+      record.stopPromise ||
+      // An unreserved record is only worth observing while its state is unknown.
+      !(record.reserved || record.phase === 'unknown')
     ) {
       return { state: 'unchanged' };
     }
@@ -327,6 +344,14 @@ export function createWorktreeLifecycle({
         record.stopPromise
       ) {
         return { state: 'unchanged' };
+      }
+      if (!record.reserved) {
+        if (record.phase === 'unknown' && state === 'dead') {
+          record.phase = 'stopped';
+          record.lastError = null;
+          publish();
+        }
+        return { state };
       }
       if (state !== 'dead') {
         record.deadObservations = 0;
@@ -350,16 +375,24 @@ export function createWorktreeLifecycle({
     }
     draining = (async () => {
       while (!(closedBy || disposed) && queued.length) {
-        const head = queued[0];
-        if (operations.has(head.target.key)) {
+        let index = -1;
+        for (let candidate = 0; candidate < queued.length; candidate += 1) {
+          const record = queued[candidate];
+          const spec = launchSpec(record, record.spec.container);
+          record.queueReason = admissionReason(spec);
+          if (
+            !operations.has(record.target.key) &&
+            record.queueReason === null
+          ) {
+            index = candidate;
+            break;
+          }
+        }
+        if (index === -1) {
           break;
         }
-        const spec = launchSpec(head, head.spec.container);
-        if (!canAdmit(spec)) {
-          break;
-        }
-        const record = queued.shift();
-        record.spec = spec;
+        const record = queued.splice(index, 1)[0];
+        record.spec = launchSpec(record, record.spec.container);
         record.reserved = true;
         record.phase = 'admitting';
         await operate(record, async () => {
@@ -403,6 +436,7 @@ export function createWorktreeLifecycle({
         ok: true,
         position: queued.indexOf(current) + 1,
         queued: true,
+        reason: current.queueReason,
       };
     }
     if (current?.operation || current?.stopPromise) {
@@ -443,12 +477,20 @@ export function createWorktreeLifecycle({
           record.phase = 'stopped';
           return { ok: true, stopped: true };
         }
-        if (!canAdmit(record.spec) || queued.length) {
+        const reason = admissionReason(record.spec);
+        if (reason) {
           record.phase = 'queued';
+          record.queueReason = reason;
           queued.push(record);
           armQueueTimer();
           publish();
-          return { container, ok: true, position: queued.length, queued: true };
+          return {
+            container,
+            ok: true,
+            position: queued.length,
+            queued: true,
+            reason,
+          };
         }
         return await launch(record);
       } catch (error) {
@@ -485,7 +527,7 @@ export function createWorktreeLifecycle({
       }
       record.phase = 'stopping';
       try {
-        await runtime.stop(record.target, record.handle);
+        const result = await runtime.stop(record.target, record.handle);
         record.handle = null;
         record.reserved = false;
         record.phase = 'stopped';
@@ -493,7 +535,10 @@ export function createWorktreeLifecycle({
         if (shouldDrain) {
           await drain();
         }
-        return { ok: true };
+        return {
+          ok: true,
+          ...(result?.warnings?.length ? { warnings: result.warnings } : {}),
+        };
       } catch (error) {
         record.phase = 'unknown';
         record.lastError = failure('STOP_FAILED', error);
@@ -524,6 +569,8 @@ export function createWorktreeLifecycle({
       );
     }
     const priorPhase = record.phase;
+    const priorHandle = record.handle;
+    let tornDown = false;
     record.phase = 'restarting';
     record.stopIntent = false;
     const result = await operate(record, async () => {
@@ -537,7 +584,7 @@ export function createWorktreeLifecycle({
             ? launchSpec(record, true)
             : record.spec;
         if (!canAdmit(replacement, record)) {
-          record.phase = 'starting';
+          record.phase = priorPhase;
           return failure(
             'RESTART_CAPACITY_UNAVAILABLE',
             'Current capacity cannot admit this restart; the existing runtime was left unchanged.'
@@ -550,21 +597,29 @@ export function createWorktreeLifecycle({
           record.lastError = failure('RESTART_FAILED', error);
           return record.lastError;
         }
-        await runtime.stop(record.target, record.handle);
+        await change();
+        if (record.stopIntent) {
+          return { ok: true, stopped: true };
+        }
+        // Once teardown is attempted its outcome decides the phase, not the
+        // state before it.
+        tornDown = true;
+        await runtime.stop(record.target, record.handle, { sidecars: false });
         record.handle = null;
         record.spec = replacement;
         if (record.stopIntent) {
           return { ok: true, stopped: true };
         }
-        await change();
-        if (record.stopIntent) {
-          return { ok: true, stopped: true };
-        }
-        return await launch(record);
+        return await launch(record, { sidecars: false });
       } catch (error) {
         record.lastError = failure('RESTART_FAILED', error);
-        record.phase = record.handle ? 'unknown' : 'stopped';
-        record.reserved = !!record.handle;
+        if (!tornDown && record.handle === priorHandle) {
+          record.phase = priorPhase;
+          record.reserved = true;
+        } else {
+          record.phase = record.handle ? 'unknown' : 'stopped';
+          record.reserved = !!record.handle;
+        }
         return record.lastError;
       }
     });

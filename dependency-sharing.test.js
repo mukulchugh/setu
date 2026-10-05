@@ -11,7 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   dependencySharingForTarget,
@@ -23,12 +23,13 @@ import {
 } from './workspace-setup.js';
 
 function fixture() {
-  // The production store correctly refuses /tmp. Keep these tiny disposable
-  // fixtures in a private home directory unless a pilot root is supplied.
+  // The production store refuses path segments named tmp or temp. The macOS
+  // per-user temp directory has neither, so fixtures stay out of the home
+  // directory unless a pilot root is supplied.
   const dir = realpathSync(
     mkdtempSync(
       join(
-        process.env.SETU_SHARING_TEST_ROOT || homedir(),
+        process.env.SETU_SHARING_TEST_ROOT || tmpdir(),
         '.setu-sharing-test-'
       )
     )

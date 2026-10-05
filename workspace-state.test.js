@@ -1,9 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWorkspaceState, StateError } from './workspace-state.js';
+import {
+  createWorkspaceState,
+  releaseHeldLocks,
+  StateError,
+} from './workspace-state.js';
 
 test('filesystem causes preserve ENOSPC but exclude arbitrary exception data', () => {
   expect(
@@ -345,7 +350,7 @@ test('generated output rejects symlinks and never changes shared input', async (
   expect(fs.readFileSync(secret, 'utf8')).toBe('fixture-only');
 });
 
-test('five-second lock deadline is monotonic and an empty/dead-PID lock is never stolen', async () => {
+test('five-second lock deadline is monotonic for unreadable locks and dead owners are reclaimed', async () => {
   let elapsed = 0;
   const { root, store } = fixture({
     now: () => elapsed,
@@ -363,11 +368,63 @@ test('five-second lock deadline is monotonic and an empty/dead-PID lock is never
   expect(fs.readFileSync(lock, 'utf8')).toBe('');
   fs.writeFileSync(lock, '{"pid":99999999,"nonce":"abandoned"}');
   elapsed = 0;
-  await expect(store.update('config', () => ({}))).rejects.toMatchObject({
+  await expect(store.update('config', () => ({}))).resolves.toMatchObject({
+    committed: true,
+  });
+  expect(elapsed).toBe(0);
+  expect(fs.existsSync(lock)).toBe(false);
+});
+
+test('a SIGKILLed real lock holder is reclaimed, while a live holder remains busy', async () => {
+  const { root, store } = fixture({ lockTimeoutMs: 40 });
+  const dead = writer(root, 'first');
+  await dead.wait('held');
+  dead.child.kill('SIGKILL');
+  await dead.closed;
+  await expect(
+    store.update('config', () => ({ reclaimed: true }))
+  ).resolves.toMatchObject({
+    committed: true,
+  });
+
+  const live = writer(root, 'first');
+  await live.wait('held');
+  await expect(
+    store.update('config', () => ({ blocked: true }))
+  ).rejects.toMatchObject({
     code: 'STATE_BUSY',
   });
-  expect(elapsed).toBe(5000);
-  expect(JSON.parse(fs.readFileSync(lock, 'utf8')).nonce).toBe('abandoned');
+  live.release();
+  await live.closed;
+});
+
+test('a deliberately retained target lease is never reclaimed and inspection reports it', async () => {
+  const { root, store } = fixture({ lockTimeoutMs: 20 });
+  const path = join(
+    fs.realpathSync(root),
+    `.setu-target-${createHash('sha256')
+      .update(join(fs.realpathSync(root), 'repo', 'topic'))
+      .digest('hex')}.lock`
+  );
+  fs.writeFileSync(
+    path,
+    JSON.stringify({ nonce: 'retained', pid: 99999999, retained: true })
+  );
+  const sameTarget = { name: 'topic', repo: 'repo' };
+  await expect(store.withTargets([sameTarget], () => {})).rejects.toMatchObject(
+    {
+      code: 'STATE_BUSY',
+    }
+  );
+  expect(store.inspectLocks()).toContainEqual({
+    alive: false,
+    kind: 'target',
+    path: path.replace(fs.realpathSync(root), root),
+    pid: 99999999,
+    retained: true,
+  });
+  releaseHeldLocks();
+  expect(fs.existsSync(path)).toBe(true);
 });
 
 test('release preserves a replacement lock even when it has the same nonce', async () => {
@@ -490,6 +547,7 @@ function writer(root, role, storeName) {
   );
   children.push({ child, closed });
   return {
+    child,
     closed,
     release: () => child.stdin.write('release\n'),
     wait(prefix) {

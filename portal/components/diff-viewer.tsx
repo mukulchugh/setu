@@ -38,7 +38,7 @@ interface DiffResponse {
   baseResolved: boolean;
   committed: DiffGroup;
   error?: string;
-  uncommitted: DiffGroup;
+  uncommitted: DiffGroup & { untracked?: string[] };
 }
 
 // Same refresh glyph DeployMenu/the sync-with-staging action already draw
@@ -284,24 +284,30 @@ export function DiffViewer({
 }: {
   repo: string;
   name: string;
-  dirty?: number;
+  dirty?: number | null;
 }) {
   const url = `/api/diff?repo=${encodeURIComponent(repo)}&name=${encodeURIComponent(name)}`;
   const {
     data,
     failed,
     refresh: load,
-  } = useVisiblePoll(url, null, async (signal) => {
-    const result = await readJson<DiffResponse>(url, signal);
-    if (
-      result.error ||
-      !Array.isArray(result.committed?.files) ||
-      !Array.isArray(result.uncommitted?.files)
-    ) {
-      throw new Error('Diff unavailable');
-    }
-    return result;
-  });
+  } = useVisiblePoll(
+    url,
+    null,
+    async (signal) => {
+      const result = await readJson<DiffResponse>(url, signal);
+      if (
+        result.error ||
+        !Array.isArray(result.committed?.files) ||
+        !Array.isArray(result.uncommitted?.files)
+      ) {
+        throw new Error('Diff unavailable');
+      }
+      return result;
+    },
+    true,
+    false
+  );
   const loading = !(data || failed);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [groupOpen, setGroupOpen] = useState({
@@ -414,23 +420,20 @@ export function DiffViewer({
   }
 
   const cleanBase = data.base.replace(/^origin\//, '');
-  // git status --porcelain (dirty) counts untracked files, `git diff HEAD`
-  // (uncommitted.totalFiles) by design doesn't, so the gap between them is
-  // exactly the untracked-file count. Approximate but honest: both count one
-  // line/entry per file, so the subtraction holds outside exotic states
-  // (an in-progress merge) this view doesn't otherwise handle either.
-  const untrackedCount =
-    dirty == null ? 0 : Math.max(0, dirty - data.uncommitted.totalFiles);
+  const untracked = data.uncommitted.untracked ?? [];
   const untrackedFootnote =
-    untrackedCount > 0
-      ? `+${untrackedCount} untracked file${untrackedCount === 1 ? '' : 's'} not shown (new, not yet added to git)`
-      : undefined;
+    untracked.length > 0
+      ? `Untracked: ${untracked.slice(0, 10).join(', ')}${untracked.length > 10 ? ` and ${untracked.length - 10} more` : ''}`
+      : dirty === null
+        ? 'Working tree status is unknown.'
+        : undefined;
 
   if (
     data.baseResolved &&
     data.committed.totalFiles === 0 &&
     data.uncommitted.totalFiles === 0 &&
-    untrackedCount === 0
+    untracked.length === 0 &&
+    dirty !== null
   ) {
     return (
       <div>

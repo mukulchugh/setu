@@ -28,15 +28,22 @@ setu new <repo> <branch> [--tunnel] [--start] [--bare] --json
                                       # --start containerizes by default (see Container mode below); --bare opts out
 setu start <repo> <branch> [--container|--bare]
                                       # start dev server via the portal — sticky per-worktree default if neither
-                                      # flag is passed (see Container mode below), queues if MAX_CONCURRENT_DEV
-                                      # is already reached
+                                      # flag is passed (see Container mode below), queues when it cannot be
+                                      # admitted; the output names the position and the reason
 setu stop <repo> <branch>            # stop dev server via the portal, or cancel it if still queued
-setu prune [--force]                 # list (or, with --force, kill) dev-server processes listening on a port
-                                      # not in the .ports registry — the "running but invisible to setu" case
+                                      # exits 1 with PORTAL_REQUIRED when the portal is not running
+setu prune [--force]                 # list (or, with --force, kill) dev-server processes that listen on an
+                                      # unregistered port AND run from inside the workspace. A registered
+                                      # worktree's Inngest port (its port + 5288) counts as registered
 setu rm <repo> <branch> [--force]    # stops servers (via portal) + removes worktree/port/domain — also removes
                                       # a container-backed worktree's node_modules volume, not just its container
                                       # requires the running portal; offline removal never deletes locally
                                       # after an uncertain response, inspect status before retrying
+                                      # never removes a worktree named main, with or without --force
+                                      # without --force it also refuses ignored local env files that are
+                                      # real files (not symlinks) and commits only a detached HEAD holds
+                                      # a registry row whose folder and git registration are both gone is
+                                      # cleaned up without --force
 setu rm <repo> <branch> --operation-id <id> [--json]
                                       # retry only the recorded removal; never turn this into a fresh delete
 setu path <repo> <branch>            # prints worktree path
@@ -52,13 +59,19 @@ setu mcp install <codex|cursor>      # register the portal's MCP server (see bel
 setu update [--restart] [--include-untracked]
                                       # guarded cutover; a running portal requires explicit --restart
                                       # untracked preservation is opt-in; exact recovery stash is retained
+                                      # only on branch main (UPDATE_BRANCH_UNSUPPORTED otherwise)
+                                      # a failure before restart aborts the rebase, restores the original
+                                      # revision, reapplies the stash and reopens the portal
 setu version                         # version + commit sha
 ```
 
 Errors go to stderr with exit code 1. `setu path` stdout is consumed by shell `cd` — never
 prints anything else. `setu start`/`setu new --start` returning `{ok: true, queued: true,
-position: N}` means it didn't start yet — it's in the portal's FIFO queue and will start
-automatically when a slot frees up; don't treat `ok: true` alone as "it's running now."
+position: N, reason}` means it didn't start yet — it's in the portal's queue and will start
+automatically when it can be admitted; don't treat `ok: true` alone as "it's running now."
+`reason` is `concurrency` (the server cap is reached) or `container-capacity` (the engine
+has no CPU or memory budget left). `setu new --start --json` reports `started: false` with
+`queued`, `position` and `reason` in that case.
 
 ## Portal HTTP API (localhost:2999)
 
@@ -74,18 +87,21 @@ refuses connection.
 | GET `/api/ports` | — | processes listening on 3000–3999 (batched single `lsof` call, ~1-2s cached) |
 | GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|trigger\|sidecar-<name>\|tunnel\|pr-review` | — | tail of that log |
 | POST `/api/create` | `{repo, name, tunnel?}` | create worktree (bun install runs in background — poll the `setup` log) |
-| POST `/api/remove` | `{repo, name, force?}` | reject dirty trees unless force is explicit, then stop and remove |
+| POST `/api/remove` | `{repo, name, force?}` | reject dirty trees unless force is explicit, then stop and remove. Refusals carry `code`: `MAIN_WORKTREE` (a worktree named `main` is never removed) or `WORKTREE_DIRTY` (tracked or untracked changes, ignored local env files that are real files, or commits only a detached HEAD holds) |
+| POST `/api/remove/cancel` | `{operationId}` | discard a pending removal whose checkout was not removed, so the worktree is usable again; refused while that removal is in flight |
+| POST `/api/sidecars` | `{repo, sidecars}` | replace a project's sidecar list. Names are trimmed and must match `^[a-zA-Z0-9_-]+$` (`SIDECAR_NAME_INVALID` otherwise). A new or edited sidecar is skipped at start, and listed in `skippedSidecars`, until it is approved |
+| POST `/api/sidecar-approvals/approve` | `{repo, name, command, args}` | approve a sidecar. `command` and `args` must be the ones the caller is looking at; a mismatch with the stored row is refused |
 | POST `/api/start` | `{repo, name, container?}` | start dev server. `container: true`/`false` forces that mode. **Omit the field entirely** (not `null` — actually absent) to get the sticky per-worktree default (see Container mode below) instead of a flat global one — this is what the portal UI's Start button does. Container mode requires a reachable Docker-API-compatible daemon, any engine — fails with an explicit error rather than silently falling back to bare if none is reachable. Returns `{ok:true, container}` if actually started (the resolved mode, useful when the caller didn't force one), or `{ok:true, queued:true, position:N, container}` if the concurrent-server cap (`maxConcurrentDevServers`, default 3) is already reached; auto-starts sidecars from `sidecars.json` alongside it |
 | POST `/api/stop` | `{repo, name}` | stop dev server (or dequeue it if still queued) — also stops its sidecars |
 | POST `/api/open` | `{repo, name, tool}` | open the worktree in an installed agent CLI (Ghostty) — `tool` must be one of `/api/agents`' returned ids |
 | POST `/api/tunnel/enable` / `/api/tunnel/disable` | `{repo, name}` | move/release the shared public URL |
 | POST `/api/inngest/start` / `/api/inngest/stop` | `{repo, name}` | inngest dev server |
 | POST `/api/trigger/start` / `/api/trigger/stop` | `{repo, name}` | trigger.dev dev server (version pinned to the worktree's @trigger.dev/sdk); spawned detached and stopped via its real process group, not just the tracked PID |
-| POST `/api/ports/kill` | `{port}` | stop whatever's on that port — routed through the real container stop path if it belongs to a known container-backed worktree (a raw SIGTERM to a container-published port would hit the engine's port-forwarding helper, not the dev server), otherwise a plain SIGTERM to the PID (bare processes, and unregistered/orphaned ports — `setu prune`'s case) |
+| POST `/api/ports/kill` | `{port, pid?}` | `port` must be in 3000-3999 or 8288-9287. A registered port goes through the worktree's real Stop (a raw SIGTERM to a container-published port would hit the engine's port-forwarding helper, not the dev server). If that Stop cannot identify the runtime, the caller sent the `pid` it saw, that process still holds the port, and no container publishes it, that one process gets SIGTERM. An unregistered port gets a plain SIGTERM. With `pid` set, a different current holder is refused with `PORT_OWNER_CHANGED` |
 | GET `/api/pr-review/status?repo=&name=` | — | pr-walkthrough plugin install status (scope-checked against this worktree), current deep-review run state, and artifact info (findings count, staleness vs. current HEAD) for `pr-walkthrough`/`pr-brief` if either has been run against this PR |
 | POST `/api/pr-review/run` | `{repo, name, skill}` | fire-and-forget: headlessly invokes the installed `pr-walkthrough`/`pr-brief` Claude Code plugin (`skill` must be one of those two) against this worktree's PR via `claude -p`, single-flight per worktree (both skills share one slot and one log). See `pr-review.js` for the invocation/security model |
 | GET `/api/pr-review/artifact?repo=&name=&skill=` | — | serves the most recent run's self-contained report HTML directly |
-| POST `/api/pr/create` | `{repo, name}` | push the branch and open a GitHub PR (`gh pr create --fill`) — fails clearly if there's no GitHub remote, no commits ahead of base, or a PR already exists |
+| POST `/api/pr/create` | `{repo, name}` | open a GitHub PR against the project's base branch (`gh pr create --fill --base <base>`, the same base `setu sync` uses). Checked before anything is pushed: a GitHub remote exists, the branch has commits ahead of base, and no PR exists for it yet |
 | POST `/api/pr/ready` | `{repo, name, ready}` | flip an existing PR between draft and ready for review (`gh pr ready` / `--undo`) |
 | GET `/api/costs` | — | last-30-days spend per provider (Anthropic + OpenAI's real Admin APIs; Gemini is detection-only, no admin API exists) from `costs.js` — `{configured, totalCostUsd, last1d, last7d, last30d, byModel, daily}` or `{configured:false, reason}`, plus a top-level `budgets` object (`{daily?, weekly?, monthly?}`, each `{limit, spent, status}` — `status` is `ok`/`warning` (≥80% of limit)/`over`/`incomplete`) if `~/.setu-costs.json` sets any budget thresholds, else `null`. `last1d`/`last7d`/`last30d` and `budgets.spent` are all derived from the same 30-day `daily` fetch — no extra API calls. Never echoes `~/.setu-costs.json`'s key values back — aggregated numbers only, see that file's own comment in `lib.js` for why |
 
@@ -108,13 +124,17 @@ Status also includes workspace-filesystem `hostHealth`; `GET /api/status?refresh
 requests a fresh storage check. Unknown storage is not zero free space. Deployment
 requires a current preflight context; an unknown completion keeps its owner and blocks
 retry until diagnosed. Never remove a target lock merely because its operation is old.
+A lock whose recorded process no longer exists is reclaimed automatically, unless it was
+retained on purpose after an unknown outcome (`"retained": true` in the lock file).
+`setu doctor` lists retained locks and locks with a dead owner. The CLI and the portal
+release their locks on SIGINT and SIGTERM.
 
 ## Action log
 
 Every mutating `POST /api/*` request appends one JSON line to `~/workspace/logs/actions.log`
 (retention checks every five seconds; logs above 5 MB retain their latest 2.5 MB): `{ts, route, repo, name, ok,
 error?}`. GET routes aren't logged (reads, not actions — the list/status polls alone run at
-800ms-3s intervals and would drown out everything else). Built specifically to close a real
+3 second intervals and would drown out everything else). Built specifically to close a real
 gap: a prior incident (a worktree silently switched from bare to a container mid-use) took
 correlating three separate external log sources by hand to root-cause, because portal.js
 logged nothing about its own requests anywhere retrievable. **`/mcp` is deliberately excluded**
@@ -145,8 +165,8 @@ Register it with whatever's connecting:
 The portal must already be running when the client starts — no retry-on-demand if `/mcp` is
 unreachable at session start. `create_worktree`/`remove_worktree`/`start_worktree`/
 `stop_worktree` and the other route-handler hot paths (tunnel/inngest/trigger/convex
-start/stop) now go through async siblings (`activePidAsync`/`listActivePortsAsync`/
-`killGroupAsync`/`gitFetchAsync` in lib.js, `Bun.spawn`-based) instead of
+start/stop) go through async helpers (`activePidAsync`/`gitFetchAsync` in lib.js and the
+command runner in dev-runtime.js, `Bun.spawn`-based) instead of
 `execFileSync`/`spawnSync`, so a slow git/lsof/kill call no longer stalls the whole
 single-threaded portal for every other in-flight request — same fix pattern `fetchPR` proved
 out earlier. `cli.js` still uses the synchronous versions (one-shot foreground process, no
@@ -190,8 +210,10 @@ Colima; not hardcoded to one engine, though only OrbStack has actually been test
 
 **What gets generated**: `writeDockerCompose()` (`lib.js`) writes `<worktree>/docker-compose.setu.yml`
 per start — gitignored via the bare repo's `.git/info/exclude` (not the tracked `.gitignore`,
-since this is local Setu tooling, not a project concern; each newly `addProject`-registered
-repo needs this added by hand once, it isn't automated). Source bind-mounts from the host;
+since this is local Setu tooling, not a project concern). `ensureSetuExcludes()` (`lib.js`)
+adds `.envrc`, `docker-compose.setu.yml`, `docker-compose.setu-agent.yml` and
+`.setu-migration-prompted` there when a project is registered and whenever a worktree is
+created, so Setu's own files never make a worktree look dirty. Source bind-mounts from the host;
 `node_modules` is a container-local **named volume**, not a bind-mount — the host installs
 macOS-native binaries (`@next/swc-darwin-arm64` etc.) that can't run in the Linux container.
 The resolved (symlink-followed) `.env.local` is bind-mounted at the same in-container path
@@ -212,8 +234,12 @@ project name, causing the second `up` to silently recreate (destroy) the first w
 container while the tracking layer kept reporting the first as running. Don't revert to a
 plain slug without re-solving this.
 
-**Concurrency**: `worktree-lifecycle.js` owns admission, FIFO queueing, Stop and restart.
-Bare and container processes share `maxConcurrentDevServers`. Restart preserves its
+**Concurrency**: `worktree-lifecycle.js` owns admission, queueing, Stop and restart.
+Bare and container processes share `maxConcurrentDevServers`. The queue is first in, first
+out among entries that can be admitted: an entry that cannot be admitted yet (for example
+a container waiting for engine CPU) does not hold back a later one that can. Restart
+applies its change first (for example a tunnel move) and leaves the runtime untouched if
+that fails; it never stops or starts sidecars. Restart preserves its
 reservation until teardown is confirmed, then checks current capacity and launches with
 the admitted limits. Tunnel changes use the same owner and preserve the running mode;
 they cannot release a slot to another worktree and then silently overbook it.
@@ -235,7 +261,7 @@ would leak forever with nothing left pointing at it.
 
 ## Conventions
 
-- Every container Setu itself stops goes through `composeDownAsync` (`stopContainer`/`removeWorktree` in portal.js), which `docker compose down`s — that *removes* the container entirely. So a compose-project container still *present* in `docker ps -a` but not `running`/`restarting` can only have gotten that way some other way: an OOM kill, a dev process that crash-looped past its `restart: on-failure` retry cap, or the container engine's own VM restarting and taking every container down with it (confirmed live: an OrbStack restart SIGKILLed a container mid-boot with nothing surfacing it — `reconcileDevServers` only adopts still-alive containers at portal boot, it never flags ones that died). `setu doctor`'s dead-container check (`composeProjectStates` in cli.js) exists for exactly this — one `docker ps -a` call bucketed by the `com.docker.compose.project` label, zero false positives by construction since Setu's own teardown never leaves a container in this state.
+- Every container Setu itself stops goes through `composeDownAsync` (the lifecycle Stop and `removeWorktree` in portal.js), which `docker compose down`s — that *removes* the container entirely. So a compose-project container still *present* in `docker ps -a` but not `running`/`restarting` can only have gotten that way some other way: an OOM kill, a dev process that crash-looped past its `restart: on-failure` retry cap, or the container engine's own VM restarting and taking every container down with it (confirmed live: an OrbStack restart SIGKILLed a container mid-boot with nothing surfacing it — `reconcileDevServers` only adopts still-alive containers at portal boot, it never flags ones that died). `setu doctor`'s dead-container check (`composeProjectStates` in cli.js) exists for exactly this — one `docker ps -a` call bucketed by the `com.docker.compose.project` label, zero false positives by construction since Setu's own teardown never leaves a container in this state.
 - `mise.toml` pins this repo's own `bun` version (`mise trust` once per clone to activate). Unrelated to `createWorktree`'s own `mise trust ...` call, which best-effort-trusts a *managed project's* own mise config on worktree creation — that's a different repo's config, not this one's. `setu doctor` reports whether `mise` itself is installed (optional, not a hard `setu setup` dependency).
 - `cmdSetup` (`cli.js`) installing Homebrew itself, when missing, exits after the install and asks the user to re-run the exact same command rather than continuing in-process. Not laziness: `BREW_PREFIX`/`CADDY_BIN`/`CLOUDFLARED_BIN` (`lib.js`) are computed once at module load, before `cmdSetup` runs — with brew missing at that point they're already frozen to a fallback (wrong on Intel Macs, merely unverified on Apple Silicon) that a mid-process `PATH` patch can't fix, since they're already-evaluated constants, not lazy lookups. A fresh process re-evaluates them correctly.
 - New branches fork from `origin/staging`.

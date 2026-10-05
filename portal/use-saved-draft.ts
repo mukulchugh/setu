@@ -24,6 +24,7 @@ export function useSavedDraft<T>(
   const [error, setError] = useState<string | null>(null),
     [message, setMessage] = useState<string | null>(null);
   const reconcileFirst = useRef(false);
+  const hasLoaded = useRef(false);
   const reader = useRef(read);
   reader.current = read;
   const writer = useRef(body);
@@ -59,11 +60,12 @@ export function useSavedDraft<T>(
         value,
         version,
         editing.current,
-        replace,
+        replace || !hasLoaded.current,
         serialize
       );
       saved.current = value;
       setLoaded(true);
+      hasLoaded.current = true;
       setError(null);
       reconcileFirst.current = false;
       current.current = reconciled;
@@ -71,6 +73,7 @@ export function useSavedDraft<T>(
       return true;
     } catch {
       if (generation.current === own) {
+        setLoaded(false);
         setError('Could not load saved values. Your draft is kept.');
       }
       return false;
@@ -89,6 +92,7 @@ export function useSavedDraft<T>(
     saved.current = empty;
     setDraft(empty);
     setLoaded(false);
+    hasLoaded.current = false;
     setError(null);
     setMessage(null);
     reconcileFirst.current = false;

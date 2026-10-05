@@ -2,6 +2,7 @@ interface PollIO<T> {
   accept: (data: T) => void;
   cancel: (timer: any) => void;
   immediate?: boolean;
+  refreshOnVisible?: boolean;
   intervalMs: number | null;
   onVisibility: (callback: () => void) => () => void;
   read: (signal: AbortSignal) => Promise<T>;
@@ -70,7 +71,7 @@ export function createVisiblePoll<T>(io: PollIO<T>) {
     }
     if (controller) {
       resumePending = true;
-    } else if (io.immediate === false) {
+    } else if (io.immediate === false || io.refreshOnVisible === false) {
       later();
     } else {
       void run();
