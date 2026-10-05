@@ -8,7 +8,7 @@ export async function runWriterCommand(cmd, argv) {
   const args = [], flags = {};
   const asJson = argv.includes('--json');
   try {
-    const allowed = new Set(cmd === 'claim' ? ['agent', 'session', 'task', 'pid'] : cmd === 'claims' ? [] : ['session']);
+    const allowed = new Set(cmd === 'claim' ? ['agent', 'session', 'task', 'pid'] : cmd === 'release' ? ['session', 'force'] : cmd === 'claims' ? [] : ['session']);
     for (let i = 0; i < argv.length; i++) {
       const arg = argv[i];
       if (arg === '--json') continue;
@@ -16,6 +16,7 @@ export async function runWriterCommand(cmd, argv) {
       if (!arg.startsWith('--')) { args.push(arg); continue; }
       const key = arg.slice(2);
       if (!allowed.has(key)) throw new Error(`Unknown option: ${arg}`);
+      if (key === 'force') { flags[key] = true; continue; }
       if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new Error(`Missing value for ${arg}`);
       flags[key] = argv[++i];
     }
@@ -26,7 +27,7 @@ export async function runWriterCommand(cmd, argv) {
     if (cmd === 'claim') {
       result = claimWriter(path, { agent: flags.agent, session: flags.session, task: flags.task, pid: flags.pid === undefined ? process.ppid : Number(flags.pid) });
     } else if (cmd === 'release') {
-      result = releaseWriter(path, flags.session);
+      result = releaseWriter(path, flags.session, { force: flags.force === true });
     } else if (cmd === 'claim-check') {
       result = checkWriter(path, flags.session);
     } else {
@@ -36,8 +37,14 @@ export async function runWriterCommand(cmd, argv) {
     if (asJson) console.log(JSON.stringify(result, null, 2));
     else if (cmd === 'claims') {
       if (!result.length) console.log('No active writer claims.');
-      for (const row of result) console.log(`${row.wtDir}: ${row.agent} (session ${row.session}, pid ${row.pid}) ${row.task}`);
-    } else if (cmd === 'claim') console.log(`Claimed ${result.wtDir} for ${result.claim.agent} (session ${result.claim.session}).`);
+      for (const row of result) {
+        if (row.unreadable) console.log(`${row.path}: unreadable writer claim: ${row.error}`);
+        else console.log(`${row.wtDir}: ${row.agent} (session ${row.session}, pid ${row.pid}) ${row.task}`);
+      }
+    } else if (cmd === 'claim') {
+      console.log(`Claimed ${result.wtDir} for ${result.claim.agent} (session ${result.claim.session}).`);
+      if (result.tookOverFrom) console.error(`Warning: took over a stale claim from ${result.tookOverFrom.agent} (session ${result.tookOverFrom.session}); this tree may hold that owner's uncommitted work.`);
+    }
     else if (cmd === 'release') console.log(`${result.released ? 'Released' : 'No writer claim on'} ${result.wtDir}.`);
     if (result.ok === false) { console.error(result.error); return 2; }
     return 0;

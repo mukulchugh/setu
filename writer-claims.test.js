@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'child_process';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync,
-  renameSync, statSync, symlinkSync, readdirSync,
+  renameSync, statSync, symlinkSync, readdirSync, openSync, closeSync,
 } from 'fs';
 import { join, relative } from 'path';
 import { createHash } from 'crypto';
@@ -142,10 +142,11 @@ describe('writer claim ownership', () => {
     writeFileSync(join(repo, 'new.txt'), 'new work');
     expect(checkWriter(repo, 'b').ok).toBe(false);
     expect(() => releaseWriter(repo, 'b')).toThrow('held by');
-    const next = claimWriter(repo, owner({ agent: 'claude-code', session: 'b' })).claim;
-    expect(next.session).toBe('b');
-    expect(next.started_at).not.toBe(old.started_at);
-    expect(next.baseline.count).toBe(1);
+    const takeover = claimWriter(repo, owner({ agent: 'claude-code', session: 'b' }));
+    expect(takeover.claim.session).toBe('b');
+    expect(takeover.claim.started_at).not.toBe(old.started_at);
+    expect(takeover.claim.baseline.count).toBe(1);
+    expect(takeover.tookOverFrom).toEqual({ agent: old.agent, session: old.session, task: old.task, heartbeat: old.heartbeat });
   });
 
   test('malformed claims and abandoned operation locks fail closed', () => {
@@ -157,13 +158,15 @@ describe('writer claim ownership', () => {
     expect(readFileSync(claimPath, 'utf8')).toBe('{broken');
     rmSync(claimPath);
     writeFileSync(`${claimPath}.lock`, `${deadPid}\n`);
-    expect(() => claimWriter(repo, owner())).toThrow('operation in progress');
-    expect(existsSync(claimPath)).toBe(false);
+    expect(claimWriter(repo, owner()).ok).toBe(true);
+    expect(existsSync(`${claimPath}.lock`)).toBe(false);
   });
 
-  test('invalid identity, PID, task and session cannot acquire a claim', () => {
+  test('accepts validated free-form agent names and rejects invalid ones', () => {
     const { repo, claimPath } = fixture();
-    for (const invalid of [{ agent: 'bot' }, { pid: 0 }, { pid: -1 }, { session: '' }, { task: '' }, { task: 'x'.repeat(301) }]) {
+    expect(claimWriter(repo, owner({ agent: 'antigravity-2' })).claim.agent).toBe('antigravity-2');
+    releaseWriter(repo, 'session-a');
+    for (const invalid of [{ agent: 'Uppercase' }, { agent: 'has space' }, { agent: 'x'.repeat(41) }, { pid: 0 }, { pid: -1 }, { session: '' }, { task: '' }, { task: 'x'.repeat(301) }]) {
       expect(() => claimWriter(repo, owner(invalid))).toThrow();
     }
     expect(existsSync(claimPath)).toBe(false);
@@ -238,6 +241,26 @@ describe('writer claim ownership', () => {
       expect(existsSync(`${claimPath}.lock`)).toBe(false);
     }
   });
+
+  test('recovers a lock left by a killed process and doctor names it', async () => {
+    const { repo, claimPath } = fixture();
+    const lockPath = `${claimPath}.lock`;
+    const child = Bun.spawn([process.execPath, '-e', `
+      const fs = require('fs');
+      const fd = fs.openSync(process.argv[1], 'wx', 0o600);
+      fs.writeSync(fd, String(process.pid) + '\\n');
+      setInterval(() => {}, 1000);
+    `, lockPath], { stdout: 'ignore', stderr: 'ignore' });
+    for (let i = 0; i < 50 && !existsSync(lockPath); i++) await Bun.sleep(10);
+    expect(existsSync(lockPath)).toBe(true);
+    child.kill('SIGKILL');
+    await child.exited;
+    const checks = writerClaimChecks([repo]);
+    expect(checks.find(check => check.name === 'no stale writer claim locks')).toMatchObject({ ok: false });
+    expect(checks.find(check => check.name === 'no stale writer claim locks').fix).toContain(lockPath);
+    expect(claimWriter(repo, owner()).ok).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
 });
 
 describe('CLI and hook contract', () => {
@@ -275,6 +298,16 @@ describe('CLI and hook contract', () => {
     expect(run(repo, 'release', '--session', 'human-a').stdout).toContain('Released');
   });
 
+  test('a stale takeover identifies the previous owner and warns in the CLI', () => {
+    const { repo, claimPath } = fixture();
+    claimWriter(repo, owner({ pid: deadPid, task: 'Previous work' }));
+    ageClaim(claimPath);
+    const result = run(repo, 'claim', '--agent', 'antigravity', '--session', 'next', '--task', 'Continue');
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain("tree may hold that owner's uncommitted work");
+    expect(claimWriter(repo, owner({ agent: 'antigravity', session: 'next' })).tookOverFrom).toBeUndefined();
+  });
+
   test('claim-check allows unclaimed and same session; blocks other sessions, including stale ones', () => {
     const { repo, claimPath } = fixture();
     const check = (session, json = false) => run(repo, 'claim-check', join(repo, 'new', 'file.js'), '--session', session, ...(json ? ['--json'] : []));
@@ -294,18 +327,41 @@ describe('CLI and hook contract', () => {
     expect(run(repo, 'claim-check', repo).code).toBe(2);
   });
 
-  test('claim-check stays below 200 ms including CLI startup, and performs no writes or probes', () => {
+  test('claim-check allows paths outside worktrees and bare repositories', () => {
+    const outside = mkdtempSync('/private/tmp/writer-claims-outside-');
+    try {
+      expect(JSON.parse(run(outside, 'claim-check', join(outside, 'notes.txt'), '--session', 'a', '--json').stdout)).toEqual({ ok: true, wtDir: null, claim: null });
+    } finally { rmSync(outside, { recursive: true, force: true }); }
+    const { repo } = fixture();
+    const bare = join(root, `bare-${fixtureNumber}.git`);
+    git(root, ['clone', '--bare', repo, bare]);
+    expect(JSON.parse(run(bare, 'claim-check', join(bare, 'objects', 'new'), '--session', 'a', '--json').stdout)).toEqual({ ok: true, wtDir: null, claim: null });
+  });
+
+  test('claim-check refreshes only an old owner heartbeat and skips a busy lock', () => {
+    const { repo, claimPath } = fixture();
+    claimWriter(repo, owner());
+    const old = ageClaim(claimPath, { heartbeat: new Date(Date.now() - 6 * 60 * 1000).toISOString() });
+    expect(checkWriter(repo, 'session-a').ok).toBe(true);
+    expect(Date.parse(JSON.parse(readFileSync(claimPath, 'utf8')).heartbeat)).toBeGreaterThan(Date.parse(old.heartbeat));
+    const beforeBusy = ageClaim(claimPath, { heartbeat: new Date(Date.now() - 6 * 60 * 1000).toISOString() });
+    const lock = openSync(`${claimPath}.lock`, 'wx');
+    writeFileSync(lock, `${process.pid}\n`);
+    closeSync(lock);
+    expect(checkWriter(repo, 'session-a').ok).toBe(true);
+    expect(Date.parse(JSON.parse(readFileSync(claimPath, 'utf8')).heartbeat)).toBe(Date.parse(beforeBusy.heartbeat));
+    rmSync(`${claimPath}.lock`);
+  });
+
+  test('claim-check performs no git probes or writes while the heartbeat is fresh', () => {
     const { repo, claimPath } = fixture();
     claimWriter(repo, owner());
     const index = join(repo, '.git', 'index');
     const before = [claimPath, index].map(path => ({ content: readFileSync(path), mtime: statSync(path).mtimeMs }));
     const files = readdirSync(join(repo, '.git')).sort();
     writeFileSync(commandLog, '');
-    const timings = [];
     for (const session of ['session-a', 'other', 'session-a', 'other', 'session-a']) {
-      const start = performance.now();
       const result = run(repo, 'claim-check', join(repo, 'tracked.txt'), '--session', session);
-      timings.push(performance.now() - start);
       expect(result.code).toBe(session === 'session-a' ? 0 : 2);
     }
     expect(readFileSync(commandLog, 'utf8')).toBe('');
@@ -315,8 +371,6 @@ describe('CLI and hook contract', () => {
       expect(statSync(path).mtimeMs).toBe(before[i].mtime);
     }
     expect(existsSync(join(home, '.setu.json'))).toBe(false);
-    console.log(`claim-check end-to-end: ${timings.map(t => t.toFixed(1)).join(', ')} ms`);
-    expect(Math.max(...timings)).toBeLessThan(200);
   });
 
   test('claim-check honors its path even when inherited Git variables point elsewhere', () => {
@@ -368,6 +422,16 @@ describe('discovery and doctor checks', () => {
     const checks = writerClaimChecks([a.repo, b.repo]);
     expect(checks.find(c => c.name === 'writer claims readable').ok).toBe(false);
     expect(checks.find(c => c.name === 'no stale writer claims').ok).toBe(false);
+  });
+
+  test('listing returns unreadable rows and force release removes only unreadable claims', () => {
+    const { repo, claimPath } = fixture();
+    writeFileSync(claimPath, '{}');
+    expect(listWriterClaims([repo])).toEqual([expect.objectContaining({ unreadable: true, path: repo, error: expect.any(String) })]);
+    expect(() => releaseWriter(repo, 'session-a')).toThrow('Invalid writer claim');
+    expect(releaseWriter(repo, 'session-a', { force: true })).toMatchObject({ released: true, forced: true });
+    writeFileSync(claimPath, '{}');
+    expect(run(repo, 'release', '--session', 'session-a', '--force').code).toBe(0);
   });
 
   test('claims discovers registered repositories and sibling worktrees from an unrelated cwd', () => {

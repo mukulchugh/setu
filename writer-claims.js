@@ -8,8 +8,9 @@ import {
 import { dirname, join, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 
-export const WRITER_AGENTS = ['claude-code', 'codex', 'cursor', 'human'];
 export const WRITER_STALE_MS = 2 * 60 * 60 * 1000;
+export const WRITER_HEARTBEAT_REFRESH_MS = 5 * 60 * 1000;
+export const WRITER_AGENT_NAME = /^[a-z0-9-]{1,40}$/;
 
 function gitRead(dir, args, timeout = 5000) {
   // Inherited Git variables must not redirect metadata reads to another
@@ -67,8 +68,13 @@ export function writerWorktree(path = process.cwd()) {
       if (!statSync(join(gitDir, 'HEAD')).isFile()) throw new Error(`Invalid git directory at ${gitDir}`);
       return { wtDir: dir, gitDir, claimPath: join(gitDir, 'setu-writer.json') };
     }
+    // A bare repository has HEAD and objects directly in its root, not a
+    // worktree marker. Hooks should leave paths there alone.
+    try {
+      if (statSync(join(dir, 'HEAD')).isFile() && statSync(join(dir, 'objects')).isDirectory()) return null;
+    } catch (e) { if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e; }
     const parent = dirname(dir);
-    if (parent === dir) throw new Error(`Cannot resolve git worktree for ${path}`);
+    if (parent === dir) return null;
     dir = parent;
   }
 }
@@ -80,7 +86,9 @@ function shortText(value, label, max) {
 }
 
 function validateOwner({ agent, session, task, pid }) {
-  if (!WRITER_AGENTS.includes(agent)) throw new Error(`agent must be one of: ${WRITER_AGENTS.join(', ')}`);
+  if (typeof agent !== 'string' || !WRITER_AGENT_NAME.test(agent)) {
+    throw new Error('agent must be 1 to 40 lowercase letters, digits, or dashes');
+  }
   shortText(session, 'session', 200);
   shortText(task, 'task', 300);
   if (!Number.isInteger(pid) || pid <= 0 || pid > 2147483647) throw new Error('pid must be a positive process ID');
@@ -116,14 +124,40 @@ function heldMessage(claim) {
   return `Worktree held by ${claim.agent} (session ${claim.session}, pid ${claim.pid}): ${claim.task}. Use \`setu new <repo> <branch>\` for a separate worktree.`;
 }
 
-function withClaimLock(claimPath, fn) {
+// Returns the lock's content when its recorded owner no longer exists.
+function deadLockContent(lockPath) {
+  let raw;
+  try { raw = readFileSync(lockPath, 'utf8'); }
+  catch { return null; }
+  if (!/^[1-9][0-9]*\n?$/.test(raw)) return null;
+  try { process.kill(Number(raw.trim()), 0); return null; }
+  catch (e) { return e.code === 'ESRCH' ? raw : null; }
+}
+
+function lockOwnerIsDead(lockPath) {
+  return deadLockContent(lockPath) !== null;
+}
+
+function withClaimLock(claimPath, fn, { skipIfBusy = false } = {}) {
   const lockPath = `${claimPath}.lock`;
   let fd;
-  try { fd = openSync(lockPath, 'wx', 0o600); }
-  catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    const claim = readClaim(claimPath);
-    throw new Error(claim ? heldMessage(claim) : `Writer claim operation in progress at ${lockPath}; retry, or use \`setu new <repo> <branch>\` for a separate worktree.`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fd = openSync(lockPath, 'wx', 0o600); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const dead = attempt === 0 ? deadLockContent(lockPath) : null;
+      if (dead !== null) {
+        // Another process may have broken this lock and taken a fresh one
+        // since we looked. Remove it only if it is still the dead owner's.
+        if (deadLockContent(lockPath) === dead) {
+          try { unlinkSync(lockPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        }
+        continue;
+      }
+      if (skipIfBusy) return undefined;
+      const claim = readClaim(claimPath);
+      throw new Error(claim ? heldMessage(claim) : `Writer claim operation in progress at ${lockPath}; retry, or use \`setu new <repo> <branch>\` for a separate worktree.`);
+    }
   }
   try {
     writeFileSync(fd, `${process.pid}\n`);
@@ -160,30 +194,43 @@ function optionalGitRef(wtDir, args) {
 
 export function claimWriter(path, owner) {
   validateOwner(owner);
-  const { wtDir, claimPath } = writerWorktree(path);
+  const location = writerWorktree(path);
+  if (!location) throw new Error(`Cannot resolve git worktree for ${path}`);
+  const { wtDir, claimPath } = location;
+  const initial = {
+    branch: optionalGitRef(wtDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
+    head: optionalGitRef(wtDir, ['rev-parse', '--verify', '--quiet', 'HEAD']),
+    baseline: writerBaseline(wtDir),
+  };
   return withClaimLock(claimPath, () => {
     const previous = readClaim(claimPath);
     const sameSession = previous?.session === owner.session;
     if (previous && !sameSession && !writerClaimStale(previous)) throw new Error(heldMessage(previous));
     const now = new Date().toISOString();
-    const initial = sameSession ? previous : {
-      started_at: now,
-      branch: optionalGitRef(wtDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
-      head: optionalGitRef(wtDir, ['rev-parse', '--verify', '--quiet', 'HEAD']),
-      baseline: writerBaseline(wtDir),
-    };
+    const tookOverFrom = previous && !sameSession ? {
+      agent: previous.agent, session: previous.session, task: previous.task, heartbeat: previous.heartbeat,
+    } : undefined;
+    const record = sameSession ? previous : { started_at: now, ...initial };
     const { agent, session, task, pid } = owner;
-    const claim = { ...initial, agent, session, task, pid, heartbeat: now };
+    const claim = { ...record, agent, session, task, pid, heartbeat: now };
     writeClaim(claimPath, claim);
-    return { ok: true, wtDir, claim };
+    return { ok: true, wtDir, claim, ...(tookOverFrom ? { tookOverFrom } : {}) };
   });
 }
 
-export function releaseWriter(path, session) {
+export function releaseWriter(path, session, { force = false } = {}) {
   shortText(session, 'session', 200);
-  const { wtDir, claimPath } = writerWorktree(path);
+  const location = writerWorktree(path);
+  if (!location) throw new Error(`Cannot resolve git worktree for ${path}`);
+  const { wtDir, claimPath } = location;
   return withClaimLock(claimPath, () => {
-    const claim = readClaim(claimPath);
+    let claim;
+    try { claim = readClaim(claimPath); }
+    catch (e) {
+      if (!force) throw e;
+      unlinkSync(claimPath);
+      return { ok: true, wtDir, released: true, forced: true };
+    }
     if (claim && claim.session !== session) throw new Error(heldMessage(claim));
     if (claim) unlinkSync(claimPath);
     return { ok: true, wtDir, released: !!claim };
@@ -192,9 +239,19 @@ export function releaseWriter(path, session) {
 
 export function checkWriter(path, session) {
   shortText(session, 'session', 200);
-  const { wtDir, claimPath } = writerWorktree(path);
+  const location = writerWorktree(path);
+  if (!location) return { ok: true, wtDir: null, claim: null };
+  const { wtDir, claimPath } = location;
   const claim = readClaim(claimPath);
   const ok = !claim || claim.session === session;
+  if (claim?.session === session && Date.now() - Date.parse(claim.heartbeat) >= WRITER_HEARTBEAT_REFRESH_MS) {
+    withClaimLock(claimPath, () => {
+      const current = readClaim(claimPath);
+      if (current?.session === session && Date.now() - Date.parse(current.heartbeat) >= WRITER_HEARTBEAT_REFRESH_MS) {
+        writeClaim(claimPath, { ...current, heartbeat: new Date().toISOString() });
+      }
+    }, { skipIfBusy: true });
+  }
   return { ok, wtDir, claim, ...(ok ? {} : { error: heldMessage(claim) }) };
 }
 
@@ -202,30 +259,40 @@ export function listWriterClaims(paths, { includeStale = false } = {}) {
   const rows = [];
   const seen = new Set();
   for (const path of paths) {
-    const { wtDir, claimPath } = writerWorktree(path);
-    if (seen.has(claimPath)) continue;
-    seen.add(claimPath);
-    const claim = readClaim(claimPath);
-    if (!claim) continue;
-    const stale = writerClaimStale(claim);
-    if (includeStale || !stale) rows.push({ wtDir, ...claim, stale });
+    try {
+      const location = writerWorktree(path);
+      if (!location) continue;
+      const { wtDir, claimPath } = location;
+      if (seen.has(claimPath)) continue;
+      seen.add(claimPath);
+      const claim = readClaim(claimPath);
+      if (!claim) continue;
+      const stale = writerClaimStale(claim);
+      if (includeStale || !stale) rows.push({ wtDir, ...claim, stale });
+    } catch (e) { rows.push({ path, unreadable: true, error: e.message }); }
   }
   return rows;
 }
 
 export function writerClaimChecks(paths) {
-  const stale = [], changed = [], unreadable = [];
+  const stale = [], changed = [], unreadable = [], staleLocks = [];
   for (const path of paths) {
     try {
-      const [claim] = listWriterClaims([path], { includeStale: true });
+      const location = writerWorktree(path);
+      if (!location) continue;
+      const { claimPath } = location;
+      const lockPath = `${claimPath}.lock`;
+      if (lockOwnerIsDead(lockPath)) staleLocks.push(lockPath);
+      const claim = readClaim(claimPath);
       if (!claim) continue;
-      if (claim.stale) stale.push(`${claim.wtDir} (${claim.agent}, session ${claim.session})`);
-      const baseline = writerBaseline(claim.wtDir);
-      if (baseline.count !== claim.baseline.count || baseline.hash !== claim.baseline.hash) changed.push(claim.wtDir);
+      if (writerClaimStale(claim)) stale.push(`${location.wtDir} (${claim.agent}, session ${claim.session})`);
+      const baseline = writerBaseline(location.wtDir);
+      if (baseline.count !== claim.baseline.count || baseline.hash !== claim.baseline.hash) changed.push(location.wtDir);
     } catch (e) { unreadable.push(e.message); }
   }
   return [
     { name: 'writer claims readable', ok: !unreadable.length, fix: unreadable.join('; ') || undefined },
+    { name: 'no stale writer claim locks', ok: !staleLocks.length, fix: staleLocks.length ? `Remove stale writer claim locks after confirming their owners are gone: ${staleLocks.join(', ')}` : undefined },
     { name: 'no stale writer claims', ok: !stale.length, fix: stale.length ? `Reclaim with setu claim, or release with the recorded session: ${stale.join(', ')}` : undefined },
     { name: 'writer claim baselines match', ok: !changed.length, fix: changed.length ? `Review changes since claim (the owner's own edits also change this baseline): ${changed.join(', ')}` : undefined },
   ];

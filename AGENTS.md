@@ -106,8 +106,9 @@ setu claims --json
 ```
 
 `claim` and `release` default to the current directory. All four commands,
-including `claim-check`, accept `--json`. Agent names are `claude-code`, `codex`,
-`cursor`, and `human`. The CLI records its parent PID by default. If a short-lived
+including `claim-check`, accept `--json`. An agent name is 1 to 40 lowercase letters,
+digits or dashes, for example `claude-code`, `codex`, `cursor`, `opencode` or `human`.
+The CLI records its parent PID by default. If a short-lived
 shell launches the CLI, pass `--pid <agent-pid>` to record the long-lived local
 agent process instead. MCP's `claim_worktree` requires this PID explicitly.
 
@@ -121,8 +122,14 @@ start time, branch, HEAD, and baseline, and updates the owner details and heartb
 
 A different session is refused with the current owner's details and a suggestion
 to use `setu new <repo> <branch>`. Takeover is allowed only when the heartbeat is
-at least two hours old **and** the recorded PID no longer exists. `release` only
-accepts the owning session, including for stale claims. Releasing an unclaimed
+at least two hours old **and** the recorded PID no longer exists. A takeover result
+carries `tookOverFrom` (the previous agent, session, task and heartbeat), and the CLI warns
+that the tree may hold that owner's uncommitted work. `claim-check` by the owning session
+refreshes a heartbeat older than five minutes, so an agent that keeps checking keeps its
+claim. `claim-check` on a path outside any Git worktree succeeds with no claim. `release` only
+accepts the owning session, including for stale claims; `release --force` removes a claim
+file only when it cannot be read. A lock left by a killed process is recovered on the next
+claim, and `setu doctor` names such locks. Releasing an unclaimed
 worktree succeeds without changing ownership. `claims` lists active claims in
 the current repository and its sibling worktrees, plus registered Setu projects
 and worktrees. It does not scan arbitrary repositories across the machine.

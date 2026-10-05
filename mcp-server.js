@@ -40,7 +40,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import * as z from 'zod/v4';
 import { PORTAL_PORT } from './lib.js';
-import { WRITER_AGENTS } from './writer-claims.js';
+import { WRITER_AGENT_NAME } from './writer-claims.js';
 
 // Populated by portal.js's initMcpServer() call, once, at startup — after
 // the functions it references are defined (safe regardless of call order
@@ -113,7 +113,7 @@ function registerTools(server) {
   server.registerTool('claim_worktree', {
     description: 'Claim the writer slot before editing a worktree. Repeat with the same session to refresh its heartbeat. A different session can take over only after two hours without a heartbeat and the owner PID has exited.',
     inputSchema: {
-      repo: z.string(), name: z.string(), agent: z.enum(WRITER_AGENTS),
+      repo: z.string(), name: z.string(), agent: z.string().regex(WRITER_AGENT_NAME),
       session: z.string().min(1).max(200), task: z.string().min(1).max(300),
       pid: z.number().int().positive().describe('long-lived local agent process ID, not the portal PID'),
     },
