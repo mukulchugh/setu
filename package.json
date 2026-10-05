@@ -28,6 +28,8 @@
   "files": [
     "cli.js",
     "lib.js",
+    "writer-claims.js",
+    "writer-claims-cli.js",
     "portal.js",
     "portal",
     "bunfig.toml",

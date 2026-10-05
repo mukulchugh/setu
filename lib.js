@@ -10,6 +10,7 @@ import {
 import { homedir, cpus, totalmem } from 'os';
 import { join, resolve, dirname } from 'path';
 import { createHash } from 'crypto';
+import { discoverWriterWorktrees } from './writer-claims.js';
 
 export const HOME        = homedir();
 export const CFG_PATH    = join(HOME, '.setu.json');
@@ -923,6 +924,15 @@ volumes:
 }
 
 // ── git worktrees ─────────────────────────────────────────────────────────────
+
+export function writerClaimPaths(workspace, cwd = process.cwd()) {
+  const candidates = [cwd];
+  if (workspace) {
+    candidates.push(...portEntries(workspace).map(e => join(workspace, e.repo, e.name)));
+    candidates.push(...Object.keys(loadProjects(workspace)).map(repo => join(workspace, `${repo}.git`)));
+  }
+  return discoverWriterWorktrees(candidates);
+}
 
 export function git(repoDir, args, opts = {}) {
   return execFileSync('git', ['-C', repoDir, ...args],

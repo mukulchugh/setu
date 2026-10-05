@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Dev portal — http://quivly.local
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, renameSync, openSync, existsSync, realpathSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join, resolve, dirname } from 'path';
@@ -24,7 +24,9 @@ import {
   worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
   spawnText, splitKey, baseBranchRef,
   loadMcpServers, saveMcpServers,
+  writerClaimPaths,
 } from './lib.js';
+import { claimWriter, releaseWriter, listWriterClaims, writerWorktree } from './writer-claims.js';
 import { connectMcpServer, finishMcpAuth, disconnectMcpServer, mcpStatuses } from './mcp.js';
 import { detectPrWalkthroughPlugin, findLatestArtifact, artifactHtmlPath, reviewRunStatus, runDeepReview } from './pr-review.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
@@ -2467,7 +2469,17 @@ function close(ws) {
 // direct in-process calls, not HTTP, so /mcp never opens a second request
 // back into this same server. Function declarations are hoisted, so every
 // name here is already defined despite most living further up the file.
+function writerPath(repo, name) {
+  if (!getPort(WORKSPACE, repo, name)) throw new Error(`No registered worktree for ${repo}/${name}`);
+  const path = realpathSync(wtPath(repo, name));
+  if (writerWorktree(path).wtDir !== path) throw new Error(`Not a worktree root: ${path}`);
+  return path;
+}
+
 initMcpServer({
+  claimWriter: (repo, name, owner) => claimWriter(writerPath(repo, name), owner),
+  releaseWriter: (repo, name, session) => releaseWriter(writerPath(repo, name), session),
+  listWriterClaims: () => listWriterClaims(writerClaimPaths(WORKSPACE)),
   computeDiff, 
   createPr, createWorktree, 
   fetchRepoPRs, 
