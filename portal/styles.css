@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@custom-variant dark (&:where(.dark, .dark *));
 
 /* IBM Plex Mono — bundled at build time (real WOFF2 files via the installed
    package), not fetched at runtime. Same lesson as the icon fix earlier
@@ -9,6 +8,7 @@
 @import "@fontsource/ibm-plex-mono/600.css";
 @import "@fontsource/ibm-plex-mono/700.css";
 @import "@fontsource/syne/800.css";
+@custom-variant dark (&:where(.dark, .dark *));
 
 /* Setu = bridge; the actual job of this screen is closer to a dispatch board
    than a SaaS dashboard — many parallel routes, each with a live signal,
@@ -21,8 +21,8 @@
   --color-board-dark: #121310;
   --color-ink: #1b1d1a;
   --color-ink-dark: #e8e9e5;
-  --color-signal-green: #1f9d63;
-  --color-signal-amber: #e0932a;
+  --color-signal-green: #157c4f;
+  --color-signal-amber: #a85f09;
   --color-signal-red: #d1402f;
   --color-rail: #8a8f87;
   /* Quivly's own core brand forest green (landing/marketing site, not the
@@ -43,9 +43,9 @@
    explicitly. Class name kept as-is to avoid renaming it at 30+ call sites. */
 .board-mono {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  font-weight: 700;
 }
 
 /* The one place that keeps a distinct display voice after the rest of the
@@ -54,13 +54,14 @@
    rather than just bold body text, without dragging the industrial/signage
    feel back into anything else. */
 .wordmark {
-  font-family: "Syne", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family:
+    "Syne", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-weight: 800;
-  letter-spacing: 0;
   /* Explicit override — this sits inside an h1 that carries .board-mono for
      the rest of the title row, and board-mono is uppercase; without this,
      "setu" silently inherits that instead of staying lowercase. */
   text-transform: none;
+  letter-spacing: 0;
 }
 
 /* Section-break divider. The double-rule "rail cross-tie" texture was part
@@ -78,35 +79,133 @@
    dot. Triggered only on an actual state transition (see StatusFlap in
    app.tsx), never ambient/looping. */
 @keyframes flap {
-  0%   { transform: rotateX(0deg);   opacity: 1; }
-  45%  { transform: rotateX(90deg);  opacity: 0.3; }
-  55%  { transform: rotateX(-90deg); opacity: 0.3; }
-  100% { transform: rotateX(0deg);   opacity: 1; }
+  0% {
+    transform: rotateX(0deg);
+    opacity: 1;
+  }
+  45% {
+    transform: rotateX(90deg);
+    opacity: 0.3;
+  }
+  55% {
+    transform: rotateX(-90deg);
+    opacity: 0.3;
+  }
+  100% {
+    transform: rotateX(0deg);
+    opacity: 1;
+  }
 }
-.flap-change { animation: flap 0.5s cubic-bezier(0.4, 0, 0.2, 1); transform-origin: center; display: inline-block; }
+.flap-change {
+  display: inline-block;
+  transform-origin: center;
+  animation: flap 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
 
 /* Frosted glass, hard edges — the flat-edged-glass hybrid this whole pass
    is built around: soft, translucent, blurred surfaces (modern/SaaS) but
    never a rounded corner (the signage system's one non-negotiable). */
-.icon-btn { display:inline-flex; align-items:center; justify-content:center; width:1.75rem; height:1.75rem; border-radius:0; background:rgba(255,255,255,0.55); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,0.75); box-shadow:0 1px 3px rgba(0,0,0,0.07); transition:background 0.15s,color 0.15s,box-shadow 0.15s; flex-shrink:0; }
-.icon-btn:hover { background:rgba(255,255,255,0.85); box-shadow:0 2px 8px rgba(0,0,0,0.12); }
-.dark .icon-btn { background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.1); }
-.dark .icon-btn:hover { background:rgba(255,255,255,0.12); }
-.tip { position:relative; }
-.tip::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%); background:#fff; color:#18181B; border:1px solid rgba(0,0,0,0.08); box-shadow:0 2px 8px rgba(0,0,0,0.12); font-size:11px; padding:3px 8px; border-radius:0; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity 0.12s; z-index:100; font-family:-apple-system,sans-serif; }
-.dark .tip::after { background:#18181B; color:#fff; border-color:rgba(255,255,255,0.1); box-shadow:0 2px 8px rgba(0,0,0,0.35); }
+.icon-btn {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  border-radius: 0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+  transition:
+    background 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
+}
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+.dark .icon-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+.dark .icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.tip {
+  position: relative;
+}
+.tip::after {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  z-index: 100;
+  padding: 3px 8px;
+  font-family: -apple-system, sans-serif;
+  font-size: 11px;
+  color: #18181b;
+  white-space: nowrap;
+  pointer-events: none;
+  content: attr(data-tip);
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  opacity: 0;
+  transform: translateX(-50%);
+  transition: opacity 0.12s;
+}
+.dark .tip::after {
+  color: #fff;
+  background: #18181b;
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
 
 /* A card with an open dropdown (kebab / force-start menu) must outrank the
    next card in the grid. backdrop-blur on the card creates its own stacking
    context, which otherwise traps the dropdown's z-index under whatever
    renders next in DOM order — this promotes the whole card, not just the
    menu, so blurred glass cards can safely hold an overflowing dropdown. */
-.wt-card:has(.menu-panel-open) { position: relative; z-index: 30; }
-.tip:hover::after { opacity:1; }
-@keyframes spin { to { transform:rotate(360deg); } }
-.spin { animation:spin 0.7s linear infinite; }
-@keyframes fadeUp { from { opacity:0; transform:translate(-50%, 6px); } to { opacity:1; transform:translate(-50%, 0); } }
-@keyframes factIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
+.wt-card:has(.menu-panel-open) {
+  position: relative;
+  z-index: 30;
+}
+.tip:hover::after,
+.tip:focus-visible::after,
+.tip:focus-within::after {
+  display: block;
+  opacity: 1;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.7s linear infinite;
+}
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+@keyframes factIn {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
 
 /* Vibrant by explicit, standing instruction (see memory: setu-ui-vibrant-
    strict-rule) — a soft color-mesh in the brand forest green + signal amber,
@@ -116,20 +215,55 @@
    frosted surfaces, not that the backdrop itself is loud. */
 .premium-bg {
   background-color: var(--color-board);
-  background-image:
-    radial-gradient(ellipse 900px 550px at 12% -8%, color-mix(in srgb, var(--color-accent) 30%, transparent), transparent 70%),
-    radial-gradient(ellipse 800px 550px at 100% -5%, color-mix(in srgb, var(--color-signal-amber) 26%, transparent), transparent 70%),
-    radial-gradient(ellipse 1000px 700px at 45% 140%, color-mix(in srgb, var(--color-accent) 18%, transparent), transparent 70%),
-    repeating-linear-gradient(180deg, rgba(0,0,0,0.012) 0px, transparent 1px, transparent 3px);
   transition: background-color 0.2s ease-out;
+}
+/* The mesh is positioned against the viewport, not the document. On the body
+   (whose background spans the whole document) a 65-row list pushed every
+   percentage-placed ellipse off screen. A fixed layer keeps the color behind
+   the glass shell at any scroll depth and paints once, without per-row blur. */
+.premium-bg::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  content: "";
+  background-image:
+    radial-gradient(
+      ellipse 900px 550px at 12% -8%,
+      color-mix(in srgb, var(--color-accent) 30%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 800px 550px at 100% -5%,
+      color-mix(in srgb, var(--color-signal-amber) 26%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 1000px 700px at 45% 140%,
+      color-mix(in srgb, var(--color-accent) 18%, transparent),
+      transparent 70%
+    );
 }
 .dark .premium-bg {
   background-color: var(--color-board-dark);
+}
+.dark .premium-bg::before {
   background-image:
-    radial-gradient(ellipse 900px 550px at 12% -8%, color-mix(in srgb, var(--color-accent) 35%, transparent), transparent 70%),
-    radial-gradient(ellipse 800px 550px at 100% -5%, color-mix(in srgb, var(--color-signal-amber) 28%, transparent), transparent 70%),
-    radial-gradient(ellipse 1000px 700px at 45% 140%, color-mix(in srgb, var(--color-accent) 22%, transparent), transparent 70%),
-    repeating-linear-gradient(180deg, rgba(255,255,255,0.015) 0px, transparent 1px, transparent 3px);
+    radial-gradient(
+      ellipse 900px 550px at 12% -8%,
+      color-mix(in srgb, var(--color-accent) 35%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 800px 550px at 100% -5%,
+      color-mix(in srgb, var(--color-signal-amber) 28%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 1000px 700px at 45% 140%,
+      color-mix(in srgb, var(--color-accent) 22%, transparent),
+      transparent 70%
+    );
 }
 
 /* Quality floor from the frontend-design skill's own checklist — visible
@@ -139,15 +273,362 @@
    without !important that utility's higher specificity would silently win
    and there would be no focus ring at all for keyboard users. */
 :focus-visible {
-  outline: 2px solid var(--color-accent) !important;
+  outline: 2px solid var(--focus-color, var(--color-accent)) !important;
   outline-offset: 2px !important;
 }
 
+.dark {
+  color-scheme: dark;
+  --focus-color: #77e3b0;
+  --color-signal-green: #70dda8;
+  --color-signal-amber: #fac46a;
+  --color-signal-red: #ff9a8c;
+}
+.section-anchor {
+  scroll-margin-top: calc(var(--portal-status-height, 0px) + 1rem);
+}
+.worktree-actions button {
+  font-size: 0.75rem;
+}
+.wt-card .board-mono {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.menu-group-label {
+  padding: 0.5rem 0.75rem 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+.menu-help {
+  max-width: 18rem;
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  color: #52525b;
+  white-space: normal;
+}
+.dark .menu-group-label {
+  color: var(--color-ink-dark);
+}
+.dark .menu-help {
+  color: #d4d4d8;
+}
+[role="menu"] {
+  max-width: calc(100vw - 2rem);
+}
+[role="menuitem"] {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.filter-chip,
+.view-choice {
+  padding: 0.5rem 0.625rem;
+  font-size: 0.75rem;
+  color: #3f3f46;
+}
+.filter-chip,
+.view-choice {
+  display: inline-flex;
+  gap: 0.5rem;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.65);
+  border: 1px solid #d4d4d8;
+}
+.filter-chip:hover {
+  background: rgba(255, 255, 255, 0.9);
+}
+.filter-selected,
+.view-choice:has(input:checked) {
+  color: #fff;
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.view-choice input {
+  accent-color: var(--color-accent);
+}
+.view-choice:has(input:focus-visible) {
+  outline: 2px solid var(--focus-color, var(--color-accent));
+  outline-offset: 2px;
+}
+.dark .filter-chip,
+.dark .view-choice {
+  color: #e4e4e7;
+}
+.dark .filter-chip,
+.dark .view-choice {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #52525b;
+}
+.dark .view-choice:has(input:checked),
+.dark .filter-selected {
+  color: #fff;
+  background: var(--color-accent);
+  border-color: #77e3b0;
+}
+.dark .filter-chip:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.command-palette {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 2rem);
+}
+.command-results {
+  min-height: 0;
+  max-height: min(20rem, 55dvh);
+}
+.sidecar-controls > div {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.sidecar-controls span {
+  overflow-wrap: anywhere;
+}
+
+@media (pointer: coarse), (max-width: 639px) {
+  summary,
+  label:has(input[type="checkbox"]),
+  label:has(input[type="radio"]) {
+    min-height: 44px;
+  }
+  label:has(input[type="checkbox"]),
+  label:has(input[type="radio"]) {
+    align-items: center;
+  }
+  button,
+  [role="menuitem"],
+  .command-option,
+  .filter-chip,
+  .view-choice,
+  .icon-btn,
+  .portal-status a,
+  .sidecar-controls a,
+  .wt-card a {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .wt-card a {
+    display: inline-flex;
+    align-items: center;
+  }
+  .portal-status a {
+    display: inline-flex;
+    align-items: center;
+  }
+  .icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+  input:not([type="radio"]):not([type="checkbox"]),
+  select {
+    max-width: 100%;
+    min-height: 44px;
+  }
+  [role="menuitem"] {
+    padding-block: 0.625rem;
+  }
+  .tip::after {
+    width: max-content;
+    max-width: min(18rem, calc(100vw - 2rem));
+    white-space: normal;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Stable geometry across navigation, long names and live status updates. */
+html {
+  scrollbar-gutter: stable;
+  scroll-padding-top: calc(var(--portal-status-height, 0px) + 1rem);
+}
+body {
+  min-width: 280px;
+  color: var(--color-ink);
+}
+.dark body {
+  color: var(--color-ink-dark);
+}
+::selection {
+  color: #fff;
+  background: #085041;
+}
+input,
+textarea {
+  caret-color: var(--color-accent);
+}
+.dark input,
+.dark textarea {
+  caret-color: #77e3b0;
+}
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+.portal-status {
+  font-variant-numeric: tabular-nums;
+}
+.glass-panel {
+  background: #ffffffb8;
+  border: 1px solid #ffffffd9;
+  box-shadow: 0 4px 18px -12px #08504150;
+  backdrop-filter: blur(12px);
+}
+.dark .glass-panel {
+  background: #18251fc9;
+  border-color: #ffffff18;
+}
+.portal-page {
+  width: 100%;
+  min-width: 0;
+}
+.portal-page-header h1,
+.worktree-name {
+  overflow-wrap: anywhere;
+}
+.worktree-name {
+  line-height: 1.45;
+}
+.wt-card {
+  box-shadow: 0 3px 14px -12px #08504155;
+}
+.section-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-block: 0 2rem;
+}
+.section-navigation a {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  color: #085041;
+  background: #ffffffa6;
+  border: 1px solid #08504124;
+}
+.dark .section-navigation a {
+  color: #a7f3ce;
+  background: #ffffff09;
+  border-color: #ffffff20;
+}
+.section-navigation a:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.25rem;
+}
+.portal-section {
+  min-width: 0;
+}
+.portal-section p {
+  line-height: 1.6;
+}
+.portal-section code,
+.portal-section li {
+  overflow-wrap: anywhere;
+}
+.skip-link {
+  position: fixed;
+  left: 1rem;
+  top: 0.5rem;
+  z-index: 100;
+  padding: 0.75rem 1rem;
+  background: #085041;
+  color: white;
+  transform: translateY(-200%);
+}
+.skip-link:focus {
+  transform: translateY(0);
+}
+.empty-state {
+  padding: 2rem 1rem;
+  color: #58665e;
+  text-align: center;
+}
+.dark .empty-state {
+  color: #bdccc3;
+}
+.page-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.page-toolbar > label {
+  flex: 1;
+  min-width: min(100%, 13rem);
+  font-size: 0.8125rem;
+}
+.page-toolbar input,
+.page-toolbar select {
+  display: block;
+  width: 100%;
+  margin-top: 0.375rem;
+}
+.read-notice {
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid #c9822540;
+  background: #fff5dcaa;
+  color: #744508;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.dark .read-notice {
+  background: #783e0c30;
+  border-color: #fbbf2460;
+  color: #fde4b2;
+}
+.log-viewer {
+  min-height: 0;
+  tab-size: 2;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 767px) {
+  .section-navigation a {
+    min-height: 44px;
+  }
+  .portal-input,
+  .command-palette input,
+  #stopped-search {
+    font-size: 1rem;
+  }
+  .section-anchor {
+    scroll-margin-top: 1rem;
+  }
+  html {
+    scroll-padding-top: 1rem;
+  }
+}
+@media (forced-colors: active) {
+  .wt-card,
+  .glass-panel {
+    border: 1px solid CanvasText;
+  }
+}
+
+.portal-page .text-zinc-400,
+.portal-workspace .text-zinc-400,
+.portal-page .text-zinc-300,
+.portal-workspace .text-zinc-300 {
+  color: #5b6b61;
+}
+.dark .portal-page .text-zinc-400,
+.dark .portal-workspace .text-zinc-400,
+.dark .portal-page .text-zinc-300,
+.dark .portal-workspace .text-zinc-300 {
+  color: #b7c6bc;
+}
+.portal-page-header > div:last-child p {
+  max-width: 65ch;
 }

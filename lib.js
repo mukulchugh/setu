@@ -2,74 +2,231 @@
 // Single source of truth for config, domains, ports, envrc/caddy/hosts writes,
 // and worktree lifecycle. Throws Error on failure; callers decide die vs JSON.
 
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  existsSync, readFileSync, writeFileSync, appendFileSync,
-  mkdirSync, unlinkSync, realpathSync, copyFileSync, chmodSync,
-} from 'fs';
-import { homedir, cpus, totalmem } from 'os';
-import { join, resolve, dirname } from 'path';
-import { createHash } from 'crypto';
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
+import { cpus, homedir, totalmem } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { createCommandRunner, renderDockerCompose } from './dev-runtime.js';
+import { assertStorageHeadroom } from './host-health.js';
+import {
+  cloneBareRepository,
+  prepareWorktreeCheckout,
+} from './workspace-setup.js';
+import { createWorkspaceState, StateError } from './workspace-state.js';
+import {
+  effectiveContainerLimits as lifecycleContainerLimits,
+  parseMemToMb as lifecycleParseMemory,
+  resourceSettings as lifecycleResourceSettings,
+} from './worktree-lifecycle.js';
+import { validateRemovalRecords } from './worktree-removal.js';
 
-export const HOME        = homedir();
-export const CFG_PATH    = join(HOME, '.setu.json');
+// Keep the established library API while lifecycle owns the implementation.
+export const effectiveContainerLimits = lifecycleContainerLimits;
+export const parseMemToMb = lifecycleParseMemory;
+export const resourceSettings = lifecycleResourceSettings;
+
+export const HOME = homedir();
+export const CFG_PATH = join(HOME, '.setu.json');
 // Deliberately separate from CFG_PATH, not a section inside it: this holds
 // org-admin-scope API keys (Anthropic/OpenAI usage & cost reporting), a
 // materially bigger blast radius than the rest of ~/.setu.json, and the
-// user writes it by hand (never through the portal, which binds 0.0.0.0 —
-// LAN-reachable, see AGENTS.md's MCP section) so a key is never typed into
+// user writes it by hand (never through the portal) so a key is never typed into
 // a form this tool could echo back. Unrelated to the committed .setu.json
 // writeSetuAgentMarkers drops into MANAGED PROJECTS below — same filename
 // stem, opposite commit semantics; see AGENTS.md's Conventions section.
 export const COSTS_CFG_PATH = join(HOME, '.setu-costs.json');
-export const SETU_DIR    = join(HOME, '.setu');
+export const SETU_DIR = join(HOME, '.setu');
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
-export const HOSTS_TMP   = '/tmp/setu-hosts';
+export const HOSTS_TMP = '/tmp/setu-hosts';
 export const HOSTS_START = '# quivly-start';
-export const HOSTS_END   = '# quivly-end';
+export const HOSTS_END = '# quivly-end';
 
-export const BREW_PREFIX = (() => {
-  try { return execFileSync('brew', ['--prefix'], { encoding: 'utf8' }).trim(); }
-  catch { return '/opt/homebrew'; }
-})();
-export const CADDY_BIN       = join(BREW_PREFIX, 'bin', 'caddy');
+// Importing shared helpers must not spawn Homebrew (including offline `setu rm`).
+export const BREW_PREFIX =
+  process.env.HOMEBREW_PREFIX ||
+  ['/opt/homebrew', '/usr/local'].find((prefix) =>
+    existsSync(join(prefix, 'bin', 'brew'))
+  ) ||
+  (process.arch === 'arm64' ? '/opt/homebrew' : '/usr/local');
+export const CADDY_BIN = join(BREW_PREFIX, 'bin', 'caddy');
 export const CLOUDFLARED_BIN = join(BREW_PREFIX, 'bin', 'cloudflared');
 
 // ── config ────────────────────────────────────────────────────────────────────
 
-export function loadConfig() {
-  try { return JSON.parse(readFileSync(CFG_PATH, 'utf8')); } catch { return {}; }
+export function workspaceState(workspace, options = {}) {
+  return createWorkspaceState({
+    configPath: CFG_PATH,
+    setuDir: SETU_DIR,
+    workspaceRoot: workspace,
+    ...options,
+  });
 }
 
-export function saveConfig(c) {
-  writeFileSync(CFG_PATH, JSON.stringify(c, null, 2) + '\n');
+export function loadConfig(options = {}) {
+  return workspaceState(undefined, options).read('config');
+}
+
+// Only fields the caller intends to change belong in patch. Never pass a stale full snapshot.
+export function saveConfig(patch, options = {}) {
+  return workspaceState(undefined, options).update('config', (current) => {
+    const next = { ...current, ...patch };
+    resourceSettings(next);
+    return next;
+  });
+}
+
+export function installedStateValue(result) {
+  if (!result.reconciled) {
+    const error = new StateError(
+      'STATE_RECONCILIATION_REQUIRED',
+      'store',
+      'readback'
+    );
+    error.committed = true;
+    throw error;
+  }
+  if (result.warning) {
+    console.warn(
+      `${result.warning.code}: ${result.warning.phase}; state was committed`
+    );
+  }
+  return result.value;
+}
+
+export function tunnelCredentials(directory, name, tunnels) {
+  const matches = tunnels.filter((t) => t.name === name);
+  if (matches.length !== 1 || !/^[0-9a-f-]{36}$/i.test(matches[0].id)) {
+    throw new Error(`Could not identify tunnel ${name}`);
+  }
+  const path = join(directory, `${matches[0].id}.json`);
+  const credentials = JSON.parse(readFileSync(path, 'utf8'));
+  if (credentials.TunnelID !== matches[0].id) {
+    throw new Error(`Credentials do not match tunnel ${name}`);
+  }
+  return path;
 }
 
 export function requireConfig() {
   const c = loadConfig();
-  if (!c.workspace || !c.domain) throw new Error('Not configured — run `setu setup` first.');
+  if (!(c.workspace && c.domain)) {
+    throw new Error('Not configured — run `setu setup` first.');
+  }
   return c;
+}
+
+export function portalRequestError(req, address) {
+  const local = (ip) =>
+    ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1';
+  if (!local(address)) {
+    return 'Setu only accepts local connections';
+  }
+  // Caddy is local too; do not let its proxy turn the portal into a LAN API.
+  const forwarded = req.headers.get('x-forwarded-for');
+  if (forwarded && !forwarded.split(',').every((ip) => local(ip.trim()))) {
+    return 'Remote proxy clients are not allowed';
+  }
+  const hosts = new Set([
+    `localhost:${PORTAL_PORT}`,
+    `127.0.0.1:${PORTAL_PORT}`,
+    `[::1]:${PORTAL_PORT}`,
+    'quivly.local',
+    'quivly.local:80',
+  ]);
+  const url = new URL(req.url);
+  if (!hosts.has((req.headers.get('host') || url.host).toLowerCase())) {
+    return 'Untrusted Host';
+  }
+  const origin = req.headers.get('origin');
+  if (origin) {
+    try {
+      const parsed = new URL(origin);
+      if (parsed.protocol !== 'http:' || !hosts.has(parsed.host)) {
+        return 'Untrusted Origin';
+      }
+    } catch {
+      return 'Untrusted Origin';
+    }
+  }
+  const oauthCallback =
+    req.method === 'GET' && url.pathname.startsWith('/api/mcp/oauth/callback/');
+  if (!oauthCallback && req.headers.get('sec-fetch-site') === 'cross-site') {
+    return 'Cross-site request rejected';
+  }
+  return null;
+}
+
+export function validateWorktreeNames(repo, name) {
+  const safe = (value) =>
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !/[\\\x00-\x20:]/.test(value) &&
+    value
+      .split('/')
+      .every(
+        (part) => part && part !== '.' && part !== '..' && !part.startsWith('-')
+      );
+  if (!safe(repo) || repo.includes('/') || !safe(name)) {
+    throw new Error('Invalid repo or worktree name');
+  }
+}
+
+export function managedWorktreePath(
+  workspace,
+  repo,
+  name,
+  { registered = true } = {}
+) {
+  validateWorktreeNames(repo, name);
+  if (!(registered || Object.hasOwn(loadProjects(workspace), repo))) {
+    throw new Error('Project is not registered');
+  }
+  if (registered && !getPort(workspace, repo, name)) {
+    throw new Error('Worktree is not registered');
+  }
+  return join(workspace, repo, name);
+}
+
+export function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 // Never written by this tool — see COSTS_CFG_PATH's own comment. Read-only,
 // same try/empty-object shape as loadConfig, so a missing/malformed file
 // just reads as "nothing configured" rather than a crash.
 export function loadCostsConfig() {
-  try { return JSON.parse(readFileSync(COSTS_CFG_PATH, 'utf8')); } catch { return {}; }
+  try {
+    return JSON.parse(readFileSync(COSTS_CFG_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
 }
 
 // ── domains ───────────────────────────────────────────────────────────────────
 
-export function slugify(name) { return name.replace(/\//g, '-'); }
+export function slugify(name) {
+  return name.replace(/\//g, '-');
+}
 
 export function localDomain(repo, name) {
-  return name === 'main' ? `${repo}.quivly.local` : `${slugify(name)}.quivly.local`;
+  return name === 'main'
+    ? `${repo}.quivly.local`
+    : `${slugify(name)}.quivly.local`;
 }
 
 // Single shared public URL per developer (dev-<name>.<zone>). One worktree at a
 // time owns it; the portal moves it between worktrees.
-export function publicDomain(c) { return c.domain; }
+export function publicDomain(c) {
+  return c.domain;
+}
 
 // ── env files ─────────────────────────────────────────────────────────────────
 
@@ -80,19 +237,31 @@ export function envLocalPath(repo, wtDir) {
 }
 
 export function parseEnvFile(path) {
-  if (!existsSync(path)) return {};
+  if (!existsSync(path)) {
+    return {};
+  }
   const out = {};
   for (const line of readFileSync(path, 'utf8').split('\n')) {
-    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (!line.trim() || line.trim().startsWith('#')) {
+      continue;
+    }
     const m = line.match(/^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*?)\s*$/);
-    if (m) out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
+    if (m) {
+      out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
+    }
   }
   return out;
 }
 
 function hasConvexEnv(dir) {
-  const env = { ...parseEnvFile(join(dir, '.env')), ...parseEnvFile(join(dir, '.env.local')) };
-  return typeof env.CONVEX_DEPLOYMENT === 'string' && env.CONVEX_DEPLOYMENT.length > 0;
+  const env = {
+    ...parseEnvFile(join(dir, '.env')),
+    ...parseEnvFile(join(dir, '.env.local')),
+  };
+  return (
+    typeof env.CONVEX_DEPLOYMENT === 'string' &&
+    env.CONVEX_DEPLOYMENT.length > 0
+  );
 }
 
 // Convex is configured for a worktree when either signal is present: a
@@ -108,9 +277,16 @@ function hasConvexEnv(dir) {
 // `deploy` from the right cwd instead of re-deriving this same resolution
 // themselves.
 export function convexDir(repo, wtDir) {
-  if (existsSync(join(wtDir, 'convex')) || hasConvexEnv(wtDir)) return wtDir;
+  if (existsSync(join(wtDir, 'convex')) || hasConvexEnv(wtDir)) {
+    return wtDir;
+  }
   const appDir = dirname(envLocalPath(repo, wtDir));
-  if (appDir !== wtDir && (existsSync(join(appDir, 'convex')) || hasConvexEnv(appDir))) return appDir;
+  if (
+    appDir !== wtDir &&
+    (existsSync(join(appDir, 'convex')) || hasConvexEnv(appDir))
+  ) {
+    return appDir;
+  }
   return null;
 }
 
@@ -119,30 +295,47 @@ export function convexDir(repo, wtDir) {
 export function pinnedTriggerVersion(wtDir) {
   try {
     const pkg = JSON.parse(readFileSync(join(wtDir, 'package.json'), 'utf8'));
-    const v = pkg.dependencies?.['@trigger.dev/sdk'] ?? pkg.devDependencies?.['@trigger.dev/sdk'];
+    const v =
+      pkg.dependencies?.['@trigger.dev/sdk'] ??
+      pkg.devDependencies?.['@trigger.dev/sdk'];
     return v ? v.replace(/^[\^~]/, '') : 'latest';
-  } catch { return 'latest'; }
+  } catch {
+    return 'latest';
+  }
 }
 
 export function readEnvrc(wtDir) {
-  try { return readFileSync(join(wtDir, '.envrc'), 'utf8'); } catch { return ''; }
+  try {
+    return readFileSync(join(wtDir, '.envrc'), 'utf8');
+  } catch {
+    return '';
+  }
 }
 
 export function tunnelEnabled(wtDir, c) {
   return readEnvrc(wtDir).includes(`https://${c.domain}`);
 }
 
-export function writeEnvrc(wtDir, port, appUrl, redirectUri) {
-  writeFileSync(join(wtDir, '.envrc'),
-    `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`);
+export async function writeEnvrc(wtDir, port, appUrl, redirectUri) {
+  installedStateValue(
+    await workspaceState(undefined).replaceText(
+      join(wtDir, '.envrc'),
+      `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`
+    )
+  );
   spawnSync('direnv', ['allow', wtDir], { stdio: 'ignore' });
 }
 
-export function configureWorktreeEnv(c, repo, name, port, withTunnel) {
+export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
   const wtDir = join(c.workspace, repo, name);
   if (withTunnel) {
     const pd = publicDomain(c);
-    writeEnvrc(wtDir, port, `https://${pd}`, `https://${pd}/authentication/callback`);
+    await writeEnvrc(
+      wtDir,
+      port,
+      `https://${pd}`,
+      `https://${pd}/authentication/callback`
+    );
   } else {
     // Was http://localhost:${port}/... — inconsistent with APP_BASE_URL on the
     // line above, and the actual root cause of "redirected to localhost" after
@@ -151,9 +344,14 @@ export function configureWorktreeEnv(c, repo, name, port, withTunnel) {
     // redirect destination, so a mismatched value here sends the browser to
     // localhost regardless of what domain the user actually visited through Caddy.
     const ld = localDomain(repo, name);
-    writeEnvrc(wtDir, port, `http://${ld}`, `http://${ld}/authentication/callback`);
+    await writeEnvrc(
+      wtDir,
+      port,
+      `http://${ld}`,
+      `http://${ld}/authentication/callback`
+    );
   }
-  writeCaddy(c, repo, name, port, withTunnel);
+  await writeCaddy(c, repo, name, port, withTunnel);
 }
 
 // ── caddy ─────────────────────────────────────────────────────────────────────
@@ -162,49 +360,105 @@ export function caddySnippetPath(workspace, repo, name) {
   return join(workspace, 'caddy.d', `${repo}-${slugify(name)}.caddy`);
 }
 
-export function writeCaddy(c, repo, name, port, withTunnel) {
-  const ld = localDomain(repo, name);
-  const body = withTunnel
-    ? `http://${ld},\nhttp://${publicDomain(c)} {\n  reverse_proxy localhost:${port}\n}\n`
-    : `http://${ld} {\n  reverse_proxy localhost:${port}\n}\n`;
-  writeFileSync(caddySnippetPath(c.workspace, repo, name), body);
+export function writeCaddy(
+  c,
+  repo,
+  name,
+  port,
+  withTunnel,
+  { state = workspaceState(c.workspace) } = {}
+) {
+  return state.withRouting(async () => {
+    const { ports } = await state.snapshot(['ports']);
+    if (
+      !ports.some((row) => row.key === `${repo}/${name}` && row.port === port)
+    ) {
+      throw new Error('Routing target registration changed');
+    }
+    const ld = localDomain(repo, name);
+    const body = withTunnel
+      ? `http://${ld},\nhttp://${publicDomain(c)} {\n  reverse_proxy localhost:${port}\n}\n`
+      : `http://${ld} {\n  reverse_proxy localhost:${port}\n}\n`;
+    const result = await state.replaceText(
+      caddySnippetPath(c.workspace, repo, name),
+      body
+    );
+    installedStateValue(result);
+    return result;
+  });
 }
 
 // Never prompts (sudo -n): callers may be detached with no TTY. The sudoers
 // rule from `setu setup` covers exactly this argv.
-export function reloadCaddy(workspace) {
-  const caddyfile = join(workspace, 'Caddyfile');
-  try {
-    execFileSync('sudo', ['-n', CADDY_BIN, 'reload', '--config', caddyfile], { stdio: 'ignore' });
-    return true;
-  } catch {
-    console.warn(`⚠  caddy reload failed — run: sudo ${CADDY_BIN} reload --config ${caddyfile}`);
-    return false;
-  }
+export function reloadCaddy(
+  workspace,
+  { state = workspaceState(workspace), run = execFileSync } = {}
+) {
+  return state.withRouting(() => {
+    const caddyfile = join(workspace, 'Caddyfile');
+    try {
+      run('sudo', ['-n', CADDY_BIN, 'reload', '--config', caddyfile], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      return true;
+    } catch {
+      console.warn(
+        `⚠  caddy reload failed — run: sudo ${CADDY_BIN} reload --config ${caddyfile}`
+      );
+      return false;
+    }
+  });
 }
 
 // ── /etc/hosts sync ───────────────────────────────────────────────────────────
 
-export function syncHosts(workspace) {
-  const raw = readFileSync('/etc/hosts', 'utf8');
-  const cleaned = raw.replace(new RegExp(`\\n?${HOSTS_START}[\\s\\S]*?${HOSTS_END}\\n?`), '');
-  const entries = portEntries(workspace)
-    .map(({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`);
-  const next = cleaned.trimEnd() + `\n${HOSTS_START}\n` + entries.join('\n') + `\n${HOSTS_END}\n`;
-  writeFileSync(HOSTS_TMP, next);
-  try {
-    execFileSync('sudo', ['-n', '/bin/cp', HOSTS_TMP, '/etc/hosts'], { stdio: 'ignore' });
-    return true;
-  } catch {
-    console.warn(`⚠  /etc/hosts sync failed — re-run \`setu setup\` to repair the sudoers rule`);
-    return false;
-  }
+export function syncHosts(
+  workspace,
+  {
+    state = workspaceState(workspace),
+    hostsPath = '/etc/hosts',
+    stagingPath = HOSTS_TMP,
+    run = execFileSync,
+  } = {}
+) {
+  return state.withRouting(async () => {
+    const raw = readFileSync(hostsPath, 'utf8');
+    const cleaned = raw.replace(
+      new RegExp(`\\n?${HOSTS_START}[\\s\\S]*?${HOSTS_END}\\n?`),
+      ''
+    );
+    const { ports } = await state.snapshot(['ports']);
+    const entries = ports.map(
+      ({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`
+    );
+    const next =
+      cleaned.trimEnd() +
+      `\n${HOSTS_START}\n` +
+      entries.join('\n') +
+      `\n${HOSTS_END}\n`;
+    installedStateValue(await state.replaceText(stagingPath, next));
+    try {
+      run('sudo', ['-n', '/bin/cp', stagingPath, hostsPath], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      return true;
+    } catch {
+      console.warn(
+        '⚠  /etc/hosts sync failed — re-run `setu setup` to repair the sudoers rule'
+      );
+      return false;
+    }
+  });
 }
 
 // ── ports registry (workspace/.ports: "repo/name:port") ──────────────────────
 
 export function portsRaw(workspace) {
-  try { return readFileSync(join(workspace, '.ports'), 'utf8').trim(); } catch { return ''; }
+  return portEntries(workspace)
+    .map((row) => `${row.key}:${row.port}`)
+    .join('\n');
 }
 
 // "repo/name" -> {repo, name}, split on the first '/'. A worktree name can
@@ -215,23 +469,26 @@ export function splitKey(key) {
 }
 
 export function portEntries(workspace) {
-  return portsRaw(workspace).split('\n').filter(Boolean).map(line => {
-    const ci   = line.lastIndexOf(':');
-    const key  = line.slice(0, ci);
-    const port = parseInt(line.slice(ci + 1), 10);
-    return { key, ...splitKey(key), port };
-  });
+  return workspaceState(workspace).read('ports');
 }
 
 export function getPort(workspace, repo, name) {
-  return portEntries(workspace).find(e => e.repo === repo && e.name === name)?.port ?? null;
+  return (
+    portEntries(workspace).find((e) => e.repo === repo && e.name === name)
+      ?.port ?? null
+  );
 }
 
 export function activePid(port) {
   try {
-    return execFileSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'],
-      { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-  } catch { return ''; }
+    return execFileSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return '';
+  }
 }
 
 // Async sibling of activePid, for portal.js's request-handler hot paths —
@@ -248,24 +505,43 @@ export async function activePidAsync(port) {
 // selectors lsof exits 1 even when it successfully printed matches (verified) —
 // execFileSync throws on that and discards output that was actually fine.
 export function listActivePorts() {
-  const res = spawnSync('lsof',
-    ['-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const res = spawnSync(
+    'lsof',
+    [
+      '-i',
+      'TCP:3000-3999',
+      '-i',
+      'TCP:8288-9287',
+      '-sTCP:LISTEN',
+      '-nP',
+      '-F',
+      'pcn',
+    ],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
   const out = res.stdout ?? '';
-  const results = []; const seen = new Set(); let cur = {};
+  const results = [];
+  const seen = new Set();
+  let cur = {};
   for (const line of out.split('\n')) {
-    if (line.startsWith('p')) cur = { pid: line.slice(1) };
-    else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) {
+    if (line.startsWith('p')) {
+      cur = { pid: line.slice(1) };
+    } else if (line.startsWith('c')) {
+      cur.cmd = line.slice(1);
+    } else if (line.startsWith('n')) {
       const m = line.match(/:(\d+)$/);
-      if (!m) continue;
+      if (!m) {
+        continue;
+      }
       // A process listening on both IPv4 and IPv6 for the same port (e.g.
       // OrbStack's port-forwarding helper, confirmed live: two separate fds
       // both bound to `*:<port>`) prints one 'n' line per socket under the
       // same 'p' block — without this, that's a duplicate row per extra
       // protocol, not one row per actually-distinct listener.
       const key = `${cur.pid}:${m[1]}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) {
+        continue;
+      }
       seen.add(key);
       results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] });
     }
@@ -277,17 +553,35 @@ export function listActivePorts() {
 // (which already tolerates lsof's exit-1-on-success quirk by never
 // throwing). portal.js's hot paths use this; cli.js keeps the sync version.
 export async function listActivePortsAsync() {
-  const out = await spawnText(['lsof', '-i', 'TCP:3000-3999', '-i', 'TCP:8288-9287', '-sTCP:LISTEN', '-nP', '-F', 'pcn']);
-  const results = []; const seen = new Set(); let cur = {};
+  const out = await spawnText([
+    'lsof',
+    '-i',
+    'TCP:3000-3999',
+    '-i',
+    'TCP:8288-9287',
+    '-sTCP:LISTEN',
+    '-nP',
+    '-F',
+    'pcn',
+  ]);
+  const results = [];
+  const seen = new Set();
+  let cur = {};
   for (const line of out.split('\n')) {
-    if (line.startsWith('p')) cur = { pid: line.slice(1) };
-    else if (line.startsWith('c')) cur.cmd = line.slice(1);
-    else if (line.startsWith('n')) {
+    if (line.startsWith('p')) {
+      cur = { pid: line.slice(1) };
+    } else if (line.startsWith('c')) {
+      cur.cmd = line.slice(1);
+    } else if (line.startsWith('n')) {
       const m = line.match(/:(\d+)$/);
-      if (!m) continue;
+      if (!m) {
+        continue;
+      }
       // Same IPv4/IPv6 dual-socket dedup as listActivePorts above.
       const key = `${cur.pid}:${m[1]}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) {
+        continue;
+      }
       seen.add(key);
       results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] });
     }
@@ -299,9 +593,20 @@ export async function listActivePortsAsync() {
 // belongs to the worktree the registry claims it does (setu doctor/prune).
 export function processCwd(pid) {
   try {
-    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
-    return out.split('\n').find(l => l.startsWith('n'))?.slice(1) ?? null;
-  } catch { return null; }
+    const out = execFileSync(
+      'lsof',
+      ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
+      { encoding: 'utf8' }
+    );
+    return (
+      out
+        .split('\n')
+        .find((l) => l.startsWith('n'))
+        ?.slice(1) ?? null
+    );
+  } catch {
+    return null;
+  }
 }
 
 // ── AI coding CLI detection ──────────────────────────────────────────────────
@@ -312,14 +617,14 @@ export function processCwd(pid) {
 // project's preferred 4 tools. Detected live (not cached) so installing a new
 // CLI doesn't need a portal restart to be picked up.
 export const AGENT_CLIS = {
-  aider:       { bin: 'aider',           label: 'Aider' },
-  amp:         { bin: 'amp',             label: 'Amp' },
+  aider: { bin: 'aider', label: 'Aider' },
+  amp: { bin: 'amp', label: 'Amp' },
   antigravity: { bin: 'antigravity-ide', label: 'Antigravity' },
-  claude:      { bin: 'claude',          label: 'Claude' },
-  codex:       { bin: 'codex',           label: 'Codex' },
-  cursor:      { bin: 'cursor-agent',    label: 'Cursor' },
-  grok:        { bin: 'grok',            label: 'Grok' },
-  opencode:    { bin: 'opencode',        label: 'opencode' },
+  claude: { bin: 'claude', label: 'Claude' },
+  codex: { bin: 'codex', label: 'Codex' },
+  cursor: { bin: 'cursor-agent', label: 'Cursor' },
+  grok: { bin: 'grok', label: 'Grok' },
+  opencode: { bin: 'opencode', label: 'opencode' },
 };
 
 export function commandExists(bin) {
@@ -339,25 +644,44 @@ export function commandExists(bin) {
 export function killGroup(pid, signal = 'TERM') {
   let pgid = pid;
   try {
-    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim();
-    if (out) pgid = parseInt(out, 10);
-  } catch {}
+    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], {
+      encoding: 'utf8',
+    }).trim();
+    if (out) {
+      pgid = Number.parseInt(out, 10);
+    }
+  } catch {
+    // Preserve the legacy signal fallback when process metadata is unavailable.
+  }
   const target = pgid === pid ? `-${pgid}` : String(pid);
-  try { execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' }); return true; }
-  catch { return false; }
+  try {
+    execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Async sibling of killGroup — same pgid-then-kill shape, Bun.spawn instead
 // of execFileSync so a stop/remove request doesn't block the whole portal.
 export async function killGroupAsync(pid, signal = 'TERM') {
   let pgid = pid;
-  const out = (await spawnText(['ps', '-o', 'pgid=', '-p', String(pid)])).trim();
-  if (out) pgid = parseInt(out, 10);
+  const out = (
+    await spawnText(['ps', '-o', 'pgid=', '-p', String(pid)])
+  ).trim();
+  if (out) {
+    pgid = Number.parseInt(out, 10);
+  }
   const target = pgid === pid ? `-${pgid}` : String(pid);
   try {
-    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], { stderr: 'ignore', stdout: 'ignore' });
+    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], {
+      stderr: 'ignore',
+      stdout: 'ignore',
+    });
     return (await proc.exited) === 0;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 export function detectAgentClis(workspace) {
@@ -366,45 +690,158 @@ export function detectAgentClis(workspace) {
     .map(([id, t]) => ({ id, label: t.label }));
   // Custom agents are never which-checked (see loadCustomAgents) — appended
   // as-is after the verified built-ins.
-  const custom = loadCustomAgents(workspace).map(({ id, label }) => ({ id, label }));
+  const custom = loadCustomAgents(workspace).map(({ id, label }) => ({
+    id,
+    label,
+  }));
   return [...builtins, ...custom];
 }
 
-export function assignPort(workspace, repo, name) {
-  const existing = getPort(workspace, repo, name);
-  if (existing) return existing;
-  const base = loadProjects(workspace)[repo]?.base ?? 3200;
-  const used = new Set(portEntries(workspace).map(e => e.port));
-  let port = base;
-  while (used.has(port) || activePid(port)) port++;
-  appendFileSync(join(workspace, '.ports'), `${repo}/${name}:${port}\n`);
-  return port;
+export async function assignPort(
+  workspace,
+  repo,
+  name,
+  { state = workspaceState(workspace), probe = allocationListeners } = {}
+) {
+  validateWorktreeNames(repo, name);
+  return state.withWorkspace(
+    ['ports', 'projects', 'removals'],
+    async (scope) => {
+      const entries = scope.read('ports'),
+        pending = scope.read('removals');
+      const key = `${repo}/${name}`;
+      const reservations = pendingRemovalReservations(pending);
+      if (reservations.some((row) => row.key === key)) {
+        throw new Error('Worktree has pending removal recovery');
+      }
+      const existing = entries.find((row) => row.key === key);
+      if (existing) {
+        return existing.port;
+      }
+      const used = new Set([
+        ...entries.map((row) => row.port),
+        ...reservations.map((row) => row.port),
+      ]);
+      // One bounded listener scan is the only OS work allowed in this metadata scope.
+      const listening = await probe();
+      if (!(listening instanceof Set)) {
+        throw new StateError(
+          'STATE_UNREADABLE',
+          'ports',
+          'listener-observation'
+        );
+      }
+      let port = scope.read('projects')[repo]?.base ?? 3200;
+      while (used.has(port) || listening.has(port)) {
+        port += 1;
+      }
+      if (port > 65_535) {
+        throw new Error('No free managed port available');
+      }
+      installedStateValue(
+        scope.replace('ports', [...entries, { key, name, port, repo }])
+      );
+      return port;
+    }
+  );
 }
 
 export function releasePort(workspace, repo, name) {
-  const keep = portEntries(workspace).filter(e => !(e.repo === repo && e.name === name));
-  writeFileSync(join(workspace, '.ports'),
-    keep.length ? keep.map(e => `${e.key}:${e.port}`).join('\n') + '\n' : '');
+  validateWorktreeNames(repo, name);
+  return workspaceState(workspace).update('ports', (entries) =>
+    entries.filter((row) => row.key !== `${repo}/${name}`)
+  );
+}
+
+function pendingRemovalReservations(pending) {
+  // The recovery owner supplies versioned records. Unknown envelopes cannot free a port.
+  const records = Object.values(pending);
+  if (
+    !records.every((row) => {
+      if (
+        !row ||
+        typeof row !== 'object' ||
+        typeof row.key !== 'string' ||
+        !Number.isInteger(row.port) ||
+        row.port < 1 ||
+        row.port > 65_535
+      ) {
+        return false;
+      }
+      const slash = row.key.indexOf('/');
+      if (slash < 1) {
+        return false;
+      }
+      try {
+        validateWorktreeNames(
+          row.key.slice(0, slash),
+          row.key.slice(slash + 1)
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    })
+  ) {
+    throw new StateError('STATE_CORRUPT', 'removals', 'reservations');
+  }
+  return records;
+}
+
+async function allocationListeners() {
+  let proc;
+  try {
+    proc = Bun.spawn(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'n'], {
+      stderr: 'pipe',
+      stdout: 'pipe',
+      timeout: 2000,
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (
+      proc.signalCode ||
+      ![0, 1].includes(code) ||
+      (code === 1 && !stdout.trim() && stderr.trim())
+    ) {
+      throw new Error('unknown listeners');
+    }
+    return new Set(
+      [...stdout.matchAll(/^n.*:(\d+)(?:\s.*)?$/gm)].map((match) =>
+        Number(match[1])
+      )
+    );
+  } catch {
+    throw new StateError('STATE_UNREADABLE', 'ports', 'listener-observation');
+  }
 }
 
 // ── projects registry (workspace/.projects: "name:base:slug:label") ──────────
 
 export function loadProjects(workspace) {
-  try {
-    return Object.fromEntries(
-      readFileSync(join(workspace, '.projects'), 'utf8').split('\n')
-        .filter(l => l.trim() && !l.startsWith('#'))
-        .map(l => {
-          const [name, base, slug, label] = l.split(':');
-          return [name, {
-            base: +base,
-            github: slug ? `https://github.com/${slug}` : null,
-            label: label?.trim() || name,
-            slug:  slug || null,
-          }];
-        })
-    );
-  } catch { return {}; }
+  return workspaceState(workspace).read('projects');
+}
+
+// Inventory includes stale registrations and missing checkouts; these expected
+// paths are for inspection only, never authorization to act on a checkout.
+export function workspaceInventoryRegistry(workspace) {
+  const registrations = portEntries(workspace).map((entry) => {
+    validateWorktreeNames(entry.repo, entry.name);
+    return { ...entry, path: join(workspace, entry.repo, entry.name) };
+  });
+  const repos = new Set([
+    ...Object.keys(loadProjects(workspace)),
+    ...registrations.map((entry) => entry.repo),
+  ]);
+  return {
+    registrations,
+    projects: [...repos].map((repo) => {
+      validateWorktreeNames(repo, 'main');
+      return { repo, repoDir: join(workspace, `${repo}.git`) };
+    }),
+  };
 }
 
 // ── project sidecars (workspace/sidecars.json: { [repo]: [{name, enabled, command, args, env}] }) ──
@@ -417,28 +854,24 @@ export function loadProjects(workspace) {
 // (a plain cloudflared tunnel, a queue worker, whatever), so nothing about
 // starting a worktree stays hardcoded to one project's toolchain.
 export function loadSidecars(workspace, repo) {
-  try {
-    const all = JSON.parse(readFileSync(join(workspace, 'sidecars.json'), 'utf8'));
-    return (all[repo] ?? []).filter(s => s.enabled !== false && s.command);
-  } catch { return []; }
+  return loadAllSidecars(workspace, repo).filter(
+    (s) => s.enabled !== false && s.command
+  );
 }
 
 // Unfiltered — the settings UI needs to show and edit disabled/incomplete
 // entries too, unlike loadSidecars() (used on the start path, which only
 // ever wants what's actually enabled and runnable).
 export function loadAllSidecars(workspace, repo) {
-  try {
-    const all = JSON.parse(readFileSync(join(workspace, 'sidecars.json'), 'utf8'));
-    return all[repo] ?? [];
-  } catch { return []; }
+  const all = workspaceState(workspace).read('sidecars');
+  return Object.hasOwn(all, repo) ? all[repo] : [];
 }
 
 export function saveSidecars(workspace, repo, sidecars) {
-  const path = join(workspace, 'sidecars.json');
-  let all = {};
-  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first sidecar ever registered */ }
-  all[repo] = sidecars;
-  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+  return workspaceState(workspace).update('sidecars', (all) => ({
+    ...all,
+    [repo]: sidecars,
+  }));
 }
 
 // ── file sync (workspace/file-sync.json: { [repo]: string[] } of glob patterns) ──
@@ -448,18 +881,15 @@ export function saveSidecars(workspace, repo, sidecars) {
 // so it gets its own independently editable copy — a .env.development.local,
 // a config/local.json, whatever a given repo needs that isn't in git.
 export function loadFileSyncGlobs(workspace, repo) {
-  try {
-    const all = JSON.parse(readFileSync(join(workspace, 'file-sync.json'), 'utf8'));
-    return Array.isArray(all[repo]) ? all[repo] : [];
-  } catch { return []; }
+  const all = workspaceState(workspace).read('fileSync');
+  return Object.hasOwn(all, repo) ? all[repo] : [];
 }
 
 export function saveFileSyncGlobs(workspace, repo, globs) {
-  const path = join(workspace, 'file-sync.json');
-  let all = {};
-  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first project to configure file sync */ }
-  all[repo] = globs;
-  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+  return workspaceState(workspace).update('fileSync', (all) => ({
+    ...all,
+    [repo]: globs,
+  }));
 }
 
 // ── sidecar approval gate (workspace/sidecar-approvals.json: { [repo]: { [name]: approvedSignature } }) ──
@@ -476,18 +906,15 @@ function sidecarSignature(s) {
 }
 
 export function loadSidecarApprovals(workspace, repo) {
-  try {
-    const all = JSON.parse(readFileSync(join(workspace, 'sidecar-approvals.json'), 'utf8'));
-    return all[repo] ?? {};
-  } catch { return {}; }
+  const all = workspaceState(workspace).read('approvals');
+  return Object.hasOwn(all, repo) ? all[repo] : {};
 }
 
 export function saveSidecarApprovals(workspace, repo, approvals) {
-  const path = join(workspace, 'sidecar-approvals.json');
-  let all = {};
-  try { all = JSON.parse(readFileSync(path, 'utf8')); } catch { /* first sidecar ever approved */ }
-  all[repo] = approvals;
-  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+  return workspaceState(workspace).update('approvals', (all) => ({
+    ...all,
+    [repo]: approvals,
+  }));
 }
 
 export function isSidecarApproved(workspace, repo, sidecar) {
@@ -496,9 +923,28 @@ export function isSidecarApproved(workspace, repo, sidecar) {
 }
 
 export function approveSidecar(workspace, repo, sidecarName, command, args) {
-  const approvals = loadSidecarApprovals(workspace, repo);
-  approvals[sidecarName] = sidecarSignature({ args, command });
-  saveSidecarApprovals(workspace, repo, approvals);
+  return workspaceState(workspace).withWorkspace(
+    ['sidecars', 'approvals'],
+    (scope) => {
+      const configured = scope.read('sidecars');
+      const current = Object.hasOwn(configured, repo)
+        ? configured[repo].find((row) => row.name === sidecarName)
+        : undefined;
+      if (
+        !current ||
+        sidecarSignature(current) !== sidecarSignature({ args, command })
+      ) {
+        throw new Error(
+          'Sidecar command changed; review it again before approving'
+        );
+      }
+      const all = scope.read('approvals');
+      return scope.replace('approvals', {
+        ...all,
+        [repo]: { ...all[repo], [sidecarName]: sidecarSignature(current) },
+      });
+    }
+  );
 }
 
 // First-run migration: sidecars configured before this gate existed should
@@ -510,20 +956,29 @@ export function approveSidecar(workspace, repo, sidecarName, command, args) {
 // every real pre-existing sidecar would demand approval forever. Bail
 // without writing instead, so the next boot retries.
 export function seedSidecarApprovalsIfMissing(workspace) {
-  const approvalsPath = join(workspace, 'sidecar-approvals.json');
-  if (existsSync(approvalsPath)) return;
-  const sidecarsPath = join(workspace, 'sidecars.json');
-  let all = {};
-  if (existsSync(sidecarsPath)) {
-    try { all = JSON.parse(readFileSync(sidecarsPath, 'utf8')); }
-    catch { return; }
-  }
-  const approvals = {};
-  for (const [repo, sidecars] of Object.entries(all)) {
-    approvals[repo] = {};
-    for (const s of sidecars) approvals[repo][s.name] = sidecarSignature(s);
-  }
-  writeFileSync(approvalsPath, JSON.stringify(approvals, null, 2) + '\n');
+  return workspaceState(workspace).withWorkspace(
+    ['sidecars', 'approvals'],
+    (scope) => {
+      if (scope.exists('approvals')) {
+        return {
+          committed: false,
+          reconciled: true,
+          status: 'unchanged',
+          value: scope.read('approvals'),
+        };
+      }
+      const approvals = Object.create(null);
+      for (const [repo, sidecars] of Object.entries(scope.read('sidecars'))) {
+        approvals[repo] = {};
+        for (const sidecar of sidecars) {
+          if (sidecar.name && sidecar.command) {
+            approvals[repo][sidecar.name] = sidecarSignature(sidecar);
+          }
+        }
+      }
+      return scope.replace('approvals', approvals);
+    }
+  );
 }
 
 // ── archived worktrees (workspace/archived-worktrees.json: array of
@@ -538,18 +993,21 @@ export function seedSidecarApprovalsIfMissing(workspace) {
 const ARCHIVE_CAP = 500; // keep only the most recent 500 removals, drop the oldest beyond that
 
 export function loadArchivedWorktrees(workspace) {
-  try {
-    const all = JSON.parse(readFileSync(join(workspace, 'archived-worktrees.json'), 'utf8'));
-    return Array.isArray(all) ? all : [];
-  } catch { return []; }
+  return workspaceState(workspace).read('archive');
 }
 
 export function appendArchivedWorktree(workspace, record) {
-  const path = join(workspace, 'archived-worktrees.json');
-  let all = loadArchivedWorktrees(workspace);
-  all.push(record);
-  if (all.length > ARCHIVE_CAP) all = all.slice(all.length - ARCHIVE_CAP);
-  writeFileSync(path, JSON.stringify(all, null, 2) + '\n');
+  return workspaceState(workspace).update('archive', (all) => {
+    const index = record.operationId
+      ? all.findIndex((row) => row.operationId === record.operationId)
+      : -1;
+    if (index < 0) {
+      all.push(record);
+    } else {
+      all[index] = { ...all[index], ...record };
+    }
+    return all.slice(-ARCHIVE_CAP);
+  });
 }
 
 // ── custom agent CLIs (workspace/custom-agents.json: [{id, label, command}]) ──
@@ -559,15 +1017,15 @@ export function appendArchivedWorktree(workspace, record) {
 // exact command they want run, which may not be a bare PATH binary at all
 // (a shell alias, a script with flags, ...).
 function kebabSlug(s) {
-  return String(s || '').toLowerCase().trim()
+  return String(s || '')
+    .toLowerCase()
+    .trim()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
 }
 
 export function loadCustomAgents(workspace) {
-  try {
-    return JSON.parse(readFileSync(join(workspace, 'custom-agents.json'), 'utf8'));
-  } catch { return []; }
+  return workspaceState(workspace).read('customAgents');
 }
 
 // Whole-list overwrite, matching saveSidecars()'s style. Also the sole place
@@ -579,18 +1037,21 @@ export function loadCustomAgents(workspace) {
 // collision with a built-in would silently hijack that tool's entry.
 export function saveCustomAgents(workspace, agents) {
   const used = new Set(Object.keys(AGENT_CLIS));
-  const out = agents.map(a => {
+  const out = agents.map((a) => {
     let id = a.id;
     if (!id || used.has(id)) {
       const base = kebabSlug(a.label) || 'agent';
       id = base;
       let n = 2;
-      while (used.has(id)) id = `${base}-${n++}`;
+      while (used.has(id)) {
+        id = `${base}-${n}`;
+        n += 1;
+      }
     }
     used.add(id);
     return { command: a.command, id, label: a.label };
   });
-  writeFileSync(join(workspace, 'custom-agents.json'), JSON.stringify(out, null, 2) + '\n');
+  return workspaceState(workspace).replace('customAgents', out);
 }
 
 // ── MCP servers (workspace/mcp-servers.json: [{id, name, transport, ...}]) ──
@@ -598,9 +1059,7 @@ export function saveCustomAgents(workspace, agents) {
 // custom agents above — connecting to an MCP server is a per-developer tool
 // preference, not scoped to one project.
 export function loadMcpServers(workspace) {
-  try {
-    return JSON.parse(readFileSync(join(workspace, 'mcp-servers.json'), 'utf8'));
-  } catch { return []; }
+  return workspaceState(workspace).read('mcpServers');
 }
 
 // id is kept as-is when already unique (so editing a server's name doesn't
@@ -612,28 +1071,41 @@ export function loadMcpServers(workspace) {
 // spec-level redirect_uri_mismatch. Renaming a server only ever touches name.
 export function saveMcpServers(workspace, servers) {
   const used = new Set();
-  const out = servers.map(s => {
+  const out = servers.map((s) => {
     let id = s.id;
     if (!id || used.has(id)) {
       const base = kebabSlug(s.name) || 'mcp-server';
       id = base;
       let n = 2;
-      while (used.has(id)) id = `${base}-${n++}`;
+      while (used.has(id)) {
+        id = `${base}-${n}`;
+        n += 1;
+      }
     }
     used.add(id);
     const server = { id, name: s.name, transport: s.transport };
     if (s.transport === 'stdio') {
       server.command = s.command;
-      if (s.args?.length) server.args = s.args;
-      if (s.env && Object.keys(s.env).length) server.env = s.env;
+      if (s.args?.length) {
+        server.args = s.args;
+      }
+      if (s.env && Object.keys(s.env).length) {
+        server.env = s.env;
+      }
     } else if (s.transport === 'http') {
       server.url = s.url;
       server.httpAuthMode = s.httpAuthMode === 'oauth' ? 'oauth' : 'headers';
-      if (server.httpAuthMode === 'headers' && s.headers && Object.keys(s.headers).length) server.headers = s.headers;
+      if (
+        server.httpAuthMode === 'headers' &&
+        s.headers &&
+        Object.keys(s.headers).length
+      ) {
+        server.headers = s.headers;
+      }
     }
     return server;
   });
-  writeFileSync(join(workspace, 'mcp-servers.json'), JSON.stringify(out, null, 2) + '\n');
+  return workspaceState(workspace).replace('mcpServers', out);
 }
 
 // ── MCP OAuth tokens (workspace/mcp-tokens.json: {[issuer]: {clientInformation, tokens}}) ──
@@ -644,25 +1116,29 @@ export function saveMcpServers(workspace, servers) {
 // must never get cross-registered client credentials. Only durable post-auth
 // artifacts live here; PKCE verifier, CSRF state, and discovery state are
 // per-attempt and stay in mcp.js's in-memory pendingAuth map, never written
-// to disk (an interrupted attempt isn't resumable across a portal restart
-// regardless, so persisting that material would only be a stray secret on
-// disk with no benefit). Every write chmod's explicitly to 0600 after
-// writing, not via writeFileSync's {mode} option — that option only applies
-// when a file is newly created, not on an overwrite of an existing one,
-// which is this file's actual save pattern (whole-file overwrite every
-// time). Accepted, explicit trade-off for a single-user local tool: the MCP
+// to disk. Issuer-field updates run under the document lock and publish a
+// complete 0600 replacement; permissions are set before rename. Accepted,
+// explicit trade-off for a single-user local tool: the MCP
 // SDK's own docs recommend OS-level secure storage "in production" — a 0600
 // file is the pragmatic choice here, not a silent shortcut.
 export function loadMcpTokens(workspace) {
-  try {
-    return JSON.parse(readFileSync(join(workspace, 'mcp-tokens.json'), 'utf8'));
-  } catch { return {}; }
+  return workspaceState(workspace).read('mcpTokens');
 }
 
-export function saveMcpTokens(workspace, tokensByIssuer) {
-  const path = join(workspace, 'mcp-tokens.json');
-  writeFileSync(path, JSON.stringify(tokensByIssuer, null, 2) + '\n');
-  chmodSync(path, 0o600);
+export function saveMcpTokens(workspace, issuer, patch) {
+  if (
+    typeof issuer !== 'string' ||
+    !issuer ||
+    !patch ||
+    typeof patch !== 'object' ||
+    Array.isArray(patch)
+  ) {
+    throw new Error('Invalid token issuer patch');
+  }
+  return workspaceState(workspace).update('mcpTokens', (all) => ({
+    ...all,
+    [issuer]: { ...all[issuer], ...patch },
+  }));
 }
 
 // Deregisters a project (drops it from the .projects registry and the "add
@@ -670,20 +1146,32 @@ export function saveMcpTokens(workspace, tokensByIssuer) {
 // worktrees, their git history, and their ports keep working exactly as
 // before. Removing a project is a registry edit, not a delete.
 export function removeProject(workspace, name) {
-  const path = join(workspace, '.projects');
-  const lines = readFileSync(path, 'utf8').split('\n')
-    .filter(l => l.trim() && !l.startsWith('#') && l.split(':')[0] !== name);
-  writeFileSync(path, lines.join('\n') + '\n');
+  return workspaceState(workspace).update('projects', (projects) => {
+    delete projects[name];
+    return projects;
+  });
 }
 
-export function registerProject(workspace, { name, slug = '', label = '' }) {
-  const projects = loadProjects(workspace);
-  if (projects[name]) return projects[name].base;
-  const usedBases = Object.values(projects).map(p => p.base).filter(Boolean);
-  let base = 3000;
-  while (usedBases.includes(base)) base += 100;
-  appendFileSync(join(workspace, '.projects'), `${name}:${base}:${slug}:${label || name}\n`);
-  return base;
+export async function registerProject(
+  workspace,
+  { name, slug = '', label = '' }
+) {
+  validateWorktreeNames(name, 'main');
+  const result = await workspaceState(workspace).update(
+    'projects',
+    (projects) => {
+      if (Object.hasOwn(projects, name)) {
+        return projects;
+      }
+      const used = new Set(Object.values(projects).map((row) => row.base));
+      let base = 3000;
+      while (used.has(base)) {
+        base += 100;
+      }
+      return { ...projects, [name]: { base, label: label || name, slug } };
+    }
+  );
+  return installedStateValue(result)[name].base;
 }
 
 // ── containers (optional per-worktree, engine-agnostic) ──────────────────────
@@ -697,9 +1185,14 @@ export function registerProject(workspace, { name, slug = '', label = '' }) {
 // additive, not a replacement path.
 
 export function containerRuntimeAvailable() {
-  const res = spawnSync('docker', ['info', '--format', '{{.ServerVersion}}|{{.OperatingSystem}}'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  if (res.status !== 0 || !res.stdout?.trim()) return { available: false, engine: null };
+  const res = spawnSync(
+    'docker',
+    ['info', '--format', '{{.ServerVersion}}|{{.OperatingSystem}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  if (res.status !== 0 || !res.stdout?.trim()) {
+    return { available: false, engine: null };
+  }
   const [version, engine] = res.stdout.trim().split('|');
   return { available: true, engine: engine || 'docker', version };
 }
@@ -712,8 +1205,13 @@ export function containerRuntimeAvailable() {
 // hypothetical. The hash is of the exact registry key, so it's collision-safe
 // regardless of how lossy the human-readable prefix is.
 export function composeProjectName(repo, name) {
-  const hash = createHash('sha1').update(`${repo}/${name}`).digest('hex').slice(0, 8);
-  const readable = `${repo}-${slugify(name)}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const hash = createHash('sha1')
+    .update(`${repo}/${name}`)
+    .digest('hex')
+    .slice(0, 8);
+  const readable = `${repo}-${slugify(name)}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-');
   return `setu-${readable}-${hash}`;
 }
 
@@ -735,8 +1233,12 @@ export function dockerComposePath(wtDir) {
 // global default.
 export function defaultContainerMode(workspace, repo, name) {
   const wtDir = join(workspace, repo, name);
-  if (existsSync(dockerComposePath(wtDir))) return true;
-  if (existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) return false;
+  if (existsSync(dockerComposePath(wtDir))) {
+    return true;
+  }
+  if (existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) {
+    return false;
+  }
   return true;
 }
 
@@ -752,19 +1254,17 @@ function migrationMarkerPath(workspace, repo, name) {
 
 export function needsMigrationPrompt(workspace, repo, name) {
   const wtDir = join(workspace, repo, name);
-  if (existsSync(dockerComposePath(wtDir))) return false; // already containerized at some point
-  if (!existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) return false; // no bare history yet either
+  if (existsSync(dockerComposePath(wtDir))) {
+    return false; // already containerized at some point
+  }
+  if (!existsSync(join(workspace, 'logs', repo, name, 'dev.log'))) {
+    return false; // no bare history yet either
+  }
   return !existsSync(migrationMarkerPath(workspace, repo, name));
 }
 
 export function markMigrationPrompted(workspace, repo, name) {
   writeFileSync(migrationMarkerPath(workspace, repo, name), '');
-}
-
-export function parseMemToMb(v) {
-  const m = String(v).trim().match(/^(\d+(?:\.\d+)?)\s*(g|m)$/i);
-  if (!m) return null;
-  return m[2].toLowerCase() === 'g' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
 }
 
 // docker info's NCPU/MemTotal report what the engine itself has available (the
@@ -784,11 +1284,19 @@ export function macCapacity() {
 }
 
 export function engineCapacity() {
-  const res = spawnSync('docker', ['info', '--format', '{{.NCPU}}|{{.MemTotal}}'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  if (res.status !== 0 || !res.stdout?.trim()) return { cpus: null, memMb: null };
+  const res = spawnSync(
+    'docker',
+    ['info', '--format', '{{.NCPU}}|{{.MemTotal}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  if (res.status !== 0 || !res.stdout?.trim()) {
+    return { cpus: null, memMb: null };
+  }
   const [cpus, memBytes] = res.stdout.trim().split('|');
-  return { cpus: parseInt(cpus, 10) || null, memMb: memBytes ? Math.floor(+memBytes / 1024 / 1024) : null };
+  return {
+    cpus: Number.parseInt(cpus, 10) || null,
+    memMb: memBytes ? Math.floor(+memBytes / 1024 / 1024) : null,
+  };
 }
 
 // "running" or "restarting" both count as alive — mid-retry-backoff (the
@@ -799,10 +1307,18 @@ export function engineCapacity() {
 // bring it back up on its own. -a includes exited/dead containers so a
 // permanently-given-up retry cap (genuinely dead) is correctly reported false.
 export function composeProjectAlive(project) {
-  const res = spawnSync('docker', ['compose', '-p', project, 'ps', '-a', '--format', '{{.State}}'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  if (res.status !== 0) return false;
-  return res.stdout.trim().split('\n').some(s => s === 'running' || s === 'restarting');
+  const res = spawnSync(
+    'docker',
+    ['compose', '-p', project, 'ps', '-a', '--format', '{{.State}}'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  if (res.status !== 0) {
+    return false;
+  }
+  return res.stdout
+    .trim()
+    .split('\n')
+    .some((s) => s === 'running' || s === 'restarting');
 }
 
 // Async sibling of composeProjectAlive — same "running"/"restarting" check,
@@ -817,23 +1333,41 @@ export function composeProjectAlive(project) {
 // pulse/main sat in procs long enough that /api/start rejected a genuine
 // retry attempt.
 export async function composeProjectAliveAsync(project) {
-  const out = await spawnText(['docker', 'compose', '-p', project, 'ps', '-a', '--format', '{{.State}}']);
-  return out.trim().split('\n').some(s => s === 'running' || s === 'restarting');
+  const out = await spawnText([
+    'docker',
+    'compose',
+    '-p',
+    project,
+    'ps',
+    '-a',
+    '--format',
+    '{{.State}}',
+  ]);
+  return out
+    .trim()
+    .split('\n')
+    .some((s) => s === 'running' || s === 'restarting');
 }
 
-// Async, spawnText-based `docker compose ... down` — portal.js's stopContainer
-// and removeWorktree used to call execFileSync('docker', ['compose', ..., 'down'])
-// directly, blocking Bun's single JS thread for however long the teardown takes
-// and stalling every other in-flight request (same class of bug fetchPR hit, and
-// the same reason activePidAsync/listActivePortsAsync/killGroupAsync exist above).
-// extraArgs lets callers pass `-v` (removeWorktree, permanently deleting the
-// worktree) vs nothing (stopContainer, which deliberately keeps the node_modules
-// volume around for a later start). Silently swallows errors, same as the
-// execFileSync call sites it replaces — neither ever surfaced a compose failure
-// to its caller, and this preserves that.
+// Teardown failures must keep the worktree tracked and prevent deletion.
 export async function composeDownAsync(project, composeFile, extraArgs = []) {
-  try { await spawnText(['docker', 'compose', '-p', project, '-f', composeFile, 'down', ...extraArgs]); }
-  catch {}
+  const proc = Bun.spawn(
+    [
+      'docker',
+      'compose',
+      '-p',
+      project,
+      '-f',
+      composeFile,
+      'down',
+      ...extraArgs,
+    ],
+    { stderr: 'pipe', stdout: 'ignore', timeout: 30_000 }
+  );
+  const error = await new Response(proc.stderr).text();
+  if ((await proc.exited) !== 0) {
+    throw new Error(error.trim() || 'Docker Compose teardown failed');
+  }
 }
 
 // Caddy's reverse_proxy target never changes between bare and containerized —
@@ -845,88 +1379,210 @@ export async function composeDownAsync(project, composeFile, extraArgs = []) {
 // (@next/swc-darwin-arm64 etc.) that can't run in the Linux container; only the
 // source tree bind-mounts from the host. The resolved (symlink-followed)
 // .env.local is bind-mounted at the same in-container path the app expects it.
-// One directory, shared by every containerized worktree of every project —
-// not a Docker named volume (those get project-prefixed by Compose unless
-// marked `external: true`, which then requires the volume to already exist
-// before `up`, real ceremony for no benefit here). A plain host bind mount
-// works because unlike node_modules (real compiled/native binaries that
-// can't cross the macOS-host/Linux-container boundary), bun's cache is just
-// downloaded registry tarballs — genuinely portable, safe to share. Bun's
-// own cache is tarball-level and keyed by name@version regardless of which
-// project asked for it (confirmed against bun.sh/docs/install/cache), so
-// two worktrees — even of different repos — installing the same version of
-// the same package both hit this cache instead of both re-fetching.
-// Concurrent `bun install`s from different containers writing here at once:
-// the one documented race (oven-sh/bun#28062) is explicitly Windows-only in
-// its own root-cause (a #[cfg(windows)] code path) — not proven safe on
-// Linux by the docs, but no equivalent Linux corruption report exists
-// either, and Setu's own concurrency cap keeps simultaneous container
-// starts small regardless.
+// Containers reuse this download cache. Bun's cache contains package contents,
+// including dist directories; never recursively sweep it for build outputs.
+// Host Darwin dependencies and container Linux dependencies remain separate:
+// each containerized worktree has its own node_modules volume.
+// Cache layout: https://bun.com/docs/pm/global-cache
 function bunCacheDir(workspace) {
   const dir = join(workspace, '.bun-cache');
   mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-export function writeDockerCompose(c, repo, name, port) {
+export async function writeDockerCompose(
+  c,
+  repo,
+  name,
+  port,
+  cap,
+  admittedSpec
+) {
   const wtDir = join(c.workspace, repo, name);
-  const project = composeProjectName(repo, name);
+  const spec = admittedSpec ?? {
+    container: true,
+    limits: effectiveContainerLimits(c, cap ?? engineCapacity()),
+    port,
+    project: composeProjectName(repo, name),
+  };
+  if (spec.port !== port || spec.project !== composeProjectName(repo, name)) {
+    throw new Error('Admitted container identity changed');
+  }
+  const hostEnvLocal = envLocalPath(repo, wtDir);
+  let envLocal = null;
+  try {
+    envLocal = {
+      container: `/workspace${hostEnvLocal.slice(wtDir.length)}`,
+      host: realpathSync(hostEnvLocal),
+    };
+  } catch {
+    /* no .env.local yet (fresh worktree) — container still boots without it */
+  }
+  const yaml = renderDockerCompose(spec, {
+    cacheDir: bunCacheDir(c.workspace),
+    env: parseEnvFile(join(wtDir, '.envrc')),
+    envLocal,
+    wtDir,
+  });
+  installedStateValue(
+    await workspaceState(c.workspace).replaceText(
+      dockerComposePath(wtDir),
+      yaml
+    )
+  );
+  return dockerComposePath(wtDir);
+}
 
-  // Map, not an array of pairs — .envrc already contains `export PORT=...`
-  // (writeEnvrc always writes it first), so a plain array would emit PORT
-  // twice and Docker's YAML parser rejects the resulting duplicate mapping
-  // key outright (`docker compose up` fails before anything starts).
-  const env = new Map([['PORT', String(port)], ['BUN_INSTALL_CACHE_DIR', '/bun-cache']]);
-  for (const [k, v] of Object.entries(parseEnvFile(join(wtDir, '.envrc')))) env.set(k, v);
-  const envLines = [...env].map(([k, v]) => `      ${k}: ${JSON.stringify(v)}`).join('\n');
+export function agentComposePath(wtDir) {
+  return join(wtDir, 'docker-compose.setu-agent.yml');
+}
 
+// Agent-container sibling of writeDockerCompose, for the short-lived headless
+// runs agent.js drives — not the long-running dev server. Every divergence
+// below was found the hard way against a real worktree, not a style choice:
+//
+//  - image/command: `opts.image` (setu-agent:latest by default) idling on
+//    `sleep infinity`. Sandcastle does the actual work via `docker exec`
+//    into this container; it never runs `bun run dev` itself, so there's
+//    nothing here that looks like writeDockerCompose's install-and-serve
+//    command.
+//  - restart: "no", not on-failure:3. A dev server resurrecting itself after
+//    a crash is the point; an agent container resurrecting itself after the
+//    run that owned it is gone is a zombie nobody is watching for exit.
+//  - the git mount, below — the one that actually breaks things if skipped.
+//  - environment is exactly `opts.env`, no .envrc parse and no injected
+//    PORT — this container serves nothing, so there's no port to publish
+//    and no dev-server env to inherit by default.
+//  - no node_modules/bun-cache/.env.local mounts. Those exist in
+//    writeDockerCompose purely to make `bun install && bun run dev` fast;
+//    an idling `sleep infinity` container never runs that command, so
+//    they'd just be unused volumes. A caller that wants installed deps
+//    reachable passes them through opts.mounts / opts.env instead.
+export async function writeAgentCompose(
+  c,
+  repo,
+  name,
+  opts = {},
+  capacity = engineCapacity()
+) {
+  const wtDir = join(c.workspace, repo, name);
+  // Suffixed, not composeProjectName(repo, name) verbatim — that exact name
+  // is already the dev-server project for this same worktree (or will be,
+  // the moment `setu start --container` runs), and two different compose
+  // files sharing one Compose project name get silently reconciled against
+  // each other on `up`. The suffix rides on the same sha1-of-registry-key
+  // composeProjectName already uses to dodge repo/name slug collisions, so
+  // it inherits that same collision-safety for free.
+  const project = `${composeProjectName(repo, name)}-agent`;
+
+  // A Setu worktree's `.git` is a *file*, not a directory — it holds
+  // `gitdir: <workspace>/<repo>.git/worktrees/<branch>`, an absolute path
+  // into the bare repo. Mounting only `wtDir:/workspace` (fine for
+  // writeDockerCompose — `bun run dev` never touches git) leaves that
+  // pointer dangling inside the container: nothing at that path, git
+  // resolution fails on the first command. The bare repo has to be mounted
+  // at the *identical* host path so the pointer resolves unchanged, and
+  // read-write because `git commit` writes objects/refs into that shared
+  // dir — read-only would turn every commit inside the container into a
+  // permission error.
+  const bareRepoDir = `${c.workspace}/${repo}.git`;
+  // node_modules MUST be a container-local named volume, exactly as
+  // writeDockerCompose does it — and for a sharper reason here. The worktree
+  // is bind-mounted read-write, so a `bun install` run *inside* the Linux
+  // container writes Linux-native binaries (@next/swc-linux-arm64-gnu et al)
+  // straight into the host's node_modules, breaking the macOS dev server
+  // running against that same worktree. An agent implementing a feature runs
+  // install/test/typecheck constantly, so this is the common path, not an
+  // edge case. The named volume is namespaced by the compose project name,
+  // which means it's also isolated from the dev server's own volume rather
+  // than racing it.
+  //
+  // The bun cache comes along for the same reason writeDockerCompose mounts
+  // it: the volume starts empty on a fresh agent run, and without the shared
+  // cache that first install is a full cold download every time.
   const volumes = [
     `      - ${wtDir}:/workspace`,
-    `      - node_modules:/workspace/node_modules`,
+    '      - node_modules:/workspace/node_modules',
     `      - ${bunCacheDir(c.workspace)}:/bun-cache`,
+    `      - ${bareRepoDir}:${bareRepoDir}`,
   ];
-  const hostEnvLocal = envLocalPath(repo, wtDir);
-  try {
-    const real = realpathSync(hostEnvLocal);
-    const inContainer = '/workspace' + hostEnvLocal.slice(wtDir.length);
-    volumes.push(`      - ${real}:${inContainer}`);
-  } catch { /* no .env.local yet (fresh worktree) — container still boots without it */ }
+  // Credential mounts are forced read-only regardless of what the caller
+  // passed in `readonly` — a writable credential mount would let a
+  // compromised agent run overwrite the token file back on the host.
+  for (const m of opts.mounts ?? []) {
+    volumes.push(`      - ${m.hostPath}:${m.sandboxPath}:ro`);
+  }
 
-  const cap = engineCapacity();
+  // Map, not Object.entries piped straight to lines — opts.env is a plain
+  // object so it can't itself carry a duplicate key, but building through a
+  // Map keeps this function immune to the same duplicate-mapping-key class
+  // of bug writeDockerCompose's PORT/env comment documents, in case a future
+  // caller merges more than one source into opts.env before calling this.
+  // Seeded before opts.env so an explicit caller value still wins, and so the
+  // mounted /bun-cache is actually used rather than sitting there inert.
+  const env = new Map([
+    ['BUN_INSTALL_CACHE_DIR', '/bun-cache'],
+    ...Object.entries(opts.env ?? {}),
+  ]);
+  const envLines = [...env].map(([k, v]) => `      ${k}: ${JSON.stringify(v)}`);
+
+  const cap = capacity;
   let memLimit = c.containerMemoryLimit ?? '4g';
   let cpuLimit = c.containerCpuLimit ?? 2;
-  if (cap.cpus && Number(cpuLimit) > cap.cpus) cpuLimit = cap.cpus;
+  if (cap.cpus && Number(cpuLimit) > cap.cpus) {
+    cpuLimit = cap.cpus;
+  }
   const memMb = parseMemToMb(memLimit);
-  if (cap.memMb && memMb && memMb > cap.memMb) memLimit = `${cap.memMb}m`;
+  if (cap.memMb && memMb && memMb > cap.memMb) {
+    memLimit = `${cap.memMb}m`;
+  }
 
-  const yaml = `# Generated by setu — regenerated on every \`setu start --container\`, do not edit by hand.
-name: ${project}
-services:
-  dev:
-    image: oven/bun:latest
-    working_dir: /workspace
-    command: sh -c "bun install && bun run dev"
-    restart: on-failure:3
-    mem_limit: "${memLimit}"
-    cpus: "${cpuLimit}"
-    ports:
-      - "${port}:${port}"
-    environment:
-${envLines}
-    volumes:
-${volumes.join('\n')}
-volumes:
-  node_modules:
-`;
-  writeFileSync(dockerComposePath(wtDir), yaml);
-  return dockerComposePath(wtDir);
+  const lines = [
+    '# Generated by setu — regenerated on every agent run, do not edit by hand.',
+    `name: ${project}`,
+    'services:',
+    '  agent:',
+    `    image: ${opts.image ?? 'setu-agent:latest'}`,
+    '    working_dir: /workspace',
+    '    command: sleep infinity',
+    '    restart: "no"',
+    `    mem_limit: "${memLimit}"`,
+    `    cpus: "${cpuLimit}"`,
+  ];
+  if (envLines.length) {
+    lines.push('    environment:', ...envLines);
+  }
+  lines.push('    volumes:', ...volumes);
+  // Egress allowlist hook: `opts.network` names a Docker network that
+  // already exists on the host (the allowlist/proxy setup lives wherever
+  // that network was created, not here) — attach to it when given, and say
+  // nothing when it's absent so Compose falls back to its own default
+  // bridge, same as every other worktree today.
+  if (opts.network) {
+    lines.push('    networks:', `      - ${opts.network}`);
+  }
+  // Top-level blocks come after the whole service block, so they're pushed
+  // here rather than inline with their service-level counterparts.
+  lines.push('volumes:', '  node_modules:');
+  if (opts.network) {
+    lines.push('networks:', `  ${opts.network}:`, '    external: true');
+  }
+
+  const yaml = `${lines.join('\n')}\n`;
+  installedStateValue(
+    await workspaceState(c.workspace).replaceText(agentComposePath(wtDir), yaml)
+  );
+  return agentComposePath(wtDir);
 }
 
 // ── git worktrees ─────────────────────────────────────────────────────────────
 
 export function git(repoDir, args, opts = {}) {
-  return execFileSync('git', ['-C', repoDir, ...args],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return execFileSync('git', ['-C', repoDir, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...opts,
+  });
 }
 
 // Async counterpart to git() for the two call sites that are genuinely
@@ -937,20 +1593,32 @@ export function git(repoDir, args, opts = {}) {
 // fetchPR already fixed. Throws on failure like git() itself (unlike
 // spawnText, which silently returns '') -- both callers rely on a failed
 // fetch aborting rather than silently proceeding against a stale base.
-async function gitFetchAsync(dir, args) {
-  const proc = Bun.spawn(['git', '-C', dir, ...args], { stderr: 'pipe', stdout: 'pipe' });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const code = await proc.exited;
-  if (code !== 0) throw new Error(stderr.trim() || `git ${args.join(' ')} failed (exit ${code})`);
-  return stdout;
+export async function gitFetchAsync(
+  dir,
+  args,
+  { spawn = (args, options) => Bun.spawn(args, options) } = {}
+) {
+  const run = createCommandRunner((args, options) =>
+    spawn(args, { ...options, killSignal: 'SIGKILL' })
+  );
+  const result = await run(['git', '-C', dir, ...args], { timeoutMs: 120_000 });
+  if (result.code !== 0 || result.timedOut || result.truncated) {
+    throw new Error(
+      result.stderr ||
+        `git ${args.join(' ')} failed or returned incomplete output (exit ${result.code})`
+    );
+  }
+  return result.stdout;
 }
 
 export function branchExists(repoDir, name) {
   for (const ref of [`refs/heads/${name}`, `refs/remotes/origin/${name}`]) {
-    if (spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', ref]).status === 0) return true;
+    if (
+      spawnSync('git', ['-C', repoDir, 'show-ref', '--verify', '--quiet', ref])
+        .status === 0
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -958,9 +1626,11 @@ export function branchExists(repoDir, name) {
 export function worktreeForBranch(repoDir, name) {
   const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
   for (const entry of porcelain.trim().split('\n\n')) {
-    const path   = entry.match(/^worktree (.+)$/m)?.[1];
+    const path = entry.match(/^worktree (.+)$/m)?.[1];
     const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
-    if (branch === name) return path;
+    if (branch === name) {
+      return path;
+    }
   }
   return null;
 }
@@ -971,13 +1641,17 @@ export function worktreeForBranch(repoDir, name) {
 // (confirmed live: a worktree directory can be on a branch with a completely
 // different name than the directory itself), so joining git ref data back to
 // a specific worktree has to go through the actual path, not an assumption.
-export function worktreeBranchMap(repoDir) {
-  const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
+export function worktreeBranchMap(
+  repoDir,
+  porcelain = git(repoDir, ['worktree', 'list', '--porcelain'])
+) {
   const map = new Map();
   for (const entry of porcelain.trim().split('\n\n')) {
-    const path   = entry.match(/^worktree (.+)$/m)?.[1];
+    const path = entry.match(/^worktree (.+)$/m)?.[1];
     const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
-    if (path && branch) map.set(resolve(path), branch);
+    if (path && branch) {
+      map.set(resolve(path), branch);
+    }
   }
   return map;
 }
@@ -988,7 +1662,8 @@ export function worktreeBranchMap(repoDir) {
 // registered repos (confirmed live: only 2 of 5 have it; using it
 // unconditionally fails with "unknown revision" on the rest).
 export function baseBranchRef(repoDir) {
-  return branchExists(repoDir, 'staging') ? 'origin/staging'
+  return branchExists(repoDir, 'staging')
+    ? 'origin/staging'
     : `origin/${git(repoDir, ['symbolic-ref', '--short', 'HEAD']).trim()}`;
 }
 
@@ -1000,22 +1675,39 @@ export function baseBranchRef(repoDir) {
 // parsing `git merge-tree` output), then immediately aborted so the worktree
 // is never left mid-conflict. Setu tells you what would conflict; resolving
 // it is still the user's job in their own editor.
-export async function syncWithBase(wtDir, repoDir) {
-  const base = baseBranchRef(repoDir);
+export async function syncWithBase(
+  wtDir,
+  repoDir,
+  {
+    resolveBase = baseBranchRef,
+    runGit = gitFetchAsync,
+    exists = existsSync,
+  } = {}
+) {
+  const base = resolveBase(repoDir);
   const branchName = base.replace(/^origin\//, '');
-  await gitFetchAsync(wtDir, ['fetch', 'origin', branchName]);
+  await runGit(wtDir, ['fetch', 'origin', branchName]);
 
-  const dirty = git(wtDir, ['status', '--porcelain']).trim();
-  if (dirty) return { error: 'Worktree has uncommitted changes — commit or stash first.', ok: false };
+  const dirty = (await runGit(wtDir, ['status', '--porcelain'])).trim();
+  if (dirty) {
+    return {
+      error: 'Worktree has uncommitted changes — commit or stash first.',
+      ok: false,
+    };
+  }
 
   try {
-    git(wtDir, ['merge', base, '--no-edit']);
+    await runGit(wtDir, ['merge', base, '--no-edit']);
     return { base, ok: true };
   } catch (mergeErr) {
-    const status = git(wtDir, ['status', '--porcelain']);
-    const conflicts = status.split('\n')
-      .filter(l => /^(UU|AA|DD|AU|UA|UD|DU)/.test(l))
-      .map(l => l.slice(3).trim());
+    if (mergeErr.code === 'OPERATION_UNKNOWN') {
+      throw mergeErr;
+    }
+    const status = await runGit(wtDir, ['status', '--porcelain']);
+    const conflicts = status
+      .split('\n')
+      .filter((l) => /^(UU|AA|DD|AU|UA|UD|DU)/.test(l))
+      .map((l) => l.slice(3).trim());
     // Only a real conflict leaves MERGE_HEAD behind — `merge --abort` itself
     // throws ("no merge to abort") if the failure was something else (e.g.
     // an unresolvable ref), which would otherwise crash this request instead
@@ -1023,10 +1715,24 @@ export async function syncWithBase(wtDir, repoDir) {
     // because a linked worktree's .git is a file pointing elsewhere, not a
     // directory — the real MERGE_HEAD lives under the main repo's
     // worktrees/<name>/ dir, which only `git` itself resolves correctly.
-    const mergeHeadPath = resolve(wtDir, git(wtDir, ['rev-parse', '--git-path', 'MERGE_HEAD']).trim());
-    if (existsSync(mergeHeadPath)) git(wtDir, ['merge', '--abort']);
-    if (!conflicts.length) return { error: `Merge failed: ${mergeErr.stderr || mergeErr.message}`, ok: false };
-    return { conflicts, error: `Would conflict in ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} — merge aborted, worktree unchanged.`, ok: false };
+    const mergeHeadPath = resolve(
+      wtDir,
+      (await runGit(wtDir, ['rev-parse', '--git-path', 'MERGE_HEAD'])).trim()
+    );
+    if (exists(mergeHeadPath)) {
+      await runGit(wtDir, ['merge', '--abort']);
+    }
+    if (!conflicts.length) {
+      return {
+        error: `Merge failed: ${mergeErr.stderr || mergeErr.message}`,
+        ok: false,
+      };
+    }
+    return {
+      conflicts,
+      error: `Would conflict in ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} — merge aborted, worktree unchanged.`,
+      ok: false,
+    };
   }
 }
 
@@ -1041,19 +1747,34 @@ export async function syncWithBase(wtDir, repoDir) {
 // responsive. Returns Map<branchName, {lastCommitAt, ahead, behind}>;
 // ahead/behind are 0 if the repo has no reachable base (rare, but
 // for-each-ref degrades to blank fields rather than erroring per-branch).
-export function branchMetadata(repoDir) {
-  const base = baseBranchRef(repoDir);
-  let raw;
-  try {
-    raw = git(repoDir, ['for-each-ref',
-      `--format=%(refname:short)\t%(committerdate:unix)\t%(ahead-behind:${base})`, 'refs/heads/']);
-  } catch { return new Map(); }
+export function branchMetadata(repoDir, raw) {
+  if (raw === undefined) {
+    const base = baseBranchRef(repoDir);
+    try {
+      raw = git(repoDir, [
+        'for-each-ref',
+        `--format=%(refname:short)\t%(committerdate:unix)\t%(ahead-behind:${base})`,
+        'refs/heads/',
+      ]);
+    } catch {
+      return new Map();
+    }
+  }
   const map = new Map();
   for (const line of raw.trim().split('\n')) {
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
     const [branch, at, ab] = line.split('\t');
-    const [ahead, behind] = (ab ?? '').trim().split(/\s+/).map(n => parseInt(n, 10) || 0);
-    map.set(branch, { ahead: ahead ?? 0, behind: behind ?? 0, lastCommitAt: parseInt(at, 10) || null });
+    const [ahead, behind] = (ab ?? '')
+      .trim()
+      .split(/\s+/)
+      .map((n) => Number.parseInt(n, 10) || 0);
+    map.set(branch, {
+      ahead: ahead ?? 0,
+      behind: behind ?? 0,
+      lastCommitAt: Number.parseInt(at, 10) || null,
+    });
   }
   return map;
 }
@@ -1070,20 +1791,39 @@ export function branchMetadata(repoDir) {
 // that matches nothing are both expected, logged, and skipped, not fatal to
 // worktree creation.
 export function syncIncludedFiles(mainDir, wtDir, globs) {
-  if (!globs?.length) return;
+  if (!globs?.length) {
+    return;
+  }
   if (!existsSync(mainDir)) {
     console.warn(`⚠  file sync skipped — no main worktree yet at ${mainDir}`);
     return;
   }
   for (const pattern of globs) {
     let matches;
-    try { matches = [...new Bun.Glob(pattern).scanSync({ cwd: mainDir, dot: true, onlyFiles: true })]; }
-    catch (e) { console.warn(`⚠  file sync: bad glob "${pattern}": ${e.message}`); continue; }
-    if (!matches.length) { console.warn(`⚠  file sync: "${pattern}" matched nothing in ${mainDir}`); continue; }
+    try {
+      matches = [
+        ...new Bun.Glob(pattern).scanSync({
+          cwd: mainDir,
+          dot: true,
+          onlyFiles: true,
+        }),
+      ];
+    } catch (e) {
+      console.warn(`⚠  file sync: bad glob "${pattern}": ${e.message}`);
+      continue;
+    }
+    if (!matches.length) {
+      console.warn(`⚠  file sync: "${pattern}" matched nothing in ${mainDir}`);
+      continue;
+    }
     for (const rel of matches) {
-      if (rel.startsWith('..')) continue; // a glob can't reach outside mainDir
+      if (rel.startsWith('..')) {
+        continue; // a glob can't reach outside mainDir
+      }
       const dest = join(wtDir, rel);
-      if (existsSync(dest)) continue; // never clobber an already-edited copy
+      if (existsSync(dest)) {
+        continue; // never clobber an already-edited copy
+      }
       try {
         mkdirSync(dirname(dest), { recursive: true });
         copyFileSync(join(mainDir, rel), dest);
@@ -1096,56 +1836,103 @@ export function syncIncludedFiles(mainDir, wtDir, globs) {
 
 // Creates worktree + port + envrc + caddy + env symlink + hosts. Dependency
 // install is the caller's job (CLI runs it inline, portal in the background).
-export async function createWorktree(c, repo, name, { tunnel = false } = {}) {
-  const repoDir = join(c.workspace, `${repo}.git`);
-  const wtDir   = join(c.workspace, repo, name);
-  if (!existsSync(repoDir)) throw new Error(`Bare repo not found: ${repoDir}\nRun: setu init <gh-slug>`);
-
-  await gitFetchAsync(repoDir, ['fetch', '--all', '--prune']);
-  git(repoDir, ['worktree', 'prune']);
-
-  if (!existsSync(wtDir)) {
-    const existingPath = worktreeForBranch(repoDir, name);
-    if (existingPath && resolve(existingPath) !== resolve(wtDir)) {
-      throw new Error(`Branch '${name}' is already checked out at ${existingPath}`);
+export async function createWorktree(
+  c,
+  repo,
+  name,
+  { tunnel = false, readStorage } = {}
+) {
+  return workspaceState(c.workspace).withTargets([{ name, repo }], async () => {
+    const pending = validateRemovalRecords(
+      workspaceState(c.workspace).read('removals')
+    );
+    if (Object.values(pending).some((row) => row.key === `${repo}/${name}`)) {
+      throw Object.assign(
+        new Error(
+          'Removal cleanup is pending for this worktree; retry its operation before creating'
+        ),
+        { code: 'REMOVAL_PENDING' }
+      );
     }
-    if (branchExists(repoDir, name)) {
-      git(repoDir, ['worktree', 'add', wtDir, name]);
-    } else {
-      // new branches fork from staging when the repo has one, else the default branch
-      const base = baseBranchRef(repoDir);
-      git(repoDir, ['worktree', 'add', '-b', name, wtDir, base]);
+    const repoDir = join(c.workspace, `${repo}.git`);
+    const wtDir = managedWorktreePath(c.workspace, repo, name, {
+      registered: false,
+    });
+    if (!existsSync(repoDir)) {
+      throw new Error(
+        `Bare repo not found: ${repoDir}\nRun: setu init <gh-slug>`
+      );
     }
-  }
 
-  const port = assignPort(c.workspace, repo, name);
-  configureWorktreeEnv(c, repo, name, port, tunnel);
+    await assertStorageHeadroom(c.workspace, readStorage);
+    await prepareWorktreeCheckout(
+      { exists: existsSync(wtDir), name, repoDir, wtDir },
+      {
+        run: createCommandRunner((args, options) => Bun.spawn(args, options)),
+      }
+    );
 
-  const mainEnv = envLocalPath(repo, join(c.workspace, repo, 'main'));
-  const wtEnv   = envLocalPath(repo, wtDir);
-  if (existsSync(mainEnv) && !existsSync(wtEnv)) {
-    spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
-  }
+    const port = await assignPort(c.workspace, repo, name);
+    await configureWorktreeEnv(c, repo, name, port, tunnel);
 
-  const mainDir = join(c.workspace, repo, 'main');
-  syncIncludedFiles(mainDir, wtDir, loadFileSyncGlobs(c.workspace, repo));
+    const mainEnv = envLocalPath(repo, join(c.workspace, repo, 'main'));
+    const wtEnv = envLocalPath(repo, wtDir);
+    if (existsSync(mainEnv) && !existsSync(wtEnv)) {
+      spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
+    }
 
-  syncHosts(c.workspace);
-  reloadCaddy(c.workspace);
+    const mainDir = join(c.workspace, repo, 'main');
+    syncIncludedFiles(mainDir, wtDir, loadFileSyncGlobs(c.workspace, repo));
 
-  return { localDom: localDomain(repo, name), port, pubDom: tunnel ? publicDomain(c) : null, wtDir };
+    await workspaceState(c.workspace).withRouting(async () => {
+      await syncHosts(c.workspace);
+      await reloadCaddy(c.workspace);
+    });
+
+    return {
+      localDom: localDomain(repo, name),
+      port,
+      pubDom: tunnel ? publicDomain(c) : null,
+      wtDir,
+    };
+  });
 }
 
 // Removes worktree + registry entries + caddy snippet + hosts. Stopping dev
 // servers / tunnel routes is the caller's job (only the portal owns processes).
-export function removeWorktree(c, repo, name) {
-  const repoDir = join(c.workspace, `${repo}.git`);
-  const wtDir   = join(c.workspace, repo, name);
-  git(repoDir, ['worktree', 'remove', '--force', wtDir]);
-  releasePort(c.workspace, repo, name);
-  try { unlinkSync(caddySnippetPath(c.workspace, repo, name)); } catch {}
-  reloadCaddy(c.workspace);
-  syncHosts(c.workspace);
+export async function assertRemovableWorktree(
+  c,
+  repo,
+  name,
+  { force = false } = {}
+) {
+  const wtDir = managedWorktreePath(c.workspace, repo, name);
+  if (typeof force !== 'boolean') {
+    throw new Error('force must be a boolean');
+  }
+  if (force) {
+    return;
+  }
+  const dirty = await gitFetchAsync(wtDir, [
+    '--no-optional-locks',
+    'status',
+    '--porcelain',
+    '--untracked-files=all',
+  ]);
+  if (dirty.trim()) {
+    throw new Error(
+      'Worktree has uncommitted changes or untracked files. Commit or stash them first; force removal permanently discards them.'
+    );
+  }
+}
+
+export async function removeWorktree() {
+  throw Object.assign(
+    new Error(
+      'PORTAL_REQUIRED: removal must use the running portal and its durable recovery controller'
+    ),
+    { code: 'PORTAL_REQUIRED' }
+  );
 }
 
 // ── sweep & import (plain git clones outside Setu's bare+worktree layout) ────
@@ -1166,8 +1953,28 @@ export function removeWorktree(c, repo, name) {
 // -prune after -print stops find from wastefully descending into a matched
 // .git's own internals (objects/, refs/, ...) once it's already been found.
 function sweepFindArgs(homeDir) {
-  return [homeDir, '(', '-name', '.*', '-a', '!', '-name', '.git', '-o', '-name', 'node_modules', ')', '-prune',
-    '-o', '-type', 'd', '-name', '.git', '-print', '-prune'];
+  return [
+    homeDir,
+    '(',
+    '-name',
+    '.*',
+    '-a',
+    '!',
+    '-name',
+    '.git',
+    '-o',
+    '-name',
+    'node_modules',
+    ')',
+    '-prune',
+    '-o',
+    '-type',
+    'd',
+    '-name',
+    '.git',
+    '-print',
+    '-prune',
+  ];
 }
 
 // Same slug.split('/').pop() cmdInit already uses to name a project off a
@@ -1177,8 +1984,11 @@ function sweepFindArgs(homeDir) {
 // user@host: prefix first. No remote at all leaves only the containing
 // directory's own name to go on.
 function deriveSweepName(remoteUrl, dirName) {
-  if (!remoteUrl) return dirName;
-  const slug = remoteUrl.trim()
+  if (!remoteUrl) {
+    return dirName;
+  }
+  const slug = remoteUrl
+    .trim()
     .replace(/^\w+:\/\/[^/]+\//, '')
     .replace(/^[^@\s]+@[^:]+:/, '')
     .replace(/\.git$/, '');
@@ -1190,10 +2000,32 @@ function deriveSweepName(remoteUrl, dirName) {
 // already-registered project's actual origin URL (read from its bare repo,
 // not the .projects slug field, so this compares the real clone source).
 // Returns null for "drop entirely" (same remote already registered).
-function classifySweepCandidate({ path, name, remoteUrl, dirty }, projects, registeredRemotes) {
-  if (remoteUrl && registeredRemotes.has(remoteUrl)) return null;
-  if (projects[name]) return { conflictWith: name, dirty, name, path, remoteUrl, status: 'conflict' };
-  return { conflictWith: null, dirty, name, path, remoteUrl, status: remoteUrl ? 'importable' : 'no-remote' };
+function classifySweepCandidate(
+  { path, name, remoteUrl, dirty },
+  projects,
+  registeredRemotes
+) {
+  if (remoteUrl && registeredRemotes.has(remoteUrl)) {
+    return null;
+  }
+  if (projects[name]) {
+    return {
+      conflictWith: name,
+      dirty,
+      name,
+      path,
+      remoteUrl,
+      status: 'conflict',
+    };
+  }
+  return {
+    conflictWith: null,
+    dirty,
+    name,
+    path,
+    remoteUrl,
+    status: remoteUrl ? 'importable' : 'no-remote',
+  };
 }
 
 // Per-candidate git probes only (not the find walk, and not git() calls
@@ -1208,25 +2040,45 @@ const SWEEP_GIT_TIMEOUT_MS = 1500;
 
 function readOriginUrl(dir) {
   try {
-    return execFileSync('git', ['-C', dir, 'remote', 'get-url', 'origin'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: SWEEP_GIT_TIMEOUT_MS }).trim() || null;
-  } catch { return null; }
+    return (
+      execFileSync('git', ['-C', dir, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: SWEEP_GIT_TIMEOUT_MS,
+      }).trim() || null
+    );
+  } catch {
+    return null;
+  }
 }
 
 function readDirty(dir) {
   try {
-    return execFileSync('git', ['-C', dir, '--no-optional-locks', 'status', '--porcelain'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: SWEEP_GIT_TIMEOUT_MS }).trim().length > 0;
-  } catch { return false; }
+    return (
+      execFileSync(
+        'git',
+        ['-C', dir, '--no-optional-locks', 'status', '--porcelain'],
+        {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: SWEEP_GIT_TIMEOUT_MS,
+        }
+      ).trim().length > 0
+    );
+  } catch {
+    return false;
+  }
 }
 
 // CLI path: execFileSync, synchronous throughout. Blocking is fine here —
 // this only runs when someone explicitly types `setu sweep`.
 export function discoverRepos(homeDir) {
   const workspace = loadConfig().workspace;
-  const projects  = workspace ? loadProjects(workspace) : {};
+  const projects = workspace ? loadProjects(workspace) : {};
   const registeredRemotes = new Set(
-    Object.keys(projects).map(name => readOriginUrl(join(workspace, `${name}.git`))).filter(Boolean)
+    Object.keys(projects)
+      .map((name) => readOriginUrl(join(workspace, `${name}.git`)))
+      .filter(Boolean)
   );
 
   let raw;
@@ -1235,14 +2087,19 @@ export function discoverRepos(homeDir) {
     // permission-denied system dirs (~/Library/.../TCC, CallHistoryDB, ...)
     // that find reports on stderr; inheriting it would dump that noise
     // straight into the user's terminal on every `setu sweep`, verified live.
-    raw = execFileSync('find', sweepFindArgs(homeDir), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch (e) { raw = e.stdout ?? ''; } // find exits non-zero on permission-denied subdirs, stdout is still complete
+    raw = execFileSync('find', sweepFindArgs(homeDir), {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    raw = e.stdout ?? '';
+  } // find exits non-zero on permission-denied subdirs, stdout is still complete
   const gitDirs = raw.split('\n').filter(Boolean);
 
   const out = [];
   for (const gitDir of gitDirs) {
-    const dir  = resolve(gitDir, '..');
-    const t0   = Date.now();
+    const dir = resolve(gitDir, '..');
+    const t0 = Date.now();
     const remoteUrl = readOriginUrl(dir);
     // Sequential (unlike the portal path's Promise.all pair), so a path that
     // already burned the full timeout on the first call — a git process
@@ -1250,10 +2107,16 @@ export function discoverRepos(homeDir) {
     // waiting the full timeout on again for the second. dirty is informational
     // only, false is a safe default for a path this unresponsive.
     const timedOut = Date.now() - t0 >= SWEEP_GIT_TIMEOUT_MS - 50;
-    const dirty  = timedOut ? false : readDirty(dir);
-    const name   = deriveSweepName(remoteUrl, dir.split('/').pop());
-    const shaped = classifySweepCandidate({ dirty, name, path: dir, remoteUrl }, projects, registeredRemotes);
-    if (shaped) out.push(shaped);
+    const dirty = timedOut ? false : readDirty(dir);
+    const name = deriveSweepName(remoteUrl, dir.split('/').pop());
+    const shaped = classifySweepCandidate(
+      { dirty, name, path: dir, remoteUrl },
+      projects,
+      registeredRemotes
+    );
+    if (shaped) {
+      out.push(shaped);
+    }
   }
   return out;
 }
@@ -1265,7 +2128,7 @@ export function discoverRepos(homeDir) {
 async function batchMap(items, size, fn) {
   const out = [];
   for (let i = 0; i < items.length; i += size) {
-    out.push(...await Promise.all(items.slice(i, i + size).map(fn)));
+    out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
   }
   return out;
 }
@@ -1282,21 +2145,35 @@ async function batchMap(items, size, fn) {
 export async function spawnText(args, { timeoutMs } = {}) {
   try {
     const opts = { stderr: 'ignore', stdout: 'pipe' };
-    if (timeoutMs) opts.timeout = timeoutMs;
+    if (timeoutMs) {
+      opts.timeout = timeoutMs;
+    }
     const proc = Bun.spawn(args, opts);
     const text = await new Response(proc.stdout).text();
     await proc.exited;
     return text.trim();
-  } catch { return ''; }
+  } catch {
+    return '';
+  }
 }
 
 async function readOriginUrlAsync(dir) {
-  const out = await spawnText(['git', '-C', dir, 'remote', 'get-url', 'origin'], { timeoutMs: SWEEP_GIT_TIMEOUT_MS });
+  const out = await spawnText(
+    ['git', '-C', dir, 'remote', 'get-url', 'origin'],
+    { timeoutMs: SWEEP_GIT_TIMEOUT_MS }
+  );
   return out || null;
 }
 
 async function readDirtyAsync(dir) {
-  return (await spawnText(['git', '-C', dir, '--no-optional-locks', 'status', '--porcelain'], { timeoutMs: SWEEP_GIT_TIMEOUT_MS })).length > 0;
+  return (
+    (
+      await spawnText(
+        ['git', '-C', dir, '--no-optional-locks', 'status', '--porcelain'],
+        { timeoutMs: SWEEP_GIT_TIMEOUT_MS }
+      )
+    ).length > 0
+  );
 }
 
 // Portal path: Bun.spawn based, async throughout (including the find walk
@@ -1309,20 +2186,30 @@ async function readDirtyAsync(dir) {
 // processes at once.
 export async function discoverReposAsync(homeDir) {
   const workspace = loadConfig().workspace;
-  const projects  = workspace ? loadProjects(workspace) : {};
+  const projects = workspace ? loadProjects(workspace) : {};
   const registeredRemotes = new Set(
-    (await batchMap(Object.keys(projects), 8, name => readOriginUrlAsync(join(workspace, `${name}.git`))))
-      .filter(Boolean)
+    (
+      await batchMap(Object.keys(projects), 8, (name) =>
+        readOriginUrlAsync(join(workspace, `${name}.git`))
+      )
+    ).filter(Boolean)
   );
 
-  const raw     = await spawnText(['find', ...sweepFindArgs(homeDir)]);
+  const raw = await spawnText(['find', ...sweepFindArgs(homeDir)]);
   const gitDirs = raw.split('\n').filter(Boolean);
-  const dirs    = gitDirs.map(g => resolve(g, '..'));
+  const dirs = gitDirs.map((g) => resolve(g, '..'));
 
-  const shaped = await batchMap(dirs, 8, async dir => {
-    const [remoteUrl, dirty] = await Promise.all([readOriginUrlAsync(dir), readDirtyAsync(dir)]);
+  const shaped = await batchMap(dirs, 8, async (dir) => {
+    const [remoteUrl, dirty] = await Promise.all([
+      readOriginUrlAsync(dir),
+      readDirtyAsync(dir),
+    ]);
     const name = deriveSweepName(remoteUrl, dir.split('/').pop());
-    return classifySweepCandidate({ dirty, name, path: dir, remoteUrl }, projects, registeredRemotes);
+    return classifySweepCandidate(
+      { dirty, name, path: dir, remoteUrl },
+      projects,
+      registeredRemotes
+    );
   });
   return shaped.filter(Boolean);
 }
@@ -1334,15 +2221,41 @@ export async function discoverReposAsync(homeDir) {
 // does the first fetch. Shared by importRepo below and portal.js's
 // addProject; stdio defaults to 'inherit' (importRepo's CLI callers want
 // clone progress visible), addProject passes 'pipe' since it's headless.
-export function cloneBareRepo(repoDir, remoteUrl, ghSlug, { stdio = 'inherit' } = {}) {
-  const useGh = ghSlug && spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
+export function cloneBareRepo(
+  repoDir,
+  remoteUrl,
+  ghSlug,
+  { stdio = 'inherit' } = {}
+) {
+  const useGh =
+    ghSlug &&
+    spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0;
   if (useGh) {
-    execFileSync('gh', ['repo', 'clone', ghSlug, repoDir, '--', '--bare'], { stdio });
+    execFileSync('gh', ['repo', 'clone', ghSlug, repoDir, '--', '--bare'], {
+      stdio,
+    });
   } else {
     execFileSync('git', ['clone', '--bare', remoteUrl, repoDir], { stdio });
   }
-  git(repoDir, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
+  git(repoDir, [
+    'config',
+    'remote.origin.fetch',
+    '+refs/heads/*:refs/remotes/origin/*',
+  ]);
   git(repoDir, ['fetch', '--all', '--prune']);
+}
+
+export async function cloneBareRepoAsync(
+  repoDir,
+  remoteUrl,
+  ghSlug,
+  {
+    run = createCommandRunner((args, options) => Bun.spawn(args, options)),
+    readStorage,
+  } = {}
+) {
+  await assertStorageHeadroom(dirname(repoDir), readStorage);
+  return cloneBareRepository(repoDir, remoteUrl, ghSlug, { run });
 }
 
 // So an agent (or human) working inside a Setu-managed project's own
@@ -1361,31 +2274,58 @@ export function cloneBareRepo(repoDir, remoteUrl, ghSlug, { stdio = 'inherit' } 
 const SETU_AGENTS_SECTION_MARKER = '## Managed by Setu';
 
 function setuAgentsSection(repo) {
-  return `${SETU_AGENTS_SECTION_MARKER}\n\n` +
-    `This project's git worktrees, local dev domains, and dev servers are managed by [Setu](https://github.com/quivly/setu) — don't run \`npm run dev\`/\`bun dev\` directly, use Setu so the portal keeps tracking the process.\n\n` +
-    `**If \`setu\` isn't installed:**\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash\nsetu setup\n\`\`\`\n\n` +
+  return (
+    `${SETU_AGENTS_SECTION_MARKER}\n\n` +
+    `This project's git worktrees, local dev domains, and dev servers are managed by [Setu](https://github.com/mukulchugh/setu) — don't run \`npm run dev\`/\`bun dev\` directly, use Setu so the portal keeps tracking the process.\n\n` +
+    `**If \`setu\` isn't installed:**\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash\nsetu setup\n\`\`\`\n\n` +
     `**Common commands** (run from anywhere):\n\`\`\`\nsetu ls ${repo}                    List this project's worktrees + running state\nsetu new ${repo} <branch>          Create a new worktree\nsetu start ${repo} <branch>        Start a worktree's dev server\nsetu stop  ${repo} <branch>        Stop it\nsetu cd    ${repo} <branch>        cd into the worktree\n\`\`\`\n\n` +
-    `Live state (ports, domains, running status): \`setu ls ${repo} --json\`, or the portal API at \`http://localhost:${PORTAL_PORT}/api/worktrees\`.\n`;
+    `Live state (ports, domains, running status): \`setu ls ${repo} --json\`, or the portal API at \`http://localhost:${PORTAL_PORT}/api/worktrees\`.\n`
+  );
 }
 
-function writeSetuAgentMarkers(repo, wtDir) {
+export async function writeSetuAgentMarkers(
+  repo,
+  wtDir,
+  { stage = gitFetchAsync } = {}
+) {
   const markerPath = join(wtDir, '.setu.json');
   if (!existsSync(markerPath)) {
-    writeFileSync(markerPath, JSON.stringify({
-      managedBy: 'setu', repo, portal: `http://localhost:${PORTAL_PORT}`,
-      install: 'curl -fsSL https://raw.githubusercontent.com/quivly/setu/main/install.sh | bash',
-      docs: 'https://github.com/quivly/setu',
-    }, null, 2) + '\n');
+    writeFileSync(
+      markerPath,
+      `${JSON.stringify(
+        {
+          docs: 'https://github.com/mukulchugh/setu',
+          install:
+            'curl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash',
+          managedBy: 'setu',
+          portal: `http://localhost:${PORTAL_PORT}`,
+          repo,
+        },
+        null,
+        2
+      )}\n`
+    );
   }
 
   const agentsPath = join(wtDir, 'AGENTS.md');
-  const existing = existsSync(agentsPath) ? readFileSync(agentsPath, 'utf8') : '';
+  const existing = existsSync(agentsPath)
+    ? readFileSync(agentsPath, 'utf8')
+    : '';
   if (!existing.includes(SETU_AGENTS_SECTION_MARKER)) {
     const trimmed = existing.replace(/\s*$/, '');
-    writeFileSync(agentsPath, (trimmed ? trimmed + '\n\n' : '') + setuAgentsSection(repo));
+    writeFileSync(
+      agentsPath,
+      (trimmed ? `${trimmed}\n\n` : '') + setuAgentsSection(repo)
+    );
   }
 
-  try { git(wtDir, ['add', '.setu.json', 'AGENTS.md']); } catch {}
+  try {
+    await stage(wtDir, ['add', '.setu.json', 'AGENTS.md']);
+  } catch (error) {
+    if (error.code === 'OPERATION_UNKNOWN') {
+      throw error;
+    }
+  }
 }
 
 // Extracted from cmdInit's clone->register->create-main-worktree sequence so
@@ -1395,31 +2335,56 @@ function writeSetuAgentMarkers(repo, wtDir) {
 // createWorktree needs it — same convention createWorktree/removeWorktree
 // above already use. Never touches whatever directory the caller discovered
 // remoteUrl from: this always clones fresh into workspace/<name>.git.
-export async function importRepo(c, { name, remoteUrl, label = '' }) {
-  const repoDir = join(c.workspace, `${name}.git`);
-  const ghSlug  = remoteUrl?.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? '';
+export async function importRepo(
+  c,
+  { name, remoteUrl, label = '' },
+  { readStorage } = {}
+) {
+  return workspaceState(c.workspace).withTargets(
+    [{ name: 'main', repo: name }],
+    async () => {
+      const pending = validateRemovalRecords(
+        workspaceState(c.workspace).read('removals')
+      );
+      if (Object.values(pending).some((row) => row.repo === name)) {
+        throw Object.assign(
+          new Error('Removal cleanup is pending for this repository'),
+          { code: 'REMOVAL_PENDING' }
+        );
+      }
+      const repoDir = join(c.workspace, `${name}.git`);
+      await assertStorageHeadroom(c.workspace, readStorage);
+      const ghSlug =
+        remoteUrl?.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ??
+        '';
 
-  if (!existsSync(repoDir)) {
-    if (!remoteUrl) throw new Error(`No remote URL for ${name}, cannot clone.`);
-    // createWorktree() below runs `git worktree add` into
-    // join(c.workspace, name, 'main'). If that directory already exists (a
-    // plain clone discovered by sweep, sitting at exactly this project's
-    // derived name) the worktree lands as an untracked subfolder inside it
-    // instead of getting its own clean directory. Verified live via sweep
-    // --import. Only checked here, gated on repoDir not existing yet, so a
-    // re-run of setu init on an already-initialized project, where this
-    // directory is expected to exist and is setu's own, is unaffected.
-    const wtParentDir = join(c.workspace, name);
-    if (existsSync(wtParentDir)) {
-      throw new Error(`A directory already exists at ${wtParentDir} and importing would nest a worktree inside it. Move or rename it first, or choose a different project name.`);
+      if (!existsSync(repoDir)) {
+        if (!remoteUrl) {
+          throw new Error(`No remote URL for ${name}, cannot clone.`);
+        }
+        // createWorktree() below runs `git worktree add` into
+        // join(c.workspace, name, 'main'). If that directory already exists (a
+        // plain clone discovered by sweep, sitting at exactly this project's
+        // derived name) the worktree lands as an untracked subfolder inside it
+        // instead of getting its own clean directory. Verified live via sweep
+        // --import. Only checked here, gated on repoDir not existing yet, so a
+        // re-run of setu init on an already-initialized project, where this
+        // directory is expected to exist and is setu's own, is unaffected.
+        const wtParentDir = join(c.workspace, name);
+        if (existsSync(wtParentDir)) {
+          throw new Error(
+            `A directory already exists at ${wtParentDir} and importing would nest a worktree inside it. Move or rename it first, or choose a different project name.`
+          );
+        }
+        await cloneBareRepoAsync(repoDir, remoteUrl, ghSlug, { readStorage });
+      }
+
+      await registerProject(c.workspace, { label, name, slug: ghSlug });
+      const result = await createWorktree(c, name, 'main', { readStorage });
+      await writeSetuAgentMarkers(name, result.wtDir);
+      return result;
     }
-    cloneBareRepo(repoDir, remoteUrl, ghSlug);
-  }
-
-  registerProject(c.workspace, { label, name, slug: ghSlug });
-  const result = await createWorktree(c, name, 'main');
-  writeSetuAgentMarkers(name, result.wtDir);
-  return result;
+  );
 }
 
 // ── portal client (used by CLI to talk to the running portal) ────────────────
@@ -1437,12 +2402,24 @@ export function portalPid() {
 // `ok === false` (mutating routes' own failure shape); an array or a
 // plain object with no `ok` key at all is success, not "no field to check."
 export async function portalRequest(path, body) {
-  const res = await fetch(`http://localhost:${PORTAL_PORT}${path}`, body === undefined
-    ? { signal: AbortSignal.timeout(5000) }
-    : { 
-        body: JSON.stringify(body), headers: { 'content-type': 'application/json' },method: 'POST', signal: AbortSignal.timeout(30000) });
+  const res = await fetch(
+    `http://localhost:${PORTAL_PORT}${path}`,
+    body === undefined
+      ? { signal: AbortSignal.timeout(5000) }
+      : {
+          body: JSON.stringify(body),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+          signal: AbortSignal.timeout(30_000),
+        }
+  );
   const data = await res.json();
-  if (data && typeof data === 'object' && !Array.isArray(data) && data.ok === false) {
+  if (
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    data.ok === false
+  ) {
     throw new Error(data.error ?? `${path} failed`);
   }
   return data;

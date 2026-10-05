@@ -7,7 +7,7 @@
   // out for Biome). Excluded here rather than fought over: two formatters
   // disagreeing on the same files is worse than one tool per subtree.
   "files": {
-    "includes": ["**", "!raycast/**"]
+    "includes": ["!raycast"]
   },
   // ultracite/biome/core defaults to double quotes; this codebase has used
   // single quotes throughout since before Biome existed here — matching the

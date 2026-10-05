@@ -19,7 +19,24 @@
 // point it touches a raw Base UI primitive — never spreads a bare `class` onto one.
 import { Dialog as DialogPrimitive } from '@base-ui/react/dialog';
 import type { ComponentChildren } from 'preact';
+import { useRef } from 'preact/hooks';
 import { cn } from './utils';
+
+// Imperatively opened dialogs have no Base UI Trigger to identify their opener.
+// Capture is only a default for direct openers. A menu can reclaim focus
+// before a dialog mounts, so menu callers must pass their stable trigger via
+// finalFocus. `true` keeps Base UI's fallback for unavailable targets.
+export function dialogReturnTarget(
+  opener: Element | null,
+  body: Element | null
+): HTMLElement | true {
+  const element = opener as HTMLElement | null;
+  return element?.isConnected &&
+    element !== body &&
+    typeof element.focus === 'function'
+    ? element
+    : true;
+}
 
 // The registry's own defaults don't exist in this repo and silently produce no CSS if copied
 // verbatim: `bg-popover`/`text-popover-foreground`/`bg-muted/50`/`ring-foreground/10`/
@@ -38,9 +55,11 @@ import { cn } from './utils';
 // candidate forms — bare `data-closed:`, bracketed `data-[closed]:`, and the fully-arbitrary
 // `[&[data-closed]]:` — compiled to byte-identical output (`&[data-closed]{...}`); the bare form
 // below is what's used since it needs no config and reads cleanest.
-const overlayCls = 'fixed inset-0 z-50 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ease-out data-closed:opacity-0';
+const overlayCls =
+  'fixed inset-0 z-50 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ease-out data-closed:opacity-0';
 
-const panelBase = 'bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl shadow-2xl rounded-none z-50 transition-all duration-200 ease-out';
+const panelBase =
+  'bg-white/90 dark:bg-zinc-900/70 backdrop-blur-xl shadow-2xl rounded-none z-50 transition-[opacity,transform] duration-150 ease-out';
 const panelPosition: Record<'center' | 'bottom', string> = {
   // Bottom sheets (LogModal etc.) own their own internal padding/height/flex layout per call
   // site — same as the old Modal, which never imposed padding on a position="bottom" child
@@ -49,22 +68,34 @@ const panelPosition: Record<'center' | 'bottom', string> = {
   // variant's all-round border) — put directly on this variant rather than layered as an
   // "undo" on top of panelBase's border, since tailwind-merge doesn't treat a later `border-b-0`
   // as canceling an earlier bare `border` (same footgun ui.tsx's own `compact` variant documents).
-  bottom: 'border-t border-zinc-200 dark:border-zinc-800 fixed inset-x-0 bottom-0 w-full data-closed:opacity-0 data-closed:translate-y-4',
+  bottom:
+    'border-t border-zinc-200 dark:border-zinc-800 fixed inset-x-0 bottom-0 w-full data-closed:opacity-0 data-closed:translate-y-4',
   // No mx-4 gutter here: unlike the old Modal (a flex child, where a margin was a real gutter),
   // this box is `fixed` + transform-centered, and a margin shifts the transform-origin math off
   // true center (left:50% + margin-left:1rem, then -translate-x-1/2 only pulls back half the
   // *border-box* width, landing 1rem right of center) and can overflow below ~26rem viewports.
   // max-w-[calc(100%-2rem)] gives the same "never touches the edge" behavior with none of that —
   // same fix the registry source already uses for this exact box.
-  center: 'border border-zinc-200 dark:border-zinc-800 fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-[calc(100%-2rem)] sm:max-w-sm p-6 data-closed:opacity-0 data-closed:scale-95',
+  center:
+    'border border-zinc-200 dark:border-zinc-800 fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain sm:max-w-sm p-5 sm:p-6 data-closed:opacity-0 data-closed:scale-95',
 };
 
 // Same X-mark path as ui.tsx's CloseIcon (a plain two-stroke glyph, not a sourced brand mark —
 // no reason to import it from the file this migration is replacing, so it's inlined here too).
 function XIcon() {
   return (
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-      <path d="M18 6l-12 12" /><path d="M6 6l12 12" />
+    <svg
+      aria-hidden="true"
+      class="h-4 w-4"
+      fill="none"
+      stroke="currentColor"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      stroke-width="2"
+      viewBox="0 0 24 24"
+    >
+      <path d="M18 6l-12 12" />
+      <path d="M6 6l12 12" />
     </svg>
   );
 }
@@ -79,12 +110,30 @@ export function Dialog({ ...props }: DialogPrimitive.Root.Props) {
 // happens to pass `className` would land in the rest spread *after* the computed `className={cn(...)}`
 // prop above it and silently wipe every class this file computes. `cn(..., className as string, cls)`
 // merges both in case a future call site uses either spelling.
-export function DialogTrigger({ class: cls, className, ...props }: DialogPrimitive.Trigger.Props & { class?: string }) {
-  return <DialogPrimitive.Trigger className={cn(className as string, cls)} {...props} />;
+export function DialogTrigger({
+  class: cls,
+  className,
+  ...props
+}: DialogPrimitive.Trigger.Props & { class?: string }) {
+  return (
+    <DialogPrimitive.Trigger
+      className={cn(className as string, cls)}
+      {...props}
+    />
+  );
 }
 
-export function DialogClose({ class: cls, className, ...props }: DialogPrimitive.Close.Props & { class?: string }) {
-  return <DialogPrimitive.Close className={cn(className as string, cls)} {...props} />;
+export function DialogClose({
+  class: cls,
+  className,
+  ...props
+}: DialogPrimitive.Close.Props & { class?: string }) {
+  return (
+    <DialogPrimitive.Close
+      className={cn(className as string, cls)}
+      {...props}
+    />
+  );
 }
 
 // Exported in case a future dialog needs to portal into a specific node or keep content mounted
@@ -94,8 +143,17 @@ export function DialogPortal({ ...props }: DialogPrimitive.Portal.Props) {
   return <DialogPrimitive.Portal {...props} />;
 }
 
-export function DialogBackdrop({ class: cls, className, ...props }: DialogPrimitive.Backdrop.Props & { class?: string }) {
-  return <DialogPrimitive.Backdrop className={cn(overlayCls, className as string, cls)} {...props} />;
+export function DialogBackdrop({
+  class: cls,
+  className,
+  ...props
+}: DialogPrimitive.Backdrop.Props & { class?: string }) {
+  return (
+    <DialogPrimitive.Backdrop
+      className={cn(overlayCls, className as string, cls)}
+      {...props}
+    />
+  );
 }
 
 // The main entry point — composes Portal + Backdrop + Popup and carries the visual panel skin
@@ -107,17 +165,39 @@ export function DialogBackdrop({ class: cls, className, ...props }: DialogPrimit
 // AddProjectModal, LogModal) already render their own header-row close affordance, and turning
 // this on unconditionally would double up on an X. New dialogs that don't want to hand-roll a
 // header should pass showCloseButton.
-export function DialogContent({ class: cls, className, position = 'center', showCloseButton = false, children, ...props }: DialogPrimitive.Popup.Props & {
-  class?: string; position?: 'center' | 'bottom'; showCloseButton?: boolean;
+export function DialogContent({
+  class: cls,
+  className,
+  position = 'center',
+  showCloseButton = false,
+  finalFocus,
+  children,
+  ...props
+}: DialogPrimitive.Popup.Props & {
+  class?: string;
+  position?: 'center' | 'bottom';
+  showCloseButton?: boolean;
 }) {
+  const opener = useRef(document.activeElement);
   return (
     <DialogPortal>
       <DialogBackdrop />
-      <DialogPrimitive.Popup className={cn(panelBase, panelPosition[position], className as string, cls)} {...props}>
+      <DialogPrimitive.Popup
+        className={cn(
+          panelBase,
+          panelPosition[position],
+          className as string,
+          cls
+        )}
+        finalFocus={
+          finalFocus ??
+          (() => dialogReturnTarget(opener.current, document.body))
+        }
+        {...props}
+      >
         {children}
         {showCloseButton && (
-          <DialogPrimitive.Close
-            className="icon-btn absolute top-3 right-3 text-zinc-500 dark:text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-100">
+          <DialogPrimitive.Close className="icon-btn absolute top-3 right-3 text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-100">
             <XIcon />
             <span class="sr-only">Close</span>
           </DialogPrimitive.Close>
@@ -127,18 +207,60 @@ export function DialogContent({ class: cls, className, position = 'center', show
   );
 }
 
-export function DialogHeader({ class: cls, children }: { class?: string; children?: ComponentChildren }) {
-  return <div class={cn('flex flex-col gap-1 mb-5', cls)}>{children}</div>;
+export function DialogHeader({
+  class: cls,
+  children,
+}: {
+  class?: string;
+  children?: ComponentChildren;
+}) {
+  return <div class={cn('mb-5 flex flex-col gap-1', cls)}>{children}</div>;
 }
 
-export function DialogFooter({ class: cls, children }: { class?: string; children?: ComponentChildren }) {
-  return <div class={cn('flex flex-col-reverse gap-3 sm:flex-row pt-1', cls)}>{children}</div>;
+export function DialogFooter({
+  class: cls,
+  children,
+}: {
+  class?: string;
+  children?: ComponentChildren;
+}) {
+  return (
+    <div class={cn('flex flex-col-reverse gap-3 pt-1 sm:flex-row', cls)}>
+      {children}
+    </div>
+  );
 }
 
-export function DialogTitle({ class: cls, className, ...props }: DialogPrimitive.Title.Props & { class?: string }) {
-  return <DialogPrimitive.Title className={cn('text-base font-semibold text-ink dark:text-ink-dark leading-none', className as string, cls)} {...props} />;
+export function DialogTitle({
+  class: cls,
+  className,
+  ...props
+}: DialogPrimitive.Title.Props & { class?: string }) {
+  return (
+    <DialogPrimitive.Title
+      className={cn(
+        'font-semibold text-base text-ink leading-none dark:text-ink-dark',
+        className as string,
+        cls
+      )}
+      {...props}
+    />
+  );
 }
 
-export function DialogDescription({ class: cls, className, ...props }: DialogPrimitive.Description.Props & { class?: string }) {
-  return <DialogPrimitive.Description className={cn('text-xs text-zinc-500 dark:text-zinc-400 mt-1', className as string, cls)} {...props} />;
+export function DialogDescription({
+  class: cls,
+  className,
+  ...props
+}: DialogPrimitive.Description.Props & { class?: string }) {
+  return (
+    <DialogPrimitive.Description
+      className={cn(
+        'mt-1 text-xs text-zinc-500 dark:text-zinc-400',
+        className as string,
+        cls
+      )}
+      {...props}
+    />
+  );
 }

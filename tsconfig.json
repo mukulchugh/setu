@@ -1,4 +1,5 @@
 {
+  "include": ["portal/**/*.ts", "portal/**/*.tsx"],
   "compilerOptions": {
     "lib": ["ESNext", "DOM"],
     "target": "ESNext",

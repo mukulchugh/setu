@@ -1,53 +1,171 @@
 #!/usr/bin/env bun
+
 // Dev portal — http://quivly.local
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, renameSync, openSync, existsSync } from 'fs';
-import { execFileSync, spawnSync } from 'child_process';
-import { tmpdir } from 'os';
-import { join, resolve, dirname } from 'path';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
+import identityFs from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { agentStatus } from './agent.js';
+import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { getCostsSummary } from './costs.js';
+import {
+  createDeploymentGuard,
+  createDeploymentLauncher,
+  createProviderResolver,
+} from './deployment-guard.js';
+import { createCommandRunner, createDevRuntime } from './dev-runtime.js';
+import { assertStorageHeadroom, createHostHealth } from './host-health.js';
+import {
+  AGENT_CLIS,
+  activePidAsync,
+  approveSidecar,
+  assertRemovableWorktree,
+  baseBranchRef,
+  branchMetadata,
+  CLOUDFLARED_BIN,
+  caddySnippetPath,
+  cloneBareRepoAsync,
+  commandExists,
+  composeDownAsync,
+  composeProjectName,
+  configureWorktreeEnv,
+  convexDir,
+  defaultContainerMode,
+  detectAgentClis,
+  discoverReposAsync,
+  dockerComposePath,
+  envLocalPath,
+  getPort,
+  HOME,
+  importRepo,
+  installedStateValue,
+  isSidecarApproved,
+  createWorktree as libCreateWorktree,
+  loadAllSidecars,
+  loadArchivedWorktrees,
+  loadCustomAgents,
+  loadFileSyncGlobs,
+  loadMcpServers,
+  loadProjects,
+  loadSidecars,
+  localDomain,
+  macCapacity,
+  managedWorktreePath,
+  markMigrationPrompted,
+  needsMigrationPrompt,
+  PORTAL_PORT,
+  parseEnvFile,
+  pinnedTriggerVersion,
+  portalRequestError,
+  portEntries,
+  publicDomain,
+  registerProject,
+  reloadCaddy,
+  removeProject,
+  requireConfig,
+  resourceSettings,
+  saveConfig,
+  saveCustomAgents,
+  saveFileSyncGlobs,
+  saveMcpServers,
+  saveSidecars,
+  seedSidecarApprovalsIfMissing,
+  shellQuote,
+  spawnText,
+  splitKey,
+  syncHosts,
+  syncWithBase,
+  tunnelEnabled,
+  validateWorktreeNames,
+  workspaceInventoryRegistry,
+  workspaceState,
+  worktreeBranchMap,
+  writeDockerCompose,
+} from './lib.js';
+import {
+  createListenerObservation,
+  probeListeningPorts,
+} from './listener-observation.js';
+import { readLogSnapshot, readLogTail } from './log-tail.js';
+import {
+  connectMcpServer,
+  disconnectMcpServer,
+  finishMcpAuth,
+  mcpHasOwnedWork,
+  mcpStatuses,
+} from './mcp.js';
+import { handleMcpRequest, initMcpServer } from './mcp-server.js';
+import { watchOwnedProcessExit } from './owned-process-map.js';
 // Bun bundles + transpiles the Preact UI referenced by this page at serve time
 import indexPage from './portal/index.html';
+import { readPortalStatus } from './portal-status.js';
 import {
-  HOME, PORTAL_PORT, CLOUDFLARED_BIN,
-  requireConfig, localDomain, publicDomain, envLocalPath, tunnelEnabled,
-  parseEnvFile, pinnedTriggerVersion, convexDir, slugify,
-  configureWorktreeEnv, reloadCaddy, syncHosts,
-  portEntries, getPort, activePid, activePidAsync, listActivePorts, listActivePortsAsync, processCwd, loadProjects, registerProject, removeProject,
-  createWorktree as libCreateWorktree, removeWorktree as libRemoveWorktree,
-  discoverReposAsync, importRepo, cloneBareRepo,
-  AGENT_CLIS, detectAgentClis, commandExists, loadSidecars, loadAllSidecars, saveSidecars, killGroup, killGroupAsync,
-  loadCustomAgents, saveCustomAgents, loadFileSyncGlobs, saveFileSyncGlobs,
-  isSidecarApproved, approveSidecar, seedSidecarApprovalsIfMissing,
-  loadArchivedWorktrees, appendArchivedWorktree,
-  containerRuntimeAvailable, composeProjectName, dockerComposePath, composeProjectAlive, composeProjectAliveAsync, composeDownAsync, writeDockerCompose,
-  defaultContainerMode, needsMigrationPrompt, markMigrationPrompted, syncWithBase,
-  worktreeBranchMap, branchMetadata, saveConfig, macCapacity, engineCapacity,
-  spawnText, splitKey, baseBranchRef,
-  loadMcpServers, saveMcpServers,
-} from './lib.js';
-import { connectMcpServer, finishMcpAuth, disconnectMcpServer, mcpStatuses } from './mcp.js';
-import { detectPrWalkthroughPlugin, findLatestArtifact, artifactHtmlPath, reviewRunStatus, runDeepReview } from './pr-review.js';
-import { handleMcpRequest, initMcpServer } from './mcp-server.js';
-import { getCostsSummary } from './costs.js';
+  createPortalUpdateControl,
+  drainPortalForUpdate,
+} from './portal-update.js';
+import {
+  artifactHtmlPath,
+  detectPrWalkthroughPlugin,
+  findLatestArtifact,
+  reviewRunStatus,
+  runDeepReview,
+} from './pr-review.js';
+import { observeProcessIdentity } from './process-observation.js';
+import {
+  applyTunnelConfiguration,
+  claimTunnelOwner,
+  createRemovalRouting,
+} from './removal-routing.js';
+import { startWorktreeSetupInstall } from './workspace-setup.js';
+import { dependencySharingForTarget } from './dependency-sharing.js';
+import { createWorkspaceInventory } from './workspace-inventory.js';
+import { safeStateCauseCode } from './workspace-state.js';
+import { createWorktreeLifecycle } from './worktree-lifecycle.js';
+import {
+  createRemovalController,
+  observeRemovalCheckout,
+  validateRemovalRecords,
+} from './worktree-removal.js';
+import {
+  createWorktreeStream,
+  readFreshWorktreeSnapshot,
+} from './worktree-stream.js';
 
 let _cfg;
-try { _cfg = requireConfig(); }
-catch (e) { console.error(`setu portal: ${e.message}`); process.exit(1); }
+let configReconciled = true;
+try {
+  _cfg = requireConfig();
+} catch (e) {
+  console.error(`setu portal: ${e.message}`);
+  process.exit(1);
+}
 
-const WORKSPACE      = _cfg.workspace;
+const WORKSPACE = _cfg.workspace;
+const readHostHealth = createHostHealth(WORKSPACE);
 // Runs once per process start, synchronously, before any route can possibly
 // be handled, so a start request can never race the migration and see a
 // pre-existing sidecar as unapproved. See seedSidecarApprovalsIfMissing's
 // own comment in lib.js for why this only ever runs once.
-seedSidecarApprovalsIfMissing(WORKSPACE);
-const TUNNEL_NAME    = _cfg.tunnel;
+await seedSidecarApprovalsIfMissing(WORKSPACE);
+const TUNNEL_NAME = _cfg.tunnel;
 const CF_CREDENTIALS_CFG = _cfg.cfCredentials;
-const PKG_DIR     = new URL('.', import.meta.url).pathname;
-const LOGS        = `${WORKSPACE}/logs`;
-const PORT        = PORTAL_PORT;
+const PKG_DIR = new URL('.', import.meta.url).pathname;
+const LOGS = `${WORKSPACE}/logs`;
+const PORT = PORTAL_PORT;
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
 
-const procs        = new Map();
 const inngestProcs = new Map();
 const triggerProcs = new Map();
 const convexDevProcs = new Map(); // `npx convex dev` per worktree, same shape as triggerProcs (no local port to cross-check)
@@ -67,28 +185,36 @@ function touchLastSeen(repo, name) {
   lastSeenAt.set(`${repo}/${name}`, Date.now());
 }
 
-const INNGEST_CLI    = 'inngest-cli';
+const INNGEST_CLI = 'inngest-cli';
 const INNGEST_OFFSET = 5288; // app port 3000 → inngest 8288, 3001 → 8289, …
 
-const CF_CREDENTIALS  = CF_CREDENTIALS_CFG;
+const CF_CREDENTIALS = CF_CREDENTIALS_CFG;
 const TUNNEL_CONF_DIR = `${WORKSPACE}/tunnel.d`;
-const MERGED_CONF     = `${TUNNEL_CONF_DIR}/merged.yml`;
-const TUNNEL_LOG      = `${LOGS}/cloudflared/tunnel.log`;
+const MERGED_CONF = `${TUNNEL_CONF_DIR}/merged.yml`;
+const TUNNEL_LOG = `${LOGS}/cloudflared/tunnel.log`;
 
 // One cloudflared process with a merged ingress config.
 // Replicas of the same tunnel are load-balanced by Cloudflare's edge — each replica
 // applies its own local ingress rules, so two replicas with different ingress maps
 // will randomly 404 each other's subdomains. Single process avoids this entirely.
 const activeTunnelMap = new Map(); // key → { pubDom, port }
-let   tunnelProc      = null;
+let tunnelProc = null;
+let tunnelTeardownUnknown = false;
 
-function inngestPort(appPort) { return appPort + INNGEST_OFFSET; }
+function inngestPort(appPort) {
+  return appPort + INNGEST_OFFSET;
+}
 
 // Same path shape lib.js already builds with join() for the same concept.
 // Kept as a template literal here (not join()) only because that's this
 // file's existing convention for WORKSPACE-relative paths throughout.
-function wtPath(repo, name) { return `${WORKSPACE}/${repo}/${name}`; }
-function repoPath(repo)     { return `${WORKSPACE}/${repo}.git`; }
+function wtPath(repo, name) {
+  return managedWorktreePath(WORKSPACE, repo, name);
+}
+function repoPath(repo) {
+  validateWorktreeNames(repo, 'main');
+  return `${WORKSPACE}/${repo}.git`;
+}
 
 // ── logging ───────────────────────────────────────────────────────────────────
 
@@ -99,29 +225,78 @@ function logDir(repo, name) {
 }
 
 function logPath(repo, name, type = 'dev') {
-  if (type === 'tunnel') return TUNNEL_LOG;
+  wtPath(repo, name);
+  if (
+    !/^(dev|setup|inngest|trigger|convex|vercel|netlify|tunnel|pr-review|sidecar-[a-zA-Z0-9_-]+)$/.test(
+      type
+    )
+  ) {
+    throw new Error('Unknown log type');
+  }
+  if (type === 'tunnel') {
+    return TUNNEL_LOG;
+  }
   return `${logDir(repo, name)}/${type}.log`;
 }
 
-function rotateLog(path) {
+const openLogPaths = new Set();
+
+function trimLog(path, keep = LOG_MAX_BYTES / 2) {
+  let fd;
   try {
-    if (statSync(path).size > LOG_MAX_BYTES) renameSync(path, path + '.old');
-  } catch {}
+    const size = statSync(path).size;
+    if (size <= LOG_MAX_BYTES) {
+      return;
+    }
+    fd = openSync(path, 'r+');
+    const buffer = Buffer.alloc(keep);
+    const read = readSync(fd, buffer, 0, keep, size - keep);
+    // Keep the inode: children hold O_APPEND descriptors across portal restarts.
+    // ponytail: copytruncate can lose a concurrent line at rotation; use a
+    // dedicated log collector if lossless diagnostic retention becomes necessary.
+    ftruncateSync(fd, 0);
+    writeSync(fd, buffer, 0, read, 0);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error('Log retention failed:', path, error.message);
+    }
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
+  }
+}
+
+const logRetentionTimer = setInterval(() => {
+  for (const path of openLogPaths) {
+    trimLog(path);
+  }
+}, 5000);
+logRetentionTimer.unref();
+
+function rotateLog(path) {
+  openLogPaths.add(path);
+  trimLog(path);
+  trimLog(`${path}.old`, LOG_MAX_BYTES);
+}
+
+function spawnWithLog(command, options, fd) {
+  try {
+    return Bun.spawn(command, { ...options, stderr: fd, stdout: fd });
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function openLogFd(repo, name, type = 'dev') {
   const path = logPath(repo, name, type);
   rotateLog(path);
-  appendFileSync(path, `\n[${ new Date().toISOString() }] ── session start ──\n`);
+  appendFileSync(path, `\n[${new Date().toISOString()}] ── session start ──\n`);
   return openSync(path, 'a');
 }
 
-function tailLog(repo, name, type = 'dev', lines = 150) {
-  try {
-    const text = readFileSync(logPath(repo, name, type), 'utf8');
-    const all  = text.split('\n');
-    return { lines: all.slice(-lines), total: all.length };
-  } catch { return { lines: [], total: 0 }; }
+function tailLog(repo, name, type = 'dev', lines = 150, previous) {
+  return readLogTail(logPath(repo, name, type), lines, { previous });
 }
 
 // ── Raycast extension dev mode ──────────────────────────────────────────────
@@ -132,6 +307,7 @@ function tailLog(repo, name, type = 'dev', lines = 150) {
 // (procs Map elsewhere) rather than treated as a one-shot command.
 const RAYCAST_DIR = `${PKG_DIR}raycast`;
 let raycastDev = null; // { proc, pid } | null
+let raycastLogSnapshot;
 
 function raycastLogPath() {
   const dir = `${LOGS}/_raycast`;
@@ -140,30 +316,57 @@ function raycastLogPath() {
 }
 
 function startRaycastDev() {
-  if (raycastDev) return { ok: true };
-  if (!existsSync(RAYCAST_DIR)) return { error: 'raycast/ not found in the setu repo', ok: false };
+  if (raycastDev) {
+    return { ok: true };
+  }
+  if (!existsSync(RAYCAST_DIR)) {
+    return { error: 'raycast/ not found in the setu repo', ok: false };
+  }
   const path = raycastLogPath();
   rotateLog(path);
-  appendFileSync(path, `\n[${new Date().toISOString()}] ── raycast dev start ──\n`);
+  appendFileSync(
+    path,
+    `\n[${new Date().toISOString()}] ── raycast dev start ──\n`
+  );
   const fd = openSync(path, 'a');
   // One script, not two spawns — `npm install` only when node_modules is
   // missing (so toggling dev mode on repeatedly doesn't reinstall every
   // time), then hands off to `ray develop` in the same process tree so a
   // single pid covers both steps for stop/kill purposes.
   const script = `${tmpdir()}/setu-raycast-dev-${Date.now()}.sh`;
-  writeFileSync(script,
-    `#!/bin/zsh\ncd "${RAYCAST_DIR}"\n[ -d node_modules ] || npm install\nexec npx ray develop\n`,
-    { mode: 0o755 });
-  const proc = Bun.spawn(['/bin/zsh', script], { cwd: RAYCAST_DIR, detached: true, stderr: fd, stdout: fd });
+  writeFileSync(
+    script,
+    `#!/bin/zsh\ncd "${RAYCAST_DIR}"\n[ -d node_modules ] || bun install\nexec bunx ray develop\n`,
+    { mode: 0o755 }
+  );
+  const proc = spawnWithLog(
+    ['/bin/zsh', script],
+    { cwd: RAYCAST_DIR, detached: true },
+    fd
+  );
   raycastDev = { pid: proc.pid, proc };
-  proc.exited.then(() => { if (raycastDev?.proc === proc) raycastDev = null; });
+  proc.exited.then(
+    () => {
+      if (raycastDev?.proc === proc) {
+        raycastDev = null;
+      }
+    },
+    () => {
+      /* Unknown exit retains ownership. */
+    }
+  );
   return { ok: true };
 }
 
 async function stopRaycastDev() {
-  if (!raycastDev) return { ok: true };
-  await killGroupAsync(raycastDev.pid);
-  raycastDev = null;
+  if (!raycastDev) {
+    return { ok: true };
+  }
+  const entry = raycastDev;
+  await devRuntime.stopProcess({ ...entry, ownedGroup: true });
+  if (raycastDev === entry) {
+    raycastDev = null;
+  }
   return { ok: true };
 }
 
@@ -181,18 +384,51 @@ let REPO_META = loadProjects(WORKSPACE);
 const gitMetaCache = new Map(); // repo -> { branchMeta, pathToBranch, fetchedAt }
 const GIT_META_TTL = 10_000;
 
-function repoGitMeta(repo) {
+const gitMetaInFlight = new Map();
+async function repoGitMeta(repo, background = false) {
   const cached = gitMetaCache.get(repo);
-  if (cached && Date.now() - cached.fetchedAt < GIT_META_TTL) return cached;
-  const repoDir = repoPath(repo);
-  let branchMeta = new Map(), pathToBranch = new Map();
-  try {
-    branchMeta = branchMetadata(repoDir);
-    pathToBranch = worktreeBranchMap(repoDir);
-  } catch {}
-  const entry = { branchMeta, fetchedAt: Date.now(), pathToBranch };
-  gitMetaCache.set(repo, entry);
-  return entry;
+  if (cached && Date.now() - cached.fetchedAt < GIT_META_TTL) {
+    return cached;
+  }
+  if (gitMetaInFlight.has(repo)) {
+    return background && cached ? cached : gitMetaInFlight.get(repo);
+  }
+  const pending = (async () => {
+    const repoDir = repoPath(repo);
+    const read = (args) =>
+      spawnText(['git', '-C', repoDir, ...args], { timeoutMs: 5000 });
+    const [staging, head, porcelain] = await Promise.all([
+      read([
+        'for-each-ref',
+        '--format=%(refname)',
+        'refs/heads/staging',
+        'refs/remotes/origin/staging',
+      ]),
+      read(['symbolic-ref', '--short', 'HEAD']),
+      read(['worktree', 'list', '--porcelain']),
+    ]);
+    const hasStaging = staging
+      .split('\n')
+      .some(
+        (ref) =>
+          ref === 'refs/heads/staging' || ref === 'refs/remotes/origin/staging'
+      );
+    const base = hasStaging ? 'origin/staging' : `origin/${head}`;
+    const raw = await read([
+      'for-each-ref',
+      `--format=%(refname:short)\t%(committerdate:unix)\t%(ahead-behind:${base})`,
+      'refs/heads/',
+    ]);
+    const entry = {
+      branchMeta: branchMetadata(repoDir, raw),
+      fetchedAt: Date.now(),
+      pathToBranch: worktreeBranchMap(repoDir, porcelain),
+    };
+    gitMetaCache.set(repo, entry);
+    return entry;
+  })().finally(() => gitMetaInFlight.delete(repo));
+  gitMetaInFlight.set(repo, pending);
+  return background && cached ? cached : pending;
 }
 
 // Uncommitted-changes count — genuinely per-worktree (live working-tree
@@ -200,17 +436,53 @@ function repoGitMeta(repo) {
 // Same shape as fetchPR: Bun.spawn (not execFileSync — see fetchPR's own
 // comment on why), short TTL cache.
 const dirtyCache = new Map();
-const DIRTY_TTL  = 5_000;
+const DIRTY_TTL = 15_000;
+let dirtyChecks = 0;
+const dirtyQueue = [];
+
+function drainDirtyQueue() {
+  while (dirtyChecks < 4 && dirtyQueue.length) {
+    dirtyChecks += 1;
+    void dirtyQueue
+      .shift()()
+      .finally(() => {
+        dirtyChecks -= 1;
+        drainDirtyQueue();
+      });
+  }
+}
 
 async function fetchDirty(repo, name) {
-  const key    = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const cached = dirtyCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < DIRTY_TTL) return cached.count;
-  const wtDir = wtPath(repo, name);
-  const raw = await spawnText(['git', '-C', wtDir, '--no-optional-locks', 'status', '--porcelain']);
-  const count = raw ? raw.split('\n').length : 0;
-  dirtyCache.set(key, { count, fetchedAt: Date.now() });
-  return count;
+  if (
+    cached?.pending ||
+    (cached && Date.now() - cached.fetchedAt < DIRTY_TTL)
+  ) {
+    return cached?.count ?? null;
+  }
+  const record = { count: cached?.count ?? null, fetchedAt: 0, pending: true };
+  dirtyCache.set(key, record);
+  // Dirty badges are background metadata. Fresh deletion checks never use this cache.
+  dirtyQueue.push(() =>
+    spawnRun(
+      wtPath(repo, name),
+      ['git', '--no-optional-locks', 'status', '--porcelain'],
+      5000
+    )
+      .then((raw) => {
+        record.count = raw.trim() ? raw.trim().split('\n').length : 0;
+      })
+      .catch(() => {
+        record.count = null;
+      })
+      .finally(() => {
+        record.pending = false;
+        record.fetchedAt = Date.now();
+      })
+  );
+  drainDirtyQueue();
+  return record.count;
 }
 
 // convexDir() reads + regex-parses up to two directories' worth of env files
@@ -227,9 +499,11 @@ const convexConfigCache = new Map(); // key: `${repo}/${name}` -> { dir, fetched
 const CONVEX_CONFIG_TTL = 10_000;
 
 function cachedConvexDir(repo, name, wtDir) {
-  const key    = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const cached = convexConfigCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < CONVEX_CONFIG_TTL) return cached.dir;
+  if (cached && Date.now() - cached.fetchedAt < CONVEX_CONFIG_TTL) {
+    return cached.dir;
+  }
   const dir = convexDir(repo, wtDir);
   convexConfigCache.set(key, { dir, fetchedAt: Date.now() });
   return dir;
@@ -238,7 +512,7 @@ function cachedConvexDir(repo, name, wtDir) {
 // ── PR cache ──────────────────────────────────────────────────────────────────
 
 const prCache = new Map();
-const PR_TTL  = 60_000;
+const PR_TTL = 60_000;
 
 // statusCheckRollup mixes two shapes in the same array (confirmed live on a
 // real merged PR that had both): CheckRun (GitHub Actions, status+conclusion)
@@ -246,59 +520,106 @@ const PR_TTL  = 60_000;
 // one summary rather than surfacing per-check detail, the badge only needs
 // passing/failing/pending/none, not a checks list.
 function summarizeChecks(rollup) {
-  if (!Array.isArray(rollup) || rollup.length === 0) return 'none';
+  if (!Array.isArray(rollup) || rollup.length === 0) {
+    return 'none';
+  }
   let sawPending = false;
   for (const c of rollup) {
     if (c.__typename === 'StatusContext') {
-      if (c.state === 'FAILURE' || c.state === 'ERROR') return 'failing';
-      if (c.state === 'PENDING' || c.state === 'EXPECTED') sawPending = true;
+      if (c.state === 'FAILURE' || c.state === 'ERROR') {
+        return 'failing';
+      }
+      if (c.state === 'PENDING' || c.state === 'EXPECTED') {
+        sawPending = true;
+      }
       continue;
     }
-    if (c.status !== 'COMPLETED') { sawPending = true; continue; }
+    if (c.status !== 'COMPLETED') {
+      sawPending = true;
+      continue;
+    }
     // SKIPPED/NEUTRAL aren't failures, a real run (path-filtered CI) can
     // skip most jobs and still be a passing PR.
-    if (c.conclusion === 'FAILURE' || c.conclusion === 'CANCELLED' ||
-        c.conclusion === 'TIMED_OUT' || c.conclusion === 'ACTION_REQUIRED') return 'failing';
+    if (
+      c.conclusion === 'FAILURE' ||
+      c.conclusion === 'CANCELLED' ||
+      c.conclusion === 'TIMED_OUT' ||
+      c.conclusion === 'ACTION_REQUIRED'
+    ) {
+      return 'failing';
+    }
   }
   return sawPending ? 'pending' : 'passing';
 }
 
+const prInFlight = new Map();
+const prWaiters = [];
+let activePrRequests = 0;
+
 async function fetchPR(repo, name) {
-  const key    = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const cached = prCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < PR_TTL) return cached;
-  try {
-    // ponytail: Bun.spawn (via spawnText) keeps event loop unblocked; execFileSync froze it with 10+ parallel calls
-    // `gh pr view <branch>` instead of `pr list --head`: one call gets
-    // state/isDraft/statusCheckRollup alongside number/title/url, where list
-    // only ever returned the bare three.
-    const raw = await spawnText(['gh', 'pr', 'view', name,
-      '--repo', REPO_META[repo]?.slug ?? repo,
-      '--json', 'number,title,url,state,isDraft,statusCheckRollup',
-    ]);
-    const raw2 = JSON.parse(raw);
-    // gh's `state` is a real three-value enum (OPEN/CLOSED/MERGED), not a
-    // boolean plus a separate merged flag, confirmed live against several
-    // merged and closed PRs. MERGED/CLOSED are terminal and take precedence
-    // over isDraft: a closed PR can still carry isDraft:true (confirmed live),
-    // but "draft" as a display state only makes sense while still open.
-    const state = raw2.state === 'MERGED' ? 'merged'
-      : raw2.state === 'CLOSED' ? 'closed'
-      : raw2.isDraft ? 'draft' : 'open';
-    const entry = {checks: summarizeChecks(raw2.statusCheckRollup),
-      fetchedAt: Date.now(),
-      number: raw2.number, 
-      state, title: raw2.title, url: raw2.url,
-    };
-    prCache.set(key, entry);
-    return entry;
-  } catch {
-    // Empty stdout (no PR for this branch, or `gh` failing) fails JSON.parse
-    // the same way `pr list` returning `[]` used to, same fallback shape.
-    const entry = { fetchedAt: Date.now() };
-    prCache.set(key, entry);
-    return entry;
+  if (cached && Date.now() - cached.fetchedAt < PR_TTL) {
+    return cached;
   }
+  if (prInFlight.has(key)) {
+    return prInFlight.get(key);
+  }
+  const pending = (async () => {
+    if (activePrRequests >= 4) {
+      await new Promise((release) => prWaiters.push(release));
+    } else {
+      activePrRequests += 1;
+    }
+    try {
+      const raw = await spawnText(
+        [
+          'gh',
+          'pr',
+          'view',
+          name,
+          '--repo',
+          REPO_META[repo]?.slug ?? repo,
+          '--json',
+          'number,title,url,state,isDraft,statusCheckRollup',
+        ],
+        { timeoutMs: 15_000 }
+      );
+      const pr = JSON.parse(raw);
+      const state =
+        pr.state === 'MERGED'
+          ? 'merged'
+          : pr.state === 'CLOSED'
+            ? 'closed'
+            : pr.isDraft
+              ? 'draft'
+              : 'open';
+      const entry = {
+        checks: summarizeChecks(pr.statusCheckRollup),
+        fetchedAt: Date.now(),
+        number: pr.number,
+        state,
+        title: pr.title,
+        url: pr.url,
+      };
+      prCache.set(key, entry);
+      return entry;
+    } catch {
+      const entry = { ...cached, fetchedAt: Date.now() };
+      prCache.set(key, entry);
+      return entry;
+    } finally {
+      prInFlight.delete(key);
+      const next = prWaiters.shift();
+      if (next) {
+        next();
+      } else {
+        activePrRequests -= 1;
+      }
+    }
+  })();
+  prInFlight.set(key, pending);
+  return pending;
 }
 
 // Repo-scoped sibling of fetchPR above -- one `gh pr list` call covers every
@@ -315,9 +636,13 @@ const repoPrsCache = new Map();
 
 async function fetchRepoPRs(repo) {
   const slug = REPO_META[repo]?.slug;
-  if (!slug) return { error: 'no GitHub repo configured for this project', prs: [] };
+  if (!slug) {
+    return { error: 'no GitHub repo configured for this project', prs: [] };
+  }
   const cached = repoPrsCache.get(repo);
-  if (cached && Date.now() - cached.fetchedAt < PR_TTL) return cached;
+  if (cached && Date.now() - cached.fetchedAt < PR_TTL) {
+    return cached;
+  }
   // spawnText swallows a bad binary/non-zero exit/timeout into an empty
   // string rather than throwing (see its own comment in lib.js) and drops
   // stderr entirely, so a genuine `gh` failure never yields the real reason
@@ -326,21 +651,43 @@ async function fetchRepoPRs(repo) {
   // this branch; only a real call failure (bad auth, unreachable repo,
   // timeout) does, which is exactly the case worth a clear, actionable
   // message instead of a raw JSON syntax error.
-  const raw = await spawnText(['gh', 'pr', 'list', '--repo', slug, '--state', 'open',
-    '--json', 'number,title,url,headRefName,isDraft,statusCheckRollup,updatedAt,author', '--limit', '50']);
+  const raw = await spawnText([
+    'gh',
+    'pr',
+    'list',
+    '--repo',
+    slug,
+    '--state',
+    'open',
+    '--json',
+    'number,title,url,headRefName,isDraft,statusCheckRollup,updatedAt,author',
+    '--limit',
+    '50',
+  ]);
   let list;
-  try { list = JSON.parse(raw); }
-  catch {
-    const entry = { error: `gh pr list failed for ${slug} -- check "gh auth status" and that the repo is reachable`, fetchedAt: Date.now(), prs: [] };
+  try {
+    list = JSON.parse(raw);
+  } catch {
+    const entry = {
+      error: `gh pr list failed for ${slug} -- check "gh auth status" and that the repo is reachable`,
+      fetchedAt: Date.now(),
+      prs: [],
+    };
     repoPrsCache.set(repo, entry);
     return entry;
   }
   const entry = {
-    error: null, fetchedAt: Date.now(),
-    prs: list.map(p => ({author: p.author?.login ?? null,branch: p.headRefName,checks: summarizeChecks(p.statusCheckRollup),
-      isDraft: p.isDraft, 
-      number: p.number, title: p.title, 
-      updatedAt: p.updatedAt, url: p.url, 
+    error: null,
+    fetchedAt: Date.now(),
+    prs: list.map((p) => ({
+      author: p.author?.login ?? null,
+      branch: p.headRefName,
+      checks: summarizeChecks(p.statusCheckRollup),
+      isDraft: p.isDraft,
+      number: p.number,
+      title: p.title,
+      updatedAt: p.updatedAt,
+      url: p.url,
     })),
   };
   repoPrsCache.set(repo, entry);
@@ -355,38 +702,83 @@ async function fetchRepoPRs(repo) {
 // mutating, user-triggered actions, so a real error (no commits to PR,
 // PR already exists, gh not authenticated) needs to surface as a message,
 // not silently look like nothing happened.
-async function spawnRun(cwd, args) {
-  const proc = Bun.spawn(args, { cwd, stderr: 'pipe', stdin: 'ignore', stdout: 'pipe' });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const code = await proc.exited;
-  if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || `${args.join(' ')} failed (exit ${code})`);
-  return stdout.trim();
+async function spawnRun(cwd, args, timeout = 120_000) {
+  const result = await checkedCommand(args, { cwd, timeoutMs: timeout });
+  if (result.code !== 0 || result.timedOut || result.truncated) {
+    throw new Error(
+      result.stderr || `${args[0]} failed or returned incomplete output`
+    );
+  }
+  return result.stdout;
 }
 
 async function createPr(repo, name) {
-  const slug = REPO_META[repo]?.slug;
-  if (!slug) throw new Error('no GitHub repo configured for this project');
-  const wtDir = wtPath(repo, name);
-  // gh pr create prompts interactively when the branch isn't fully pushed
-  // yet -- with stdin ignored that would just hang, so push explicitly
-  // first rather than relying on gh's own interactive fallback.
-  await spawnRun(wtDir, ['git', 'push', '-u', 'origin', name]);
-  const url = await spawnRun(wtDir, ['gh', 'pr', 'create', '--fill', '--repo', slug]);
-  prCache.delete(`${repo}/${name}`); // force a fresh fetchPR instead of showing "no PR" until the TTL expires
-  return { ok: true, url };
+  return lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
+    const slug = REPO_META[repo]?.slug;
+    if (!slug) {
+      throw new Error('no GitHub repo configured for this project');
+    }
+    const wtDir = wtPath(repo, name);
+    const branch = await worktreeBranch(repo, name, true);
+    // gh pr create prompts interactively when the branch isn't fully pushed
+    // yet -- with stdin ignored that would just hang, so push explicitly
+    // first rather than relying on gh's own interactive fallback.
+    await spawnRun(wtDir, ['git', 'push', '-u', 'origin', branch]);
+    const url = await spawnRun(wtDir, [
+      'gh',
+      'pr',
+      'create',
+      '--fill',
+      '--repo',
+      slug,
+      '--head',
+      branch,
+    ]);
+    prCache.delete(`${repo}/${branch}`);
+    return { ok: true, url };
+  });
 }
 
 async function setPrReady(repo, name, ready) {
-  const slug = REPO_META[repo]?.slug;
-  if (!slug) throw new Error('no GitHub repo configured for this project');
-  const args = ['pr', 'ready', name, '--repo', slug];
-  if (!ready) args.push('--undo');
-  await spawnRun(wtPath(repo, name), ['gh', ...args]);
-  prCache.delete(`${repo}/${name}`);
-  return { ok: true };
+  return lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
+    const slug = REPO_META[repo]?.slug;
+    if (!slug) {
+      throw new Error('no GitHub repo configured for this project');
+    }
+    const branch = await worktreeBranch(repo, name, true);
+    const args = ['pr', 'ready', branch, '--repo', slug];
+    if (!ready) {
+      args.push('--undo');
+    }
+    await spawnRun(wtPath(repo, name), ['gh', ...args]);
+    prCache.delete(`${repo}/${branch}`);
+    return { ok: true };
+  });
+}
+
+async function worktreeBranch(repo, name, mutation = false) {
+  const wtDir = wtPath(repo, name);
+  const branch = await spawnRun(wtDir, [
+    'git',
+    'symbolic-ref',
+    '--short',
+    'HEAD',
+  ]);
+  if (!branch || branch.startsWith('-')) {
+    throw new Error('A checked-out branch is required');
+  }
+  if (mutation) {
+    const defaultBranch = await spawnRun(repoPath(repo), [
+      'git',
+      'symbolic-ref',
+      '--short',
+      'HEAD',
+    ]);
+    if (new Set(['main', 'master', 'staging', defaultBranch]).has(branch)) {
+      throw new Error('PR mutations require a feature branch');
+    }
+  }
+  return branch;
 }
 
 // ── diff viewer (per-worktree, computed on demand, no cache unlike the
@@ -414,33 +806,47 @@ const DIFF_MAX_FILES = 300;
 // otherwise be mistaken for the file-header lines, which only ever appear
 // once, before the first "@@" of a file.
 function parseUnifiedDiff(raw) {
-  if (!raw) return [];
+  if (!raw) {
+    return [];
+  }
   const files = [];
-  let cur = null, hunk = null, oldLine = 0, newLine = 0, seenFiles = 0;
+  let cur = null,
+    hunk = null,
+    oldLine = 0,
+    newLine = 0,
+    seenFiles = 0;
 
   function flushHunk() {
     // Once a file is flagged tooLarge its hunks are dropped at render time
     // anyway, so skip retaining them here: an oversized file's content
     // shouldn't sit in memory for the rest of the parse.
-    if (cur && hunk && !cur.tooLarge) cur.hunks.push(hunk);
+    if (cur && hunk && !cur.tooLarge) {
+      cur.hunks.push(hunk);
+    }
     hunk = null;
   }
   function flushFile() {
     flushHunk();
-    if (cur) files.push(cur);
+    if (cur) {
+      files.push(cur);
+    }
     cur = null;
   }
 
   for (const line of raw.split('\n')) {
     if (line.startsWith('diff --git ')) {
       flushFile();
-      seenFiles++;
+      seenFiles += 1;
       // "a/<path> b/<path>": greedy match backtracks to the rightmost
       // " b/", which is correct for the common case (identical paths, or a
       // path that doesn't itself contain the literal substring " b/").
       const m = line.slice('diff --git '.length).match(/^a\/(.*) b\/(.*)$/);
-      cur = {additions: 0, deletions: 0, 
-        file: m ? m[2] : line.slice('diff --git '.length), hunks: [], sawHunk: false,
+      cur = {
+        additions: 0,
+        deletions: 0,
+        file: m ? m[2] : line.slice('diff --git '.length),
+        hunks: [],
+        sawHunk: false,
         // A file past DIFF_MAX_FILES gets sliced out of the response by
         // summarizeDiff regardless, so reuse the same skip-building path an
         // individually oversized file already takes below: count its real
@@ -450,60 +856,99 @@ function parseUnifiedDiff(raw) {
       };
       continue;
     }
-    if (!cur) continue; // stray output before the first file header, shouldn't happen
+    if (!cur) {
+      continue; // stray output before the first file header, shouldn't happen
+    }
 
     if (line.startsWith('Binary files ')) {
       cur.binary = true;
       const m = line.match(/^Binary files (.+) and (.+) differ$/);
       if (m) {
-        const a = m[1].replace(/^a\//, ''), b = m[2].replace(/^b\//, '');
-        cur.file = b !== '/dev/null' ? b : a; // deleted binary file, show the old path
+        const a = m[1].replace(/^a\//, ''),
+          b = m[2].replace(/^b\//, '');
+        cur.file = b === '/dev/null' ? a : b; // deleted binary file, show the old path
       }
       continue;
     }
     if (!cur.sawHunk && line.startsWith('--- ')) {
       const p = line.slice(4).replace(/^a\//, '');
-      if (p !== '/dev/null') cur._oldPath = p;
+      if (p !== '/dev/null') {
+        cur._oldPath = p;
+      }
       continue;
     }
     if (!cur.sawHunk && line.startsWith('+++ ')) {
       const p = line.slice(4).replace(/^b\//, '');
-      cur.file = p !== '/dev/null' ? p : (cur._oldPath ?? cur.file); // deleted file, show the old path
+      cur.file = p === '/dev/null' ? (cur._oldPath ?? cur.file) : p; // deleted file, show the old path
       continue;
     }
     const hm = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hm) {
       flushHunk();
       cur.sawHunk = true;
-      oldLine = parseInt(hm[1], 10);
-      newLine = parseInt(hm[2], 10);
+      oldLine = Number.parseInt(hm[1], 10);
+      newLine = Number.parseInt(hm[2], 10);
       hunk = { header: line, lines: [] };
       continue;
     }
-    if (!hunk) continue; // metadata between file header and first hunk (index/mode/rename lines)
+    if (!hunk) {
+      continue; // metadata between file header and first hunk (index/mode/rename lines)
+    }
 
     // Counts and line numbers keep advancing even past the size cap (an
     // oversized file should still report an accurate total), only the
     // per-line array stops growing.
     if (line.startsWith('+')) {
-      cur.additions++;
-      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), newLine: newLine++, type: 'add' }); else newLine++;
+      cur.additions += 1;
+      if (cur.tooLarge) {
+        newLine += 1;
+      } else {
+        hunk.lines.push({
+          content: line.slice(1),
+          newLine,
+          type: 'add',
+        });
+        newLine += 1;
+      }
     } else if (line.startsWith('-')) {
-      cur.deletions++;
-      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), oldLine: oldLine++, type: 'remove' }); else oldLine++;
+      cur.deletions += 1;
+      if (cur.tooLarge) {
+        oldLine += 1;
+      } else {
+        hunk.lines.push({
+          content: line.slice(1),
+          oldLine,
+          type: 'remove',
+        });
+        oldLine += 1;
+      }
     } else if (line.startsWith(' ')) {
-      if (!cur.tooLarge) hunk.lines.push({ content: line.slice(1), newLine: newLine++, oldLine: oldLine++, type: 'context' });
-      else { oldLine++; newLine++; }
+      if (cur.tooLarge) {
+        oldLine += 1;
+        newLine += 1;
+      } else {
+        hunk.lines.push({
+          content: line.slice(1),
+          newLine,
+          oldLine,
+          type: 'context',
+        });
+        newLine += 1;
+        oldLine += 1;
+      }
     }
     // A "\ No newline at end of file" marker matches none of the above and is dropped, as intended.
 
-    if (!cur.tooLarge && cur.additions + cur.deletions > DIFF_FILE_LINE_CAP) cur.tooLarge = true;
+    if (!cur.tooLarge && cur.additions + cur.deletions > DIFF_FILE_LINE_CAP) {
+      cur.tooLarge = true;
+    }
   }
   flushFile();
 
   // Strip internal-only bookkeeping before handing back to the caller.
   return files.map(({ sawHunk, _oldPath, tooLarge, hunks, ...f }) =>
-    tooLarge ? { ...f, hunks: [], tooLarge: true } : { ...f, hunks });
+    tooLarge ? { ...f, hunks: [], tooLarge: true } : { ...f, hunks }
+  );
 }
 
 // additions/deletions are summed across ALL parsed files (before the
@@ -511,10 +956,15 @@ function parseUnifiedDiff(raw) {
 // file list itself is truncated.
 function summarizeDiff(raw) {
   const all = parseUnifiedDiff(raw);
-  let additions = 0, deletions = 0;
-  for (const f of all) { additions += f.additions; deletions += f.deletions; }
+  let additions = 0,
+    deletions = 0;
+  for (const f of all) {
+    additions += f.additions;
+    deletions += f.deletions;
+  }
   return {
-    additions, deletions,
+    additions,
+    deletions,
     files: all.slice(0, DIFF_MAX_FILES),
     totalFiles: all.length,
     truncatedFileCount: Math.max(0, all.length - DIFF_MAX_FILES),
@@ -530,9 +980,9 @@ function summarizeDiff(raw) {
 // diff HEAD` alone covers both staged and unstaged changes in one pass, since
 // it compares the working tree directly against HEAD regardless of index state.
 async function computeDiff(repo, name) {
-  const wtDir   = wtPath(repo, name);
+  const wtDir = wtPath(repo, name);
   const repoDir = repoPath(repo);
-  const base    = baseBranchRef(repoDir);
+  const base = baseBranchRef(repoDir);
 
   // baseBranchRef always returns a ref name, but that ref may not actually
   // resolve (origin/<default> never fetched, a stale remote-tracking branch).
@@ -541,14 +991,29 @@ async function computeDiff(repo, name) {
   // unresolvable base is indistinguishable from "this branch is fully
   // merged", so the UI would tell a worktree that's 60 commits ahead that it
   // has no changes. Check explicitly and let the frontend say so.
-  const baseResolved = !!(await spawnText(['git', '-C', wtDir, 'rev-parse', '--verify', '--quiet', base]));
+  const baseResolved = !!(await spawnText([
+    'git',
+    '-C',
+    wtDir,
+    'rev-parse',
+    '--verify',
+    '--quiet',
+    base,
+  ]));
 
   const [committedRaw, uncommittedRaw] = await Promise.all([
-    baseResolved ? spawnText(['git', '-C', wtDir, 'diff', `${base}...HEAD`]) : Promise.resolve(''),
+    baseResolved
+      ? spawnText(['git', '-C', wtDir, 'diff', `${base}...HEAD`])
+      : Promise.resolve(''),
     spawnText(['git', '-C', wtDir, 'diff', 'HEAD']),
   ]);
 
-  return { base, baseResolved, committed: summarizeDiff(committedRaw), uncommitted: summarizeDiff(uncommittedRaw) };
+  return {
+    base,
+    baseResolved,
+    committed: summarizeDiff(committedRaw),
+    uncommitted: summarizeDiff(uncommittedRaw),
+  };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -556,22 +1021,27 @@ async function computeDiff(repo, name) {
 // ponytail: ports.js's activePid() call in getWorktrees() used to run once per
 // worktree, every poll (3s idle / 800ms mid-start) — same execFileSync-freezes-the-
 // event-loop bug fetchPR() already had. Batch + short TTL cache, shared with /api/ports.
-let _portsCache = null, _portsCacheAt = 0;
-const PORTS_TTL = 1500;
+const listenerObservation = createListenerObservation(probeListeningPorts);
 
 async function activePortsCached() {
-  const now = Date.now();
-  if (_portsCache && now - _portsCacheAt < PORTS_TTL) return _portsCache;
-  _portsCache = await listActivePortsAsync();
-  _portsCacheAt = now;
-  return _portsCache;
+  return listenerObservation.read();
 }
 
 // Shared by /api/ports and mcp-server.js's list_ports tool.
 async function listPortsWithWorktree() {
   const ports = await activePortsCached();
-  const registry = Object.fromEntries(portEntries(WORKSPACE).map(e => [e.port, e.key]));
-  return ports.map(p => ({ ...p, worktree: registry[p.port] ?? null }));
+  if (listenerObservation.observation().state !== 'ready') {
+    throw Object.assign(
+      new Error(
+        'Current listeners could not be checked. Previous ports are retained.'
+      ),
+      { code: 'LISTENER_PROBE_FAILED' }
+    );
+  }
+  const registry = Object.fromEntries(
+    portEntries(WORKSPACE).map((e) => [e.port, e.key])
+  );
+  return ports.map((p) => ({ ...p, worktree: registry[p.port] ?? null }));
 }
 
 async function killPort(port) {
@@ -582,292 +1052,580 @@ async function killPort(port) {
   // the real stop path whenever the port belongs to a known, container-backed
   // worktree; the raw PID-kill fallback below stays for bare processes and for
   // genuinely-unregistered ports (setu prune's orphan-killing case).
-  const owner = portEntries(WORKSPACE).find(e => e.port === port);
-  const entry = owner && procs.get(owner.key);
-  if (entry?.container) {
-    await stopContainer(owner.repo, owner.name, entry.container);
-    if (procs.get(owner.key) === entry) procs.delete(owner.key);
-    drainQueue();
-    return { ok: true };
+  const owner = portEntries(WORKSPACE).find((e) => e.port === port);
+  if (owner) {
+    return stopWorktree(owner.repo, owner.name, port);
   }
   const pid = await activePidAsync(port);
-  if (!pid) return { error: 'nothing on that port', ok: false };
-  try { process.kill(parseInt(pid), 'SIGTERM'); return { ok: true }; }
-  catch (e) { return { error: String(e), ok: false }; }
+  if (!pid) {
+    return { error: 'nothing on that port', ok: false };
+  }
+  try {
+    process.kill(Number.parseInt(pid, 10), 'SIGTERM');
+    return { ok: true };
+  } catch (e) {
+    return { error: String(e), ok: false };
+  }
 }
 
 // Resource usage — only ever called for `active` worktrees (no point
 // measuring what isn't running), so this never scales with the full 45+
 // worktree registry, only with maxConcurrentDevServers (default 3).
-async function activeMemMb(entry) {
-  if (!entry) return null;
+const memorySamples = new Map();
+async function activeMemMb(entry, key) {
+  if (!entry) {
+    return null;
+  }
+  let sample = memorySamples.get(key);
+  if (!sample || sample.generation !== entry.generation) {
+    sample = { generation: entry.generation };
+    memorySamples.set(key, sample);
+  }
+  if (!sample.pending && (!sample.at || Date.now() - sample.at > 10_000)) {
+    sample.at = Date.now();
+    sample.pending = measureActiveMemMb(entry, key)
+      .then((value) => {
+        sample.memMb = value;
+      })
+      .catch(() => {
+        sample.memMb = null;
+      })
+      .finally(() => {
+        sample.pending = null;
+      });
+  }
+  return sample.memMb ?? null;
+}
+
+async function measureActiveMemMb(entry, key) {
+  if (!entry) {
+    return null;
+  }
   if (entry.container) {
-    const id = (await spawnText(['docker', 'compose', '-p', entry.container, 'ps', '-q'])).split('\n')[0];
-    if (!id) return null;
-    const raw = await spawnText(['docker', 'stats', '--no-stream', '--format', '{{.MemUsage}}', id]);
+    const id = (
+      await spawnText(
+        ['docker', 'compose', '-p', entry.container, 'ps', '-q'],
+        { timeoutMs: 3000 }
+      )
+    ).split('\n')[0];
+    if (!id) {
+      return null;
+    }
+    const raw = await spawnText(
+      ['docker', 'stats', '--no-stream', '--format', '{{.MemUsage}}', id],
+      { timeoutMs: 3000 }
+    );
     // "123.4MiB / 4GiB" — only the used side matters here
     const m = raw.match(/^([\d.]+)\s*(MiB|GiB)/);
-    if (!m) return null;
-    return m[2] === 'GiB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
+    if (!m) {
+      return null;
+    }
+    return m[2] === 'GiB'
+      ? Number.parseFloat(m[1]) * 1024
+      : Number.parseFloat(m[1]);
   }
-  if (entry.pid) return processFootprintMb(entry.pid);
+  if (entry.pid) {
+    const rows = await worktreeProcessTree(key, entry);
+    return rows.length
+      ? rows.reduce((sum, row) => sum + row.rss, 0) / 1024
+      : null;
+  }
   return null;
 }
 
-async function getWorktrees() {
-  const activePorts = new Set((await activePortsCached()).map(p => p.port));
+let worktreesInFlight = null;
+function getWorktrees() {
+  if (!worktreesInFlight) {
+    worktreesInFlight = computeWorktrees().finally(() => {
+      worktreesInFlight = null;
+    });
+  }
+  return worktreesInFlight;
+}
+
+async function computeWorktrees() {
+  const activePorts = new Set((await activePortsCached()).map((p) => p.port));
   return Promise.all(
     portEntries(WORKSPACE).map(async ({ key, repo, name, port }) => {
-      const slug     = name.replace(/\//g, '-');
-      const domain   = localDomain(repo, name);
-      const wtDir    = wtPath(repo, name);
+      const slug = name.replace(/\//g, '-');
+      const domain = localDomain(repo, name);
+      const wtDir = wtPath(repo, name);
       const tunnelOn = tunnelEnabled(wtDir, _cfg);
-      const meta     = REPO_META[repo] ?? { github: null, label: repo };
-      const branchUrl = meta.github ? `${meta.github}/tree/${name}` : null;
-      const pr        = name !== 'main' ? await fetchPR(repo, name) : null;
+      const meta = REPO_META[repo] ?? { github: null, label: repo };
+
       const iPort = inngestPort(port);
       const active = activePorts.has(port);
-      const procEntry = procs.get(key);
+      const procEntry = lifecycle.snapshot(key);
 
       // Worktree directory name isn't reliably the branch name — join
       // through the real path->branch map, not an assumption (see
       // worktreeBranchMap's comment in lib.js for the confirmed live case
       // where this bit us).
-      const { branchMeta, pathToBranch } = repoGitMeta(repo);
+      const { branchMeta, pathToBranch } = await repoGitMeta(repo, true);
       const branch = pathToBranch.get(resolve(wtDir)) ?? name;
-      const gm = branchMeta.get(branch) ?? { ahead: 0, behind: 0, lastCommitAt: null };
+      const branchUrl = meta.github ? `${meta.github}/tree/${branch}` : null;
+      // Badges refresh in the background; an offline GitHub must not hold up
+      // local start/stop state. fetchPR bounds and deduplicates the work.
+      if (branch !== 'main') {
+        void fetchPR(repo, branch);
+      }
+      const pr = branch === 'main' ? null : prCache.get(`${repo}/${branch}`);
+      const gm = branchMeta.get(branch) ?? {
+        ahead: 0,
+        behind: 0,
+        lastCommitAt: null,
+      };
       const [dirty, memMb] = await Promise.all([
         fetchDirty(repo, name),
-        active ? activeMemMb(procEntry) : Promise.resolve(null),
+        active ? activeMemMb(procEntry, key) : Promise.resolve(null),
       ]);
 
       return {
         active,
-        ahead:         gm.ahead,
-        behind:        gm.behind,
+        agent: agentStatus(repo, name),
+        ahead: gm.ahead,
+        behind: gm.behind,
         branch,
         branchUrl,
-        container:     procEntry?.container ?? null,
-        convexActive:     convexDevProcs.has(key),
+        container: procEntry?.container ?? null,
+        convexActive: convexDevProcs.has(key),
         // Gate for whether the Convex section renders at all -- unlike
         // Inngest/Trigger (assumed available to every worktree), Convex is
         // only relevant to worktrees that actually have it configured.
         convexConfigured: cachedConvexDir(repo, name, wtDir) !== null,
-        convexDeploy:     convexDeployStatus(repo, name),
+        convexDeploy: convexDeployStatus(repo, name),
         // Directory birthtime, not a subprocess — statSync is essentially
         // free (no spawn) and APFS supports real birthtime. This is
         // creation time, not last-activity — don't conflate the two in the
         // UI (lastCommitAt is the "worked on" signal).
-        createdAt: (() => { try { return Math.floor(statSync(wtDir).birthtimeMs / 1000); } catch { return null; } })(),
-        dirty,domain, 
+        createdAt: (() => {
+          try {
+            return Math.floor(statSync(wtDir).birthtimeMs / 1000);
+          } catch {
+            return null;
+          }
+        })(),
+        dirty,
+        domain,
         inngestActive: inngestProcs.has(key) || activePorts.has(iPort),
-        inngestPort:   iPort,
-        key, 
-        label:         meta.label,
-        lastCommitAt:  gm.lastCommitAt,
-        memMb,name, 
+        inngestPort: iPort,
+        key,
+        label: meta.label,
+        lastCommitAt: gm.lastCommitAt,
+        lifecycleError: procEntry?.lastError ?? null,
+        memMb,
+        name,
         needsMigrationPrompt: needsMigrationPrompt(WORKSPACE, repo, name),
         netlifyDeploy: netlifyStatus(repo, name),
         // What a plain Start (no explicit --container/--bare) would resolve
         // to right now — lets the UI show this *before* the click instead of
         // the user finding out after, which is the exact blind spot that let
         // an established worktree get silently switched to a container.
-        nextStartMode: defaultContainerMode(WORKSPACE, repo, name) ? 'container' : 'bare',port, 
-        pr:            pr?.url ? { checks: pr.checks, number: pr.number, state: pr.state, title: pr.title, url: pr.url } : null,pubDomain: publicDomain(_cfg), 
-        queued:        queuePosition(key) !== null,
-        queuePosition: queuePosition(key),repo, 
+        nextStartMode: defaultContainerMode(WORKSPACE, repo, name)
+          ? 'container'
+          : 'bare',
+        operation: lifecycle.operationStatus(key),
+        phase: procEntry?.phase ?? 'stopped',
+        port,
+        pr: pr?.url
+          ? {
+              checks: pr.checks,
+              number: pr.number,
+              state: pr.state,
+              title: pr.title,
+              url: pr.url,
+            }
+          : null,
+        pubDomain: publicDomain(_cfg),
+        queued: queuePosition(key) !== null,
+        queuePosition: queuePosition(key),
+        repo,
         // Configured custom sidecars (sidecars.json, repo-scoped) and
         // whether each is actually running for THIS worktree right now --
         // previously tracked correctly in sidecarProcs but never surfaced
         // to any client, so there was no way to see one was alive short of
         // reading its raw log file.
-        sidecars: loadSidecars(WORKSPACE, repo).map(s => ({active: sidecarProcs.has(`${key}/${s.name}`),
-          name: s.name, 
-        })),slug, 
-        triggerActive: triggerProcs.has(key),tunnelOn,
+        sidecars: loadSidecars(WORKSPACE, repo).map((s) => ({
+          active: sidecarProcs.has(`${key}/${s.name}`),
+          name: s.name,
+        })),
+        slug,
+        starting: !!procEntry?.reserved && !procEntry.stopping && !active,
+        stopping: !!procEntry?.stopping,
+        triggerActive: triggerProcs.has(key),
+        tunnelOn,
         tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
-        vercelDeploy:  vercelStatus(repo, name),
+        vercelDeploy: vercelStatus(repo, name),
       };
     })
   );
 }
 
 // ── dev server ────────────────────────────────────────────────────────────────
-// Each next-server can still be several hundred MB to low-GB even after the
-// Turbopack-eviction fix (Next.js ≥16.3.0) — unbounded concurrent starts is
-// exactly the failure mode this whole portal exists to prevent. Cap concurrent
-// dev servers; anything beyond the cap queues and starts automatically as a
-// slot frees up (a worktree stopping, or exiting on its own).
-// `let`, not `const` — the settings page (POST /api/settings) updates this
-// in-memory so a concurrency-cap change takes effect immediately, not only
-// after the portal process restarts. Persisted to ~/.setu.json via
-// saveConfig() at the same time so it survives a real restart too.
-let MAX_CONCURRENT_DEV = _cfg.maxConcurrentDevServers ?? 3;
-const startQueue = []; // [{ key, repo, name, port }], FIFO
+function worktreeTarget(
+  repo,
+  name,
+  port = getPort(WORKSPACE, repo, name),
+  { registered = true } = {}
+) {
+  return Object.freeze({
+    key: `${repo}/${name}`,
+    name,
+    port,
+    project: composeProjectName(repo, name),
+    repo,
+    repoDir: repoPath(repo),
+    wtDir: managedWorktreePath(WORKSPACE, repo, name, { registered }),
+  });
+}
+
+// The observation must distinguish command failure from confirmed absence.
+const checkedCommand = createCommandRunner((args, options) =>
+  Bun.spawn(args, options)
+);
+
+async function readInventoryRuntime() {
+  const ports = await listenerObservation.read().catch(() => []);
+  const known = listenerObservation.observation().state === 'ready';
+  const listening = new Set(ports.map((entry) => entry.port));
+  const sidecarKeys = new Set(
+    [...sidecarProcs.keys()].map((key) => key.slice(0, key.lastIndexOf('/')))
+  );
+  return new Map(
+    portEntries(WORKSPACE).map(({ key, port }) => {
+      const owned = lifecycle.snapshot(key);
+      const supporting = inngestProcs.has(key) || triggerProcs.has(key) ||
+        convexDevProcs.has(key) || sidecarKeys.has(key);
+      return [key, {
+        active: owned?.reserved || supporting ? true : known ? listening.has(port) : null,
+        operation: queuePosition(key) !== null
+          ? { kind: 'start', phase: 'queued' }
+          : lifecycle.operationStatus(key),
+        lastPortalActivityAt: lastSeenAt.get(key) ?? null,
+      }];
+    })
+  );
+}
+
+const workspaceInventory = createWorkspaceInventory({
+  readRegistry: () => workspaceInventoryRegistry(WORKSPACE),
+  readRuntime: readInventoryRuntime,
+  run: checkedCommand,
+});
+
+async function processEvidence(pid) {
+  const [started, location] = await Promise.all([
+    checkedCommand(['ps', '-p', String(pid), '-o', 'lstart=']),
+    checkedCommand(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn']),
+  ]);
+  const cwd = location.stdout
+    .split('\n')
+    .find((cwdLine) => cwdLine.startsWith('n'))
+    ?.slice(1);
+  if (
+    started.code !== 0 ||
+    location.code !== 0 ||
+    !started.stdout ||
+    !cwd ||
+    started.timedOut ||
+    location.timedOut
+  ) {
+    return null;
+  }
+  return { cwd: await identityFs.realpath(cwd), startedAt: started.stdout };
+}
+
+async function containerState(project) {
+  try {
+    const result = await checkedCommand([
+      'docker',
+      'ps',
+      '--filter',
+      `label=com.docker.compose.project=${project}`,
+      '--format',
+      '{{.ID}}',
+    ]);
+    return result.code === 0 && !result.timedOut
+      ? result.stdout
+        ? 'alive'
+        : 'dead'
+      : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function discoverDevRuntime(target) {
+  if (existsSync(dockerComposePath(target.wtDir))) {
+    const state = await containerState(target.project);
+    if (state !== 'dead') {
+      return {
+        handle: {
+          container: target.project,
+          observedState: state,
+          ownedGroup: false,
+          pid: null,
+        },
+        state,
+      };
+    }
+  }
+  try {
+    const listener = await checkedCommand([
+      'lsof',
+      '-nP',
+      `-iTCP:${target.port}`,
+      '-sTCP:LISTEN',
+      '-t',
+    ]);
+    if (listener.code === 1 && !listener.stdout && !listener.stderr) {
+      return { state: 'dead' };
+    }
+    if (listener.code !== 0 || listener.timedOut) {
+      return { state: 'unknown' };
+    }
+    const pids = [...new Set(listener.stdout.split(/\s+/).filter(Boolean))];
+    if (pids.length !== 1 || !/^\d+$/.test(pids[0])) {
+      return { state: 'unknown' };
+    }
+    const pid = Number(pids[0]);
+    const cwd = await checkedCommand([
+      'lsof',
+      '-a',
+      '-p',
+      String(pid),
+      '-d',
+      'cwd',
+      '-Fn',
+    ]);
+    const directory = cwd.stdout
+      .split('\n')
+      .find((cwdLine) => cwdLine.startsWith('n'))
+      ?.slice(1);
+    if (
+      cwd.code !== 0 ||
+      !directory ||
+      (await identityFs.realpath(directory)) !==
+        (await identityFs.realpath(target.wtDir))
+    ) {
+      return { state: 'unknown' };
+    }
+    const evidence = await processEvidence(pid);
+    if (
+      !evidence ||
+      evidence.cwd !== (await identityFs.realpath(target.wtDir))
+    ) {
+      return { state: 'unknown' };
+    }
+    return { handle: { evidence, ownedGroup: false, pid }, state: 'alive' };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
+const devRuntime = createDevRuntime({
+  clock: { now: () => performance.now(), sleep: (ms) => Bun.sleep(ms) },
+  closeLog: closeSync,
+  composeDown: composeDownAsync,
+  containerState,
+  discover: discoverDevRuntime,
+  openLog: (target) => {
+    touchLastSeen(target.repo, target.name);
+    return openLogFd(target.repo, target.name, 'dev');
+  },
+  prepareBare: (target) => ({
+    ...process.env,
+    PORT: String(target.port),
+    ...parseEnvFile(join(target.wtDir, '.envrc')),
+  }),
+  prepareContainer: (target, spec) =>
+    writeDockerCompose(
+      _cfg,
+      target.repo,
+      target.name,
+      target.port,
+      undefined,
+      spec
+    ),
+  sidecarStops: [
+    (target) => stopInngest(target.repo, target.name, target.port),
+    (target) => stopTrigger(target.repo, target.name),
+    (target) => stopConvexDev(target.repo, target.name),
+    (target) => stopSidecars(target.repo, target.name),
+  ],
+  signal: (pid, signal) => process.kill(pid, signal),
+  spawn: (args, options) => Bun.spawn(args, options),
+  startSidecars: (target) =>
+    startSidecars(target.repo, target.name, target.port),
+  verifyHandle: async (handle) => {
+    if (!handle.evidence) {
+      return false;
+    }
+    try {
+      return (
+        JSON.stringify(await processEvidence(handle.pid)) ===
+        JSON.stringify(handle.evidence)
+      );
+    } catch {
+      return false;
+    }
+  },
+});
+
+const lifecycle = createWorktreeLifecycle({
+  assertStorage: () => assertStorageHeadroom(WORKSPACE, readHostHealth),
+  capacity: {
+    refresh: async () => {
+      const result = await checkedCommand([
+        'docker',
+        'info',
+        '--format',
+        '{{.ServerVersion}}|{{.OperatingSystem}}|{{.NCPU}}|{{.MemTotal}}',
+      ]);
+      const [version, engine, cpus, bytes] = result.stdout.split('|');
+      return {
+        available: result.code === 0 && !result.timedOut && !!version,
+        cpus: Number(cpus) || null,
+        engine: version ? engine || 'docker' : null,
+        memMb: Math.floor(Number(bytes) / 1024 / 1024) || null,
+      };
+    },
+  },
+  clock: { clearTimeout, now: () => performance.now(), setTimeout },
+  hasSupportingWork: supportingWorkActive,
+  runtime: devRuntime,
+  settings: _cfg,
+  validateTarget: async (target, { kind } = {}) => {
+    if (!configReconciled) {
+      throw new Error(
+        'Installed configuration is unresolved; retry settings recovery before mutation'
+      );
+    }
+    if (kind === 'remove') {
+      return;
+    }
+    await removals.assertCanMutate(target, { kind });
+    if (
+      [
+        'start',
+        'setup',
+        'project-setup',
+        'deploy',
+        'sidecar-start',
+        'sync',
+        'review',
+      ].includes(kind)
+    ) {
+      await assertStorageHeadroom(WORKSPACE, readHostHealth);
+    }
+    if (kind === 'project-setup') {
+      return;
+    }
+    if (kind === 'setup') {
+      if (!loadProjects(WORKSPACE)[target.repo]) {
+        throw new Error('Project is not registered');
+      }
+      return;
+    }
+    if (
+      !target.port ||
+      getPort(WORKSPACE, target.repo, target.name) !== target.port ||
+      !existsSync(target.wtDir)
+    ) {
+      throw new Error('Worktree registration changed; refresh and retry');
+    }
+  },
+  withTarget: (target, task) =>
+    workspaceState(WORKSPACE).withTargets([target], task),
+});
+
+function supportingWorkActive() {
+  return (
+    !configReconciled ||
+    removals.pending().length > 0 ||
+    memoryCheckRunning ||
+    !!raycastDev ||
+    !!tunnelProc ||
+    tunnelTeardownUnknown ||
+    activeTunnelMap.size > 0 ||
+    mcpHasOwnedWork() ||
+    [inngestProcs, triggerProcs, convexDevProcs, sidecarProcs].some(
+      (map) => map.size > 0
+    )
+  );
+}
+const portalProcessIdentity = await observeProcessIdentity(process.pid);
+const updateControl = createPortalUpdateControl({
+  hasSupportingWork: supportingWorkActive,
+  lifecycle,
+  processIdentity: portalProcessIdentity,
+});
+const portalSockets = new Set();
+let updateShutdown = null;
+
+function stopPortalForUpdate(server) {
+  if (updateShutdown) {
+    return;
+  }
+  // Admission is already owner-closed. Drain the acknowledgement and current
+  // reads, close our own WebSockets, then exit. No unrelated daemon is signalled.
+  updateShutdown = drainPortalForUpdate({
+    closeConnections: () => {
+      for (const socket of [...portalSockets]) {
+        close(socket);
+        socket.close(1001, 'Portal update');
+      }
+    },
+    dispose: () => {
+      clearInterval(logRetentionTimer);
+      clearInterval(memoryCheckTimer);
+      clearInterval(idleCheckTimer);
+      lifecycle.dispose();
+    },
+    exit: (code) => process.exit(code),
+    stopServer: () => server.stop(false),
+  }).catch(() => {
+    console.error(
+      'Portal update stop is unconfirmed; admission remains closed.'
+    );
+  });
+}
 
 function queuePosition(key) {
-  const i = startQueue.findIndex(q => q.key === key);
-  return i === -1 ? null : i + 1;
+  const index = lifecycle.queueSnapshot().findIndex((item) => item.key === key);
+  return index === -1 ? null : index + 1;
 }
 
-function drainQueue() {
-  while (startQueue.length && procs.size < MAX_CONCURRENT_DEV) {
-    const next = startQueue.shift();
-    if (procs.has(next.key)) continue; // started some other way already
-    if (next.container) spawnContainer(next.repo, next.name, next.port);
-    else spawnWorktree(next.repo, next.name, next.port);
+// Boot adoption finishes before request handling begins. Unknown Docker state
+// keeps its project reservation; the engine's forwarding PID is never adopted.
+async function reconcileDevServers() {
+  const entries = portEntries(WORKSPACE);
+  for (let index = 0; index < entries.length; index += 8) {
+    await Promise.all(
+      entries.slice(index, index + 8).map(async ({ repo, name, port }) => {
+        const target = worktreeTarget(repo, name, port);
+        const found = await discoverDevRuntime(target);
+        if (found.state === 'dead') {
+          return;
+        }
+        const handle = found.handle ?? {
+          observedState: 'unknown',
+          ownedGroup: false,
+          pid: null,
+        };
+        lifecycle.adopt(target, handle);
+        openLogPaths.add(logPath(repo, name));
+        touchLastSeen(repo, name);
+      })
+    );
   }
 }
 
-function spawnWorktree(repo, name, port) {
-  const key   = `${repo}/${name}`;
-  const wtDir = wtPath(repo, name);
-  const env  = { ...process.env, PORT: String(port), ...parseEnvFile(join(wtDir, '.envrc')) };
-  const fd   = openLogFd(repo, name, 'dev');
-  const proc = Bun.spawn(['bun', 'dev'], { cwd: wtDir, env, stderr: fd, stdout: fd });
-  const entry = wrapProc(proc);
-  procs.set(key, entry);
-  lastSeenAt.set(key, Date.now()); // idle-timeout baseline: clock starts at spawn, not at zero
-  proc.exited.then(() => { if (procs.get(key) === entry) { procs.delete(key); drainQueue(); } });
-  return { skippedSidecars: startSidecars(repo, name, port) };
+function startWorktree(repo, name, port, container = true) {
+  return lifecycle.start(worktreeTarget(repo, name, port), container);
 }
-
-// Container path: `docker compose up -d --build` returns as soon as containers
-// are created and detached — the slow part (bun install && bun run dev) runs
-// INSIDE the container afterward, so this is not a blocking start any more than
-// the bare path is. Readiness is observed the same way as bare processes: once
-// the container's published port opens, getWorktrees()'s existing lsof-based
-// scan sees it — no container-specific polling needed there.
-function spawnContainer(repo, name, port) {
-  const key   = `${repo}/${name}`;
-  const wtDir = wtPath(repo, name);
-  writeDockerCompose(_cfg, repo, name, port);
-  const project = composeProjectName(repo, name);
-  const fd = openLogFd(repo, name, 'dev');
-  const proc = Bun.spawn(
-    ['docker', 'compose', '-p', project, '-f', dockerComposePath(wtDir), 'up', '-d', '--build'],
-    { cwd: wtDir, stderr: fd, stdout: fd });
-  const entry = wrapContainer(project);
-  procs.set(key, entry);
-  proc.exited.then((code) => {
-    // Only `up -d` itself failing (bad compose file, daemon unreachable) lands
-    // here fast — the app's own boot happens after this exits, inside the
-    // container. A nonzero exit means no container is actually running, so
-    // don't leave a phantom "running" entry blocking the concurrency slot.
-    if (code !== 0 && procs.get(key) === entry) { procs.delete(key); drainQueue(); }
-  });
-  return { skippedSidecars: startSidecars(repo, name, port) };
-}
-
-async function stopContainer(repo, name, project) {
-  const wtDir = wtPath(repo, name);
-  // No -v: the node_modules named volume survives, so the next `up` skips
-  // `bun install` unless the compose file's volume was ever pruned separately.
-  await composeDownAsync(project, dockerComposePath(wtDir));
-}
-
-// Boot-time only: procs starts empty on every portal restart, same blind spot
-// reconcileTriggerSidecars() fixes for Trigger — without this, a dev server
-// that predates this portal instance (e.g. still running from before a
-// restart) doesn't count against MAX_CONCURRENT_DEV, so the cap silently
-// undercounts real concurrent servers. Container-backed worktrees are checked
-// FIRST via `docker compose ps` — falling through to the generic port scan for
-// them would misidentify the engine's own port-forwarding helper process as
-// "the dev server pid" and a later stop would try to kill it directly, which
-// isn't safe (that helper isn't scoped to one container).
-function reconcileDevServers() {
-  const activePorts = new Map(listActivePorts().map(p => [p.port, p.pid]));
-  for (const { key, repo, name, port } of portEntries(WORKSPACE)) {
-    if (procs.has(key)) continue;
-    const wtDir = wtPath(repo, name);
-    if (existsSync(dockerComposePath(wtDir))) {
-      const project = composeProjectName(repo, name);
-      if (composeProjectAlive(project)) { procs.set(key, wrapContainer(project)); continue; }
-    }
-    const pid = activePorts.get(port);
-    if (pid) {
-      procs.set(key, wrapPid(+pid));
-      // True start time is unknown for a process discovered already running
-      // (it predates this portal instance). Use portal-restart time as a
-      // conservative idle-timeout baseline rather than leaving it untracked.
-      lastSeenAt.set(key, Date.now());
-    }
-  }
-}
-
-async function startWorktree(repo, name, port, container = true) {
-  const key = `${repo}/${name}`;
-  const existing = procs.get(key);
-  if (existing) {
-    // A procs entry isn't proof of life — its container/process can have
-    // already died without checkMemoryCeilings noticing yet (it requires 2
-    // consecutive misses a minute apart before freeing the slot, so up to
-    // ~2 minutes of staleness). Blindly trusting the Map here rejected a
-    // genuine restart with a false "already running" — confirmed live.
-    // Verify directly instead of trusting the Map alone; a stale hit clears
-    // itself and falls through to a real start rather than staying stuck.
-    const alive = existing.container
-      ? await composeProjectAliveAsync(existing.container)
-      : !!(await activePidAsync(port));
-    if (alive) return { error: 'already running', ok: false };
-    procs.delete(key);
-  }
-  if (queuePosition(key)) return { ok: true, position: queuePosition(key), queued: true };
-  if (container) {
-    const rt = containerRuntimeAvailable();
-    // Fail loud, not silently downgrade to bare — a caller expecting a hard
-    // memory/CPU cap getting a silently-uncapped process instead would defeat
-    // the entire point. Explicit --bare is the escape hatch, not a fallback
-    // this function reaches for on its own.
-    if (!rt.available) return { error: 'no Docker-compatible daemon reachable (docker info failed) — start OrbStack/Docker Desktop, or pass --bare to run natively instead', ok: false };
-  }
-  if (procs.size >= MAX_CONCURRENT_DEV) {
-    startQueue.push({ container, key, name, port, repo });
-    return { container, ok: true, position: startQueue.length, queued: true };
-  }
-  const spawned = container ? spawnContainer(repo, name, port) : spawnWorktree(repo, name, port);
-  const result = { container, ok: true };
-  // Only present when something was actually skipped. Every other caller
-  // of /api/start keeps getting the exact response shape it already handles.
-  if (spawned?.skippedSidecars?.length) result.skippedSidecars = spawned.skippedSidecars;
-  return result;
-}
-
-// drain=false is for callers that stop a worktree only to immediately respawn
-// the SAME one (a restart, not a real vacancy) — checkMemoryCeilings' restart
-// path and the tunnel toggle below. Defaulting drain=true here and letting
-// drainQueue() run unconditionally used to admit a queued worktree into the
-// slot in the moment between stop and respawn, and then the caller's respawn
-// added the original worktree back on top — procs.size silently exceeding
-// MAX_CONCURRENT_DEV, the exact thing the cap exists to prevent. If the
-// respawn itself later fails, spawnWorktree/spawnContainer's own `.then`
-// handlers already drain the queue — so skipping the drain here never leaves
-// a slot stuck, it only avoids double-counting during a same-worktree restart.
-async function stopWorktree(repo, name, port, { drain = true } = {}) {
-  const key = `${repo}/${name}`;
-  const qi = startQueue.findIndex(q => q.key === key);
-  if (qi !== -1) startQueue.splice(qi, 1);
-  const entry = procs.get(key);
-  procs.delete(key);
-  if (entry?.container) {
-    await stopContainer(repo, name, entry.container);
-  } else {
-    // Raw single-pid kill, not killGroup() (lib.js): spawnWorktree() below
-    // spawns the dev server without detached:true, so it shares this portal
-    // process's own pgid rather than leading its own. killGroup would look
-    // that pgid up, see pgid !== pid, and fall back to this exact same
-    // single-pid kill anyway (verified empirically), so this is already
-    // equivalent, not an inconsistency to fix.
-    const pid = await activePidAsync(port);
-    if (pid) { try { execFileSync('kill', [pid]); } catch {} }
-  }
-  await Promise.all([
-    stopInngest(repo, name, port),
-    stopTrigger(repo, name),
-    stopConvexDev(repo, name),
-    stopSidecars(repo, name),
-  ]);
-  if (drain) drainQueue();
+function stopWorktree(repo, name, port) {
+  return lifecycle.stop(worktreeTarget(repo, name, port));
 }
 
 // Port + container-mode resolution wrapped around startWorktree/stopWorktree
@@ -875,22 +1633,32 @@ async function stopWorktree(repo, name, port, { drain = true } = {}) {
 // tools share one implementation instead of three copies of this logic.
 async function startWorktreeByName(repo, name, container) {
   const port = getPort(WORKSPACE, repo, name);
-  if (!port) return { ok: false };
-  const useContainer = container === undefined ? defaultContainerMode(WORKSPACE, repo, name) : container !== false;
-  if (container !== undefined && needsMigrationPrompt(WORKSPACE, repo, name)) markMigrationPrompted(WORKSPACE, repo, name);
+  if (!port) {
+    return { ok: false };
+  }
+  const useContainer =
+    container === undefined
+      ? defaultContainerMode(WORKSPACE, repo, name)
+      : container !== false;
+  if (container !== undefined && needsMigrationPrompt(WORKSPACE, repo, name)) {
+    markMigrationPrompted(WORKSPACE, repo, name);
+  }
   return startWorktree(repo, name, port, useContainer);
 }
 
 async function stopWorktreeByName(repo, name) {
   const port = getPort(WORKSPACE, repo, name);
-  if (!port) return { ok: false };
-  await stopWorktree(repo, name, port);
-  return { ok: true };
+  if (!port) {
+    return { ok: false };
+  }
+  return stopWorktree(repo, name, port);
 }
 
 // Shared by /api/sync and mcp-server.js's sync_worktree tool.
 async function syncWorktreeByName(repo, name) {
-  return syncWithBase(wtPath(repo, name), repoPath(repo));
+  return lifecycle.runOperation(worktreeTarget(repo, name), 'sync', () =>
+    syncWithBase(wtPath(repo, name), repoPath(repo))
+  );
 }
 
 // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
@@ -901,76 +1669,131 @@ async function syncWorktreeByName(repo, name) {
 // Returns the names of any sidecars skipped for lacking approval, so the
 // start path (spawnWorktree/spawnContainer -> startWorktree) can surface it
 // to whoever asked for the start, instead of just silently not running.
-function startSidecars(repo, name, port) {
+async function startSidecars(repo, name, port) {
   const wtDir = wtPath(repo, name);
   const skipped = [];
   for (const s of loadSidecars(WORKSPACE, repo)) {
     const key = `${repo}/${name}/${s.name}`;
-    if (sidecarProcs.has(key)) continue;
+    if (sidecarProcs.has(key)) {
+      continue;
+    }
     // New or edited since it was last approved: skip only this one sidecar,
     // the dev server and every other already-approved sidecar still start.
     // s.name guarded truthy: a nameless row (settings UI allows adding one
     // with a command but no name yet) still gets gated, just not reported by
     // an empty string the toast would render as "sidecar '' needs approval".
-    if (!isSidecarApproved(WORKSPACE, repo, s)) { if (s.name) skipped.push(s.name); continue; }
-    const fd  = openLogFd(repo, name, `sidecar-${s.name}`);
+    if (!isSidecarApproved(WORKSPACE, repo, s)) {
+      if (s.name) {
+        skipped.push(s.name);
+      }
+      continue;
+    }
+    await assertStorageHeadroom(WORKSPACE, readHostHealth);
+    const fd = openLogFd(repo, name, `sidecar-${s.name}`);
     const env = { ...process.env, PORT: String(port), ...s.env };
-    const proc = Bun.spawn([s.command, ...(s.args ?? [])], { cwd: wtDir, detached: true, env, stderr: fd, stdout: fd });
+    const proc = spawnWithLog(
+      [s.command, ...(s.args ?? [])],
+      { cwd: wtDir, detached: true, env },
+      fd
+    );
     const entry = wrapProc(proc);
     sidecarProcs.set(key, entry);
-    proc.exited.then(() => { if (sidecarProcs.get(key) === entry) sidecarProcs.delete(key); });
+    watchOwnedProcessExit(
+      sidecarProcs,
+      key,
+      entry,
+      proc.exited,
+      (ownedHandle) => devRuntime.observe(null, ownedHandle)
+    );
   }
   return skipped;
 }
 
 async function stopSidecars(repo, name) {
   const prefix = `${repo}/${name}/`;
-  const keys = [...sidecarProcs.keys()].filter(k => k.startsWith(prefix));
-  await Promise.all(keys.map(k => killGroupAsync(sidecarProcs.get(k).pid)));
-  for (const k of keys) sidecarProcs.delete(k);
+  const keys = [...sidecarProcs.keys()].filter((k) => k.startsWith(prefix));
+  const results = await Promise.allSettled(
+    keys.map(async (key) => {
+      const entry = sidecarProcs.get(key);
+      await devRuntime.stopProcess(entry);
+      if (sidecarProcs.get(key) === entry) {
+        sidecarProcs.delete(key);
+      }
+    })
+  );
+  const failure = results.find((result) => result.status === 'rejected');
+  if (failure) {
+    throw failure.reason;
+  }
 }
 
 // Uniform wrapper for both freshly-spawned (native Bun.Subprocess) and reconciled
 // (discovered-at-startup, PID only) sidecar entries — lets stop paths kill either
 // the same way, and lets a portal restart re-adopt a still-live sidecar instead of
 // losing track of it (inngestProcs/triggerProcs start as empty Maps every restart).
-function wrapProc(proc) { return { native: proc, pid: proc.pid }; }
-function wrapPid(pid)   { return { native: null, pid }; }
-// Container-backed entries have no OS pid Setu owns directly (the tracked
-// process is `docker compose up -d`, which exits once containers are
-// created) — `container` holds the compose project name instead, and
-// stop/reconcile paths branch on its presence.
-function wrapContainer(project) { return { container: project, native: null, pid: null }; }
-
+function wrapProc(proc) {
+  return { native: proc, ownedGroup: true, pid: proc.pid };
+}
+function wrapPid(pid) {
+  return { native: null, ownedGroup: false, pid };
+}
 // ── inngest dev server ────────────────────────────────────────────────────────
 
 async function startInngest(repo, name, port) {
-  const key   = `${repo}/${name}`;
-  if (inngestProcs.has(key)) return { error: 'already running', ok: false };
+  const key = `${repo}/${name}`;
+  if (inngestProcs.has(key)) {
+    return { error: 'already running', ok: false };
+  }
   const iPort = inngestPort(port);
-  if (await activePidAsync(iPort)) return { error: `port ${iPort} already in use (untracked process)`, ok: false };
-  const fd    = openLogFd(repo, name, 'inngest');
-  const proc  = Bun.spawn(
-    [INNGEST_CLI, 'dev', '-p', String(iPort), '-u', `http://localhost:${port}/api/inngest`, '--no-discovery'],
-    { detached: true, stderr: fd, stdout: fd }
+  if (await activePidAsync(iPort)) {
+    return {
+      error: `port ${iPort} already in use (untracked process)`,
+      ok: false,
+    };
+  }
+  const fd = openLogFd(repo, name, 'inngest');
+  const proc = spawnWithLog(
+    [
+      INNGEST_CLI,
+      'dev',
+      '-p',
+      String(iPort),
+      '-u',
+      `http://localhost:${port}/api/inngest`,
+      '--no-discovery',
+    ],
+    { detached: true },
+    fd
   );
   const entry = wrapProc(proc);
   inngestProcs.set(key, entry);
-  proc.exited.then(() => { if (inngestProcs.get(key) === entry) inngestProcs.delete(key); });
+  watchOwnedProcessExit(inngestProcs, key, entry, proc.exited, (ownedHandle) =>
+    devRuntime.observe(null, ownedHandle)
+  );
   return { ok: true, port: iPort };
 }
 
 async function stopInngest(repo, name, port) {
-  const key   = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const entry = inngestProcs.get(key);
-  if (entry) await killGroupAsync(entry.pid);
-  inngestProcs.delete(key);
+  if (entry) {
+    await devRuntime.stopProcess(entry);
+  }
+  if (inngestProcs.get(key) === entry) {
+    inngestProcs.delete(key);
+  }
   // fall back to whatever's actually bound to the inngest port, same pattern as
   // stopWorktree — the tracked entry can be stale after a portal restart
-  const iPort = port != null ? inngestPort(port) : null;
-  const pid   = iPort ? await activePidAsync(iPort) : null;
-  if (pid) await killGroupAsync(pid);
-  if (!entry && !pid) return { error: 'not running', ok: false };
+  const iPort = port === null || port === undefined ? null : inngestPort(port);
+  const pid = iPort ? await activePidAsync(iPort) : null;
+  if (pid) {
+    throw new Error(
+      'Inngest listener ownership is unconfirmed; refusing to signal an untracked PID'
+    );
+  }
+  if (!(entry || pid)) {
+    return { error: 'not running', ok: false };
+  }
   return { ok: true };
 }
 
@@ -982,51 +1805,109 @@ async function stopInngest(repo, name, port) {
 // accurate across a portal restart instead.
 const TRIGGER_MAX_CONCURRENT_RUNS = 2;
 
-function startTrigger(repo, name) {
+async function startTrigger(repo, name) {
   const key = `${repo}/${name}`;
-  if (triggerProcs.has(key)) return { error: 'already running', ok: false };
+  await reconcileTriggerSidecars();
+  if (triggerProcs.has(key)) {
+    return { error: 'already running', ok: false };
+  }
   const wtDir = wtPath(repo, name);
-  const fd    = openLogFd(repo, name, 'trigger');
+  const fd = openLogFd(repo, name, 'trigger');
   // trigger tasks import Supabase keys etc. from the shared .env.local at load time
-  const env   = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
-  const proc  = Bun.spawn(
-    ['bunx', `trigger.dev@${pinnedTriggerVersion(wtDir)}`, 'dev', '--max-concurrent-runs', String(TRIGGER_MAX_CONCURRENT_RUNS)],
-    { cwd: wtDir, detached: true, env, stderr: fd, stdout: fd });
+  const env = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
+  const proc = spawnWithLog(
+    [
+      'bunx',
+      `trigger.dev@${pinnedTriggerVersion(wtDir)}`,
+      'dev',
+      '--max-concurrent-runs',
+      String(TRIGGER_MAX_CONCURRENT_RUNS),
+    ],
+    { cwd: wtDir, detached: true, env },
+    fd
+  );
   const entry = wrapProc(proc);
   triggerProcs.set(key, entry);
-  proc.exited.then(() => { if (triggerProcs.get(key) === entry) triggerProcs.delete(key); });
+  watchOwnedProcessExit(triggerProcs, key, entry, proc.exited, (ownedHandle) =>
+    devRuntime.observe(null, ownedHandle)
+  );
   return { ok: true };
 }
 
 async function stopTrigger(repo, name) {
-  const key   = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const entry = triggerProcs.get(key);
-  if (!entry) return { error: 'not running', ok: false };
+  if (!entry) {
+    return { error: 'not running', ok: false };
+  }
+  if (!entry.ownedGroup) {
+    throw Object.assign(
+      new Error(
+        'Legacy Trigger process group ownership is unconfirmed; stop it through its original owner and diagnose remaining children before removal'
+      ),
+      { code: 'SUPPORTING_PROCESS_UNOWNED' }
+    );
+  }
   // group-kill, not entry.native?.kill() — trigger.dev v4.5.3's own SIGTERM handler
   // races ahead of and defeats the code path that would dispose its esbuild child
   // (source-verified), so signal the whole process group directly instead
-  await killGroupAsync(entry.pid);
-  triggerProcs.delete(key);
+  await devRuntime.stopProcess(entry);
+  if (triggerProcs.get(key) === entry) {
+    triggerProcs.delete(key);
+  }
   return { ok: true };
 }
 
 // Startup-only: discover trigger dev processes already running (from before this
 // portal instance started) and adopt them into triggerProcs, keyed by matching
 // their cwd against a known worktree. Cheap because it only runs once at boot.
-function reconcileTriggerSidecars() {
+async function reconcileTriggerSidecars() {
   let raw;
-  try { raw = execFileSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8' }); }
-  catch { return; }
+  const probe = await checkedCommand(['ps', '-eo', 'pid=,command=']);
+  if (probe.code !== 0 || probe.timedOut || probe.truncated) {
+    throw new Error(
+      'Supporting-process discovery is unavailable; admission cannot open safely'
+    );
+  }
+  raw = probe.stdout;
   const dirToKey = new Map(
-    portEntries(WORKSPACE).map(({ key, repo, name }) => [wtPath(repo, name), key])
+    portEntries(WORKSPACE).map(({ key, repo, name }) => [
+      wtPath(repo, name),
+      key,
+    ])
   );
   for (const line of raw.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+.*\.bin\/trigger dev\b/);
-    if (!m) continue;
+    if (!m) {
+      continue;
+    }
     const pid = +m[1];
-    const cwd = processCwd(pid);
+    const cwdProbe = await checkedCommand([
+      'lsof',
+      '-a',
+      '-p',
+      String(pid),
+      '-d',
+      'cwd',
+      '-Fn',
+    ]);
+    const cwd =
+      cwdProbe.code === 0
+        ? cwdProbe.stdout
+            .split('\n')
+            .find((cwdLine) => cwdLine.startsWith('n'))
+            ?.slice(1)
+        : null;
     const key = cwd && dirToKey.get(cwd);
-    if (key && !triggerProcs.has(key)) triggerProcs.set(key, wrapPid(pid));
+    if (key && !triggerProcs.has(key)) {
+      const evidence = await processEvidence(pid);
+      if (!evidence || evidence.cwd !== (await identityFs.realpath(cwd))) {
+        throw new Error(
+          'Trigger process identity is unknown; retry after reconciliation'
+        );
+      }
+      triggerProcs.set(key, { ...wrapPid(pid), evidence });
+    }
   }
 }
 
@@ -1060,26 +1941,59 @@ function convexDeployStatus(repo, name) {
 // (the Map starts empty every restart) -- same problem inngest's own
 // `activePid(iPort)` check on its bound port solves for itself, but convex
 // dev has no local port to check instead.
-function convexDevAlreadyRunning(dir) {
+async function convexDevAlreadyRunning(dir) {
   let raw;
-  try { raw = execFileSync('ps', ['-eo', 'pid=,command='], { encoding: 'utf8' }); }
-  catch { return false; }
+  const probe = await checkedCommand(['ps', '-eo', 'pid=,command=']);
+  if (probe.code !== 0 || probe.timedOut || probe.truncated) {
+    throw new Error(
+      'Supporting-process discovery is unknown; retry before Start'
+    );
+  }
+  raw = probe.stdout;
   for (const line of raw.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+.*\bconvex dev\b/);
-    if (m && processCwd(+m[1]) === dir) return true;
+    if (!m) {
+      continue;
+    }
+    const cwd = await checkedCommand([
+      'lsof',
+      '-a',
+      '-p',
+      m[1],
+      '-d',
+      'cwd',
+      '-Fn',
+    ]);
+    if (cwd.code !== 0) {
+      throw new Error(
+        'Supporting-process ownership is unknown; retry before Start'
+      );
+    }
+    if (cwd.stdout.split('\n').includes(`n${dir}`)) {
+      return true;
+    }
   }
   return false;
 }
 
-function startConvexDev(repo, name) {
+async function startConvexDev(repo, name) {
   const key = `${repo}/${name}`;
-  if (convexDevProcs.has(key)) return { error: 'already running', ok: false };
+  if (convexDevProcs.has(key)) {
+    return { error: 'already running', ok: false };
+  }
   const wtDir = wtPath(repo, name);
   const dir = convexDir(repo, wtDir);
-  if (!dir) return { error: 'Convex is not configured in this worktree', ok: false };
-  if (!commandExists('npx')) return { error: 'npx not found on PATH', ok: false };
-  if (convexDevAlreadyRunning(dir)) {
-    return { error: `a convex dev process already appears to be running in ${dir} (untracked, likely from before a portal restart)`, ok: false };
+  if (!dir) {
+    return { error: 'Convex is not configured in this worktree', ok: false };
+  }
+  if (!commandExists('bunx')) {
+    return { error: 'bunx not found on PATH', ok: false };
+  }
+  if (await convexDevAlreadyRunning(dir)) {
+    return {
+      error: `a convex dev process already appears to be running in ${dir} (untracked, likely from before a portal restart)`,
+      ok: false,
+    };
   }
   const fd = openLogFd(repo, name, 'convex');
   // stdin: 'ignore', not inherited -- detection only proves convex/ or
@@ -1089,443 +2003,600 @@ function startConvexDev(repo, name) {
   // with no terminal attached, an inherited stdin would hang forever with
   // convexActive stuck true and an empty log, instead of failing the prompt
   // and exiting so the log actually explains what happened.
-  const proc = Bun.spawn(['npx', 'convex', 'dev'],
-    { cwd: dir, detached: true, stderr: fd, stdin: 'ignore', stdout: fd });
+  const proc = spawnWithLog(
+    ['bunx', 'convex', 'dev'],
+    { cwd: dir, detached: true, stdin: 'ignore' },
+    fd
+  );
   const entry = wrapProc(proc);
   convexDevProcs.set(key, entry);
-  proc.exited.then(() => { if (convexDevProcs.get(key) === entry) convexDevProcs.delete(key); });
+  watchOwnedProcessExit(
+    convexDevProcs,
+    key,
+    entry,
+    proc.exited,
+    (ownedHandle) => devRuntime.observe(null, ownedHandle)
+  );
   return { ok: true };
 }
 
 async function stopConvexDev(repo, name) {
-  const key   = `${repo}/${name}`;
+  const key = `${repo}/${name}`;
   const entry = convexDevProcs.get(key);
-  if (!entry) return { error: 'not running', ok: false };
-  await killGroupAsync(entry.pid);
-  convexDevProcs.delete(key);
+  if (!entry) {
+    const dir = convexDir(repo, wtPath(repo, name));
+    if (dir && (await convexDevAlreadyRunning(dir))) {
+      throw Object.assign(
+        new Error(
+          'An untracked Convex process still uses this worktree; removal requires confirmed teardown'
+        ),
+        { code: 'SUPPORTING_PROCESS_UNOWNED' }
+      );
+    }
+    return { error: 'not running', ok: false };
+  }
+  await devRuntime.stopProcess(entry);
+  if (convexDevProcs.get(key) === entry) {
+    convexDevProcs.delete(key);
+  }
   return { ok: true };
 }
 
-// preview/production are the only two convex deploy modes -- unlike vercel's
-// or netlify's third named-custom-target option, convex's preview-vs-prod
-// split really is just whether --preview-create is passed, so there's
-// nothing a third option would add here. The preview name comes from the
-// worktree's real branch, not the worktree directory name (those two can
-// differ -- see the branch-resolution comment in getWorktrees above), run
-// through the same slugify() every local domain already uses, so one preview
-// deployment always maps to the same branch without the user typing or
-// remembering a name.
-function deployToConvex(repo, name, target) {
-  // Reserved to exactly these two words, not treated as a free-text custom
-  // target the way vercelArgs/netlifyArgs above treat anything that isn't
-  // 'production'/'preview' -- convex genuinely only has two deploy modes (see
-  // this function's own comment above), so an unrecognized target is a
-  // caller mistake, not a third mode to fall through to. Without this guard
-  // a typo like 'staging' would silently run (and store) a preview deploy
-  // under the wrong label instead of failing loudly.
-  if (target !== 'preview' && target !== 'production') {
-    return { error: "target must be 'preview' or 'production'", ok: false };
-  }
-  const key = `${repo}/${name}`;
-  if (convexDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
-  const wtDir = wtPath(repo, name);
-  const dir = convexDir(repo, wtDir);
-  if (!dir) return { error: 'Convex is not configured in this worktree', ok: false };
-  if (!commandExists('npx')) return { error: 'npx not found on PATH', ok: false };
-
-  const { pathToBranch } = repoGitMeta(repo);
-  const branch = pathToBranch.get(resolve(wtDir)) ?? name;
-  const args = target === 'production' ? ['deploy'] : ['deploy', '--preview-create', slugify(branch)];
-
-  convexDeploys.set(key, { deploying: true, error: null, ok: false, startedAt: Date.now(), target });
-  // Piped, not the shared 'convex' log fd directly: startConvexDev above may
-  // already hold that fd open for the persistent dev process, and
-  // openLogFd's own rotateLog call (past 5MB) renames the log path out from
-  // under whichever fd was opened first -- the dev process would keep
-  // writing to the renamed, no-longer-tailed file. Captured here and
-  // appended once at exit instead, so a deploy can never collide with the
-  // dev process's log lifecycle. Tradeoff: no live streaming of deploy
-  // progress in the log tab, only the full output once it finishes --
-  // acceptable for an occasional, normally-short action, unlike the dev
-  // process's own log.
-  const proc = Bun.spawn(['npx', 'convex', ...args],
-    { cwd: dir, stderr: 'pipe', stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
-
-  (async () => {
-    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    const code = await proc.exited;
-    const finishedAt = convexDeploys.get(key)?.startedAt ?? Date.now();
-    const combined = `${out}${err}`.trim();
-    appendFileSync(logPath(repo, name, 'convex'), `\n[deploy ${target}]\n${combined}\n`);
-    if (code === 0) {
-      convexDeploys.set(key, { deploying: false, error: null, ok: true, startedAt: finishedAt, target });
-    } else {
-      const reason = combined.split('\n').filter(l => l.trim()).at(-1) ?? `convex deploy exited ${code}`;
-      convexDeploys.set(key, { deploying: false, error: reason, ok: false, startedAt: finishedAt, target });
-    }
-  })();
-
-  return { deploying: true, ok: true, target };
-}
-
-// ── vercel deploy (per worktree, one-shot, not long-running like a dev
-// server) ──────────────────────────────────────────────────────────────────
-// Tracked separately from procs/inngestProcs/triggerProcs: those all model
-// "is a process currently running," but a deploy's interesting state is what
-// it produced (a URL) or why it failed, which outlives the process itself.
-const vercelDeploys = new Map(); // key: `${repo}/${name}` -> { deploying, url, error, target, startedAt }
-
+// Deployment status outlives the one-shot CLI process. Admission and exact
+// destination comparison are owned by deploymentGuard before a launcher runs.
+const vercelDeploys = new Map();
+const netlifyDeploys = new Map();
+const deploymentEpoch = crypto.randomUUID();
 function vercelStatus(repo, name) {
   return vercelDeploys.get(`${repo}/${name}`) ?? null;
 }
-
-// preview/production/custom-target are mutually exclusive vercel deploy
-// flags. 'production' and 'preview' are reserved regardless of which path
-// called this (the picker menu or a typed custom name) so a user can't
-// accidentally shadow --prod behind --target=production.
-function vercelArgs(target) {
-  if (target === 'production') return ['deploy', '--yes', '--prod'];
-  if (target === 'preview') return ['deploy', '--yes'];
-  return ['deploy', '--yes', `--target=${target}`];
-}
-
-function deployToVercel(repo, name, target) {
-  const key = `${repo}/${name}`;
-  if (vercelDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
-  if (!commandExists('vercel')) return { error: 'vercel CLI not found on PATH, install it first', ok: false };
-  const wtDir = wtPath(repo, name);
-  if (!existsSync(join(wtDir, '.vercel', 'project.json'))) {
-    return { error: `this worktree isn't linked to a Vercel project, run "vercel link" in ${wtDir} first`, ok: false };
-  }
-
-  const fd = openLogFd(repo, name, 'vercel');
-  vercelDeploys.set(key, { deploying: true, error: null, startedAt: Date.now(), target, url: null });
-  // stdin: 'ignore', not inherited: --yes skips vercel's own prompts, but a
-  // stale/expired auth token can still make it prompt anyway. Inherited
-  // stdin would then block forever with no terminal attached, wedging
-  // `deploying: true` permanently. Ignored stdin makes that prompt hit EOF
-  // and the process exit (nonzero) instead, so the timeout below is a
-  // backstop for a different failure mode (a genuinely hung network call),
-  // not the only guard against this one.
-  const proc = Bun.spawn(['vercel', ...vercelArgs(target)],
-    { cwd: wtDir, stderr: fd, stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
-
-  (async () => {
-    const url = (await new Response(proc.stdout).text()).trim();
-    const code = await proc.exited;
-    const finishedAt = vercelDeploys.get(key)?.startedAt ?? Date.now();
-    if (code === 0 && url) {
-      appendFileSync(logPath(repo, name, 'vercel'), `\n${url}\n`);
-      vercelDeploys.set(key, { deploying: false, error: null, startedAt: finishedAt, target, url });
-    } else {
-      // The real reason (bad auth, project mismatch, build failure) went to
-      // the log fd above, not to stdout, which is why this reads it back
-      // instead of settling for a bare exit code.
-      const reason = tailLog(repo, name, 'vercel', 20).lines.filter(l => l.trim()).at(-1) ?? `vercel exited ${code}`;
-      appendFileSync(logPath(repo, name, 'vercel'), `\n[deploy failed] ${reason}\n`);
-      vercelDeploys.set(key, { deploying: false, error: reason, startedAt: finishedAt, target, url: null });
-    }
-  })();
-
-  return { deploying: true, ok: true, target };
-}
-
-// ── netlify deploy (per worktree, one-shot, mirrors the vercel block above)
-const netlifyDeploys = new Map(); // key: `${repo}/${name}` -> { deploying, url, error, target, startedAt }
-
 function netlifyStatus(repo, name) {
   return netlifyDeploys.get(`${repo}/${name}`) ?? null;
 }
 
-// preview/production/branch-custom are mutually exclusive netlify deploy
-// modes, same convention as vercelArgs above. netlify deploy has no --yes or
-// --auto flag to skip its own prompts (checked netlify-cli's own commander
-// option list directly, nothing like that exists) -- see deployToNetlify's
-// own comment below for why stdin: 'ignore' is enough on its own.
-function netlifyArgs(target) {
-  if (target === 'production') return ['deploy', '--json', '--prod'];
-  if (target === 'preview') return ['deploy', '--json'];
-  return ['deploy', '--json', '--context', `branch:${target}`];
-}
-
-// netlify deploy --json prints exactly one pretty-printed JSON object to
-// stdout and nothing else (netlify-cli's own log() helper is a no-op once
-// --json is anywhere in argv, confirmed in its source), but a misbehaving
-// local build step could still write noise ahead of it, so this takes the
-// last top-level object in the captured text instead of assuming the whole
-// stream is clean. Works because the real payload is a flat object (no
-// nested braces), so its own opening brace is always the last "{" in the
-// text -- verified against a synthetic noisy sample before wiring this in.
-function parseNetlifyJson(text) {
-  const trimmed = text.trim();
-  try { return JSON.parse(trimmed); } catch {}
-  const idx = trimmed.lastIndexOf('{');
-  if (idx === -1) return null;
-  try { return JSON.parse(trimmed.slice(idx)); } catch { return null; }
-}
-
-function deployToNetlify(repo, name, target) {
-  const key = `${repo}/${name}`;
-  if (netlifyDeploys.get(key)?.deploying) return { error: 'a deploy is already running for this worktree', ok: false };
-  if (!commandExists('netlify')) return { error: 'netlify CLI not found on PATH, install it first', ok: false };
-  const wtDir = wtPath(repo, name);
-  // .netlify/state.json is netlify link's output, same role .vercel/project.json
-  // plays above -- but its mere existence only proves this worktree was linked
-  // at some point, not that the site id it names is still valid. The linked id
-  // read here gets compared against the deploy result's own site_id below,
-  // because a stale or reauthorized netlify token doesn't fail the same way a
-  // bad vercel token does: netlify-cli's own site-resolution logic treats that
-  // as "not linked, not interactive" and silently auto-creates a new site to
-  // deploy to instead of erroring out.
-  let linkedSiteId = null;
-  try { linkedSiteId = JSON.parse(readFileSync(join(wtDir, '.netlify', 'state.json'), 'utf8')).siteId ?? null; } catch {}
-  if (!linkedSiteId) {
-    return { error: `this worktree isn't linked to a Netlify site, run "netlify link" in ${wtDir} first`, ok: false };
+async function installedDeployTool(provider) {
+  const executable = Bun.which(provider);
+  if (!executable) {
+    return null;
   }
-
-  const fd = openLogFd(repo, name, 'netlify');
-  netlifyDeploys.set(key, { deploying: true, error: null, startedAt: Date.now(), target, url: null });
-  // stdin: 'ignore', not inherited: with no --yes/--auto flag to lean on, the
-  // thing standing between this and a wedged prompt is netlify-cli's own
-  // isInteractive() gate (checked directly in its source), which requires
-  // stdin.isTTY && stdout.isTTY before it will ever call inquirer.prompt.
-  // Ignored stdin makes that false, so every prompt path it has (missing
-  // publish directory, a locked production site, an unlinked project) takes
-  // its non-interactive fallback or fails cleanly instead of hanging with no
-  // terminal attached. The timeout below is a backstop for a different
-  // failure mode (a genuinely hung network call or local build step).
-  const proc = Bun.spawn(['netlify', ...netlifyArgs(target)],
-    { cwd: wtDir, stderr: fd, stdin: 'ignore', stdout: 'pipe', timeout: 15 * 60 * 1000 });
-
-  (async () => {
-    const out = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    const finishedAt = netlifyDeploys.get(key)?.startedAt ?? Date.now();
-    const data = code === 0 ? parseNetlifyJson(out) : null;
-    // A clean exit with a parseable result naming a DIFFERENT site than the
-    // one this worktree is linked to (see the comment above linkedSiteId)
-    // means netlify picked a site on its own -- don't trust that url.
-    const ok = code === 0 && data && data.site_id === linkedSiteId;
-    const url = ok ? (data.url || data.deploy_url || null) : null;
-
-    if (ok && url) {
-      appendFileSync(logPath(repo, name, 'netlify'), `\n${url}\n`);
-      netlifyDeploys.set(key, { deploying: false, error: null, startedAt: finishedAt, target, url });
-      return;
+  const realExecutable = await identityFs.realpath(executable);
+  const packageName = provider === 'netlify' ? 'netlify-cli' : provider;
+  let directory = dirname(realExecutable);
+  for (let depth = 0; depth < 10; depth += 1) {
+    try {
+      const pkg = JSON.parse(
+        await identityFs.readFile(join(directory, 'package.json'), 'utf8')
+      );
+      if (pkg.name === packageName) {
+        return { executable: realExecutable, version: pkg.version };
+      }
+    } catch {
+      // Keep searching parent directories for the installed package metadata.
     }
-
-    let reason;
-    if (code === 0 && data && data.site_id !== linkedSiteId) {
-      reason = `netlify deployed to a different site (${data.site_id}) than the one linked here (${linkedSiteId}), not trusting the result, check the netlify auth token`;
-      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] ${reason}\n`);
-    } else if (code === 0 && !data) {
-      // Exited clean but the --json payload didn't parse -- the log fd above
-      // only captured stderr, and stdout (where the payload actually lands)
-      // is otherwise lost, so dump it here or the log won't explain why.
-      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] could not parse --json output:\n${out}\n`);
-      reason = 'could not parse netlify --json output, see the log';
-    } else {
-      // The real reason (bad auth, build failure, project mismatch) went to
-      // the log fd above, not to stdout, which is why this reads it back
-      // instead of settling for a bare exit code.
-      reason = tailLog(repo, name, 'netlify', 20).lines.filter(l => l.trim()).at(-1) ?? `netlify exited ${code}`;
-      appendFileSync(logPath(repo, name, 'netlify'), `\n[deploy failed] ${reason}\n`);
+    const parent = dirname(directory);
+    if (parent === directory) {
+      break;
     }
-    netlifyDeploys.set(key, { deploying: false, error: reason, startedAt: finishedAt, target, url: null });
-  })();
+    directory = parent;
+  }
+  return null;
+}
 
-  return { deploying: true, ok: true, target };
+const launchDeployment = createDeploymentLauncher({
+  appendLog: (repo, name, provider, text) =>
+    appendFileSync(logPath(repo, name, provider), text),
+  closeLog: closeSync,
+  now: Date.now,
+  openLog: openLogFd,
+  spawn: (args, options) => Bun.spawn(args, options),
+  stores: {
+    convex: convexDeploys,
+    netlify: netlifyDeploys,
+    vercel: vercelDeploys,
+  },
+  tailError: (repo, name, provider) =>
+    tailLog(repo, name, provider, 20)
+      .lines.filter((line) => line.trim())
+      .at(-1),
+});
+const deploymentGuard = createDeploymentGuard({
+  branch: async (target) => {
+    const result = await checkedCommand([
+      'git',
+      '-C',
+      target.wtDir,
+      'symbolic-ref',
+      '--quiet',
+      '--short',
+      'HEAD',
+    ]);
+    return result.code === 0 && !result.timedOut && !result.truncated
+      ? result.stdout.trim()
+      : null;
+  },
+  deploymentState: (target) => ({
+    epoch: deploymentEpoch,
+    providers: Object.fromEntries(
+      Object.entries({
+        convex: convexDeploys,
+        netlify: netlifyDeploys,
+        vercel: vercelDeploys,
+      }).map(([provider, store]) => {
+        const entry = store.get(target.key);
+        return [
+          provider,
+          entry
+            ? {
+                deploying: entry.deploying,
+                phase: entry.phase ?? null,
+                startedAt: entry.startedAt,
+                target: entry.target,
+              }
+            : null,
+        ];
+      })
+    ),
+  }),
+  identity: (target) => inspectCheckoutIdentity(target, identityFs),
+  launch: async (...args) => {
+    await assertStorageHeadroom(WORKSPACE, readHostHealth);
+    return launchDeployment(...args);
+  },
+  operation: (target) => lifecycle.operationStatus(target.key),
+  resolveProvider: createProviderResolver({
+    readJson: async (path) =>
+      JSON.parse(await identityFs.readFile(path, 'utf8')),
+    run: checkedCommand,
+    tool: installedDeployTool,
+  }),
+  startOperation: (target, launch) =>
+    lifecycle.startOperation(target, 'deploy', launch),
+  target: worktreeTarget,
+  validate: (target) => removals.assertCanMutate(target, { kind: 'deploy' }),
+});
+
+function deployToConvex(repo, name, target, expectedContext) {
+  return deploymentGuard.dispatch({
+    expectedContext,
+    name,
+    provider: 'convex',
+    repo,
+    target,
+  });
+}
+function deployToVercel(repo, name, target, expectedContext) {
+  return deploymentGuard.dispatch({
+    expectedContext,
+    name,
+    provider: 'vercel',
+    repo,
+    target,
+  });
+}
+function deployToNetlify(repo, name, target, expectedContext) {
+  return deploymentGuard.dispatch({
+    expectedContext,
+    name,
+    provider: 'netlify',
+    repo,
+    target,
+  });
 }
 
 // ── single cloudflared process with merged ingress ────────────────────────────
 
-function writeMergedConf() {
+async function writeMergedConf() {
   mkdirSync(TUNNEL_CONF_DIR, { recursive: true });
   const rules = [...activeTunnelMap.values()]
-    .map(({ pubDom, port }) => `  - hostname: ${pubDom}\n    service: http://localhost:${port}`)
+    .map(
+      ({ pubDom, port }) =>
+        `  - hostname: ${pubDom}\n    service: http://localhost:${port}`
+    )
     .join('\n');
-  writeFileSync(MERGED_CONF, [
-    `tunnel: ${TUNNEL_NAME}`,
-    `credentials-file: ${CF_CREDENTIALS}`,
-    `protocol: http2`,
-    `ingress:`,
-    rules,
-    `  - service: http_status:404`,
-  ].join('\n') + '\n');
+  installedStateValue(
+    await workspaceState(WORKSPACE).replaceText(
+      MERGED_CONF,
+      `${[
+        `tunnel: ${TUNNEL_NAME}`,
+        `credentials-file: ${CF_CREDENTIALS}`,
+        'protocol: http2',
+        'ingress:',
+        rules,
+        '  - service: http_status:404',
+      ].join('\n')}\n`
+    )
+  );
 }
 
 function openTunnelLog() {
   const dir = `${LOGS}/cloudflared`;
   mkdirSync(dir, { recursive: true });
   rotateLog(TUNNEL_LOG);
-  appendFileSync(TUNNEL_LOG, `\n[${new Date().toISOString()}] ── session start ──\n`);
+  appendFileSync(
+    TUNNEL_LOG,
+    `\n[${new Date().toISOString()}] ── session start ──\n`
+  );
   return openSync(TUNNEL_LOG, 'a');
 }
 
-function restartTunnel() {
-  if (tunnelProc) { tunnelProc.kill(); tunnelProc = null; }
-  // reap orphaned cloudflared from a previous portal — two replicas of the same
-  // tunnel serve divergent ingress maps and randomly 404 (see comment above)
-  spawnSync('pkill', ['-f', `cloudflared --config ${MERGED_CONF}`]);
-  if (activeTunnelMap.size === 0) return;
-  writeMergedConf();
-  const fd = openTunnelLog();
-  tunnelProc = Bun.spawn(
-    [CLOUDFLARED_BIN, '--config', MERGED_CONF, 'tunnel', 'run', TUNNEL_NAME],
-    { stderr: fd, stdout: fd }
-  );
-  tunnelProc.exited.then(() => { tunnelProc = null; });
+async function restartTunnel() {
+  return workspaceState(WORKSPACE).withRouting(async () => {
+    tunnelTeardownUnknown = true;
+    if (tunnelProc) {
+      tunnelProc.kill();
+    }
+    // reap orphaned cloudflared from a previous portal — two replicas of the same
+    // tunnel serve divergent ingress maps and randomly 404 (see comment above)
+    const pattern = `(^|/)cloudflared --config ${MERGED_CONF.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}( |$)`;
+    const reaped = await checkedCommand(['pkill', '-f', pattern]);
+    if (![0, 1].includes(reaped.code) || reaped.timedOut) {
+      throw new Error('Previous tunnel process teardown is unconfirmed');
+    }
+    const deadline = performance.now() + 5000;
+    for (;;) {
+      const remaining = await checkedCommand(['pgrep', '-f', pattern]);
+      if (
+        remaining.code === 1 &&
+        !remaining.stdout &&
+        !remaining.timedOut &&
+        !remaining.truncated
+      ) {
+        break;
+      }
+      if (
+        remaining.code !== 0 ||
+        remaining.timedOut ||
+        remaining.truncated ||
+        performance.now() >= deadline
+      ) {
+        throw new Error(
+          'Tunnel exit is unconfirmed; retry Disable before update cutover'
+        );
+      }
+      await Bun.sleep(50);
+    }
+    tunnelProc = null;
+    tunnelTeardownUnknown = false;
+    if (activeTunnelMap.size === 0) {
+      return;
+    }
+    await writeMergedConf();
+    const fd = openTunnelLog();
+    try {
+      tunnelProc = Bun.spawn(
+        [
+          CLOUDFLARED_BIN,
+          '--config',
+          MERGED_CONF,
+          'tunnel',
+          'run',
+          TUNNEL_NAME,
+        ],
+        { stderr: fd, stdout: fd }
+      );
+    } finally {
+      closeSync(fd);
+    }
+    const proc = tunnelProc;
+    proc.exited.then(
+      () => {
+        if (tunnelProc === proc) {
+          tunnelProc = null;
+        }
+      },
+      () => {
+        tunnelTeardownUnknown = true;
+      }
+    );
+  });
 }
 
-function addTunnelRoute(repo, name, pubDom, port) {
-  activeTunnelMap.set(`${repo}/${name}`, { port, pubDom });
-  restartTunnel();
-  return { ok: true };
+async function addTunnelRoute(repo, name, pubDom, port) {
+  return workspaceState(WORKSPACE).withRouting(async () => {
+    activeTunnelMap.set(`${repo}/${name}`, { port, pubDom });
+    await restartTunnel();
+    return { ok: true };
+  });
 }
 
-function removeTunnelRoute(repo, name) {
-  activeTunnelMap.delete(`${repo}/${name}`);
-  restartTunnel();
-  return { ok: true };
+async function removeTunnelRoute(repo, name) {
+  return workspaceState(WORKSPACE).withRouting(async () => {
+    activeTunnelMap.delete(`${repo}/${name}`);
+    await restartTunnel();
+    return { ok: true };
+  });
 }
 
 // ── per-worktree tunnel toggle ────────────────────────────────────────────────
 
-// Resumes a worktree in whatever mode it was actually running before —
-// container or bare — instead of always spawnWorktree (bare). Always-bare
-// used to silently strip a containerized worktree's memory/CPU cap on every
-// tunnel toggle, with nothing telling the user it happened.
-function respawnAsBefore(repo, name, port, wasContainer) {
-  if (wasContainer) spawnContainer(repo, name, port); else spawnWorktree(repo, name, port);
+// The shared URL is serialized outside per-target admission. Internal helpers
+// do not reacquire this serializer, including when one enable evicts another.
+let tunnelChange = Promise.resolve();
+function serializeTunnel(change) {
+  const result = tunnelChange.then(change);
+  tunnelChange = result.catch(() => undefined);
+  return result;
 }
-
-async function enableTunnel(repo, name, port) {
-  // Only one worktree can use the shared tunnel URL — evict any currently active one
-  for (const [key, { port: p }] of activeTunnelMap.entries()) {
-    if (key === `${repo}/${name}`) continue;
-    const { repo: kRepo, name: kName } = splitKey(key);
-    await disableTunnel(kRepo, kName, p);
-  }
-  const key = `${repo}/${name}`;
-  const wasContainer = !!procs.get(key)?.container;
-  const wasRunning = !!(await activePidAsync(port));
-  const pubDom = publicDomain(_cfg);
-  // drain: false — this is a same-worktree restart, not a real vacancy; see
-  // stopWorktree's comment. Captured wasContainer before stopping since
-  // stopWorktree deletes the procs entry.
-  if (wasRunning) await stopWorktree(repo, name, port, { drain: false });
-  configureWorktreeEnv(_cfg, repo, name, port, true);
-  reloadCaddy(WORKSPACE);
-  addTunnelRoute(repo, name, pubDom, port);
-  // spawnContainer/spawnWorktree directly, not startWorktree — this is
-  // resuming something that was already running a moment ago, not a fresh
-  // admission decision, so it shouldn't get stuck behind the concurrency queue.
-  if (wasRunning) respawnAsBefore(repo, name, port, wasContainer);
-  return { ok: true };
+async function changeTunnel(repo, name, port, enabled) {
+  const target = worktreeTarget(repo, name, port);
+  const apply = () =>
+    applyTunnelConfiguration(enabled, {
+      addRoute: () => addTunnelRoute(repo, name, publicDomain(_cfg), port),
+      configure: () => configureWorktreeEnv(_cfg, repo, name, port, enabled),
+      reload: () => reloadCaddy(WORKSPACE),
+      removeRoute: () => removeTunnelRoute(repo, name),
+    });
+  return lifecycle.snapshot(target.key)?.reserved
+    ? lifecycle.restart(target, apply)
+    : lifecycle.runOperation(target, 'tunnel', apply);
 }
-
-async function disableTunnel(repo, name, port) {
-  const key = `${repo}/${name}`;
-  const wasContainer = !!procs.get(key)?.container;
-  const wasRunning = !!(await activePidAsync(port));
-  if (wasRunning) await stopWorktree(repo, name, port, { drain: false });
-  removeTunnelRoute(repo, name);
-  configureWorktreeEnv(_cfg, repo, name, port, false);
-  reloadCaddy(WORKSPACE);
-  if (wasRunning) respawnAsBefore(repo, name, port, wasContainer);
-  return { ok: true };
+function withTunnelOwner(repo, name, claim) {
+  return claimTunnelOwner(
+    `${repo}/${name}`,
+    {
+      release: (key, { port: previousPort }) => {
+        const previous = splitKey(key);
+        return changeTunnel(previous.repo, previous.name, previousPort, false);
+      },
+      routes: () => activeTunnelMap.entries(),
+      serialize: serializeTunnel,
+    },
+    claim
+  );
+}
+function enableTunnel(repo, name, port) {
+  return withTunnelOwner(repo, name, () =>
+    changeTunnel(repo, name, port, true)
+  );
+}
+function disableTunnel(repo, name, port) {
+  return serializeTunnel(() => changeTunnel(repo, name, port, false));
 }
 
 // ── create / remove worktree ──────────────────────────────────────────────────
 
+const setupContexts = new Map();
 async function createWorktree(repo, name, tunnel) {
-  const res = await libCreateWorktree(_cfg, repo, name, { tunnel });
-  if (tunnel) addTunnelRoute(repo, name, publicDomain(_cfg), res.port);
+  const target = worktreeTarget(repo, name, null, { registered: false });
+  const sharing = dependencySharingForTarget(_cfg, repo, name);
+  const create = () =>
+    lifecycle.startOperation(target, 'setup', async () => {
+      let context = setupContexts.get(target.key);
+      if (context) {
+        const current = await inspectCheckoutIdentity(target, identityFs);
+        if (
+          !current.known ||
+          JSON.stringify(current) !== JSON.stringify(context.identity)
+        ) {
+          throw new Error(
+            'Setup checkout identity changed; automatic retry is blocked'
+          );
+        }
+        if (context.tunnel !== !!tunnel) {
+          throw new Error('Retry setup with the original tunnel choice');
+        }
+        if (context.ready) {
+          return {
+            domain: context.res.localDom,
+            ok: true,
+            port: context.res.port,
+            setup: 'ready',
+          };
+        }
+      } else {
+        if (getPort(WORKSPACE, repo, name)) {
+          throw new Error(
+            'Worktree is already registered; existing setup cannot be replayed without its original operation'
+          );
+        }
+        context = { identity: null, ready: false, res: null, tunnel: !!tunnel };
+      }
+      if (!context.res) {
+        try {
+          context.res = await libCreateWorktree(_cfg, repo, name, {
+            tunnel,
+            readStorage: readHostHealth,
+          });
+        } catch (error) {
+          context.identity = await inspectCheckoutIdentity(target, identityFs);
+          if (context.identity.known) {
+            setupContexts.set(target.key, context);
+          }
+          throw error;
+        }
+        context.identity = await inspectCheckoutIdentity(target, identityFs);
+        setupContexts.set(target.key, context);
+      }
+      const { res } = context;
+      if (tunnel) {
+        await addTunnelRoute(repo, name, publicDomain(_cfg), res.port);
+      }
 
-  // mise trust + bun install (background — takes a while)
-  const setupFd = openLogFd(repo, name, 'setup');
-  Bun.spawn(['zsh', '-c', `mise trust "${res.wtDir}" 2>/dev/null; cd "${res.wtDir}" && bun install`],
-    { stderr: setupFd, stdout: setupFd });
-
-  return { domain: res.localDom, ok: true, port: res.port };
+      return startWorktreeSetupInstall(context, {
+        assertStorage: () => assertStorageHeadroom(WORKSPACE, readHostHealth),
+        sharing,
+        closeLog: closeSync,
+        exists: existsSync,
+        openLog: () => openLogFd(repo, name, 'setup'),
+        spawn: (args, options) => Bun.spawn(args, options),
+        stopProcess: devRuntime.stopProcess,
+      });
+    });
+  // A completed setup retry only validates/returns its existing result. It must
+  // not evict whichever checkout acquired the public URL after setup finished.
+  return tunnel && !setupContexts.get(target.key)?.ready
+    ? withTunnelOwner(repo, name, create)
+    : create();
 }
 
-async function removeWorktree(repo, name, reason = 'manual') {
-  // stop dev server and tunnel route first
-  const port = getPort(WORKSPACE, repo, name);
-  if (port) await stopWorktree(repo, name, port);
-  if (activeTunnelMap.has(`${repo}/${name}`)) removeTunnelRoute(repo, name);
+const removals = createRemovalController({
+  admit: (target, task) =>
+    lifecycle.runOperation(target, 'remove', async (controls) => {
+      // Older standalone Trigger processes may have appeared after boot.
+      await reconcileTriggerSidecars();
+      return task(controls);
+    }),
+  assertClean: (target, force) =>
+    assertRemovableWorktree(_cfg, target.repo, target.name, { force }),
+  capture: async (target, reason) => ({
+    archive: {
+      branch:
+        (await repoGitMeta(target.repo)).pathToBranch.get(
+          resolve(target.wtDir)
+        ) ?? target.name,
+      label: REPO_META[target.repo]?.label ?? target.repo,
+      name: target.name,
+      prUrl: prCache.get(target.key)?.url ?? null,
+      reason: reason === 'merged' ? 'merged' : 'manual',
+      removedAt: Math.floor(Date.now() / 1000),
+      repo: target.repo,
+    },
+    identity: await inspectCheckoutIdentity(target, identityFs),
+  }),
+  now: () => Date.now(),
+  observe: (record) =>
+    observeRemovalCheckout(
+      record,
+      worktreeTarget(record.repo, record.name, record.port, {
+        registered: false,
+      }),
+      { fs: identityFs, run: checkedCommand }
+    ),
+  randomId: () => crypto.randomUUID(),
+  removeVolumes: async (record) => {
+    const wtDir = managedWorktreePath(WORKSPACE, record.repo, record.name, {
+      registered: false,
+    });
+    const path = dockerComposePath(wtDir);
+    try {
+      const stat = await identityFs.lstat(path);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error(
+          'Compose output identity changed; volume cleanup is blocked'
+        );
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return;
+      }
+      throw error;
+    }
+    await composeDownAsync(composeProjectName(record.repo, record.name), path, [
+      '-v',
+    ]);
+  },
+  serialize: serializeTunnel,
+  state: workspaceState(WORKSPACE),
+  ...createRemovalRouting({
+    fs: identityFs,
+    onRemoved: (record) => {
+      prCache.delete(record.key);
+      lastSeenAt.delete(record.key);
+      setupContexts.delete(record.key);
+    },
+    reloadCaddy: () => reloadCaddy(WORKSPACE),
+    removeTunnelRoute,
+    snippetPath: (record) =>
+      caddySnippetPath(WORKSPACE, record.repo, record.name),
+    syncHosts: () => syncHosts(WORKSPACE),
+    withRouting: (task) => workspaceState(WORKSPACE).withRouting(task),
+  }),
+  removeGit: async (record, force) => {
+    const result = await checkedCommand(
+      [
+        'git',
+        '-C',
+        record.identity.repositoryPath,
+        'worktree',
+        'remove',
+        ...(force ? ['--force'] : []),
+        record.identity.checkoutPath,
+      ],
+      { timeoutMs: 120_000 }
+    );
+    if (result.code !== 0 || result.timedOut) {
+      throw new Error(
+        result.stderr || 'Git worktree removal failed or timed out'
+      );
+    }
+  },
+});
 
-  // The worktree is being permanently removed, not just stopped — unlike a
-  // normal stop (stopContainer's `down` deliberately keeps the node_modules
-  // volume so a later start skips reinstalling), there's no later start
-  // coming. Without this, the volume leaks forever with nothing left
-  // pointing at it — the exact kind of disk bloat this tool exists to avoid.
-  // Must run before libRemoveWorktree deletes the directory (and the compose
-  // file with it) below.
-  const wtDir = wtPath(repo, name);
-  if (existsSync(dockerComposePath(wtDir))) {
-    await composeDownAsync(composeProjectName(repo, name), dockerComposePath(wtDir), ['-v']);
-  }
-
-  // Read everything the archive record needs while the worktree (and its PR
-  // cache entry) still exist, since libRemoveWorktree below deletes the
-  // directory and the key is cleared from prCache right after. Not written
-  // yet: only append once removal actually succeeds, so a failed `git
-  // worktree remove` never leaves a phantom archive entry for a worktree
-  // that's still there.
-  const archiveRecord = {
-    branch: repoGitMeta(repo).pathToBranch.get(resolve(wtDir)) ?? name,
-    label:  REPO_META[repo]?.label ?? repo,name,
-    prUrl:  prCache.get(`${repo}/${name}`)?.url ?? null,
-    reason: reason === 'merged' ? 'merged' : 'manual',
-    removedAt: Math.floor(Date.now() / 1000),
-    repo, 
-  };
-
-  try { libRemoveWorktree(_cfg, repo, name); }
-  catch (e) { return { error: String(e), ok: false }; }
-
-  appendArchivedWorktree(WORKSPACE, archiveRecord);
-  prCache.delete(`${repo}/${name}`);
-  lastSeenAt.delete(`${repo}/${name}`);
-  return { ok: true };
+async function removeWorktree(
+  repo,
+  name,
+  reason = 'manual',
+  force = false,
+  operationId
+) {
+  return removals.remove(
+    worktreeTarget(repo, name, getPort(WORKSPACE, repo, name), {
+      registered: false,
+    }),
+    { force, operationId, reason }
+  );
 }
 
 // ── project registration ──────────────────────────────────────────────────────
 
-function addProject({ github = '', name: nameArg = '', label = '' }) {
+async function addProject({ github = '', name: nameArg = '', label = '' }) {
   // Normalise GitHub input → org/repo slug
-  const slug = github.trim()
+  const slug = github
+    .trim()
     .replace(/^https?:\/\/github\.com\//, '')
     .replace(/^git@github\.com:/, '')
     .replace(/\.git$/, '');
 
-  const name  = (nameArg.trim() || slug.split('/').at(-1) || '').replace(/[^a-zA-Z0-9._-]/g, '-');
-  if (!name) return { error: 'repo name required', ok: false };
+  const name = (nameArg.trim() || slug.split('/').at(-1) || '').replace(
+    /[^a-zA-Z0-9._-]/g,
+    '-'
+  );
+  if (!name) {
+    return { error: 'repo name required', ok: false };
+  }
 
   const label_ = label.trim() || name;
   const repoDir = repoPath(name);
 
-  if (loadProjects(WORKSPACE)[name]) {
-    return { error: `${name} is already registered`, ok: false };
-  }
+  return lifecycle.runOperation(
+    worktreeTarget(name, 'main', null, { registered: false }),
+    'project-setup',
+    async () => {
+      if (loadProjects(WORKSPACE)[name]) {
+        return { error: `${name} is already registered`, ok: false };
+      }
 
-  // Bare clone (existing) or bare init (new)
-  mkdirSync(WORKSPACE, { recursive: true });
-  if (slug && !existsSync(repoDir)) {
-    // stdio: 'pipe' (cloneBareRepo's default is 'inherit', for the CLI path):
-    // this is headless, there's no terminal to show clone progress to.
-    cloneBareRepo(repoDir, `git@github.com:${slug}.git`, slug, { stdio: 'pipe' });
-  } else if (!slug) {
-    mkdirSync(repoDir, { recursive: true });
-    execFileSync('git', ['-C', repoDir, 'init', '--bare']);
-  }
+      // Bare clone (existing) or bare init (new)
+      mkdirSync(WORKSPACE, { recursive: true });
+      if (slug && !existsSync(repoDir)) {
+        // stdio: 'pipe' (cloneBareRepo's default is 'inherit', for the CLI path):
+        // this is headless, there's no terminal to show clone progress to.
+        await cloneBareRepoAsync(repoDir, `git@github.com:${slug}.git`, slug, {
+          readStorage: readHostHealth,
+        });
+      } else if (!slug) {
+        mkdirSync(repoDir, { recursive: true });
+        const initialized = await checkedCommand(
+          ['git', '-C', repoDir, 'init', '--bare'],
+          { timeoutMs: 120_000 }
+        );
+        if (initialized.code !== 0 || initialized.timedOut) {
+          throw new Error(
+            initialized.stderr || 'Bare repository initialization failed'
+          );
+        }
+      }
 
-  const base = registerProject(WORKSPACE, { label: label_, name, slug });
-  REPO_META = loadProjects(WORKSPACE);
+      const base = await registerProject(WORKSPACE, {
+        label: label_,
+        name,
+        slug,
+      });
+      REPO_META = loadProjects(WORKSPACE);
 
-  return { base, label: label_, name, ok: true, slug: slug || null };
+      return { base, label: label_, name, ok: true, slug: slug || null };
+    }
+  );
 }
 
 // ── open in Ghostty ───────────────────────────────────────────────────────────
@@ -1534,19 +2605,35 @@ function addProject({ github = '', name: nameArg = '', label = '' }) {
 // installed on this machine, not just the tools one project happened to use.
 
 function openInGhostty(wtDir, tool) {
-  const cmd = AGENT_CLIS[tool]?.bin
-    ?? loadCustomAgents(WORKSPACE).find(a => a.id === tool)?.command;
-  if (!cmd) return { error: 'unknown tool', ok: false };
+  const cmd =
+    AGENT_CLIS[tool]?.bin ??
+    loadCustomAgents(WORKSPACE).find((a) => a.id === tool)?.command;
+  if (!cmd) {
+    return { error: 'unknown tool', ok: false };
+  }
   const script = `${tmpdir()}/qdev-${Date.now()}.sh`;
-  writeFileSync(script, `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd "${wtDir}"\n${cmd}\nexec zsh -l\n`, { mode: 0o755 });
+  writeFileSync(
+    script,
+    `#!/bin/zsh\nsource "$HOME/.zshrc"\ncd -- ${shellQuote(wtDir)} || exit\n${cmd}\nexec zsh -l\n`,
+    { mode: 0o700 }
+  );
   // Not a raw `ghostty` spawn — Ghostty's own --help is explicit that launching
   // the terminal from the CLI isn't supported on macOS ("use open -na
   // Ghostty.app"). The raw binary silently spawns a process with zero children
   // and never runs the script; /api/open still returned {ok:true} throughout
   // since Bun.spawn not throwing synchronously was the only check — confirmed
   // live via a marker-file test that only the `open -na` form actually executes.
-  Bun.spawn(['open', '-na', 'Ghostty', '--args', `--working-directory=${wtDir}`, `--command=${script}`],
-    { detached: true, stdio: ['ignore', 'ignore', 'ignore'] });
+  Bun.spawn(
+    [
+      'open',
+      '-na',
+      'Ghostty',
+      '--args',
+      `--working-directory=${wtDir}`,
+      `--command=${script}`,
+    ],
+    { detached: true, stdio: ['ignore', 'ignore', 'ignore'] }
+  );
   return { ok: true };
 }
 
@@ -1556,13 +2643,68 @@ function openInGhostty(wtDir, tool) {
 // branches below. fn can be sync or async: `await` on a plain value is a
 // no-op, so this works uniformly for both.
 async function jsonTry(fn) {
-  try { return Response.json(await fn()); }
-  catch (e) { return Response.json({ error: String(e), ok: false }, { status: 500 }); }
+  try {
+    return Response.json(await fn());
+  } catch (e) {
+    return Response.json(
+      {
+        error: String(e),
+        ok: false,
+        ...(e.code ? { code: e.code } : {}),
+        ...(typeof e.committed === 'boolean' ? { committed: e.committed } : {}),
+        ...(e.phase ? { phase: e.phase } : {}),
+        ...(typeof e.reconciled === 'boolean'
+          ? { reconciled: e.reconciled }
+          : {}),
+        ...(safeStateCauseCode(e.causeCode) ? { causeCode: e.causeCode } : {}),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+async function updateRoutes(req, pathname, method, server) {
+  if (pathname === '/api/update/capabilities' && method === 'GET') {
+    return Response.json(updateControl.capabilities());
+  }
+  if (
+    !['/api/update/quiesce', '/api/update/reopen', '/api/update/stop'].includes(
+      pathname
+    ) ||
+    method !== 'POST'
+  ) {
+    return null;
+  }
+  const body = await req.json().catch(() => null);
+  const result = pathname.endsWith('/quiesce')
+    ? updateControl.quiesce(body)
+    : pathname.endsWith('/reopen')
+      ? await updateControl.reopen(body)
+      : updateControl.prepareStop(body);
+  if (result.ok && pathname.endsWith('/stop')) {
+    setImmediate(() => stopPortalForUpdate(server));
+  }
+  return Response.json(result, { status: result.ok ? 200 : 409 });
+}
+
+function persistedAction(result) {
+  installedStateValue(result);
+  return {
+    committed: result.committed,
+    ok: true,
+    reconciled: true,
+    status: result.status,
+    ...(result.warning ? { warning: result.warning } : {}),
+  };
 }
 
 // Shared by /api/projects and mcp-server.js's list_projects tool.
 function listProjectsSummary() {
-  return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({ github: m.github, label: m.label, name }));
+  return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({
+    github: m.github,
+    label: m.label,
+    name,
+  }));
 }
 
 // Each domain router below returns a Response for a route it owns, or null
@@ -1570,7 +2712,9 @@ function listProjectsSummary() {
 // if none match. Split by domain (worktree lifecycle, project/sweep,
 // settings, raycast) for size, not by rewriting the dispatch logic itself.
 async function projectRoutes(req, pathname, method, server) {
-  if (pathname === '/api/projects') return Response.json(listProjectsSummary());
+  if (pathname === '/api/projects') {
+    return Response.json(listProjectsSummary());
+  }
 
   if (method === 'POST' && pathname === '/api/project/add') {
     const body = await req.json().catch(() => ({}));
@@ -1579,7 +2723,9 @@ async function projectRoutes(req, pathname, method, server) {
 
   if (method === 'POST' && pathname === '/api/project/remove') {
     const body = await req.json().catch(() => ({}));
-    return jsonTry(() => { removeProject(WORKSPACE, body.name); return { ok: true }; });
+    return jsonTry(async () =>
+      persistedAction(await removeProject(WORKSPACE, body.name))
+    );
   }
 
   // Sweep: finds plain git clones already on disk that were never brought
@@ -1600,23 +2746,45 @@ async function projectRoutes(req, pathname, method, server) {
   if (method === 'POST' && pathname === '/api/sweep/import') {
     const body = await req.json().catch(() => ({}));
     const { name, remoteUrl, label } = body;
-    if (!name || !remoteUrl) return Response.json({ error: 'name and remoteUrl required', ok: false });
+    if (!(name && remoteUrl)) {
+      return Response.json({ error: 'name and remoteUrl required', ok: false });
+    }
     // Same guard addProject() already uses — a conflicting candidate should
     // never reach here (the UI disables those rows), but importRepo() itself
     // would otherwise silently no-op against the wrong existing project.
-    if (loadProjects(WORKSPACE)[name]) return Response.json({ error: `${name} is already registered`, ok: false });
-    return jsonTry(async () => {
-      await importRepo(_cfg, { label, name, remoteUrl });
-      REPO_META = loadProjects(WORKSPACE);
-      return { ok: true };
-    });
+    if (loadProjects(WORKSPACE)[name]) {
+      return Response.json({
+        error: `${name} is already registered`,
+        ok: false,
+      });
+    }
+    return jsonTry(() =>
+      lifecycle.runOperation(
+        worktreeTarget(name, 'main', null, { registered: false }),
+        'project-setup',
+        async () => {
+          if (loadProjects(WORKSPACE)[name]) {
+            return { error: `${name} is already registered`, ok: false };
+          }
+          await importRepo(
+            _cfg,
+            { label, name, remoteUrl },
+            { readStorage: readHostHealth }
+          );
+          REPO_META = loadProjects(WORKSPACE);
+          return { ok: true };
+        }
+      )
+    );
   }
 
   return null;
 }
 
 async function settingsRoutes(req, pathname, method, server) {
-  if (pathname === '/api/agents') return Response.json(detectAgentClis(WORKSPACE));
+  if (pathname === '/api/agents') {
+    return Response.json(detectAgentClis(WORKSPACE));
+  }
 
   // Anthropic/OpenAI cost_report calls are real external network round
   // trips (2 providers, each potentially paginated) — same idleTimeout
@@ -1632,25 +2800,73 @@ async function settingsRoutes(req, pathname, method, server) {
   // this path returns from here and never falls through to it.
   if (pathname === '/api/settings') {
     if (method === 'GET') {
+      if (!configReconciled) {
+        const installed = requireConfig();
+        resourceSettings(installed);
+        if (installed.workspace !== WORKSPACE) {
+          throw new Error(
+            'Configured workspace changed; a reviewed portal restart is required.'
+          );
+        }
+        _cfg = installed;
+        configReconciled = true;
+        try {
+          await lifecycle.updateSettings(installed);
+        } catch (error) {
+          configReconciled = false;
+          throw error;
+        }
+      }
       return Response.json({
         containerCpuLimit: _cfg.containerCpuLimit ?? 2,
         containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
-        docker: engineCapacity(),
+        docker: await cachedContainerRuntime(),
         mac: macCapacity(),
-        maxConcurrentDevServers: MAX_CONCURRENT_DEV,
+        maxConcurrentDevServers: lifecycle.status().max,
       });
     }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      if (body.maxConcurrentDevServers != null) {
-        MAX_CONCURRENT_DEV = Math.max(1, Number(body.maxConcurrentDevServers) || 1);
-        _cfg.maxConcurrentDevServers = MAX_CONCURRENT_DEV;
-        drainQueue(); // a raised cap should immediately start anything already queued
+      try {
+        const patch = Object.fromEntries(
+          [
+            'maxConcurrentDevServers',
+            'containerMemoryLimit',
+            'containerCpuLimit',
+          ]
+            .filter((key) => body[key] !== null && body[key] !== undefined)
+            .map((key) => [key, body[key]])
+        );
+        resourceSettings({ ..._cfg, ...patch });
+        const committed = await saveConfig(patch);
+        configReconciled = committed.reconciled === true;
+        _cfg = installedStateValue(committed);
+        await lifecycle.updateSettings(_cfg);
+        return Response.json({
+          ...persistedAction(committed),
+          settings: {
+            containerCpuLimit: _cfg.containerCpuLimit,
+            containerMemoryLimit: _cfg.containerMemoryLimit,
+            maxConcurrentDevServers: _cfg.maxConcurrentDevServers,
+          },
+        });
+      } catch (error) {
+        return Response.json(
+          {
+            error: error.message,
+            ok: false,
+            ...(error.code ? { code: error.code } : {}),
+            ...(typeof error.committed === 'boolean'
+              ? { committed: error.committed }
+              : {}),
+            ...(error.phase ? { phase: error.phase } : {}),
+            ...(safeStateCauseCode(error.causeCode)
+              ? { causeCode: error.causeCode }
+              : {}),
+          },
+          { status: 400 }
+        );
       }
-      if (body.containerMemoryLimit != null) _cfg.containerMemoryLimit = String(body.containerMemoryLimit);
-      if (body.containerCpuLimit != null) _cfg.containerCpuLimit = Number(body.containerCpuLimit) || 1;
-      saveConfig(_cfg);
-      return Response.json({ ok: true });
     }
   }
 
@@ -1664,17 +2880,23 @@ async function settingsRoutes(req, pathname, method, server) {
       const repo = p.get('repo') ?? '';
       // `approved` is computed, not stored on the sidecar itself, so the
       // settings UI can show a per-row badge without a second request.
-      return Response.json(loadAllSidecars(WORKSPACE, repo).map(s => ({ ...s, approved: isSidecarApproved(WORKSPACE, repo, s) })));
+      return Response.json(
+        loadAllSidecars(WORKSPACE, repo).map((s) => ({
+          ...s,
+          approved: isSidecarApproved(WORKSPACE, repo, s),
+        }))
+      );
     }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      return jsonTry(() => {
+      return jsonTry(async () => {
         // Strip the computed `approved` field the GET above adds, in case
         // the caller round-trips what it fetched. sidecars.json only ever
         // owns name/enabled/command/args/env, approval lives in its own file.
         const sidecars = (body.sidecars ?? []).map(({ approved, ...s }) => s);
-        saveSidecars(WORKSPACE, body.repo, sidecars);
-        return { ok: true };
+        return persistedAction(
+          await saveSidecars(WORKSPACE, body.repo, sidecars)
+        );
       });
     }
   }
@@ -1684,11 +2906,16 @@ async function settingsRoutes(req, pathname, method, server) {
   // stale client can't approve a command it no longer matches.
   if (pathname === '/api/sidecar-approvals/approve' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    return jsonTry(() => {
-      const s = loadAllSidecars(WORKSPACE, body.repo).find(x => x.name === body.name);
-      if (!s) throw new Error(`sidecar '${body.name}' not found for ${body.repo}`);
-      approveSidecar(WORKSPACE, body.repo, s.name, s.command, s.args);
-      return { ok: true };
+    return jsonTry(async () => {
+      const s = loadAllSidecars(WORKSPACE, body.repo).find(
+        (x) => x.name === body.name
+      );
+      if (!s) {
+        throw new Error(`sidecar '${body.name}' not found for ${body.repo}`);
+      }
+      return persistedAction(
+        await approveSidecar(WORKSPACE, body.repo, s.name, s.command, s.args)
+      );
     });
   }
 
@@ -1698,20 +2925,30 @@ async function settingsRoutes(req, pathname, method, server) {
   // this repo, not retroactively applied to worktrees that already exist.
   if (pathname === '/api/file-sync-globs') {
     const p = new URL(req.url).searchParams;
-    if (method === 'GET') return Response.json(loadFileSyncGlobs(WORKSPACE, p.get('repo') ?? ''));
+    if (method === 'GET') {
+      return Response.json(loadFileSyncGlobs(WORKSPACE, p.get('repo') ?? ''));
+    }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      return jsonTry(() => { saveFileSyncGlobs(WORKSPACE, body.repo, body.globs ?? []); return { ok: true }; });
+      return jsonTry(async () =>
+        persistedAction(
+          await saveFileSyncGlobs(WORKSPACE, body.repo, body.globs ?? [])
+        )
+      );
     }
   }
 
   // Custom agents: same shape as sidecars above — GET for the settings UI to
   // edit, POST replaces the whole (global, not per-repo) list.
   if (pathname === '/api/custom-agents') {
-    if (method === 'GET') return Response.json(loadCustomAgents(WORKSPACE));
+    if (method === 'GET') {
+      return Response.json(loadCustomAgents(WORKSPACE));
+    }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      return jsonTry(() => { saveCustomAgents(WORKSPACE, body.agents ?? []); return { ok: true }; });
+      return jsonTry(async () =>
+        persistedAction(await saveCustomAgents(WORKSPACE, body.agents ?? []))
+      );
     }
   }
 
@@ -1721,7 +2958,7 @@ async function settingsRoutes(req, pathname, method, server) {
 function mcpCallbackHtml(title, body) {
   return new Response(
     `<!doctype html><html><head><title>${title}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${title}</h2><p>${body}</p></body></html>`,
-    { headers: { 'content-type': 'text/html' } },
+    { headers: { 'content-type': 'text/html' } }
   );
 }
 
@@ -1739,11 +2976,23 @@ async function mcpRoutes(req, pathname, method) {
   if (pathname === '/api/mcp-servers') {
     if (method === 'GET') {
       const statuses = mcpStatuses();
-      return Response.json(loadMcpServers(WORKSPACE).map(s => ({ ...s, ...(statuses[s.id] ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] }) })));
+      return Response.json(
+        loadMcpServers(WORKSPACE).map((s) => ({
+          ...s,
+          ...(statuses[s.id] ?? {
+            error: null,
+            status: 'disconnected',
+            stderrTail: [],
+            tools: [],
+          }),
+        }))
+      );
     }
     if (method === 'POST') {
       const body = await req.json().catch(() => ({}));
-      return jsonTry(() => { saveMcpServers(WORKSPACE, body.servers ?? []); return { ok: true }; });
+      return jsonTry(async () =>
+        persistedAction(await saveMcpServers(WORKSPACE, body.servers ?? []))
+      );
     }
   }
 
@@ -1754,16 +3003,20 @@ async function mcpRoutes(req, pathname, method) {
   // shows up on the next /api/mcp-servers poll via mcp.js's own status map.
   if (pathname === '/api/mcp/connect' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    const server = loadMcpServers(WORKSPACE).find(s => s.id === body.id);
-    if (!server) return Response.json({ error: 'server not found', ok: false }, { status: 404 });
-    connectMcpServer(server, WORKSPACE).catch(() => {}); // internal errors are already caught and recorded in mcp.js's own status map
+    const server = loadMcpServers(WORKSPACE).find((s) => s.id === body.id);
+    if (!server) {
+      return Response.json(
+        { error: 'server not found', ok: false },
+        { status: 404 }
+      );
+    }
+    connectMcpServer(server, WORKSPACE).catch(() => undefined); // internal errors are already caught and recorded in mcp.js's own status map
     return Response.json({ ok: true });
   }
 
   if (pathname === '/api/mcp/disconnect' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    disconnectMcpServer(body.id);
-    return Response.json({ ok: true });
+    return jsonTry(() => disconnectMcpServer(body.id));
   }
 
   // Hit by a real browser tab redirected here by the authorization server,
@@ -1773,16 +3026,37 @@ async function mcpRoutes(req, pathname, method) {
     const serverId = pathname.slice('/api/mcp/oauth/callback/'.length);
     const p = new URL(req.url).searchParams;
     if (p.get('error')) {
-      return mcpCallbackHtml('Authorization denied', `The authorization server reported: ${p.get('error_description') ?? p.get('error')}. You can close this tab and try again from Setu.`);
+      return mcpCallbackHtml(
+        'Authorization denied',
+        `The authorization server reported: ${p.get('error_description') ?? p.get('error')}. You can close this tab and try again from Setu.`
+      );
     }
     const code = p.get('code');
     const state = p.get('state');
-    if (!code || !state) return mcpCallbackHtml('Bad callback', 'Missing code or state parameter. You can close this tab and try again from Setu.');
-    const server = loadMcpServers(WORKSPACE).find(s => s.id === serverId);
-    if (!server) return mcpCallbackHtml('Unknown server', 'This server is no longer configured in Setu. You can close this tab.');
+    if (!(code && state)) {
+      return mcpCallbackHtml(
+        'Bad callback',
+        'Missing code or state parameter. You can close this tab and try again from Setu.'
+      );
+    }
+    const server = loadMcpServers(WORKSPACE).find((s) => s.id === serverId);
+    if (!server) {
+      return mcpCallbackHtml(
+        'Unknown server',
+        'This server is no longer configured in Setu. You can close this tab.'
+      );
+    }
     const result = await finishMcpAuth(server, code, state);
-    if (!result.ok) return mcpCallbackHtml('Authorization failed', `${result.error} You can close this tab and try again from Setu.`);
-    return mcpCallbackHtml('Authorized', 'You can close this tab and return to Setu.');
+    if (!result.ok) {
+      return mcpCallbackHtml(
+        'Authorization failed',
+        `${result.error} You can close this tab and try again from Setu.`
+      );
+    }
+    return mcpCallbackHtml(
+      'Authorized',
+      'You can close this tab and return to Setu.'
+    );
   }
 
   return null;
@@ -1790,17 +3064,27 @@ async function mcpRoutes(req, pathname, method) {
 
 async function raycastRoutes(req, pathname, method) {
   if (pathname === '/api/raycast/status') {
-    return Response.json({ dirExists: existsSync(RAYCAST_DIR), running: !!raycastDev });
+    return Response.json({
+      dirExists: existsSync(RAYCAST_DIR),
+      running: !!raycastDev,
+    });
   }
   if (pathname === '/api/raycast/log') {
     const n = Number(new URL(req.url).searchParams.get('n') ?? 150);
-    try {
-      const all = readFileSync(raycastLogPath(), 'utf8').split('\n');
-      return Response.json({ lines: all.slice(-n) });
-    } catch { return Response.json({ lines: [] }); }
+    raycastLogSnapshot = readLogTail(`${LOGS}/_raycast/dev.log`, n, {
+      previous: raycastLogSnapshot,
+    });
+    return Response.json(raycastLogSnapshot);
   }
-  if (method === 'POST' && pathname === '/api/raycast/start') return Response.json(startRaycastDev());
-  if (method === 'POST' && pathname === '/api/raycast/stop') return Response.json(await stopRaycastDev());
+  if (method === 'POST' && pathname === '/api/raycast/start') {
+    return jsonTry(async () => {
+      await assertStorageHeadroom(RAYCAST_DIR);
+      return startRaycastDev();
+    });
+  }
+  if (method === 'POST' && pathname === '/api/raycast/stop') {
+    return Response.json(await stopRaycastDev());
+  }
 
   return null;
 }
@@ -1817,27 +3101,59 @@ const PR_REVIEW_SKILLS = new Set(['pr-walkthrough', 'pr-brief']);
 async function prReviewStatus(repo, name) {
   const wtDir = wtPath(repo, name);
   const pluginInstalled = detectPrWalkthroughPlugin(wtDir);
-  const pr = await fetchPR(repo, name);
-  if (!pr.number) return { artifacts: {}, pluginInstalled, pr: null, run: null };
+  const pr = await fetchPR(repo, await worktreeBranch(repo, name));
+  if (!pr.number) {
+    return { artifacts: {}, pluginInstalled, pr: null, run: null };
+  }
   const slug = REPO_META[repo]?.slug ?? repo;
-  const headSha = (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
+  const headSha =
+    (await spawnText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
   const artifacts = {};
-  for (const skill of PR_REVIEW_SKILLS) artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
-  return { artifacts, pluginInstalled, pr: { number: pr.number }, run: reviewRunStatus(repo, name) };
+  for (const skill of PR_REVIEW_SKILLS) {
+    artifacts[skill] = findLatestArtifact(slug, pr.number, skill, headSha);
+  }
+  return {
+    artifacts,
+    pluginInstalled,
+    pr: { number: pr.number },
+    run: reviewRunStatus(repo, name),
+  };
 }
 
 // Shared by /api/pr-review/run and mcp-server.js's run_pr_review tool.
 async function prReviewRun(repo, name, skill) {
-  if (!PR_REVIEW_SKILLS.has(skill)) throw new Error('unknown skill');
-  const pr = await fetchPR(repo, name);
-  if (!pr.number) return { error: 'no pull request associated with this worktree', ok: false };
-  const slug = REPO_META[repo]?.slug ?? repo;
-  touchLastSeen(repo, name);
-  const fd = openLogFd(repo, name, 'pr-review');
-  return runDeepReview(repo, name, skill, {
-    logFd: fd, logPath: logPath(repo, name, 'pr-review'), prNumber: pr.number,slug, spawnText,
-    wtDir: wtPath(repo, name), 
-  });
+  return lifecycle.startOperation(
+    worktreeTarget(repo, name),
+    'review',
+    async () => {
+      if (!PR_REVIEW_SKILLS.has(skill)) {
+        throw new Error('unknown skill');
+      }
+      const pr = await fetchPR(repo, await worktreeBranch(repo, name));
+      if (!pr.number) {
+        return {
+          error: 'no pull request associated with this worktree',
+          ok: false,
+        };
+      }
+      const slug = REPO_META[repo]?.slug ?? repo;
+      touchLastSeen(repo, name);
+      const fd = openLogFd(repo, name, 'pr-review');
+      let completion;
+      const result = runDeepReview(repo, name, skill, {
+        logFd: fd,
+        logPath: logPath(repo, name, 'pr-review'),
+        onCompletion: (promise) => {
+          completion = promise;
+        },
+        prNumber: pr.number,
+        slug,
+        spawnText,
+        wtDir: wtPath(repo, name),
+      });
+      return { completion, result };
+    }
+  );
 }
 
 // prReviewRoutes must run before worktreeRoutes, same ordering constraint
@@ -1845,16 +3161,32 @@ async function prReviewRun(repo, name, skill) {
 async function prReviewRoutes(req, pathname, method) {
   if (pathname === '/api/pr-review/status' && method === 'GET') {
     const p = new URL(req.url).searchParams;
-    const repo = p.get('repo'), name = p.get('name');
-    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
+    const repo = p.get('repo'),
+      name = p.get('name');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
     return jsonTry(() => prReviewStatus(repo, name));
   }
 
   if (pathname === '/api/pr-review/run' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
     const { repo, name, skill } = body;
-    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
-    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ error: 'unknown skill', ok: false }, { status: 400 });
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    if (!PR_REVIEW_SKILLS.has(skill)) {
+      return Response.json(
+        { error: 'unknown skill', ok: false },
+        { status: 400 }
+      );
+    }
     return jsonTry(() => prReviewRun(repo, name, skill));
   }
 
@@ -1863,16 +3195,45 @@ async function prReviewRoutes(req, pathname, method) {
   // matching the existing "Open in browser" pattern for worktree URLs.
   if (pathname === '/api/pr-review/artifact' && method === 'GET') {
     const p = new URL(req.url).searchParams;
-    const repo = p.get('repo'), name = p.get('name'), skill = p.get('skill');
-    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
-    if (!PR_REVIEW_SKILLS.has(skill)) return Response.json({ error: 'unknown skill', ok: false }, { status: 400 });
-    const pr = await fetchPR(repo, name);
-    if (!pr.number) return new Response('No pull request for this worktree', { status: 404 });
+    const repo = p.get('repo'),
+      name = p.get('name'),
+      skill = p.get('skill');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    if (!PR_REVIEW_SKILLS.has(skill)) {
+      return Response.json(
+        { error: 'unknown skill', ok: false },
+        { status: 400 }
+      );
+    }
+    const pr = await fetchPR(repo, await worktreeBranch(repo, name));
+    if (!pr.number) {
+      return new Response('No pull request for this worktree', { status: 404 });
+    }
     const slug = REPO_META[repo]?.slug ?? repo;
     const artifact = findLatestArtifact(slug, pr.number, skill, null);
-    const path = artifact && artifactHtmlPath(slug, pr.number, skill, artifact.snapshot, artifact.htmlFile);
-    if (!path || !existsSync(path)) return new Response('No report generated yet', { status: 404 });
-    return new Response(Bun.file(path));
+    const path =
+      artifact &&
+      artifactHtmlPath(
+        slug,
+        pr.number,
+        skill,
+        artifact.snapshot,
+        artifact.htmlFile
+      );
+    if (!(path && existsSync(path))) {
+      return new Response('No report generated yet', { status: 404 });
+    }
+    return new Response(Bun.file(path), {
+      headers: {
+        'Content-Security-Policy':
+          "sandbox allow-scripts; connect-src 'none'; form-action 'none'; base-uri 'none'",
+      },
+    });
   }
 
   return null;
@@ -1885,6 +3246,10 @@ async function prReviewRoutes(req, pathname, method) {
 // only be read once, and if this ran first it would swallow the body meant
 // for e.g. a POST to /api/settings before settingsRoutes ever saw it.
 async function worktreeRoutes(req, pathname, method, server) {
+  if (pathname === '/api/workspace-inventory' && method === 'GET') {
+    server?.timeout(req, 0);
+    return Response.json(await workspaceInventory.read());
+  }
   if (pathname === '/api/worktrees') {
     // Same idleTimeout hazard /api/sweep already documents and fixes (see
     // its own comment) -- 45+ worktrees each potentially needing an
@@ -1892,7 +3257,11 @@ async function worktreeRoutes(req, pathname, method, server) {
     // a portal restart) can genuinely exceed Bun's default 10s idle timeout
     // for a real HTTP client (web UI, Raycast) hitting this route directly.
     server?.timeout(req, 0);
-    return Response.json(await getWorktrees());
+    return Response.json(
+      new URL(req.url).searchParams.get('snapshot') === '1'
+        ? await getWorktreeSnapshot()
+        : await getWorktrees()
+    );
   }
 
   // Full list, most-recent-first: same client-side-pagination convention
@@ -1904,19 +3273,41 @@ async function worktreeRoutes(req, pathname, method, server) {
   }
 
   if (pathname === '/api/status') {
-    return Response.json(computeStatus());
+    return Response.json(
+      await computeStatus(new URL(req.url).searchParams.get('refresh') === '1')
+    );
   }
 
   if (pathname === '/api/logs') {
-    const p    = new URL(req.url).searchParams;
-    const repo = p.get('repo'), name = p.get('name');
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name');
     // Polling this endpoint only happens while a LogModal/LiveLog panel is
     // actually mounted for this worktree (portal/components/logs.tsx). That's
     // a real "someone is watching" signal, unlike the always-on
     // /api/worktrees list poll. Counts toward the idle-timeout clock below.
-    if (repo && name) touchLastSeen(repo, name);
-    const res  = tailLog(repo, name, p.get('type') ?? 'dev', Number(p.get('n') ?? 150));
+    if (repo && name) {
+      touchLastSeen(repo, name);
+    }
+    const res = tailLog(
+      repo,
+      name,
+      p.get('type') ?? 'dev',
+      Number(p.get('n') ?? 150)
+    );
     return Response.json(res);
+  }
+
+  if (pathname === '/api/deploy/preflight' && method === 'GET') {
+    const p = new URL(req.url).searchParams;
+    return Response.json(
+      await deploymentGuard.preflight({
+        name: p.get('name'),
+        provider: p.get('provider'),
+        repo: p.get('repo'),
+        target: p.get('target'),
+      })
+    );
   }
 
   // Deploy status is also folded into /api/worktrees (vercelDeploy field,
@@ -1943,9 +3334,15 @@ async function worktreeRoutes(req, pathname, method, server) {
   // Manual-fetch, not polled (see DiffViewer): a human actually looking at a
   // worktree's diff is real activity, same as opening its log viewer above.
   if (pathname === '/api/diff') {
-    const p    = new URL(req.url).searchParams;
-    const repo = p.get('repo'), name = p.get('name');
-    if (!repo || !name) return Response.json({ error: 'repo and name required', ok: false }, { status: 400 });
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
     touchLastSeen(repo, name);
     return jsonTry(() => computeDiff(repo, name));
   }
@@ -1957,7 +3354,12 @@ async function worktreeRoutes(req, pathname, method, server) {
   // comment above) -- a GET never reads req.json().
   if (pathname === '/api/repo-prs') {
     const repo = new URL(req.url).searchParams.get('repo');
-    if (!repo) return Response.json({ error: 'repo required', ok: false }, { status: 400 });
+    if (!repo) {
+      return Response.json(
+        { error: 'repo required', ok: false },
+        { status: 400 }
+      );
+    }
     return jsonTry(() => fetchRepoPRs(repo));
   }
 
@@ -1968,13 +3370,23 @@ async function worktreeRoutes(req, pathname, method, server) {
     // Any POST action referencing a specific worktree (start/stop/sync/
     // tunnel/inngest/trigger/open) is real, user-driven activity. Touch it
     // once here rather than at each branch below.
-    if (repo && name) touchLastSeen(repo, name);
+    if (repo && name) {
+      touchLastSeen(repo, name);
+    }
 
     if (pathname === '/api/create') {
       return jsonTry(() => createWorktree(repo, name, !!tunnel));
     }
     if (pathname === '/api/remove') {
-      return Response.json(await removeWorktree(repo, name, reason));
+      return jsonTry(() =>
+        removeWorktree(
+          repo,
+          name,
+          reason,
+          body.force ?? false,
+          body.operationId
+        )
+      );
     }
     if (pathname === '/api/start') {
       // Container is the default for dev servers, not opt-in — but ONLY when
@@ -2003,43 +3415,94 @@ async function worktreeRoutes(req, pathname, method, server) {
       return jsonTry(() => setPrReady(repo, name, !!body.ready));
     }
     if (pathname === '/api/tunnel/enable') {
-      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort();
+      if (!port) {
+        return Response.json({ ok: false }, { status: 404 });
+      }
       return Response.json(await enableTunnel(repo, name, port));
     }
     if (pathname === '/api/tunnel/disable') {
-      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
+      const port = wtPort();
+      if (!port) {
+        return Response.json({ ok: false }, { status: 404 });
+      }
       return Response.json(await disableTunnel(repo, name, port));
     }
     if (pathname === '/api/inngest/start') {
-      const port = wtPort(); if (!port) return Response.json({ ok: false }, { status: 404 });
-      return Response.json(await startInngest(repo, name, port));
+      const port = wtPort();
+      if (!port) {
+        return Response.json({ ok: false }, { status: 404 });
+      }
+      return Response.json(
+        await lifecycle.runOperation(
+          worktreeTarget(repo, name, port),
+          'sidecar-start',
+          () => startInngest(repo, name, port)
+        )
+      );
     }
     if (pathname === '/api/inngest/stop') {
       return Response.json(await stopInngest(repo, name, wtPort()));
     }
     if (pathname === '/api/trigger/start') {
-      return Response.json(startTrigger(repo, name));
+      return Response.json(
+        await lifecycle.runOperation(
+          worktreeTarget(repo, name),
+          'sidecar-start',
+          () => startTrigger(repo, name)
+        )
+      );
     }
     if (pathname === '/api/trigger/stop') {
       return Response.json(await stopTrigger(repo, name));
     }
     if (pathname === '/api/convex/start') {
-      return Response.json(startConvexDev(repo, name));
+      return Response.json(
+        await lifecycle.runOperation(
+          worktreeTarget(repo, name),
+          'sidecar-start',
+          () => startConvexDev(repo, name)
+        )
+      );
     }
     if (pathname === '/api/convex/stop') {
       return Response.json(await stopConvexDev(repo, name));
     }
     if (pathname === '/api/convex/deploy') {
-      if (!target) return Response.json({ error: 'target required', ok: false });
-      return jsonTry(() => deployToConvex(repo, name, target));
+      if (!target) {
+        return Response.json({
+          code: 'INVALID_DEPLOY_TARGET',
+          error: 'target required',
+          ok: false,
+        });
+      }
+      return jsonTry(() =>
+        deployToConvex(repo, name, target, body.expectedContext)
+      );
     }
     if (pathname === '/api/vercel/deploy') {
-      if (!target) return Response.json({ error: 'target required', ok: false });
-      return jsonTry(() => deployToVercel(repo, name, target));
+      if (!target) {
+        return Response.json({
+          code: 'INVALID_DEPLOY_TARGET',
+          error: 'target required',
+          ok: false,
+        });
+      }
+      return jsonTry(() =>
+        deployToVercel(repo, name, target, body.expectedContext)
+      );
     }
     if (pathname === '/api/netlify/deploy') {
-      if (!target) return Response.json({ error: 'target required', ok: false });
-      return jsonTry(() => deployToNetlify(repo, name, target));
+      if (!target) {
+        return Response.json({
+          code: 'INVALID_DEPLOY_TARGET',
+          error: 'target required',
+          ok: false,
+        });
+      }
+      return jsonTry(() =>
+        deployToNetlify(repo, name, target, body.expectedContext)
+      );
     }
     if (pathname === '/api/open') {
       return Response.json(openInGhostty(wtPath(repo, name), tool));
@@ -2079,12 +3542,30 @@ function logAction(pathname, body, ok, error) {
     ts: new Date().toISOString(),
     ...(error ? { error: String(error).slice(0, 500) } : {}),
   };
-  try { appendFileSync(ACTIONS_LOG, JSON.stringify(entry) + '\n'); } catch {}
+  try {
+    appendFileSync(ACTIONS_LOG, `${JSON.stringify(entry)}\n`);
+  } catch {
+    // Logging cannot replace the action's already established result.
+  }
 }
 
 async function handle(req, server) {
+  const denied = portalRequestError(req, server.requestIP(req)?.address);
+  if (denied) {
+    return Response.json({ error: denied, ok: false }, { status: 403 });
+  }
   const { pathname } = new URL(req.url);
   const method = req.method;
+
+  // OAuth's redirect is a GET, but its callback exchanges and persists tokens.
+  if (method === 'GET' && pathname.startsWith('/api/mcp/oauth/callback/')) {
+    const result = await updateControl.mutate(() =>
+      routeRequest(req, server, pathname, method)
+    );
+    return result instanceof Response
+      ? result
+      : Response.json(result, { status: 409 });
+  }
 
   // Only POST /api/* is a mutating action worth logging -- /ws (an upgrade,
   // not a normal response) and every GET route fall straight through to the
@@ -2096,16 +3577,39 @@ async function handle(req, server) {
   // instead of its real result. Covering MCP calls needs its own envelope-
   // aware handling, not a blind extension of this wrapper -- real, tracked
   // gap, not solved here.
-  if (method !== 'POST' || !pathname.startsWith('/api/')) return routeRequest(req, server, pathname, method);
+  if (method !== 'POST' || !pathname.startsWith('/api/')) {
+    return routeRequest(req, server, pathname, method);
+  }
 
   // Request bodies can only be read once and every route handler below
   // already does its own req.json() internally -- clone before routing so
   // this wrapper can independently read the same body for the log entry.
   const bodyClone = req.clone();
-  const res = await routeRequest(req, server, pathname, method);
+  const routed = pathname.startsWith('/api/update/')
+    ? await routeRequest(req, server, pathname, method)
+    : await updateControl.mutate(
+        () => routeRequest(req, server, pathname, method),
+        {
+          recovery: [
+            '/api/stop',
+            '/api/inngest/stop',
+            '/api/trigger/stop',
+            '/api/convex/stop',
+            '/api/raycast/stop',
+            '/api/mcp/disconnect',
+          ].includes(pathname),
+        }
+      );
+  const res =
+    routed instanceof Response
+      ? routed
+      : Response.json(routed, { status: 409 });
   const [body, resBody] = await Promise.all([
     bodyClone.json().catch(() => null),
-    res.clone().json().catch(() => null),
+    res
+      .clone()
+      .json()
+      .catch(() => null),
   ]);
   logAction(pathname, body, resBody?.ok !== false, resBody?.error);
   return res;
@@ -2119,7 +3623,9 @@ async function routeRequest(req, server, pathname, method) {
   // time rather than reassigned later since ServerWebSocket.data is meant
   // to be set this way, not written to after the fact.
   if (pathname === '/ws') {
-    if (server.upgrade(req, { data: new Set() })) return;
+    if (server.upgrade(req, { data: new Set() })) {
+      return;
+    }
     return new Response('Upgrade failed', { status: 400 });
   }
 
@@ -2140,9 +3646,19 @@ async function routeRequest(req, server, pathname, method) {
   }
 
   // worktreeRoutes must run last, see its own comment for why.
-  for (const routes of [projectRoutes, settingsRoutes, mcpRoutes, prReviewRoutes, raycastRoutes, worktreeRoutes]) {
+  for (const routes of [
+    updateRoutes,
+    projectRoutes,
+    settingsRoutes,
+    mcpRoutes,
+    prReviewRoutes,
+    raycastRoutes,
+    worktreeRoutes,
+  ]) {
     const res = await routes(req, pathname, method, server);
-    if (res) return res;
+    if (res) {
+      return res;
+    }
   }
   return new Response('Not found', { status: 404 });
 }
@@ -2157,64 +3673,185 @@ async function routeRequest(req, server, pathname, method) {
 const DEV_MEM_CEILING_MB = _cfg.devMemCeilingMb ?? 8192;
 const MEM_CHECK_INTERVAL = 60_000;
 
-function processFootprintMb(pid) {
-  try {
-    const out = execFileSync('footprint', [String(pid)], { encoding: 'utf8' });
-    const m = out.match(/phys_footprint:\s*([\d.]+)\s*(MB|GB)/);
-    if (!m) return 0;
-    return m[2] === 'GB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
-  } catch { return 0; }
+async function processFootprintMb(pid) {
+  const out = await spawnText(['footprint', String(pid)], { timeoutMs: 3000 });
+  const match = out.match(/phys_footprint:\s*([\d.]+)\s*(KB|MB|GB)/i);
+  if (match) {
+    return (
+      Number(match[1]) *
+      { GB: 1024, KB: 1 / 1024, MB: 1 }[match[2].toUpperCase()]
+    );
+  }
+  return null;
 }
 
-const deadContainerStrikes = new Map(); // key -> consecutive "not alive" readings
+// UI refresh uses one cheap process table, including children of Bun's
+// script wrapper. Footprint sampling stays in the minute-scale watchdog.
+let processMemoryCache = null;
+let processMemoryAt = 0;
+async function processMemory() {
+  if (!processMemoryCache || Date.now() - processMemoryAt > 5000) {
+    processMemoryAt = Date.now();
+    processMemoryCache = spawnText(['ps', '-axo', 'pid=,ppid=,pgid=,rss='], {
+      timeoutMs: 2000,
+    }).then((raw) =>
+      raw
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const [pid, ppid, pgid, rss] = line.trim().split(/\s+/).map(Number);
+          return { pgid, pid, ppid, rss };
+        })
+    );
+  }
+  return processMemoryCache;
+}
+
+async function processTree(entry) {
+  const rows = await processMemory();
+  const pids = new Set([entry.pid]);
+  // Adopted processes have no owned group, so walk their descendants only.
+  let added;
+  do {
+    added = false;
+    for (const row of rows) {
+      if (
+        !pids.has(row.pid) &&
+        (pids.has(row.ppid) || (entry.ownedGroup && row.pgid === entry.pid))
+      ) {
+        pids.add(row.pid);
+        added = true;
+      }
+    }
+  } while (added);
+  return rows.filter((row) => pids.has(row.pid));
+}
+
+async function worktreeProcessTree(key, entry) {
+  const roots = entry?.pid ? [entry] : [];
+  for (const map of [inngestProcs, triggerProcs, convexDevProcs]) {
+    const sidecar = map.get(key);
+    if (sidecar?.pid) {
+      roots.push(sidecar);
+    }
+  }
+  for (const [name, sidecar] of sidecarProcs) {
+    if (name.startsWith(`${key}/`) && sidecar.pid) {
+      roots.push(sidecar);
+    }
+  }
+  const rows = (await Promise.all(roots.map(processTree))).flat();
+  return [...new Map(rows.map((row) => [row.pid, row])).values()];
+}
 
 async function checkMemoryCeilings() {
-  for (const [key, entry] of procs.entries()) {
-    if (entry.container) {
-      // Docker's own cgroup limit + `restart: on-failure:3` already enforce
-      // and retry the memory ceiling — nothing in Setu needs to restart a
-      // container itself. But `docker compose up -d` exits successfully the
-      // moment containers are created, long before a crash-loop plays out, so
-      // nothing else ever notices a container that permanently gave up after
-      // exhausting its retries — without this, its concurrency slot stays
-      // occupied forever (verified live: a memory limit too small for the
-      // app to ever boot left a dead entry in `procs` indefinitely).
-      if (composeProjectAlive(entry.container)) {
-        deadContainerStrikes.delete(key);
-      } else {
-        // Require two consecutive misses, not one — a single "not alive"
-        // reading can be a transient window during a legitimate recreate
-        // (a tunnel toggle or manual restart respawning the same worktree),
-        // not just a container that's genuinely given up for good. Treating
-        // one miss as final risked freeing a slot — and losing container
-        // tracking — for a worktree that was actually fine a moment later.
-        const strikes = (deadContainerStrikes.get(key) ?? 0) + 1;
-        if (strikes >= 2) {
-          console.warn(`⚠ ${key} container exited and is not restarting — freeing its slot`);
-          procs.delete(key);
-          deadContainerStrikes.delete(key);
-          drainQueue();
-        } else {
-          deadContainerStrikes.set(key, strikes);
-        }
-      }
+  const sidecarKeys = new Set([
+    ...inngestProcs.keys(),
+    ...triggerProcs.keys(),
+    ...convexDevProcs.keys(),
+    ...[...sidecarProcs.keys()].map((key) =>
+      key.slice(0, key.lastIndexOf('/'))
+    ),
+  ]);
+  for (const key of sidecarKeys) {
+    const entry = lifecycle.snapshot(key);
+    if (entry?.reserved && !entry.container) {
       continue;
     }
-    const mb = processFootprintMb(entry.pid);
+    const rows = await worktreeProcessTree(key, null);
+    let mb = 0;
+    for (let i = 0; i < rows.length; i += 4) {
+      mb += (
+        await Promise.all(
+          rows
+            .slice(i, i + 4)
+            .map(
+              async (row) =>
+                (await processFootprintMb(row.pid)) ?? row.rss / 1024
+            )
+        )
+      ).reduce((a, b) => a + b, 0);
+    }
+    if (mb <= DEV_MEM_CEILING_MB) {
+      continue;
+    }
+    const { repo, name } = splitKey(key);
+    console.warn(
+      `${key} native sidecars exceed ${DEV_MEM_CEILING_MB}MB; stopping sidecars`
+    );
+    const settled = await Promise.allSettled([
+      stopInngest(repo, name, getPort(WORKSPACE, repo, name)),
+      stopTrigger(repo, name),
+      stopConvexDev(repo, name),
+      stopSidecars(repo, name),
+    ]);
+    const failed = settled.find((item) => item.status === 'rejected');
+    if (failed) {
+      console.error(`${key} sidecar stop failed:`, failed.reason);
+    }
+  }
+  for (const entry of lifecycle.snapshots()) {
+    if (!entry.reserved || entry.stopping) {
+      continue;
+    }
+    const { key } = entry;
+    await lifecycle.reconcile(key, entry.generation);
+    const current = lifecycle.snapshot(key);
+    if (
+      !current?.reserved ||
+      current.generation !== entry.generation ||
+      current.stopping ||
+      current.phase === 'unknown' ||
+      current.container
+    ) {
+      continue;
+    }
+    const tree = await worktreeProcessTree(key, current);
+    let mb = 0;
+    for (let i = 0; i < tree.length; i += 4) {
+      const samples = await Promise.all(
+        tree
+          .slice(i, i + 4)
+          .map(
+            async (row) => (await processFootprintMb(row.pid)) ?? row.rss / 1024
+          )
+      );
+      mb += samples.reduce((sum, value) => sum + value, 0);
+    }
+    const latest = lifecycle.snapshot(key);
+    if (
+      !latest?.reserved ||
+      latest.generation !== entry.generation ||
+      latest.stopping
+    ) {
+      continue;
+    }
     if (mb > DEV_MEM_CEILING_MB) {
-      const { repo, name } = splitKey(key);
-      const port = getPort(WORKSPACE, repo, name);
-      console.warn(`⚠ ${key} dev server at ${Math.round(mb)}MB, exceeds ${DEV_MEM_CEILING_MB}MB ceiling — restarting`);
-      // Awaited, not fire-and-forget: stopWorktree's kill is now async
-      // (activePidAsync/killGroupAsync), and spawnWorktree respawning on the
-      // same port before the old process is actually gone would race it.
-      await stopWorktree(repo, name, port, { drain: false });
-      if (port) spawnWorktree(repo, name, port);
+      console.warn(
+        `${key} dev server at ${Math.round(mb)}MB exceeds ${DEV_MEM_CEILING_MB}MB; restarting`
+      );
+      const result = await lifecycle.restart(latest.target);
+      if (!result.ok) {
+        console.error(result.error);
+      }
     }
   }
 }
 
-setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
+let memoryCheckRunning = false;
+const memoryCheckTimer = setInterval(async () => {
+  if (memoryCheckRunning || updateControl.stopping()) {
+    return;
+  }
+  memoryCheckRunning = true;
+  try {
+    await checkMemoryCeilings();
+  } catch (error) {
+    console.error(error);
+  } finally {
+    memoryCheckRunning = false;
+  }
+}, MEM_CHECK_INTERVAL);
 
 // ── idle-timeout auto-stop ───────────────────────────────────────────────────
 // Opt-in (0 = disabled) companion to checkMemoryCeilings above: stops a bare
@@ -2249,7 +3886,7 @@ setInterval(checkMemoryCeilings, MEM_CHECK_INTERVAL);
 // lastSeenAt) even once nobody is actually looking at it. There's no
 // session/viewer/visibility tracking in this portal today. Accepted gap for
 // v1, not a claim of perfect accuracy.
-const IDLE_TIMEOUT_MS     = _cfg.idleTimeoutMs ?? 0; // 0 = disabled
+const IDLE_TIMEOUT_MS = _cfg.idleTimeoutMs ?? 0; // 0 = disabled
 const IDLE_CHECK_INTERVAL = 60_000;
 // Floor under IDLE_TIMEOUT_MS itself: a worktree younger than this never
 // gets reaped even if someone configures a very small timeout, so a dev
@@ -2257,47 +3894,79 @@ const IDLE_CHECK_INTERVAL = 60_000;
 const IDLE_MIN_UPTIME_MS = 2 * 60_000;
 
 function checkIdleTimeouts() {
-  if (!IDLE_TIMEOUT_MS) return;
+  if (!IDLE_TIMEOUT_MS) {
+    return;
+  }
   const now = Date.now();
   const threshold = Math.max(IDLE_TIMEOUT_MS, IDLE_MIN_UPTIME_MS);
-  for (const [key, entry] of procs.entries()) {
+  for (const entry of lifecycle.snapshots()) {
+    const { key } = entry;
+    if (!entry.reserved || entry.stopping) {
+      continue;
+    }
     // Container-mode worktrees already have Docker's own lifecycle (restart
     // policy, plus checkMemoryCeilings' dead-container reap above). This
     // check is bare-process-only.
-    if (entry.container) continue;
+    if (entry.container) {
+      continue;
+    }
     // A worktree with an active public tunnel route can be getting real
     // traffic from outside this portal entirely (someone hitting the public
     // URL) — none of that shows up as a portal-side request, so lastSeenAt
     // can't see it. Leave tunneled worktrees out of idle-timeout scope
     // rather than risk stopping a server that's actually serving traffic.
-    if (activeTunnelMap.has(key)) continue;
+    if (activeTunnelMap.has(key)) {
+      continue;
+    }
     const seenAt = lastSeenAt.get(key);
-    if (seenAt == null) continue; // no baseline yet, nothing to measure against
+    if (seenAt === null || seenAt === undefined) {
+      continue; // no baseline yet, nothing to measure against
+    }
     const idleMs = now - seenAt;
-    if (idleMs < threshold) continue;
+    if (idleMs < threshold) {
+      continue;
+    }
     const { repo, name } = splitKey(key);
     const port = getPort(WORKSPACE, repo, name);
-    console.warn(`⚠ ${key} idle for ${Math.round(idleMs / 60_000)}m, exceeds ${Math.round(IDLE_TIMEOUT_MS / 60_000)}m idle timeout — stopping`);
+    console.warn(
+      `⚠ ${key} idle for ${Math.round(idleMs / 60_000)}m, exceeds ${Math.round(IDLE_TIMEOUT_MS / 60_000)}m idle timeout — stopping`
+    );
     // Not awaited: stopWorktree is async now, but nothing here depends on
     // its kill actually finishing before the next line — unlike the memory-
     // ceiling restart path, there's no immediate respawn to race.
-    stopWorktree(repo, name, port);
+    stopWorktree(repo, name, port).catch((error) => console.error(error));
     lastSeenAt.delete(key);
   }
 }
 
-setInterval(checkIdleTimeouts, IDLE_CHECK_INTERVAL);
+const idleCheckTimer = setInterval(() => {
+  if (!updateControl.stopping()) {
+    checkIdleTimeouts();
+  }
+}, IDLE_CHECK_INTERVAL);
 
 // Rebuild merged ingress and restart the single tunnel process for all enabled worktrees
-;(async () => {
-  syncHosts(WORKSPACE);
-  reconcileDevServers();
-  reconcileTriggerSidecars();
+await (async () => {
+  const pending = validateRemovalRecords(
+    workspaceState(WORKSPACE).read('removals')
+  );
+  await syncHosts(WORKSPACE);
+  await reconcileDevServers();
+  await reconcileTriggerSidecars();
   const wts = await getWorktrees().catch(() => []);
   for (const w of wts) {
-    if (w.tunnelOn) activeTunnelMap.set(w.key, { port: w.port, pubDom: w.pubDomain });
+    const recovery = Object.values(pending).find((row) => row.key === w.key);
+    const detached =
+      recovery?.completed?.includes('tunnel') ||
+      recovery?.attempting === 'tunnel' ||
+      recovery?.attempting === 'git';
+    if (w.tunnelOn && !detached) {
+      activeTunnelMap.set(w.key, { port: w.port, pubDom: w.pubDomain });
+    }
   }
-  if (activeTunnelMap.size > 0) restartTunnel();
+  if (activeTunnelMap.size > 0) {
+    await restartTunnel();
+  }
 })();
 
 // ── WebSocket push (real-time sync) ─────────────────────────────────────────
@@ -2317,33 +3986,45 @@ const wsTopics = new Map(); // topic -> { interval, subscriberCount, lastBroadca
 
 // Exactly what GET /api/status already returns, factored out so the HTTP
 // route and the WS tick below can never drift apart from each other.
-function computeStatus() {
-  const rt = containerRuntimeAvailable();
-  return {
-    concurrency: { active: procs.size, max: MAX_CONCURRENT_DEV, queued: startQueue.length },
-    container: {
-      cpuLimit: _cfg.containerCpuLimit ?? 2,engine: rt.engine,
-      engineAvailable: rt.available, 
-      memoryLimit: _cfg.containerMemoryLimit ?? '4g',
-    },
-  };
+function cachedContainerRuntime() {
+  return lifecycle.refreshCapacity();
 }
 
-async function wsTickWorktrees() {
-  const entry = wsTopics.get('worktrees');
-  if (!entry) return; // last subscriber left between the tick firing and it actually running
-  // null, not [], on failure: the client does an unconditional setWorktrees
-  // on every push, so broadcasting an empty list here would blank out its
-  // last good state instead of just skipping this tick like a failed poll
-  // used to.
-  const worktrees = await getWorktrees().catch(() => null);
-  if (!worktrees) return;
-  const payload = { status: computeStatus(), worktrees };
-  const json = JSON.stringify(payload);
-  if (json === entry.lastBroadcast) return;
-  entry.lastBroadcast = json;
-  server.publish('worktrees', JSON.stringify({ data: payload, topic: 'worktrees' }));
+async function computeStatus(refreshHealth = false) {
+  return readPortalStatus(
+    {
+      config: _cfg,
+      lifecycle,
+      pendingRemovals: () => removals.pending(),
+      readHostHealth,
+    },
+    refreshHealth
+  );
 }
+
+let snapshotInFlight = null;
+function getWorktreeSnapshot() {
+  if (!snapshotInFlight) {
+    snapshotInFlight = (async () => {
+      // A composition that started before this read may contain an older listener set.
+      if (worktreesInFlight) {
+        await worktreesInFlight.catch(() => undefined);
+      }
+      return readFreshWorktreeSnapshot({
+        listeners: listenerObservation,
+        status: computeStatus,
+        worktrees: getWorktrees,
+      });
+    })().finally(() => {
+      snapshotInFlight = null;
+    });
+  }
+  return snapshotInFlight;
+}
+const worktreeStream = createWorktreeStream({
+  publish: (topic, payload) => server.publish(topic, payload),
+  readSnapshot: getWorktreeSnapshot,
+});
 
 // repo never contains a slash (same assumption splitKey in lib.js makes for
 // the plain `repo/name` key), but name can, e.g. a branch called
@@ -2353,7 +4034,9 @@ function splitLogTopic(topic) {
   const rest = topic.slice('logs:'.length);
   const firstSlash = rest.indexOf('/');
   const lastSlash = rest.lastIndexOf('/');
-  if (firstSlash === -1 || firstSlash === lastSlash) return null; // not repo/name/type shaped
+  if (firstSlash === -1 || firstSlash === lastSlash) {
+    return null; // not repo/name/type shaped
+  }
   return {
     name: rest.slice(firstSlash + 1, lastSlash),
     repo: rest.slice(0, firstSlash),
@@ -2363,58 +4046,63 @@ function splitLogTopic(topic) {
 
 function wsTickLog(topic, repo, name, type) {
   const entry = wsTopics.get(topic);
-  if (!entry) return; // last subscriber left between the tick firing and it actually running
-  const { lines, total } = tailLog(repo, name, type);
-  if (total === entry.lastTotal) return; // nothing new since the last tick
-  const rotated = total < entry.lastTotal; // rotateLog renamed the file out from under the cursor
-  const delta = total - entry.lastTotal;
-  const newLines = rotated || delta > lines.length ? lines : lines.slice(-delta);
-  entry.lastTotal = total;
-  server.publish(topic, JSON.stringify({ data: newLines, topic }));
+  if (!entry) {
+    return;
+  }
+  const snapshot = readLogSnapshot(entry, () => logPath(repo, name, type));
+  if (snapshot) {
+    server.publish(topic, JSON.stringify({ data: snapshot, topic }));
+  }
 }
 
 function wsSubscribeLog(ws, topic) {
-  if (!topic.startsWith('logs:')) return; // only logs:* topics are sub/unsub driven, see 'worktrees' handling in open/close
+  if (!topic.startsWith('logs:') || ws.data.has(topic)) {
+    return;
+  }
   const parsed = splitLogTopic(topic);
-  if (!parsed) return; // malformed topic, ignore silently same as a malformed frame
+  if (!parsed) {
+    return;
+  }
   const { repo, name, type } = parsed;
-  ws.subscribe(topic);
-  ws.data.add(topic);
+  try {
+    logPath(repo, name, type);
+  } catch {
+    return;
+  }
   let entry = wsTopics.get(topic);
   if (!entry) {
-    entry = { interval: null, lastBroadcast: null, lastTotal: null, subscriberCount: 0 };
+    entry = {
+      interval: null,
+      signature: null,
+      snapshot: null,
+      subscriberCount: 0,
+    };
     wsTopics.set(topic, entry);
+    entry.interval = setInterval(
+      () => wsTickLog(topic, repo, name, type),
+      1000
+    );
   }
-  entry.subscriberCount++;
-  const { lines, total } = tailLog(repo, name, type);
-  if (entry.subscriberCount === 1) {
-    // First subscriber starts the tick, baselined on this same tailLog call
-    // (not zero), so the first 1000ms tick diffs against real state instead
-    // of re-publishing everything as "new" a second time. This connection's
-    // catch-up is the whole window tailLog just returned.
-    entry.lastTotal = total;
-    entry.interval = setInterval(() => wsTickLog(topic, repo, name, type), 1000);
-    ws.send(JSON.stringify({ data: lines, topic }));
-  } else {
-    // A later subscriber joining an already-ticking topic. Lines beyond the
-    // shared entry.lastTotal baseline are about to go out to everyone (this
-    // connection included, it's already ws.subscribe()'d above) on the next
-    // regular tick, so trim them out of this one-time catch-up. Otherwise
-    // the client's accumulate-by-concat log view would see them twice, once
-    // here and once from that tick's publish.
-    const pending = total - entry.lastTotal;
-    const catchUp = pending > 0 ? lines.slice(0, lines.length - pending) : lines;
-    ws.send(JSON.stringify({ data: catchUp, topic }));
-  }
+  // Flush pending changes to existing subscribers before the new socket
+  // joins, then give it the identical bounded snapshot.
+  wsTickLog(topic, repo, name, type);
+  ws.subscribe(topic);
+  ws.data.add(topic);
+  entry.subscriberCount += 1;
+  ws.send(JSON.stringify({ data: entry.snapshot, topic }));
 }
 
 function wsUnsubscribeLog(ws, topic) {
-  if (!ws.data.has(topic)) return; // not actually subscribed, nothing to do
+  if (!ws.data.has(topic)) {
+    return; // not actually subscribed, nothing to do
+  }
   ws.unsubscribe(topic);
   ws.data.delete(topic);
   const entry = wsTopics.get(topic);
-  if (!entry) return;
-  entry.subscriberCount--;
+  if (!entry) {
+    return;
+  }
+  entry.subscriberCount -= 1;
   if (entry.subscriberCount <= 0) {
     clearInterval(entry.interval);
     wsTopics.delete(topic);
@@ -2422,45 +4110,37 @@ function wsUnsubscribeLog(ws, topic) {
 }
 
 async function open(ws) {
-  // ws.data (a Set of logs:* topics this connection currently holds) was
-  // already seeded at server.upgrade(req, { data: new Set() }) in handle().
-  // 'worktrees' isn't tracked in it since every connection always holds
-  // exactly one, unconditionally, so close() below decrements it directly.
-  ws.subscribe('worktrees');
-  let entry = wsTopics.get('worktrees');
-  if (!entry) {
-    entry = { interval: null, lastBroadcast: null, lastTotal: null, subscriberCount: 0 };
-    wsTopics.set('worktrees', entry);
+  if (updateControl.stopping()) {
+    ws.close(1001, 'Portal update');
+    return;
   }
-  entry.subscriberCount++;
-  if (entry.subscriberCount === 1) entry.interval = setInterval(wsTickWorktrees, 3000);
-  // Always send this connection its own immediate snapshot, independent of
-  // the shared tick's diff-guard. Without this, a tab whose WS drops and
-  // reconnects while other tabs stay connected would sit on stale state
-  // until entry.lastBroadcast (shared across every subscriber) next
-  // actually changes -- the diff-guard exists to skip redundant broadcasts
-  // to already-synced connections, not to gate a brand new one's first sync.
-  const worktrees = await getWorktrees().catch(() => null);
-  if (worktrees) ws.send(JSON.stringify({ data: { status: computeStatus(), worktrees }, topic: 'worktrees' }));
+  portalSockets.add(ws);
+  await worktreeStream.open(ws);
 }
 
 function message(ws, raw) {
   let msg;
-  try { msg = JSON.parse(raw); } catch { return; } // a stray non-JSON frame must not crash the connection
-  if (!msg || typeof msg !== 'object') return;
-  if (typeof msg.sub === 'string') wsSubscribeLog(ws, msg.sub);
-  else if (typeof msg.unsub === 'string') wsUnsubscribeLog(ws, msg.unsub);
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  } // a stray non-JSON frame must not crash the connection
+  if (!msg || typeof msg !== 'object') {
+    return;
+  }
+  if (typeof msg.sub === 'string') {
+    wsSubscribeLog(ws, msg.sub);
+  } else if (typeof msg.unsub === 'string') {
+    wsUnsubscribeLog(ws, msg.unsub);
+  }
 }
 
 function close(ws) {
-  for (const topic of [...ws.data]) wsUnsubscribeLog(ws, topic);
-  const entry = wsTopics.get('worktrees');
-  if (!entry) return;
-  entry.subscriberCount--;
-  if (entry.subscriberCount <= 0) {
-    clearInterval(entry.interval);
-    wsTopics.delete('worktrees');
+  portalSockets.delete(ws);
+  for (const topic of [...ws.data]) {
+    wsUnsubscribeLog(ws, topic);
   }
+  worktreeStream.close(ws);
 }
 
 // Wires mcp-server.js's tools straight to this file's own functions --
@@ -2468,24 +4148,43 @@ function close(ws) {
 // back into this same server. Function declarations are hoisted, so every
 // name here is already defined despite most living further up the file.
 initMcpServer({
-  computeDiff, 
-  createPr, createWorktree, 
-  fetchRepoPRs, 
-  getWorktrees, 
-  listPorts: listPortsWithWorktree, listProjects: listProjectsSummary,prReviewRun,prReviewStatus, removeWorktree,setPrReady,
-  startWorktree: startWorktreeByName, stopWorktree: stopWorktreeByName,
-  syncWorktree: syncWorktreeByName,tailLog,
+  computeDiff,
+  createPr,
+  createWorktree,
+  fetchRepoPRs,
+  getWorktrees,
+  listPorts: listPortsWithWorktree,
+  listProjects: listProjectsSummary,
+  prReviewRun,
+  prReviewStatus,
+  removeWorktree,
+  setPrReady,
+  startWorktree: startWorktreeByName,
+  stopWorktree: stopWorktreeByName,
+  syncWorktree: syncWorktreeByName,
+  tailLog,
 });
 
 const server = Bun.serve({
   development: false,
   fetch: handle,
+  hostname: '127.0.0.1',
   port: PORT,
   // Both routes serve the identical SPA shell — the client-side router (app.tsx)
   // reads location.pathname itself. Needed so a hard refresh or a direct link
   // to /worktree/:repo/:name doesn't 404 (client-side pushState alone only
   // handles in-app navigation, not a fresh page load hitting the server).
-  routes: { '/': indexPage, '/archived': indexPage, '/costs': indexPage, '/help': indexPage, '/ports': indexPage, '/repo/:repo': indexPage, '/settings': indexPage, '/worktree/:repo/:name': indexPage },
+  routes: {
+    '/': indexPage,
+    '/archived': indexPage,
+    '/inventory': indexPage,
+    '/costs': indexPage,
+    '/help': indexPage,
+    '/ports': indexPage,
+    '/repo/:repo': indexPage,
+    '/settings': indexPage,
+    '/worktree/:repo/:name': indexPage,
+  },
   websocket: { close, message, open },
 });
 console.log(`Portal → http://quivly.local  (localhost:${PORT})`);

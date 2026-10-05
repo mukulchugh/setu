@@ -1,6 +1,7 @@
 // Sidebar trivia card — self-contained: owns its own rotation timer, takes
 // no props, zero coupling to App's state.
-import { useState, useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
+import { useVisiblePoll } from '../use-visible-poll';
 
 // Real, specific facts about what setu does, not filler copy — each one
 // traces back to an actual mechanism in lib.js/portal.js/cli.js. Refreshed
@@ -14,7 +15,7 @@ const SETU_FACTS = [
   'Port bands are handed out in blocks of 100 starting at 3000, one block per project.',
   "Sync with staging only ever does a clean merge. If it can't merge cleanly, it aborts and leaves your branch exactly as it was.",
   "Container mode works with any Docker daemon, OrbStack included. It's engine agnostic by design.",
-  "In container mode, node_modules lives in its own Docker volume, not a bind mount — so a native macOS binary in it never has to run inside the Linux container.",
+  'In container mode, node_modules lives in its own Docker volume, not a bind mount — so a native macOS binary in it never has to run inside the Linux container.',
   "Concurrency limits auto clamp to your machine's real CPU and memory, not a hardcoded number.",
   'Sidecars are defined per project in sidecars.json, so each repo can run its own supporting processes.',
   "A sidecar's command has to be explicitly approved before it's allowed to run. Edit it later, even by one character, and that approval is revoked automatically.",
@@ -40,33 +41,71 @@ const SETU_FACTS = [
 // sequentially through the deck instead, so a manual click feels like
 // browsing the stack rather than re-rolling it.
 export function TriviaCard() {
-  const [i, setI] = useState(() => Math.floor(Math.random() * SETU_FACTS.length));
+  const [i, setI] = useState(() =>
+    Math.floor(Math.random() * SETU_FACTS.length)
+  );
+  const [wide, setWide] = useState(
+    () => matchMedia('(min-width: 1024px)').matches
+  );
   useEffect(() => {
-    const t = setInterval(() => {
-      setI(prev => {
+    const media = matchMedia('(min-width: 1024px)');
+    const update = () => setWide(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+  useVisiblePoll(
+    wide ? 'trivia-rotation' : null,
+    45_000,
+    () => {
+      setI((prev) => {
         let next = Math.floor(Math.random() * SETU_FACTS.length);
-        while (next === prev) next = Math.floor(Math.random() * SETU_FACTS.length);
+        while (next === prev) {
+          next = Math.floor(Math.random() * SETU_FACTS.length);
+        }
         return next;
       });
-    }, 45000);
-    return () => clearInterval(t);
-  }, []);
-  const step = (dir: 1 | -1) => setI(prev => (prev + dir + SETU_FACTS.length) % SETU_FACTS.length);
+      return Promise.resolve();
+    },
+    false
+  );
+  const step = (dir: 1 | -1) =>
+    setI((prev) => (prev + dir + SETU_FACTS.length) % SETU_FACTS.length);
   return (
     <div class="relative">
-      <div class="absolute inset-0 translate-x-2.5 translate-y-1 rotate-2 bg-white/40 dark:bg-white/5 border border-white/60 dark:border-white/10 shadow-md rounded-none" />
-      <div class="absolute inset-0 translate-x-1 translate-y-0.5 rotate-1 bg-white/55 dark:bg-white/8 border border-white/70 dark:border-white/10 shadow-md rounded-none" />
-      <div key={i} class="relative flex flex-col gap-2 backdrop-blur-md bg-white/75 dark:bg-white/10 border border-white/80 dark:border-white/10 shadow-lg rounded-none p-3 animate-[factIn_0.4s_ease-out]">
+      <div class="absolute inset-0 translate-x-2.5 translate-y-1 rotate-2 rounded-none border border-white/60 bg-white/40 shadow-md dark:border-white/10 dark:bg-white/5" />
+      <div class="absolute inset-0 translate-x-1 translate-y-0.5 rotate-1 rounded-none border border-white/70 bg-white/55 shadow-md dark:border-white/10 dark:bg-white/8" />
+      <div
+        class="relative flex animate-[factIn_0.4s_ease-out] flex-col gap-2 rounded-none border border-white/80 bg-white/75 p-3 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-white/10"
+        key={i}
+      >
         <div class="flex items-center justify-between gap-2">
-          <span class="board-mono text-[9px] font-bold text-zinc-400 shrink-0">SETU TRIVIA</span>
-          <div class="flex items-center gap-1 shrink-0">
-            <button onClick={() => step(-1)} data-tip="Previous fact"
-              class="tip w-5 h-5 flex items-center justify-center rounded-none text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors duration-150">‹</button>
-            <button onClick={() => step(1)} data-tip="Next fact"
-              class="tip w-5 h-5 flex items-center justify-center rounded-none text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors duration-150">›</button>
+          <span class="board-mono shrink-0 font-bold text-[9px] text-zinc-400">
+            SETU TRIVIA
+          </span>
+          <div class="flex shrink-0 items-center gap-1">
+            <button
+              aria-label="Previous fact"
+              class="tip flex h-5 w-5 items-center justify-center rounded-none text-zinc-400 transition-colors duration-150 hover:bg-black/5 hover:text-zinc-700 dark:hover:bg-white/10 dark:hover:text-zinc-200"
+              data-tip="Previous fact"
+              onClick={() => step(-1)}
+              type="button"
+            >
+              ‹
+            </button>
+            <button
+              aria-label="Next fact"
+              class="tip flex h-5 w-5 items-center justify-center rounded-none text-zinc-400 transition-colors duration-150 hover:bg-black/5 hover:text-zinc-700 dark:hover:bg-white/10 dark:hover:text-zinc-200"
+              data-tip="Next fact"
+              onClick={() => step(1)}
+              type="button"
+            >
+              ›
+            </button>
           </div>
         </div>
-        <p class="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">{SETU_FACTS[i]}</p>
+        <p class="text-xs text-zinc-500 leading-relaxed dark:text-zinc-400">
+          {SETU_FACTS[i]}
+        </p>
       </div>
     </div>
   );

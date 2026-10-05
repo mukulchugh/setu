@@ -1,30 +1,79 @@
 // Per-worktree diff review. Fetches GET /api/diff on mount (see portal.js's
 // computeDiff/parseUnifiedDiff for the backend half) and renders it. Manual
-// refresh only, no interval poll: unlike LiveLog above, this isn't a stream
+// refresh and visibility resume, no interval poll: unlike LiveLog above, this isn't a stream
 // to watch, it's a "let me look at what changed" snapshot.
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useEffect, useId, useState } from 'preact/hooks';
 import { Badge } from '../ui/badge';
 import { IconButton } from '../ui/button';
-import { tablerRefresh, tablerChevronRight } from './icons';
+import { readJson, useVisiblePoll } from '../use-visible-poll';
+import { tablerChevronRight, tablerRefresh } from './icons';
 
-type DiffLine = { type: 'add' | 'remove' | 'context'; content: string; oldLine?: number; newLine?: number };
-type DiffHunk = { header: string; lines: DiffLine[] };
-type DiffFile = { file: string; additions: number; deletions: number; hunks: DiffHunk[]; binary?: boolean; tooLarge?: boolean };
-type DiffGroup = { files: DiffFile[]; additions: number; deletions: number; totalFiles: number; truncatedFileCount: number };
-type DiffResponse = { base: string; baseResolved: boolean; committed: DiffGroup; uncommitted: DiffGroup; error?: string };
+interface DiffLine {
+  content: string;
+  newLine?: number;
+  oldLine?: number;
+  type: 'add' | 'remove' | 'context';
+}
+interface DiffHunk {
+  header: string;
+  lines: DiffLine[];
+}
+interface DiffFile {
+  additions: number;
+  binary?: boolean;
+  deletions: number;
+  file: string;
+  hunks: DiffHunk[];
+  tooLarge?: boolean;
+}
+interface DiffGroup {
+  additions: number;
+  deletions: number;
+  files: DiffFile[];
+  totalFiles: number;
+  truncatedFileCount: number;
+}
+interface DiffResponse {
+  base: string;
+  baseResolved: boolean;
+  committed: DiffGroup;
+  error?: string;
+  uncommitted: DiffGroup;
+}
 
 // Same refresh glyph DeployMenu/the sync-with-staging action already draw
 // elsewhere in app.tsx: one icon meaning "reload this," not a second one.
 function RefreshIcon({ spinning }: { spinning: boolean }) {
   return (
-    <svg class={`w-4 h-4 ${spinning ? 'spin' : ''}`} fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerRefresh.path} /></svg>
+    <svg
+      aria-hidden="true"
+      class={`h-4 w-4 ${spinning ? 'spin' : ''}`}
+      fill="none"
+      stroke="currentColor"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      stroke-width="2.5"
+      viewBox="0 0 24 24"
+    >
+      <path d={tablerRefresh.path} />
+    </svg>
   );
 }
 
 function Chevron({ open }: { open: boolean }) {
   return (
-    <svg class={`w-3 h-3 shrink-0 text-zinc-400 transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
-      fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d={tablerChevronRight.path} /></svg>
+    <svg
+      aria-hidden="true"
+      class={`h-3 w-3 shrink-0 text-zinc-400 transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+      fill="none"
+      stroke="currentColor"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      stroke-width="2.5"
+      viewBox="0 0 24 24"
+    >
+      <path d={tablerChevronRight.path} />
+    </svg>
   );
 }
 
@@ -33,7 +82,11 @@ const LINE_BG: Record<DiffLine['type'], string> = {
   context: 'text-zinc-600 dark:text-zinc-400',
   remove: 'bg-signal-red/10 dark:bg-signal-red/15 text-signal-red',
 };
-const LINE_PREFIX: Record<DiffLine['type'], string> = { add: '+', context: ' ', remove: '-' };
+const LINE_PREFIX: Record<DiffLine['type'], string> = {
+  add: '+',
+  context: ' ',
+  remove: '-',
+};
 
 function HunkBlock({ hunk }: { hunk: DiffHunk }) {
   return (
@@ -41,16 +94,25 @@ function HunkBlock({ hunk }: { hunk: DiffHunk }) {
       {/* Quieter separator row, not a full line. Code-shaped content (often
           includes a function name), so this stays font-mono rather than the
           uppercase board-mono treatment used for pure UI labels. */}
-      <div class="font-mono text-[10px] tracking-wide text-zinc-400 dark:text-zinc-500 bg-zinc-50 dark:bg-zinc-800/40 px-3 py-1 border-y border-zinc-100 dark:border-zinc-800">
+      <div class="border-zinc-100 border-y bg-zinc-50 px-3 py-1 font-mono text-[10px] text-zinc-400 tracking-wide dark:border-zinc-800 dark:bg-zinc-800/40 dark:text-zinc-500">
         {hunk.header}
       </div>
       <div class="overflow-x-auto">
         {hunk.lines.map((l, i) => (
-          <div key={i} class={`flex text-[11px] leading-[1.5] font-mono ${LINE_BG[l.type]}`}>
-            <span class="select-none shrink-0 w-9 text-right pr-1.5 text-zinc-300 dark:text-zinc-600">{l.oldLine ?? ''}</span>
-            <span class="select-none shrink-0 w-9 text-right pr-2 text-zinc-300 dark:text-zinc-600">{l.newLine ?? ''}</span>
-            <span class="select-none shrink-0 w-3 text-center opacity-60">{LINE_PREFIX[l.type]}</span>
-            <span class="whitespace-pre pr-3 flex-1">{l.content}</span>
+          <div
+            class={`flex font-mono text-[11px] leading-[1.5] ${LINE_BG[l.type]}`}
+            key={i}
+          >
+            <span class="w-9 shrink-0 select-none pr-1.5 text-right text-zinc-300 dark:text-zinc-600">
+              {l.oldLine ?? ''}
+            </span>
+            <span class="w-9 shrink-0 select-none pr-2 text-right text-zinc-300 dark:text-zinc-600">
+              {l.newLine ?? ''}
+            </span>
+            <span class="w-3 shrink-0 select-none text-center opacity-60">
+              {LINE_PREFIX[l.type]}
+            </span>
+            <span class="flex-1 whitespace-pre pr-3">{l.content}</span>
           </div>
         ))}
       </div>
@@ -63,70 +125,148 @@ function HunkBlock({ hunk }: { hunk: DiffHunk }) {
 // opening this view, so they start open.
 const AUTO_EXPAND_MAX_FILES = 2;
 
-function FileRow({ f, expanded, onToggle }: { f: DiffFile; expanded: boolean; onToggle: () => void }) {
-  const collapsible = !f.binary && !f.tooLarge && f.hunks.length > 0;
+function FileRow({
+  f,
+  expanded,
+  onToggle,
+}: {
+  f: DiffFile;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const collapsible = !(f.binary || f.tooLarge) && f.hunks.length > 0;
+  const panelId = useId();
   return (
-    <div class="border-b border-zinc-100 dark:border-zinc-800 last:border-0">
-      <div class={`flex items-center gap-2 px-3 py-2 text-xs ${collapsible ? 'cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/40' : ''}`}
-        onClick={collapsible ? onToggle : undefined}>
-        {collapsible ? <Chevron open={expanded} /> : <span class="w-3 shrink-0" />}
-        <span class="font-mono text-zinc-700 dark:text-zinc-300 truncate flex-1">{f.file}</span>
+    <div class="border-zinc-100 border-b last:border-0 dark:border-zinc-800">
+      <button
+        aria-controls={collapsible ? panelId : undefined}
+        aria-expanded={collapsible ? expanded : undefined}
+        class={`flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs ${collapsible ? 'cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/40' : ''}`}
+        disabled={!collapsible}
+        onClick={collapsible ? onToggle : undefined}
+        type="button"
+      >
+        {collapsible ? (
+          <Chevron open={expanded} />
+        ) : (
+          <span class="w-3 shrink-0" />
+        )}
+        <span class="min-w-0 flex-1 break-words font-mono text-zinc-700 dark:text-zinc-300">
+          {f.file}
+        </span>
         {f.binary ? (
           <Badge tone="zinc">binary</Badge>
         ) : f.tooLarge ? (
-          <Badge tone="amber" tip="Hunk content skipped past the size guard">{f.additions + f.deletions} lines</Badge>
+          <Badge tip="Hunk content skipped past the size guard" tone="amber">
+            {f.additions + f.deletions} lines
+          </Badge>
         ) : (
           <>
             <Badge tone="emerald">+{f.additions}</Badge>
             <Badge tone="red">-{f.deletions}</Badge>
           </>
         )}
-      </div>
-      {f.binary && <div class="px-3 pb-2 -mt-1 text-xs text-zinc-400">binary file changed</div>}
-      {f.tooLarge && <div class="px-3 pb-2 -mt-1 text-xs text-zinc-400">too large to display, {f.additions + f.deletions} lines changed</div>}
-      {collapsible && expanded && f.hunks.map((h, i) => <HunkBlock key={i} hunk={h} />)}
+      </button>
+      {f.binary && (
+        <div class="-mt-1 px-3 pb-2 text-xs text-zinc-400">
+          binary file changed
+        </div>
+      )}
+      {f.tooLarge && (
+        <div class="-mt-1 px-3 pb-2 text-xs text-zinc-400">
+          too large to display, {f.additions + f.deletions} lines changed
+        </div>
+      )}
+      {collapsible && (
+        <div hidden={!expanded} id={panelId}>
+          {expanded && f.hunks.map((h, i) => <HunkBlock hunk={h} key={i} />)}
+        </div>
+      )}
     </div>
   );
 }
 
-function DiffGroupSection({ label, group, emptyText, warning, footnote, groupKey, expanded, onToggleFile, open, onToggleOpen }: {
-  label: string; group: DiffGroup; emptyText: string; warning?: string; footnote?: string; groupKey: string;
-  expanded: Record<string, boolean>; onToggleFile: (key: string) => void;
-  open: boolean; onToggleOpen: () => void;
+function DiffGroupSection({
+  label,
+  group,
+  emptyText,
+  warning,
+  footnote,
+  groupKey,
+  expanded,
+  onToggleFile,
+  open,
+  onToggleOpen,
+}: {
+  label: string;
+  group: DiffGroup;
+  emptyText: string;
+  warning?: string;
+  footnote?: string;
+  groupKey: string;
+  expanded: Record<string, boolean>;
+  onToggleFile: (key: string) => void;
+  open: boolean;
+  onToggleOpen: () => void;
 }) {
+  const panelId = useId();
   return (
     <div class="mb-4 last:mb-0">
-      <div class="flex items-center gap-2 cursor-pointer select-none mb-2" onClick={onToggleOpen}>
-        <Chevron open={open} />
-        <h3 class="board-mono text-[10px] font-bold text-zinc-400">{label}</h3>
-        {group.totalFiles > 0 && (
-          <span class="text-[11px] text-zinc-400">
-            {group.totalFiles} file{group.totalFiles === 1 ? '' : 's'} · <span class="text-signal-green">+{group.additions}</span> <span class="text-signal-red">-{group.deletions}</span>
+      <h3>
+        <button
+          aria-controls={panelId}
+          aria-expanded={open}
+          class="mb-2 flex select-none flex-wrap items-center gap-2 text-left"
+          onClick={onToggleOpen}
+          type="button"
+        >
+          <Chevron open={open} />
+          <span class="board-mono font-bold text-[10px] text-zinc-400">
+            {label}
           </span>
+          {group.totalFiles > 0 && (
+            <span class="text-[11px] text-zinc-400">
+              {group.totalFiles} file{group.totalFiles === 1 ? '' : 's'} ·{' '}
+              <span class="text-signal-green">+{group.additions}</span>{' '}
+              <span class="text-signal-red">-{group.deletions}</span>
+            </span>
+          )}
+        </button>
+      </h3>
+      <div hidden={!open} id={panelId}>
+        {open && (
+          <>
+            {warning ? (
+              <p class="pl-5 text-signal-red text-xs">{warning}</p>
+            ) : group.files.length === 0 ? (
+              <p class="pl-5 text-xs text-zinc-400">{emptyText}</p>
+            ) : (
+              <div class="rounded-none border border-zinc-200 dark:border-zinc-800">
+                {group.files.map((f, i) => (
+                  // Index, not f.file: a rename plus an unrelated file sharing
+                  // that same new path elsewhere in the group would otherwise
+                  // collide (parser sets `file` from the "+++ b/" side).
+                  <FileRow
+                    expanded={!!expanded[`${groupKey}:${f.file}`]}
+                    f={f}
+                    key={i}
+                    onToggle={() => onToggleFile(`${groupKey}:${f.file}`)}
+                  />
+                ))}
+                {group.truncatedFileCount > 0 && (
+                  <p class="px-3 py-2 text-xs text-zinc-400">
+                    +{group.truncatedFileCount} more file
+                    {group.truncatedFileCount === 1 ? '' : 's'} not shown
+                  </p>
+                )}
+              </div>
+            )}
+            {footnote && (
+              <p class="mt-1 pl-5 text-xs text-zinc-400">{footnote}</p>
+            )}
+          </>
         )}
       </div>
-      {open && (
-        <>
-          {warning ? (
-            <p class="text-xs text-signal-red pl-5">{warning}</p>
-          ) : group.files.length === 0 ? (
-            <p class="text-xs text-zinc-400 pl-5">{emptyText}</p>
-          ) : (
-            <div class="border border-zinc-200 dark:border-zinc-800 rounded-none">
-              {group.files.map((f, i) => (
-                // Index, not f.file: a rename plus an unrelated file sharing
-                // that same new path elsewhere in the group would otherwise
-                // collide (parser sets `file` from the "+++ b/" side).
-                <FileRow key={i} f={f} expanded={!!expanded[`${groupKey}:${f.file}`]} onToggle={() => onToggleFile(`${groupKey}:${f.file}`)} />
-              ))}
-              {group.truncatedFileCount > 0 && (
-                <p class="text-xs text-zinc-400 px-3 py-2">+{group.truncatedFileCount} more file{group.truncatedFileCount === 1 ? '' : 's'} not shown</p>
-              )}
-            </div>
-          )}
-          {footnote && <p class="text-xs text-zinc-400 pl-5 mt-1">{footnote}</p>}
-        </>
-      )}
     </div>
   );
 }
@@ -137,71 +277,129 @@ function DiffGroupSection({ label, group, emptyText, warning, footnote, groupKey
 // diff HEAD` which by design only sees tracked ones). DiffViewer still does
 // its own fetch for everything else, this is a small enrichment, not a
 // dependency on the parent's data being fresh.
-export function DiffViewer({ repo, name, dirty }: { repo: string; name: string; dirty?: number }) {
-  const [data, setData] = useState<DiffResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export function DiffViewer({
+  repo,
+  name,
+  dirty,
+}: {
+  repo: string;
+  name: string;
+  dirty?: number;
+}) {
+  const url = `/api/diff?repo=${encodeURIComponent(repo)}&name=${encodeURIComponent(name)}`;
+  const {
+    data,
+    failed,
+    refresh: load,
+  } = useVisiblePoll(url, null, async (signal) => {
+    const result = await readJson<DiffResponse>(url, signal);
+    if (
+      result.error ||
+      !Array.isArray(result.committed?.files) ||
+      !Array.isArray(result.uncommitted?.files)
+    ) {
+      throw new Error('Diff unavailable');
+    }
+    return result;
+  });
+  const loading = !(data || failed);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [groupOpen, setGroupOpen] = useState({ committed: true, uncommitted: true });
+  const [groupOpen, setGroupOpen] = useState({
+    committed: true,
+    uncommitted: true,
+  });
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res: DiffResponse = await fetch(`/api/diff?repo=${encodeURIComponent(repo)}&name=${encodeURIComponent(name)}`).then(r => r.json());
-      if (res?.error) { setError(res.error); }
-      else {
-        setData(res);
-        setError(null);
-        // Reset per-file expand state to this fetch's own default rather than
-        // carrying stale keys from a previous diff forward.
-        const next: Record<string, boolean> = {};
-        for (const [groupKey, group] of [['committed', res.committed], ['uncommitted', res.uncommitted]] as const) {
-          const autoOpen = group.files.length <= AUTO_EXPAND_MAX_FILES;
-          for (const f of group.files) next[`${groupKey}:${f.file}`] = autoOpen;
+  useEffect(() => {
+    const next: Record<string, boolean> = {};
+    if (data) {
+      for (const [groupKey, group] of [
+        ['committed', data.committed],
+        ['uncommitted', data.uncommitted],
+      ] as const) {
+        const autoOpen = group.files.length <= AUTO_EXPAND_MAX_FILES;
+        for (const file of group.files) {
+          next[`${groupKey}:${file.file}`] = autoOpen;
         }
-        setExpanded(next);
       }
-    } catch (e) { setError(String(e)); }
-    setLoading(false);
-  }, [repo, name]);
+    }
+    setExpanded((previous) =>
+      Object.fromEntries(
+        Object.entries(next).map(([key, value]) => [
+          key,
+          previous[key] ?? value,
+        ])
+      )
+    );
+  }, [data]);
 
-  useEffect(() => { load(); }, [load]);
-
-  function toggleFile(key: string) { setExpanded(e => ({ ...e, [key]: !e[key] })); }
+  function toggleFile(key: string) {
+    setExpanded((e) => ({ ...e, [key]: !e[key] }));
+  }
 
   // When the base can't be resolved, `committed` is empty by construction
   // (computeDiff never even runs that diff), so a combined total would
   // quietly undercount without saying so. Scope the header to what was
   // actually measured rather than assert a total that's missing a piece.
   const header = (
-    <div class="flex items-center justify-between mb-3">
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
       <div class="text-xs text-zinc-400">
-        {!data ? (loading ? 'Loading…' : ' ') : !data.baseResolved ? (
-          <>
-            {data.uncommitted.totalFiles} uncommitted file{data.uncommitted.totalFiles === 1 ? '' : 's'} changed ·{' '}
-            <span class="text-signal-green">+{data.uncommitted.additions}</span>{' '}
-            <span class="text-signal-red">-{data.uncommitted.deletions}</span>{' '}
-            (base unresolved, committed diff unavailable)
-          </>
+        {data ? (
+          data.baseResolved ? (
+            <>
+              {data.committed.totalFiles + data.uncommitted.totalFiles} file
+              {data.committed.totalFiles + data.uncommitted.totalFiles === 1
+                ? ''
+                : 's'}{' '}
+              changed ·{' '}
+              <span class="text-signal-green">
+                +{data.committed.additions + data.uncommitted.additions}
+              </span>{' '}
+              <span class="text-signal-red">
+                -{data.committed.deletions + data.uncommitted.deletions}
+              </span>
+            </>
+          ) : (
+            <>
+              {data.uncommitted.totalFiles} uncommitted file
+              {data.uncommitted.totalFiles === 1 ? '' : 's'} changed ·{' '}
+              <span class="text-signal-green">
+                +{data.uncommitted.additions}
+              </span>{' '}
+              <span class="text-signal-red">-{data.uncommitted.deletions}</span>{' '}
+              (base unresolved, committed diff unavailable)
+            </>
+          )
+        ) : loading ? (
+          'Loading…'
         ) : (
-          <>
-            {data.committed.totalFiles + data.uncommitted.totalFiles} file{data.committed.totalFiles + data.uncommitted.totalFiles === 1 ? '' : 's'} changed ·{' '}
-            <span class="text-signal-green">+{data.committed.additions + data.uncommitted.additions}</span>{' '}
-            <span class="text-signal-red">-{data.committed.deletions + data.uncommitted.deletions}</span>
-          </>
+          ' '
         )}
       </div>
-      <IconButton tone="zinc" tip="Refresh diff" onClick={load} disabled={loading}>
+      <IconButton
+        disabled={loading}
+        onClick={load}
+        tip="Refresh diff"
+        tone="zinc"
+      >
         <RefreshIcon spinning={loading} />
       </IconButton>
     </div>
   );
 
-  if (error) {
+  const readError = failed && (
+    <p class="mb-3 text-signal-red text-xs" role="status">
+      Could not refresh this diff.{' '}
+      {data ? 'Showing the last successful read. ' : ''}
+      <button class="underline" onClick={load} type="button">
+        Retry
+      </button>
+    </p>
+  );
+  if (failed && !data) {
     return (
       <div>
         {header}
-        <p class="text-xs text-signal-red">Failed to load diff: {error}</p>
+        {readError}
       </div>
     );
   }
@@ -221,16 +419,26 @@ export function DiffViewer({ repo, name, dirty }: { repo: string; name: string; 
   // exactly the untracked-file count. Approximate but honest: both count one
   // line/entry per file, so the subtraction holds outside exotic states
   // (an in-progress merge) this view doesn't otherwise handle either.
-  const untrackedCount = dirty != null ? Math.max(0, dirty - data.uncommitted.totalFiles) : 0;
-  const untrackedFootnote = untrackedCount > 0
-    ? `+${untrackedCount} untracked file${untrackedCount === 1 ? '' : 's'} not shown (new, not yet added to git)`
-    : undefined;
+  const untrackedCount =
+    dirty == null ? 0 : Math.max(0, dirty - data.uncommitted.totalFiles);
+  const untrackedFootnote =
+    untrackedCount > 0
+      ? `+${untrackedCount} untracked file${untrackedCount === 1 ? '' : 's'} not shown (new, not yet added to git)`
+      : undefined;
 
-  if (data.baseResolved && data.committed.totalFiles === 0 && data.uncommitted.totalFiles === 0 && untrackedCount === 0) {
+  if (
+    data.baseResolved &&
+    data.committed.totalFiles === 0 &&
+    data.uncommitted.totalFiles === 0 &&
+    untrackedCount === 0
+  ) {
     return (
       <div>
         {header}
-        <p class="text-xs text-zinc-400">No changes since branching from {cleanBase}</p>
+        <p class="text-xs text-zinc-400">
+          No changes since branching from {cleanBase}
+        </p>
+        {readError}
       </div>
     );
   }
@@ -238,15 +446,37 @@ export function DiffViewer({ repo, name, dirty }: { repo: string; name: string; 
   return (
     <div>
       {header}
-      <DiffGroupSection label={`Committed since branching from ${cleanBase}`}
-        group={data.committed} emptyText={`No changes since branching from ${cleanBase}`}
-        warning={!data.baseResolved ? `Could not resolve base branch ${cleanBase}. Try fetching origin in this worktree.` : undefined}
-        groupKey="committed" expanded={expanded} onToggleFile={toggleFile}
-        open={groupOpen.committed} onToggleOpen={() => setGroupOpen(g => ({ ...g, committed: !g.committed }))} />
-      <DiffGroupSection label="Uncommitted changes"
-        group={data.uncommitted} emptyText="No changes to tracked files" footnote={untrackedFootnote}
-        groupKey="uncommitted" expanded={expanded} onToggleFile={toggleFile}
-        open={groupOpen.uncommitted} onToggleOpen={() => setGroupOpen(g => ({ ...g, uncommitted: !g.uncommitted }))} />
+      {readError}
+      <DiffGroupSection
+        emptyText={`No changes since branching from ${cleanBase}`}
+        expanded={expanded}
+        group={data.committed}
+        groupKey="committed"
+        label={`Committed since branching from ${cleanBase}`}
+        onToggleFile={toggleFile}
+        onToggleOpen={() =>
+          setGroupOpen((g) => ({ ...g, committed: !g.committed }))
+        }
+        open={groupOpen.committed}
+        warning={
+          data.baseResolved
+            ? undefined
+            : `Could not resolve base branch ${cleanBase}. Try fetching origin in this worktree.`
+        }
+      />
+      <DiffGroupSection
+        emptyText="No changes to tracked files"
+        expanded={expanded}
+        footnote={untrackedFootnote}
+        group={data.uncommitted}
+        groupKey="uncommitted"
+        label="Uncommitted changes"
+        onToggleFile={toggleFile}
+        onToggleOpen={() =>
+          setGroupOpen((g) => ({ ...g, uncommitted: !g.uncommitted }))
+        }
+        open={groupOpen.uncommitted}
+      />
     </div>
   );
 }

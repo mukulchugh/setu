@@ -27,11 +27,13 @@ export type Worktree = {
   label: string;
   domain: string;
   active: boolean;
+  starting?: boolean;
+  stopping?: boolean;
   queued?: boolean;
   queuePosition?: number | null;
   container: string | null;
   nextStartMode: "container" | "bare";
-  dirty: number;
+  dirty: number | null;
   ahead: number;
   behind: number;
 };
@@ -54,18 +56,32 @@ export type ActionResult = {
   ok: boolean;
   error?: string;
   conflicts?: string[];
+  code?: string;
+  removed?: boolean | null;
+  operationId?: string;
+  pendingSteps?: string[];
+  completed?: string[];
+  networkUncertain?: boolean;
   [key: string]: unknown;
 };
+
+export type PendingRemoval = {
+  operationId: string;
+  repo: string;
+  name: string;
+  removed: boolean | null;
+  pendingSteps: string[];
+  error?: string;
+};
+export type PortalStatus = { pendingRemovals?: PendingRemoval[] };
 
 function portalUrl(): string {
   const { portalUrl: pref } = getPreferenceValues<{ portalUrl?: string }>();
   return (pref || "http://localhost:2999").replace(/\/$/, "");
 }
 
-// Every fetch here can fail the same one way — the portal isn't running.
-// Callers surface that specific case distinctly (a "run `setu portal`"
-// empty state) rather than a generic error, so this throws a typed error
-// the UI layer can check for.
+// Reads can offer a portal recovery action. A failed mutation response is
+// uncertain: the request may already have reached the portal.
 export class PortalUnreachableError extends Error {
   constructor() {
     super("Setu portal isn't reachable");
@@ -88,27 +104,46 @@ async function post(
   path: string,
   body: Record<string, unknown>,
 ): Promise<ActionResult> {
+  const uncertain = (): ActionResult => ({
+    ok: false,
+    code:
+      path === "/api/remove"
+        ? "REMOVAL_OUTCOME_UNKNOWN"
+        : "ACTION_OUTCOME_UNKNOWN",
+    networkUncertain: true,
+    ...(path === "/api/remove" ? { removed: null } : {}),
+    ...(typeof body.operationId === "string"
+      ? { operationId: body.operationId }
+      : {}),
+    error: "Outcome not confirmed. Refresh status before trying again.",
+  });
   let res: Response;
   try {
     res = await fetch(`${portalUrl()}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+      redirect: "error",
     });
   } catch {
-    throw new PortalUnreachableError();
+    return uncertain();
   }
-  // If the portal's response body isn't valid JSON (a raw error page, an
-  // empty body, etc), this falls back to just the HTTP status with no
-  // `error` field. Callers like runAction in list-worktrees.tsx still show
-  // a failure toast in that case, just without explanation text.
-  return (await res.json().catch(() => ({ ok: res.ok }))) as ActionResult;
+  try {
+    const result = (await res.json()) as ActionResult;
+    if (!result || typeof result.ok !== "boolean" || (!res.ok && result.ok))
+      return uncertain();
+    return result;
+  } catch {
+    return uncertain();
+  }
 }
 
 export const listWorktrees = () => get<Worktree[]>("/api/worktrees");
 export const listProjects = () => get<Project[]>("/api/projects");
 export const listAgents = () => get<Agent[]>("/api/agents");
 export const listPorts = () => get<Port[]>("/api/ports");
+export const getStatus = () => get<PortalStatus>("/api/status");
 
 // Kills whatever's listening on the port directly (or, for a container-
 // backed worktree, routes through the real container stop path — same
@@ -137,8 +172,18 @@ export const syncWorktree = (repo: string, name: string) =>
 export const createWorktree = (repo: string, name: string, tunnel = false) =>
   post("/api/create", { repo, name, tunnel });
 
-export const removeWorktree = (repo: string, name: string) =>
-  post("/api/remove", { repo, name });
+export const removeWorktree = (
+  repo: string,
+  name: string,
+  operationId?: string,
+) =>
+  post("/api/remove", {
+    repo,
+    name,
+    ...(operationId === undefined ? {} : { operationId }),
+  });
+
+export const portalRecoveryUrl = () => `${portalUrl()}/#pending-cleanup`;
 
 export const openTool = (repo: string, name: string, tool: string) =>
   post("/api/open", { repo, name, tool });
@@ -146,4 +191,4 @@ export const openTool = (repo: string, name: string, tool: string) =>
 // The portal web UI's per-worktree deep link. Used by both list-worktrees
 // and quick-open's "Open in Setu Portal" action.
 export const portalWebUrl = (w: WorktreeRef) =>
-  `http://quivly.local/worktree/${w.repo}/${encodeURIComponent(w.name)}`;
+  `${portalUrl()}/worktree/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.name)}`;

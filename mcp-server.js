@@ -38,7 +38,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import * as z from 'zod/v4';
+import z from 'zod/v4';
 import { PORTAL_PORT } from './lib.js';
 
 // Populated by portal.js's initMcpServer() call, once, at startup — after
@@ -50,16 +50,34 @@ export function initMcpServer(d) {
   deps = d;
 }
 
-// Mirrors portalRequest's old contract (lib.js): a result shaped like
-// {ok:false, error} throws instead of being returned as a "success". Several
-// of portal.js's own functions (startWorktree, removeWorktree, ...) report
-// failure this way rather than throwing, so tool handlers need the same
-// unwrap portalRequest used to do — now applied locally instead of over HTTP.
-function unwrap(result) {
-  if (result && typeof result === 'object' && result.ok === false) {
-    throw new Error(result.error || 'request failed');
+// Preserve recovery fields for both returned refusals and thrown state errors.
+// The SDK's default exception response contains only the error message.
+async function mutationResult(call) {
+  let result;
+  try {
+    result = await call();
+  } catch (error) {
+    result = { error: error?.message ?? String(error), ok: false };
+    for (const key of [
+      'code',
+      'causeCode',
+      'committed',
+      'reconciled',
+      'phase',
+      'operationId',
+    ]) {
+      if (error?.[key] !== undefined) {
+        result[key] = error[key];
+      }
+    }
   }
-  return result;
+  return {
+    ...text(result),
+    isError: result?.ok === false,
+    ...(result && typeof result === 'object' && !Array.isArray(result)
+      ? { structuredContent: result }
+      : {}),
+  };
 }
 
 // ── response shaping ────────────────────────────────────────────────────────
@@ -73,11 +91,33 @@ function unwrap(result) {
 // client-side-only concern for this API). An agent asking "what worktrees
 // exist" needs a small fraction of that.
 function compactWorktree(w) {
-  return {active: w.active, ahead: w.ahead, behind: w.behind,branch: w.branch, container: w.container,
-    dirty: w.dirty, domain: w.domain, label: w.label,name: w.name, 
-    port: w.port, 
-    pr: w.pr ? { checks: w.pr.checks, number: w.pr.number, state: w.pr.state, url: w.pr.url } : null,
-    repo: w.repo, 
+  return {
+    active: w.active,
+    ahead: w.ahead,
+    behind: w.behind,
+    branch: w.branch,
+    container: w.container,
+    dirty: w.dirty,
+    domain: w.domain,
+    label: w.label,
+    lifecycleError: w.lifecycleError,
+    name: w.name,
+    operation: w.operation,
+    phase: w.phase,
+    port: w.port,
+    pr: w.pr
+      ? {
+          checks: w.pr.checks,
+          number: w.pr.number,
+          state: w.pr.state,
+          url: w.pr.url,
+        }
+      : null,
+    queued: w.queued,
+    queuePosition: w.queuePosition,
+    repo: w.repo,
+    starting: w.starting,
+    stopping: w.stopping,
   };
 }
 
@@ -89,181 +129,367 @@ function compactWorktree(w) {
 const DIFF_VERBOSE_FILE_CAP = 20;
 
 function shapeDiffGroup(group, verbose) {
-  if (!group) return group;
-  const base = { additions: group.additions, deletions: group.deletions, totalFiles: group.totalFiles };
+  if (!group) {
+    return group;
+  }
+  const base = {
+    additions: group.additions,
+    deletions: group.deletions,
+    totalFiles: group.totalFiles,
+  };
   if (!verbose) {
-    return { ...base, files: group.files.map(f => ({ additions: f.additions, binary: !!f.binary, deletions: f.deletions, file: f.file })) };
+    return {
+      ...base,
+      files: group.files.map((f) => ({
+        additions: f.additions,
+        binary: !!f.binary,
+        deletions: f.deletions,
+        file: f.file,
+      })),
+    };
   }
   const shown = group.files.slice(0, DIFF_VERBOSE_FILE_CAP);
   return {
     ...base,
     files: shown,
-    truncatedFileCount: Math.max(0, group.files.length - shown.length) + (group.truncatedFileCount ?? 0),
+    truncatedFileCount:
+      Math.max(0, group.files.length - shown.length) +
+      (group.truncatedFileCount ?? 0),
   };
 }
 
 function text(value) {
-  return { content: [{ text: typeof value === 'string' ? value : JSON.stringify(value, null, 2), type: 'text' }] };
+  return {
+    content: [
+      {
+        text:
+          typeof value === 'string' ? value : JSON.stringify(value, null, 2),
+        type: 'text',
+      },
+    ],
+  };
 }
 
 // ── tool registration ───────────────────────────────────────────────────────
 
 function registerTools(server) {
-  server.registerTool('list_worktrees', {
-    annotations: { readOnlyHint: true },
-    description: 'List every registered Setu worktree with its branch, port, running state, uncommitted-change count, and PR summary.',
-    inputSchema: {},
-    title: 'List worktrees',
-  }, async () => {
-    const worktrees = await deps.getWorktrees();
-    return text(worktrees.map(compactWorktree));
-  });
-
-  server.registerTool('create_worktree', {
-    description: 'Create a new Setu worktree for a branch (forks from the repo\'s base branch if the branch doesn\'t exist yet). Does not start the dev server.',
-    inputSchema: {
-      name: z.string().describe('branch name'),
-      repo: z.string().describe('registered project name, e.g. "quivly-app"'),
-      tunnel: z.boolean().optional().describe('enable the shared public tunnel for this worktree on creation'),
+  server.registerTool(
+    'list_worktrees',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List every registered Setu worktree with its branch, port, running state, uncommitted-change count, and PR summary.',
+      inputSchema: {},
+      title: 'List worktrees',
     },
-    title: 'Create worktree',
-  }, async ({ repo, name, tunnel }) => {
-    return text(unwrap(await deps.createWorktree(repo, name, !!tunnel)));
-  });
+    async () => {
+      const worktrees = await deps.getWorktrees();
+      return text(worktrees.map(compactWorktree));
+    }
+  );
 
-  server.registerTool('start_worktree', {
-    description: 'Start a worktree\'s dev server. Omit `container` to use the sticky per-worktree default; pass true/false to force container or bare mode.',
-    inputSchema: {
-      container: z.boolean().optional().describe('force container (true) or bare (false) mode; omit for the sticky default'),name: z.string(),
-      repo: z.string(), 
+  server.registerTool(
+    'create_worktree',
+    {
+      description:
+        "Create a new Setu worktree for a branch (forks from the repo's base branch if the branch doesn't exist yet). Does not start the dev server.",
+      inputSchema: {
+        name: z.string().describe('branch name'),
+        repo: z.string().describe('registered project name, e.g. "quivly-app"'),
+        tunnel: z
+          .boolean()
+          .optional()
+          .describe(
+            'enable the shared public tunnel for this worktree on creation'
+          ),
+      },
+      title: 'Create worktree',
     },
-    title: 'Start dev server',
-  }, async ({ repo, name, container }) => {
-    return text(unwrap(await deps.startWorktree(repo, name, container)));
-  });
+    ({ repo, name, tunnel }) =>
+      mutationResult(() => deps.createWorktree(repo, name, !!tunnel))
+  );
 
-  server.registerTool('stop_worktree', {
-    annotations: { destructiveHint: true },
-    description: 'Stop a worktree\'s dev server (or dequeue it if still waiting for a concurrency slot). Also stops its sidecars.',
-    inputSchema: { name: z.string(), repo: z.string() },
-    title: 'Stop dev server',
-  }, async ({ repo, name }) => {
-    return text(unwrap(await deps.stopWorktree(repo, name)));
-  });
-
-  server.registerTool('sync_worktree', {
-    description: 'Merge the worktree\'s resolved base branch (staging, or the repo\'s default) into it. Clean merges only: a would-be conflict is attempted, detected, and aborted (worktree left unchanged), never left mid-conflict -- resolving a real conflict is still the caller\'s job. Fails if the worktree has uncommitted changes.',
-    inputSchema: { name: z.string(), repo: z.string() },
-    title: 'Sync worktree with base branch',
-  }, async ({ repo, name }) => {
-    return text(unwrap(await deps.syncWorktree(repo, name)));
-  });
-
-  server.registerTool('remove_worktree', {
-    annotations: { destructiveHint: true },
-    description: 'Stop the dev server and permanently remove a worktree\'s directory, port, and domain. The git branch itself is NOT deleted. For a container-backed worktree this also removes its node_modules volume.',
-    inputSchema: {name: z.string(),
-      reason: z.enum(['manual', 'merged']).optional().describe('defaults to "manual"'),
-      repo: z.string(), 
+  server.registerTool(
+    'start_worktree',
+    {
+      description:
+        "Start a worktree's dev server. Omit `container` to use the sticky per-worktree default; pass true/false to force container or bare mode.",
+      inputSchema: {
+        container: z
+          .boolean()
+          .optional()
+          .describe(
+            'force container (true) or bare (false) mode; omit for the sticky default'
+          ),
+        name: z.string(),
+        repo: z.string(),
+      },
+      title: 'Start dev server',
     },
-    title: 'Remove worktree',
-  }, async ({ repo, name, reason }) => {
-    return text(unwrap(await deps.removeWorktree(repo, name, reason ?? 'manual')));
-  });
+    ({ repo, name, container }) =>
+      mutationResult(() => deps.startWorktree(repo, name, container))
+  );
 
-  server.registerTool('get_diff', {
-    annotations: { readOnlyHint: true },
-    description: 'Diff a worktree\'s branch against its base and its uncommitted changes. Defaults to stats + filenames only; pass verbose:true for actual hunks (capped to the first 20 files).',
-    inputSchema: {name: z.string(),
-      repo: z.string(), 
-      verbose: z.boolean().optional().describe('include full line-by-line hunks, default false (stats + filenames only)'),
+  server.registerTool(
+    'stop_worktree',
+    {
+      annotations: { destructiveHint: true },
+      description:
+        "Stop a worktree's dev server (or dequeue it if still waiting for a concurrency slot). Also stops its sidecars.",
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Stop dev server',
     },
-    title: 'Get worktree diff',
-  }, async ({ repo, name, verbose }) => {
-    const diff = await deps.computeDiff(repo, name);
-    return text({
-      base: diff.base, baseResolved: diff.baseResolved,
-      committed: shapeDiffGroup(diff.committed, !!verbose),
-      uncommitted: shapeDiffGroup(diff.uncommitted, !!verbose),
-    });
-  });
+    ({ repo, name }) => mutationResult(() => deps.stopWorktree(repo, name))
+  );
 
-  server.registerTool('get_logs', {
-    annotations: { readOnlyHint: true },
-    description: 'Tail a worktree\'s log file (dev server by default; also tunnel/inngest/trigger/setup/sidecar-<name>/pr-review).',
-    inputSchema: {
-      lines: z.number().int().positive().optional().describe('max lines, default 150'),name: z.string(),
-      repo: z.string(), 
-      type: z.string().optional().describe('log type, default "dev"'),
+  server.registerTool(
+    'sync_worktree',
+    {
+      description:
+        "Merge the worktree's resolved base branch (staging, or the repo's default) into it. Clean merges only: a would-be conflict is attempted, detected, and aborted (worktree left unchanged), never left mid-conflict -- resolving a real conflict is still the caller's job. Fails if the worktree has uncommitted changes.",
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Sync worktree with base branch',
     },
-    title: 'Get worktree log tail',
-  }, async ({ repo, name, type, lines }) => {
-    const res = deps.tailLog(repo, name, type ?? 'dev', lines ?? 150);
-    return text(res.lines?.join('\n') ?? '');
-  });
+    ({ repo, name }) => mutationResult(() => deps.syncWorktree(repo, name))
+  );
 
-  server.registerTool('list_ports', {
-    annotations: { readOnlyHint: true },
-    description: 'List processes currently listening on Setu\'s port range (3000-3999) and which worktree, if any, each belongs to.',
-    inputSchema: {},
-    title: 'List active ports',
-  }, async () => {
-    return text(await deps.listPorts());
-  });
-
-  server.registerTool('list_projects', {
-    annotations: { readOnlyHint: true },
-    description: 'List every project registered with Setu (name, label, GitHub repo if any).',
-    inputSchema: {},
-    title: 'List registered projects',
-  }, async () => {
-    return text(deps.listProjects());
-  });
-
-  server.registerTool('list_repo_prs', {
-    annotations: { readOnlyHint: true },
-    description: 'List every open GitHub PR on a registered project\'s repo, whether or not a Setu worktree exists for it yet.',
-    inputSchema: { repo: z.string() },
-    title: 'List open PRs on a repo',
-  }, async ({ repo }) => {
-    return text(await deps.fetchRepoPRs(repo));
-  });
-
-  server.registerTool('get_pr_review_status', {
-    annotations: { readOnlyHint: true },
-    description: 'Check whether the pr-walkthrough Claude Code plugin is installed for a worktree, whether a deep review is currently running, and the latest review/brief artifact info (findings count, staleness vs. current HEAD) if one exists.',
-    inputSchema: { name: z.string(), repo: z.string() },
-    title: 'Get PR review status',
-  }, async ({ repo, name }) => {
-    return text(await deps.prReviewStatus(repo, name));
-  });
-
-  server.registerTool('run_pr_review', {
-    description: 'Start a headless deep PR review (pr-walkthrough) or product brief (pr-brief) against a worktree\'s PR via the installed Claude Code plugin. Fire-and-forget: returns immediately once the run starts, real API budget is spent on Claude\'s account, and the run takes several minutes. Call get_pr_review_status separately to poll progress and get the result.',
-    inputSchema: {name: z.string(),
-      repo: z.string(), 
-      skill: z.enum(['pr-walkthrough', 'pr-brief']),
+  server.registerTool(
+    'remove_worktree',
+    {
+      annotations: { destructiveHint: true },
+      description:
+        "Stop the dev server and permanently remove a worktree's directory, port, and domain. Dirty worktrees are refused unless force is explicitly approved. The git branch is kept. Container node_modules volumes are removed. If cleanup is pending, retry with the returned operationId; this resumes that operation only.",
+      inputSchema: {
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Permanently discard uncommitted and untracked files; only with explicit user approval'
+          ),
+        name: z.string(),
+        operationId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            'Exact pending removal to resume; never starts a new removal'
+          ),
+        reason: z
+          .enum(['manual', 'merged'])
+          .optional()
+          .describe('defaults to "manual"'),
+        repo: z.string(),
+      },
+      title: 'Remove worktree',
     },
-    title: 'Run a deep PR review',
-  }, async ({ repo, name, skill }) => {
-    return text(await deps.prReviewRun(repo, name, skill));
-  });
+    async ({ repo, name, reason, force, operationId }) => {
+      let result;
+      try {
+        result = await deps.removeWorktree(
+          repo,
+          name,
+          reason ?? 'manual',
+          force ?? false,
+          operationId
+        );
+        if (!result || typeof result.ok !== 'boolean') {
+          result = {
+            code: 'REMOVAL_OUTCOME_UNKNOWN',
+            error:
+              'Removal outcome was not confirmed. Read status before retrying.',
+            ok: false,
+            removed: null,
+          };
+        }
+      } catch (error) {
+        result = {
+          code: error?.code ?? 'REMOVAL_OUTCOME_UNKNOWN',
+          error: error?.message ?? String(error),
+          ok: false,
+          removed: error?.removed ?? null,
+        };
+        for (const key of [
+          'operationId',
+          'pendingSteps',
+          'completed',
+          'completedStages',
+          'causeCode',
+          'committed',
+          'reconciled',
+          'phase',
+        ]) {
+          if (error?.[key] !== undefined) {
+            result[key] = error[key];
+          }
+        }
+      }
+      return {
+        ...text(result),
+        isError: !result.ok,
+        structuredContent: result,
+      };
+    }
+  );
 
-  server.registerTool('create_pr', {
-    description: 'Push the worktree\'s branch and open a GitHub PR for it (gh pr create --fill, title/body autofilled from commits). Fails clearly if the repo has no GitHub remote, the branch has no commits ahead of its base, or a PR already exists -- call list_worktrees or get_diff first if unsure. Never valid for a worktree named "main" (Setu\'s fixed slot for a project\'s primary line, never itself a PR candidate).',
-    inputSchema: { name: z.string(), repo: z.string() },
-    title: 'Create a pull request',
-  }, async ({ repo, name }) => {
-    return text(unwrap(await deps.createPr(repo, name)));
-  });
+  server.registerTool(
+    'get_diff',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        "Diff a worktree's branch against its base and its uncommitted changes. Defaults to stats + filenames only; pass verbose:true for actual hunks (capped to the first 20 files).",
+      inputSchema: {
+        name: z.string(),
+        repo: z.string(),
+        verbose: z
+          .boolean()
+          .optional()
+          .describe(
+            'include full line-by-line hunks, default false (stats + filenames only)'
+          ),
+      },
+      title: 'Get worktree diff',
+    },
+    async ({ repo, name, verbose }) => {
+      const diff = await deps.computeDiff(repo, name);
+      return text({
+        base: diff.base,
+        baseResolved: diff.baseResolved,
+        committed: shapeDiffGroup(diff.committed, !!verbose),
+        uncommitted: shapeDiffGroup(diff.uncommitted, !!verbose),
+      });
+    }
+  );
 
-  server.registerTool('pr_ready', {
-    description: 'Mark an existing open PR as ready for review, or convert it back to draft. Requires a PR to already exist on the worktree (see list_worktrees\'s pr field, or list_repo_prs) -- use create_pr first if there isn\'t one yet.',
-    inputSchema: { name: z.string(), ready: z.boolean().describe('true to mark ready for review, false to convert to draft'), repo: z.string() },
-    title: 'Toggle a PR between draft and ready for review',
-  }, async ({ repo, name, ready }) => {
-    return text(unwrap(await deps.setPrReady(repo, name, ready)));
-  });
+  server.registerTool(
+    'get_logs',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        "Tail a worktree's log file (dev server by default; also tunnel/inngest/trigger/setup/sidecar-<name>/pr-review).",
+      inputSchema: {
+        lines: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('max lines, default 150'),
+        name: z.string(),
+        repo: z.string(),
+        type: z.string().optional().describe('log type, default "dev"'),
+      },
+      title: 'Get worktree log tail',
+    },
+    ({ repo, name, type, lines }) => {
+      const res = deps.tailLog(repo, name, type ?? 'dev', lines ?? 150);
+      let output = res.lines?.join('\n') ?? '';
+      if (res.state === 'read-error') {
+        const retention = res.retained ? ' Showing retained output.' : '';
+        output = `Log read failed (${res.code ?? 'READ_FAILED'}).${retention}${output ? `\n${output}` : ''}`;
+      } else if (res.state === 'missing') {
+        output = 'Log file is missing.';
+      } else if (res.state === 'empty') {
+        output = 'Log file is empty.';
+      }
+      return {
+        ...text(output),
+        isError: res.state === 'read-error',
+        structuredContent: res,
+      };
+    }
+  );
+
+  server.registerTool(
+    'list_ports',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        "List processes currently listening on Setu's port range (3000-3999) and which worktree, if any, each belongs to.",
+      inputSchema: {},
+      title: 'List active ports',
+    },
+    async () => text(await deps.listPorts())
+  );
+
+  server.registerTool(
+    'list_projects',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List every project registered with Setu (name, label, GitHub repo if any).',
+      inputSchema: {},
+      title: 'List registered projects',
+    },
+    async () => text(deps.listProjects())
+  );
+
+  server.registerTool(
+    'list_repo_prs',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        "List every open GitHub PR on a registered project's repo, whether or not a Setu worktree exists for it yet.",
+      inputSchema: { repo: z.string() },
+      title: 'List open PRs on a repo',
+    },
+    async ({ repo }) => text(await deps.fetchRepoPRs(repo))
+  );
+
+  server.registerTool(
+    'get_pr_review_status',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'Check whether the pr-walkthrough Claude Code plugin is installed for a worktree, whether a deep review is currently running, and the latest review/brief artifact info (findings count, staleness vs. current HEAD) if one exists.',
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Get PR review status',
+    },
+    async ({ repo, name }) => text(await deps.prReviewStatus(repo, name))
+  );
+
+  server.registerTool(
+    'run_pr_review',
+    {
+      description:
+        "Start a headless deep PR review (pr-walkthrough) or product brief (pr-brief) against a worktree's PR via the installed Claude Code plugin. Fire-and-forget: returns immediately once the run starts, real API budget is spent on Claude's account, and the run takes several minutes. Call get_pr_review_status separately to poll progress and get the result.",
+      inputSchema: {
+        name: z.string(),
+        repo: z.string(),
+        skill: z.enum(['pr-walkthrough', 'pr-brief']),
+      },
+      title: 'Run a deep PR review',
+    },
+    ({ repo, name, skill }) =>
+      mutationResult(() => deps.prReviewRun(repo, name, skill))
+  );
+
+  server.registerTool(
+    'create_pr',
+    {
+      description:
+        "Push the worktree's branch and open a GitHub PR for it (gh pr create --fill, title/body autofilled from commits). Fails clearly if the repo has no GitHub remote, the branch has no commits ahead of its base, or a PR already exists -- call list_worktrees or get_diff first if unsure. Never valid for a worktree named \"main\" (Setu's fixed slot for a project's primary line, never itself a PR candidate).",
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Create a pull request',
+    },
+    ({ repo, name }) => mutationResult(() => deps.createPr(repo, name))
+  );
+
+  server.registerTool(
+    'pr_ready',
+    {
+      description:
+        "Mark an existing open PR as ready for review, or convert it back to draft. Requires a PR to already exist on the worktree (see list_worktrees's pr field, or list_repo_prs) -- use create_pr first if there isn't one yet.",
+      inputSchema: {
+        name: z.string(),
+        ready: z
+          .boolean()
+          .describe('true to mark ready for review, false to convert to draft'),
+        repo: z.string(),
+      },
+      title: 'Toggle a PR between draft and ready for review',
+    },
+    ({ repo, name, ready }) =>
+      mutationResult(() => deps.setPrReady(repo, name, ready))
+  );
 }
 
 // Shown once to the connecting client at initialize time (MCP's own
@@ -293,16 +519,16 @@ EFFICIENT USE
 - The portal daemon must already be running for any of this to work; there's no auto-start on a failed connection.`;
 
 function buildServer() {
-  const server = new McpServer({ name: 'setu', version: '1.0.0' }, { instructions: INSTRUCTIONS });
+  const server = new McpServer(
+    { name: 'setu', version: '1.0.0' },
+    { instructions: INSTRUCTIONS }
+  );
   registerTools(server);
   return server;
 }
 
-// Bound to the same host/port set the portal itself already claims to be
-// safe on (see portal.js's own /mcp mount comment for why this matters —
-// Bun.serve defaults to 0.0.0.0, so this is LAN-reachable, not just
-// loopback, and the SDK's DNS-rebinding check is off and inert by default
-// unless allowedHosts is set explicitly).
+// The outer portal guard requires a local peer and trusted Origin. Keep the
+// SDK's Host validation enabled as an additional boundary for MCP clients.
 const ALLOWED_HOSTS = [`localhost:${PORTAL_PORT}`, `127.0.0.1:${PORTAL_PORT}`];
 
 export async function handleMcpRequest(req) {

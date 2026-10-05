@@ -7,9 +7,17 @@
 // duplicated per caller.
 export type PrChecks = 'passing' | 'failing' | 'pending' | 'none';
 
-export function checksTone(checks: PrChecks): 'emerald' | 'red' | 'amber' | 'zinc' {
-  if (checks === 'passing') return 'emerald';
-  if (checks === 'failing') return 'red';
-  if (checks === 'pending') return 'amber';
+export function checksTone(
+  checks: PrChecks
+): 'emerald' | 'red' | 'amber' | 'zinc' {
+  if (checks === 'passing') {
+    return 'emerald';
+  }
+  if (checks === 'failing') {
+    return 'red';
+  }
+  if (checks === 'pending') {
+    return 'amber';
+  }
   return 'zinc';
 }

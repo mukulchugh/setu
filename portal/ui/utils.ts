@@ -5,7 +5,7 @@
 // primitive built off the shadcn registry expects this to exist at
 // "portal/ui/utils.ts" — that's the registry's own `@/lib/utils` import
 // path, adapted to this repo's layout.
-import { clsx, type ClassValue } from 'clsx';
+import { type ClassValue, clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
 export function cn(...inputs: ClassValue[]) {

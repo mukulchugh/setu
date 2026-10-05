@@ -11,9 +11,10 @@
 // Tailwind v4 @theme. Every visual class below instead comes straight from
 // ui.tsx's PrimaryButton/SecondaryButton/IconButton — this is a like-for-like
 // visual port, not a redesign.
-import type { ComponentChildren, JSX } from 'preact';
+
 import { Button as ButtonPrimitive } from '@base-ui/react/button';
 import { cva, type VariantProps } from 'class-variance-authority';
+import type { ComponentChildren, JSX } from 'preact';
 import { cn } from './utils';
 
 // Mirrors ui.tsx's `Tone` union — duplicated, not imported, so this file has
@@ -22,8 +23,11 @@ import { cn } from './utils';
 // styles.css), same vocabulary every existing call site already uses.
 export type Tone = 'emerald' | 'amber' | 'red' | 'zinc';
 
-const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber', 
-  emerald: 'text-signal-green', red: 'text-signal-red', zinc: 'text-zinc-400',
+const TONE_TEXT: Record<Tone, string> = {
+  amber: 'text-signal-amber',
+  emerald: 'text-signal-green',
+  red: 'text-signal-red',
+  zinc: 'text-zinc-400',
 };
 
 // ---------------------------------------------------------------------------
@@ -34,7 +38,7 @@ const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber',
 // per-component ring would double up, not add anything.
 // ---------------------------------------------------------------------------
 const buttonVariants = cva(
-  'whitespace-nowrap board-mono text-[11px] font-bold rounded-none backdrop-blur-md transition-all duration-150 ease-out disabled:opacity-50 disabled:pointer-events-none active:translate-y-px',
+  'inline-flex items-center justify-center gap-2 whitespace-normal text-center rounded-none font-semibold text-sm transition-colors duration-150 ease-out disabled:pointer-events-none disabled:opacity-50',
   {
     defaultVariants: { compact: false, variant: 'primary' },
     variants: {
@@ -48,10 +52,10 @@ const buttonVariants = cva(
         true: 'px-3 py-1.5',
       },
       variant: {
-        // Glass + tactile: frosted translucency with a hard offset shadow
-        // that collapses on press. Accent (Quivly forest green) reserved
-        // for primary actions only.
-        primary: 'bg-accent text-white border border-accent shadow-[0_2px_0_0_rgba(0,0,0,0.25)] hover:brightness-125 hover:shadow-[0_2px_12px_0_rgba(8,80,65,0.45)] active:shadow-none',
+        // Forest green marks the primary action; press feedback changes color
+        // without moving surrounding controls.
+        primary:
+          'border border-accent bg-accent text-white shadow-sm hover:bg-emerald-900 active:bg-emerald-950',
         // aria-expanded styling is new vs. the old SecondaryButton: Base UI
         // sets aria-expanded on trigger elements (e.g. a Menu.Trigger
         // rendered as this Button via `render`), so a menu/dialog trigger
@@ -62,22 +66,41 @@ const buttonVariants = cva(
         // never generated CSS from it and that two-variant composition is
         // unverified; confirm it renders once a consumer imports Button
         // before trusting the dark-mode half.
-        secondary: 'bg-white/55 dark:bg-white/5 border border-white/75 dark:border-white/10 text-ink dark:text-ink-dark shadow-sm hover:bg-white/85 dark:hover:bg-white/10 aria-expanded:bg-white/85',
+        secondary:
+          'border border-white/75 bg-white/55 text-ink shadow-sm hover:bg-white/85 aria-expanded:bg-white/85 dark:border-white/10 dark:bg-white/5 dark:text-ink-dark dark:hover:bg-white/10',
       },
     },
-  },
+  }
 );
 
 export interface ButtonProps extends VariantProps<typeof buttonVariants> {
-  onClick?: () => void;
-  disabled?: boolean;
+  'aria-controls'?: string;
+  'aria-describedby'?: string;
+  'aria-expanded'?: boolean;
+  'aria-label'?: string;
+  'aria-pressed'?: boolean;
   children: ComponentChildren;
   class?: string;
+  disabled?: boolean;
+  onClick?: () => void;
 }
 
-export function Button({ variant, compact, onClick, disabled, children, class: cls }: ButtonProps) {
+export function Button({
+  variant,
+  compact,
+  onClick,
+  disabled,
+  children,
+  class: cls,
+  ...props
+}: ButtonProps) {
   return (
-    <ButtonPrimitive onClick={onClick} disabled={disabled} className={cn(buttonVariants({ compact, variant }), cls)}>
+    <ButtonPrimitive
+      {...props}
+      className={cn(buttonVariants({ compact, variant }), cls)}
+      disabled={disabled}
+      onClick={onClick}
+    >
       {children}
     </ButtonPrimitive>
   );
@@ -88,18 +111,34 @@ export function Button({ variant, compact, onClick, disabled, children, class: c
 // CSS (styles.css's .tip::after), `href`/`target` switches to link-mode.
 // ---------------------------------------------------------------------------
 export interface IconButtonProps {
-  tone?: Tone;
-  tip: string;
-  onClick?: (e: JSX.TargetedMouseEvent<HTMLElement>) => void;
+  children: ComponentChildren;
   disabled?: boolean;
   href?: string;
+  // Accessible name when it should differ from the short visible tooltip.
+  label?: string;
+  onClick?: (e: JSX.TargetedMouseEvent<HTMLElement>) => void;
   target?: string;
-  children: ComponentChildren;
+  tip: string;
+  tone?: Tone;
 }
 
-export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target, children }: IconButtonProps) {
-  const toneCls = disabled ? 'text-zinc-300' : `${TONE_TEXT[tone]} hover:bg-current/10`;
-  const cls = cn('tip icon-btn transition-all duration-200 ease-out', toneCls);
+export function IconButton({
+  tone = 'zinc',
+  tip,
+  label,
+  onClick,
+  disabled,
+  href,
+  target,
+  children,
+}: IconButtonProps) {
+  const toneCls = disabled
+    ? 'text-zinc-300'
+    : `${TONE_TEXT[tone]} hover:bg-current/10`;
+  const cls = cn(
+    'tip icon-btn transition-colors duration-150 ease-out',
+    toneCls
+  );
 
   if (href) {
     // The old version fell back to `pointer-events-none` for the disabled
@@ -110,9 +149,16 @@ export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target
     // itself removes the navigation with no CSS trade-off, and
     // `aria-disabled` communicates the state to assistive tech.
     return (
-      <a href={disabled ? undefined : href} target={target}
+      <a
+        aria-disabled={disabled || undefined}
+        aria-label={label ?? tip}
+        class={cls}
+        data-tip={tip}
+        href={disabled ? undefined : href}
         rel={target === '_blank' ? 'noopener noreferrer' : undefined}
-        role={disabled ? 'link' : undefined} aria-disabled={disabled || undefined} data-tip={tip} class={cls}>
+        role={disabled ? 'link' : undefined}
+        target={target}
+      >
         {children}
       </a>
     );
@@ -125,7 +171,13 @@ export function IconButton({ tone = 'zinc', tip, onClick, disabled, href, target
   // disabled button: "Starting…" (app.tsx:318), "Deploying to…"
   // (app.tsx:387, 665) are live tooltips now instead of dead ones.
   return (
-    <ButtonPrimitive onClick={onClick} disabled={disabled} data-tip={tip} className={cls}>
+    <ButtonPrimitive
+      aria-label={label ?? tip}
+      className={cls}
+      data-tip={tip}
+      disabled={disabled}
+      onClick={onClick}
+    >
       {children}
     </ButtonPrimitive>
   );

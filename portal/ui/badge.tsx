@@ -7,9 +7,9 @@
 // isValidElement + a useMergedRefs hook, no useSyncExternalStore), the same
 // render path every Dialog/Menu part the spike drove goes through.
 import { useRender } from '@base-ui/react/use-render';
+import { cva } from 'class-variance-authority';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { cva } from 'class-variance-authority';
 import { cn } from './utils';
 
 // Signal colors, not generic Tailwind brights — railway/aviation "clear /
@@ -20,17 +20,35 @@ import { cn } from './utils';
 // change — only what color that maps to changed, not the semantic vocabulary.
 export type Tone = 'emerald' | 'amber' | 'red' | 'zinc';
 
-const TONE_TEXT: Record<Tone, string> = {amber: 'text-signal-amber', 
-  emerald: 'text-signal-green', red: 'text-signal-red',
+const TONE_TEXT: Record<Tone, string> = {
+  amber: 'text-signal-amber',
+  emerald: 'text-signal-green',
+  red: 'text-signal-red',
   zinc: 'text-zinc-500 dark:text-zinc-400',
 };
-const TONE_DOT: Record<Tone, string> = {amber: 'bg-signal-amber', 
-  emerald: 'bg-signal-green', red: 'bg-signal-red',
+const TONE_DOT: Record<Tone, string> = {
+  amber: 'bg-signal-amber',
+  emerald: 'bg-signal-green',
+  red: 'bg-signal-red',
   zinc: 'bg-zinc-300 dark:bg-zinc-600',
 };
 
-export function StatusDot({ tone, pulse = false }: { tone: Tone; pulse?: boolean }) {
-  return <span class={cn('w-1.5 h-1.5 rounded-full shrink-0 transition-colors duration-300', TONE_DOT[tone], pulse && 'animate-pulse')} />;
+export function StatusDot({
+  tone,
+  pulse = false,
+}: {
+  tone: Tone;
+  pulse?: boolean;
+}) {
+  return (
+    <span
+      class={cn(
+        'h-1.5 w-1.5 shrink-0 rounded-full transition-colors duration-300',
+        TONE_DOT[tone],
+        pulse && 'animate-pulse'
+      )}
+    />
+  );
 }
 
 // The signature moment: a genuine split-flap flip, but ONLY on an actual
@@ -43,11 +61,20 @@ export function StatusFlap({ text, tone }: { text: string; tone: Tone }) {
   const prev = useRef(text);
   const [flapping, setFlapping] = useState(false);
   useEffect(() => {
-    if (prev.current !== text) { setFlapping(true); prev.current = text; }
+    if (prev.current !== text) {
+      setFlapping(true);
+      prev.current = text;
+    }
   }, [text]);
   return (
-    <span class={cn('board-mono text-[11px] font-bold shrink-0', TONE_TEXT[tone], flapping && 'flap-change')}
-      onAnimationEnd={() => setFlapping(false)}>
+    <span
+      class={cn(
+        'board-mono shrink-0 font-bold text-[11px]',
+        TONE_TEXT[tone],
+        flapping && 'flap-change'
+      )}
+      onAnimationEnd={() => setFlapping(false)}
+    >
       {text}
     </span>
   );
@@ -58,7 +85,7 @@ export function StatusFlap({ text, tone }: { text: string; tone: Tone }) {
 // existing hover-tooltip CSS (styles.css's .tip::after) rather than a new
 // mechanism. rounded-none always — no border radius anywhere in this app.
 const badgeVariants = cva(
-  'tip board-mono text-[9px] font-bold px-1.5 py-0.5 rounded-none shrink-0 transition-colors duration-200',
+  'tip board-mono shrink-0 rounded-none px-1.5 py-0.5 font-bold text-[9px] transition-colors duration-200',
   {
     defaultVariants: { tone: 'zinc' },
     variants: {
@@ -73,7 +100,7 @@ const badgeVariants = cva(
         zinc: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
       },
     },
-  },
+  }
 );
 
 // Routed through Base UI's useRender (not a plain <span>) so Badge picks up
@@ -82,7 +109,13 @@ const badgeVariants = cva(
 // No call site needs that today; it's free (defaults to a plain span when
 // `render` is omitted) and is what the actual base-nova registry source
 // (ui.shadcn.com/r/styles/base-nova/badge.json) hands you for this component.
-export function Badge({ tone = 'zinc', tip, class: cls, render, children }: {
+export function Badge({
+  tone = 'zinc',
+  tip,
+  class: cls,
+  render,
+  children,
+}: {
   tone?: Tone;
   tip?: string;
   class?: string;
