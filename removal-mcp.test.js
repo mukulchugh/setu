@@ -47,16 +47,19 @@ function toolJson(response) {
 }
 
 const TOOL_NAMES = [
+  'claim_worktree',
   'create_pr',
   'create_worktree',
   'get_diff',
   'get_logs',
   'get_pr_review_status',
+  'list_claims',
   'list_ports',
   'list_projects',
   'list_repo_prs',
   'list_worktrees',
   'pr_ready',
+  'release_worktree',
   'remove_worktree',
   'run_pr_review',
   'start_worktree',
@@ -64,7 +67,7 @@ const TOOL_NAMES = [
   'sync_worktree',
 ];
 
-test('inbound MCP initializes and discovers all 15 existing tools without invoking a backend', async () => {
+test('inbound MCP initializes and discovers all 18 tools without invoking a backend', async () => {
   initMcpServer({});
   const initialized = await requestMcp('initialize', {
     capabilities: {},
@@ -89,6 +92,14 @@ test('inbound MCP initializes and discovers all 15 existing tools without invoki
     'pr-brief',
   ]);
   expect(schema.pr_ready.required.sort()).toEqual(['name', 'ready', 'repo']);
+  expect(schema.claim_worktree.required.sort()).toEqual([
+    'agent',
+    'name',
+    'pid',
+    'repo',
+    'session',
+    'task',
+  ]);
 });
 
 test('MCP exact retry returns complete partial removal as structured tool error', async () => {

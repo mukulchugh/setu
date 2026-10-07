@@ -40,6 +40,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import z from 'zod/v4';
 import { PORTAL_PORT } from './lib.js';
+import { WRITER_AGENT_NAME } from './writer-claims.js';
 
 // Populated by portal.js's initMcpServer() call, once, at startup — after
 // the functions it references are defined (safe regardless of call order
@@ -201,6 +202,57 @@ function text(value) {
 // ── tool registration ───────────────────────────────────────────────────────
 
 function registerTools(server) {
+  server.registerTool(
+    'claim_worktree',
+    {
+      description:
+        'Claim the writer slot before editing a worktree. Repeat with the same session to refresh its heartbeat. A different session can take over only after two hours without a heartbeat and the owner PID has exited.',
+      inputSchema: {
+        repo: z.string(),
+        name: z.string(),
+        agent: z.string().regex(WRITER_AGENT_NAME),
+        session: z.string().min(1).max(200),
+        task: z.string().min(1).max(300),
+        pid: z
+          .number()
+          .int()
+          .positive()
+          .describe('long-lived local agent process ID, not the portal PID'),
+      },
+      title: 'Claim worktree writer slot',
+    },
+    ({ repo, name, ...owner }) =>
+      mutationResult(() => deps.claimWriter(repo, name, owner))
+  );
+
+  server.registerTool(
+    'release_worktree',
+    {
+      description:
+        'Release a worktree writer claim at the end of the task. Only the session holding it can release it.',
+      inputSchema: {
+        repo: z.string(),
+        name: z.string(),
+        session: z.string().min(1).max(200),
+      },
+      title: 'Release worktree writer slot',
+    },
+    ({ repo, name, session }) =>
+      mutationResult(() => deps.releaseWriter(repo, name, session))
+  );
+
+  server.registerTool(
+    'list_claims',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List active writer claims across known worktrees, including agent, session, task, owner PID, heartbeat, and starting git baseline. Stale claims are reported by setu doctor.',
+      inputSchema: {},
+      title: 'List writer claims',
+    },
+    async () => text(await deps.listWriterClaims())
+  );
+
   server.registerTool(
     'list_worktrees',
     {
@@ -530,6 +582,7 @@ function registerTools(server) {
 const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.quivly.local\` domain). This server is a full front door onto it — the same backend the web UI and CLI use, no capability gap.
 
 TOOL GROUPS
+- Writer coordination: claim_worktree -> edit (refresh the same session periodically) -> release_worktree; list_claims shows current owners. Supply the local agent PID when claiming. If another session holds the claim, use a separate worktree.
 - Discovery (read-only, cheap, call these first): list_projects, list_worktrees, list_repo_prs, list_ports.
 - Lifecycle: create_worktree -> start_worktree -> ... -> stop_worktree / remove_worktree.
 - Debugging: get_logs, get_diff, list_ports, get_pr_review_status / run_pr_review.

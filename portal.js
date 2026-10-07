@@ -10,6 +10,7 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  realpathSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -93,7 +94,14 @@ import {
   workspaceState,
   worktreeBranchMap,
   writeDockerCompose,
+  writerClaimPaths,
 } from './lib.js';
+import {
+  claimWriter,
+  listWriterClaims,
+  releaseWriter,
+  writerWorktree,
+} from './writer-claims.js';
 import {
   createListenerObservation,
   probeListeningPorts,
@@ -4382,7 +4390,19 @@ function close(ws) {
 // direct in-process calls, not HTTP, so /mcp never opens a second request
 // back into this same server. Function declarations are hoisted, so every
 // name here is already defined despite most living further up the file.
+function writerPath(repo, name) {
+  if (!getPort(WORKSPACE, repo, name)) throw new Error(`No registered worktree for ${repo}/${name}`);
+  const path = realpathSync(wtPath(repo, name));
+  if (writerWorktree(path).wtDir !== path) throw new Error(`Not a worktree root: ${path}`);
+  return path;
+}
+
 initMcpServer({
+  claimWriter: (repo, name, owner) =>
+    claimWriter(writerPath(repo, name), owner),
+  releaseWriter: (repo, name, session) =>
+    releaseWriter(writerPath(repo, name), session),
+  listWriterClaims: () => listWriterClaims(writerClaimPaths(WORKSPACE)),
   computeDiff,
   createPr,
   createWorktree,

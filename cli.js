@@ -55,6 +55,7 @@ import {
   tunnelCredentials,
   tunnelEnabled,
   workspaceState,
+  writerClaimPaths,
 } from './lib.js';
 import {
   requestPortalMutation,
@@ -81,6 +82,12 @@ import {
 } from './cli-helpers.js';
 
 const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
+
+// Writer-claim commands run before the update nudge and need none of the workspace setup below.
+if (['claim', 'release', 'claims', 'claim-check'].includes(process.argv[2])) {
+  const { runWriterCommand } = await import('./writer-claims-cli.js');
+  process.exit(await runWriterCommand(process.argv[2], process.argv.slice(3)));
+}
 const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
 
 process.on('SIGINT', () => {
@@ -1462,6 +1469,7 @@ function composeProjectStates(rawPsOutput) {
 async function cmdDoctor() {
   const c = loadConfig();
   const workspace = c.workspace ?? '';
+  const { writerClaimChecks } = await import('./writer-claims.js');
 
   // Shared across multiple checks below — fetch once, not once per check.
   // Bun.spawn (via spawnText), not execFileSync/spawnSync: checks run
@@ -1837,10 +1845,11 @@ async function cmdDoctor() {
       .then(() => true)
       .catch(() => false),
   }));
+  checkThunks.push(async () => writerClaimChecks(writerClaimPaths(workspace)));
 
-  const checks = (await Promise.all(checkThunks.map((fn) => fn()))).map(
-    (r) => ({ ...r, ok: !!r.ok })
-  );
+  const checks = (await Promise.all(checkThunks.map((fn) => fn())))
+    .flat()
+    .map((r) => ({ ...r, ok: !!r.ok }));
 
   if (asJson) {
     console.log(JSON.stringify(checks, null, 2));
@@ -1910,6 +1919,13 @@ function cmdHelp() {
   ${C}Portal${R}
     setu portal                      Start web UI at http://quivly.local
     setu portal stop                 Stop portal
+
+  ${C}Writer claims${R}
+    setu claim [worktree] --agent X --session Y --task "..." [--pid N] [--json]
+                                      Claim or refresh this session's writer slot (default: cwd)
+    setu release [worktree] --session Y [--json]   Release only this session's claim
+    setu claims [--json]             List active claims across known worktrees
+    setu claim-check <path> --session Y [--json]  Read-only hook check: 0 allowed, 2 blocked
 
   ${C}MCP — let an agent drive Setu directly${R}
     setu mcp install codex           Register Setu's MCP server in ~/.codex/config.toml

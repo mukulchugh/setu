@@ -28,6 +28,7 @@ import {
   resourceSettings as lifecycleResourceSettings,
 } from './worktree-lifecycle.js';
 import { validateRemovalRecords } from './worktree-removal.js';
+import { discoverWriterWorktrees } from './writer-claims.js';
 
 // Keep the established library API while lifecycle owns the implementation.
 export const effectiveContainerLimits = lifecycleContainerLimits;
@@ -1620,6 +1621,15 @@ export async function writeAgentCompose(
 }
 
 // ── git worktrees ─────────────────────────────────────────────────────────────
+
+export function writerClaimPaths(workspace, cwd = process.cwd()) {
+  const candidates = [cwd];
+  if (workspace) {
+    candidates.push(...portEntries(workspace).map(e => join(workspace, e.repo, e.name)));
+    candidates.push(...Object.keys(loadProjects(workspace)).map(repo => join(workspace, `${repo}.git`)));
+  }
+  return discoverWriterWorktrees(candidates);
+}
 
 export function git(repoDir, args, opts = {}) {
   return execFileSync('git', ['-C', repoDir, ...args], {

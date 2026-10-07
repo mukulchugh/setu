@@ -39,6 +39,8 @@
     "worktree-lifecycle.js",
     "worktree-removal.js",
     "worktree-stream.js",
+    "writer-claims-cli.js",
+    "writer-claims.js",
     "portal",
     "claude-plugin",
     "raycast/src",
@@ -54,7 +56,7 @@
   "scripts": {
     "check": "ultracite check",
     "fix": "ultracite fix",
-    "test": "bun test checkout-identity.test.js cli-helpers.test.js cli-setup.test.js dependency-sharing.test.js deployment-guard.test.js dev-runtime.test.js git-operations.test.js hardening.regression.test.js host-health.test.js lib-safety.test.js listener-observation.test.js log-tail.test.js mcp.connection.test.js owned-process-map.test.js portal-update.test.js portal.api.test.ts portal.costs-read.test.ts portal.deploy-intent.test.ts portal.dialog-focus.test.ts portal.dropdown-ref.test.tsx portal.host-storage.test.ts portal.inventory-read.test.ts portal.log-read.test.ts portal.mcp-config.test.ts portal.read-array.test.ts portal.regression.test.js portal.settings-draft.test.ts portal.socket-client.test.ts portal.ui-helpers.test.ts portal.visible-poll.test.ts portal.worktree-list.test.ts process-observation.test.js removal-mcp.test.js removal-raycast.test.ts remove-command.test.js trigger-command.test.js update-command.test.js update-transaction.real.test.js update-transaction.test.js workspace-inventory.test.js workspace-setup.test.js workspace-state.callers.test.js workspace-state.test.js worktree-lifecycle.test.js worktree-removal.test.js worktree-stream.test.js && bun agent.test.js && bun lib.agent-compose.test.js",
+    "test": "bun test checkout-identity.test.js cli-helpers.test.js cli-setup.test.js dependency-sharing.test.js deployment-guard.test.js dev-runtime.test.js git-operations.test.js hardening.regression.test.js host-health.test.js lib-safety.test.js listener-observation.test.js log-tail.test.js mcp.connection.test.js owned-process-map.test.js portal-update.test.js portal.api.test.ts portal.costs-read.test.ts portal.deploy-intent.test.ts portal.dialog-focus.test.ts portal.dropdown-ref.test.tsx portal.host-storage.test.ts portal.inventory-read.test.ts portal.log-read.test.ts portal.mcp-config.test.ts portal.read-array.test.ts portal.regression.test.js portal.settings-draft.test.ts portal.socket-client.test.ts portal.ui-helpers.test.ts portal.visible-poll.test.ts portal.worktree-list.test.ts process-observation.test.js removal-mcp.test.js removal-raycast.test.ts remove-command.test.js trigger-command.test.js update-command.test.js update-transaction.real.test.js update-transaction.test.js workspace-inventory.test.js workspace-setup.test.js workspace-state.callers.test.js workspace-state.test.js worktree-lifecycle.test.js worktree-removal.test.js worktree-stream.test.js writer-claims.test.js && bun agent.test.js && bun lib.agent-compose.test.js",
     "typecheck": "bun raycast/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && bun raycast/node_modules/typescript/bin/tsc --noEmit -p raycast/tsconfig.json",
     "verify": "bun run test && bun run typecheck"
   },

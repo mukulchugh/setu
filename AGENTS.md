@@ -7,7 +7,8 @@ single shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) that one worktre
 **Debugging anything setu-related? Start with `setu doctor --json`.** It checks every layer
 (brew deps, dnsmasq, resolver, caddy, sudoers, cloudflared, git sync, worktree-registry
 hygiene, container runtime reachability, container memory budget vs. engine capacity, portal,
-container-mode worktrees whose container died without Setu stopping it — see Conventions)
+container-mode worktrees whose container died without Setu stopping it, stale writer
+claims, and changed writer baselines; see Conventions and Writer claims)
 and returns `[{name, ok, fix}]`. Exit code 0 = all healthy. Checks run concurrently, not
 sequentially — don't assume output order reflects check duration.
 
@@ -129,6 +130,97 @@ retained on purpose after an unknown outcome (`"retained": true` in the lock fil
 `setu doctor` lists retained locks and locks with a dead owner. The CLI and the portal
 release their locks on SIGINT and SIGTERM.
 
+## Writer claims
+
+Before editing, claim the worktree with your agent name, a unique session ID,
+and a short task. Keep the same session ID throughout the task. If using an
+agent hook, use the actual session ID supplied by that agent, so the hook and
+claim agree. Never reuse another agent's session ID.
+
+```sh
+setu claim /path/to/worktree --agent codex --session session-123 --task "Fix login redirect"
+# Refresh the heartbeat periodically during long tasks, for example every 30 minutes:
+setu claim /path/to/worktree --agent codex --session session-123 --task "Fix login redirect"
+# Release after finishing, including when abandoning the task:
+setu release /path/to/worktree --session session-123
+setu claims --json
+```
+
+`claim` and `release` default to the current directory. All four commands,
+including `claim-check`, accept `--json`. An agent name is 1 to 40 lowercase letters,
+digits or dashes, for example `claude-code`, `codex`, `cursor`, `opencode` or `human`.
+The CLI records its parent PID by default. If a short-lived
+shell launches the CLI, pass `--pid <agent-pid>` to record the long-lived local
+agent process instead. MCP's `claim_worktree` requires this PID explicitly.
+
+Claims live in `setu-writer.json` inside the worktree's own Git directory, so
+linked worktrees have separate claims. The file records `agent`, `session`,
+`task`, `pid`, `started_at`, `heartbeat`, `branch`, `head`, and `baseline`
+(`count` and SHA-256 `hash` of the exact `git status --porcelain` output).
+Branch and HEAD come from Git at claim time. Detached HEAD has a null branch;
+an unborn branch has a null HEAD. A same-session refresh preserves the original
+start time, branch, HEAD, and baseline, and updates the owner details and heartbeat.
+
+A different session is refused with the current owner's details and a suggestion
+to use `setu new <repo> <branch>`. Takeover is allowed only when the heartbeat is
+at least two hours old **and** the recorded PID no longer exists. A takeover result
+carries `tookOverFrom` (the previous agent, session, task and heartbeat), and the CLI warns
+that the tree may hold that owner's uncommitted work. `claim-check` by the owning session
+refreshes a heartbeat older than five minutes, so an agent that keeps checking keeps its
+claim. `claim-check` on a path outside any Git worktree succeeds with no claim. `release` only
+accepts the owning session, including for stale claims; `release --force` removes a claim
+file only when it cannot be read. A lock left by a killed process is recovered on the next
+claim, and `setu doctor` names such locks. Releasing an unclaimed
+worktree succeeds without changing ownership. `claims` lists active claims in
+the current repository and its sibling worktrees, plus registered Setu projects
+and worktrees. It does not scan arbitrary repositories across the machine.
+
+`setu doctor` reports stale claims, unreadable claim files, and changes to the
+starting baseline. A changed baseline is a prompt to review, not proof of another
+writer: the owner's own edits change it too. This status hash tracks changed paths
+and status codes, not file contents, so further edits to an already-modified file
+may leave it unchanged.
+
+Claim writes and releases share an exclusive `setu-writer.json.lock` and publish
+complete JSON snapshots atomically. If a process is killed during a claim operation,
+the lock may remain. Inspect the PID in that lock and remove only the lock after
+confirming that operation has exited. Do not delete a live owner's claim to bypass
+the refusal.
+
+For a PreToolUse command hook, call `setu claim-check <target-path> --session <id>`
+before allowing a write. Exit 0 permits the tool; exit 2 blocks it with an owner
+description on stderr. Errors also block. The check reads only the worktree
+location and claim file, without running status, refreshing a heartbeat, or
+contacting the portal. A stale claim held by another session still blocks until
+explicitly reclaimed or released. File paths, new files, nested directories, and
+symlinks are supported.
+
+An example user-managed PreToolUse script that reads the hook JSON on stdin:
+
+```js
+#!/usr/bin/env bun
+import { spawnSync } from 'child_process';
+import { resolve } from 'path';
+
+try {
+  const event = await Bun.stdin.json();
+  const target = resolve(event.cwd, event.tool_input?.file_path ?? '.');
+  const result = spawnSync('setu', ['claim-check', target, '--session', event.session_id], { stdio: 'inherit' });
+  process.exit(result.status === 0 ? 0 : 2);
+} catch {
+  console.error('Cannot check writer claim; verify the hook input and Setu installation.');
+  process.exit(2);
+}
+```
+
+Use this with write-capable tools such as Edit and Write. A shell or batch tool
+that can write to several worktrees needs a wrapper that checks each target;
+checking only its current directory cannot cover writes elsewhere. Claims are
+cooperative coordination and do not stop programs that bypass these checks.
+Setu does not install or change Claude or Codex hooks/settings. The MCP tools are
+`claim_worktree` (`repo`, `name`, `agent`, `session`, `task`, `pid`),
+`release_worktree` (`repo`, `name`, `session`), and `list_claims` (no arguments).
+
 ## Action log
 
 Every mutating `POST /api/*` request appends one JSON line to `~/workspace/logs/actions.log`
@@ -147,10 +239,11 @@ this log — real, tracked gap, not yet solved.
 ## MCP server (localhost:2999/mcp) — let an agent drive Setu directly
 
 Same portal, same backend functions, a fourth front door (web UI / CLI / Raycast / MCP, in
-that order of age) — `mcp-server.js`'s 15 tools (`list_worktrees`, `create_worktree`,
+that order of age). The 18 tools in `mcp-server.js` (`list_worktrees`, `create_worktree`,
 `start_worktree`, `stop_worktree`, `sync_worktree`, `remove_worktree`, `get_diff`, `get_logs`,
 `list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`,
-`create_pr`, `pr_ready`) call straight into portal.js's own functions in-process, not over
+`create_pr`, `pr_ready`, `claim_worktree`, `release_worktree`, `list_claims`) call straight
+into portal.js's own functions in-process, not over
 HTTP — no self-fetch loopback. Streamable HTTP, stateless (fresh `McpServer` per request),
 DNS-rebinding protection on, no CORS. The portal binds `127.0.0.1`; HTTP, WebSocket and MCP requests share a loopback/Host/Origin guard. Local Caddy access works, forwarded remote clients are rejected. The server also sends a real `instructions` string on
 connect (MCP's own `InitializeResult.instructions` field) — architecture overview, tool
