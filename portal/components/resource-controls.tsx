@@ -2,6 +2,7 @@
 // relevant disclosure; mutations stay separate from their review state.
 import { useRef, useState } from 'preact/hooks';
 import { post } from '../api';
+import { formatStorageBytes } from '../host-storage';
 import { inputCls, Section } from '../ui';
 import { Badge, StatusDot, type Tone } from '../ui/badge';
 import { Button } from '../ui/button';
@@ -333,6 +334,10 @@ function StorageControls({ repo, name, toast }: TargetProps) {
                   (item) => item.rootId === root.id || item.id === root.id
                 );
                 const state = observation?.state ?? 'unknown';
+                const observedAt =
+                  typeof observation?.observedAt === 'number'
+                    ? new Date(observation.observedAt)
+                    : null;
                 return (
                   <tr
                     class="border-zinc-200/60 border-t dark:border-white/10"
@@ -353,13 +358,17 @@ function StorageControls({ repo, name, toast }: TargetProps) {
                       {observation ? (
                         <>
                           <span>
-                            logical {storageBytes(observation.logicalBytes)}
+                            Logical bytes:{' '}
+                            {storageBytes(observation.logicalBytes)}
                           </span>
                           <span class="ml-2 text-zinc-500">
-                            allocated {storageBytes(observation.allocatedBytes)}
+                            Allocated bytes:{' '}
+                            {storageBytes(observation.allocatedBytes)}
                           </span>
                           <div class="text-zinc-500">
-                            {text(observation.observedAt)}
+                            {observedAt && Number.isFinite(observedAt.getTime())
+                              ? observedAt.toLocaleString()
+                              : 'Unknown time'}
                           </div>
                         </>
                       ) : (
@@ -527,6 +536,7 @@ function OperationsControls({ repo, name }: TargetProps) {
   );
   const events = operations.data?.ok ? array(operations.data.events) : [];
   const leases = admission.data?.ok ? array(admission.data.leases) : [];
+  const limits = record(admission.data?.limits);
   return (
     <Section title="Operations & admission">
       <ReadProblem
@@ -562,13 +572,19 @@ function OperationsControls({ repo, name }: TargetProps) {
             )
           )}
         </div>
-        <div>
+        <div class="min-w-0">
           <h3 class="mb-2 font-medium text-sm">Admission</h3>
           {admission.data?.ok && (
-            <p class="mb-2 text-xs text-zinc-500">
-              Configured limits:{' '}
-              {JSON.stringify(admission.data.limits ?? 'unknown')}
-            </p>
+            <div class="mb-2 text-xs text-zinc-500">
+              <p>Managed session limit: {text(limits?.maxManagedSessions)}</p>
+              <p>
+                Free-space reserve:{' '}
+                {typeof limits?.lowStorageFloorBytes === 'number' &&
+                Number.isFinite(limits.lowStorageFloorBytes)
+                  ? formatStorageBytes(limits.lowStorageFloorBytes)
+                  : 'unknown'}
+              </p>
+            </div>
           )}
           {leases.length ? (
             <ul class="space-y-2 text-xs">
