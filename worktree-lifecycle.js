@@ -70,6 +70,7 @@ export function createWorktreeLifecycle({
   const operations = new Map();
   const background = new Map();
   const operationResults = new Map();
+  const startWaiters = new Map();
   let generation = 0;
   let policy = resourceSettings(settings);
   let draining = null;
@@ -221,7 +222,42 @@ export function createWorktreeLifecycle({
           target: record.target,
         })
       : null;
+  function startOutcome(record) {
+    if (disposed || records.get(record.target.key) !== record) {
+      return Object.freeze({ ok: false, state: 'unknown' });
+    }
+    if (record.phase === 'running') {
+      return Object.freeze({ ok: true, state: 'running' });
+    }
+    if (record.phase === 'unknown') {
+      return Object.freeze({ ok: false, state: 'unknown' });
+    }
+    if (record.phase === 'stopped') {
+      if (record.lastError) {
+        return Object.freeze({
+          ...record.lastError,
+          ok: false,
+          state: 'failed',
+        });
+      }
+      return Object.freeze({
+        ok: false,
+        state: record.stopIntent ? 'cancelled' : 'stopped',
+      });
+    }
+    return null;
+  }
+  function settleStartWaiters() {
+    for (const [record, waiter] of startWaiters) {
+      const outcome = startOutcome(record);
+      if (outcome) {
+        startWaiters.delete(record);
+        waiter.resolve(outcome);
+      }
+    }
+  }
   function publish() {
+    settleStartWaiters();
     try {
       onChange();
     } catch {
@@ -242,6 +278,7 @@ export function createWorktreeLifecycle({
       target: Object.freeze({ ...target }),
     };
     records.set(target.key, record);
+    settleStartWaiters();
     return record;
   }
   function operate(record, operation) {
@@ -782,7 +819,30 @@ export function createWorktreeLifecycle({
   }
   function dispose() {
     disposed = true;
+    settleStartWaiters();
     armQueueTimer();
+  }
+  function waitForStart(target) {
+    const record = records.get(target.key);
+    if (!record) {
+      return Promise.resolve(Object.freeze({ ok: false, state: 'unknown' }));
+    }
+    const outcome = startOutcome(record);
+    if (outcome) {
+      return Promise.resolve(outcome);
+    }
+    let waiter = startWaiters.get(record);
+    if (!waiter) {
+      let resolve;
+      waiter = {
+        promise: new Promise((done) => {
+          resolve = done;
+        }),
+        resolve,
+      };
+      startWaiters.set(record, waiter);
+    }
+    return waiter.promise;
   }
   function quiescenceStatus(token) {
     if (!closedBy || token !== closedBy) {
@@ -864,5 +924,6 @@ export function createWorktreeLifecycle({
     updateSettings,
     waitForOperation: (target) =>
       background.get(target.key) ?? Promise.resolve(),
+    waitForStart,
   });
 }

@@ -3,8 +3,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renderDockerCompose } from './dev-runtime.js';
-import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 import { createWorkspaceState } from './workspace-state.js';
+import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 
 function deferred() {
   let resolve, reject;
@@ -126,6 +126,111 @@ test('a booting worktree owns one slot until all teardown finishes', async () =>
   expect(f.lifecycle.status().active).toBe(1);
   expect(f.running.has('repo/b')).toBe(true);
   expect(f.lifecycle.snapshot('repo/a').phase).toBe('stopped');
+});
+
+test('waitForStart remains pending through queueing and starting, then resolves observed running', async () => {
+  const f = fixture();
+  await f.lifecycle.start(target('a'), false);
+  await f.lifecycle.start(target('b'), false);
+  const waiting = f.lifecycle.waitForStart(target('b'));
+  expect(f.lifecycle.waitForStart(target('b'))).toBe(waiting);
+  let settled = false;
+  void waiting.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+
+  await f.lifecycle.stop(target('a'));
+  expect(f.lifecycle.snapshot('repo/b').phase).toBe('starting');
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  const snapshot = f.lifecycle.snapshot('repo/b');
+  await f.lifecycle.reconcile('repo/b', snapshot.generation);
+  await expect(waiting).resolves.toEqual({ ok: true, state: 'running' });
+});
+
+test('waitForStart reports a known failure or queued cancellation before running', async () => {
+  const failed = fixture({
+    controller: {
+      validateTarget: async () => {
+        throw new Error('fixture target refused');
+      },
+    },
+  });
+  await failed.lifecycle.start(target('a'), false);
+  await expect(
+    failed.lifecycle.waitForStart(target('a'))
+  ).resolves.toMatchObject({
+    code: 'START_FAILED',
+    ok: false,
+    state: 'failed',
+  });
+
+  const cancelled = fixture();
+  await cancelled.lifecycle.start(target('a'), false);
+  await cancelled.lifecycle.start(target('b'), false);
+  const waiting = cancelled.lifecycle.waitForStart(target('b'));
+  await cancelled.lifecycle.stop(target('b'));
+  await expect(waiting).resolves.toEqual({
+    ok: false,
+    state: 'cancelled',
+  });
+});
+
+test('waitForStart never certifies unknown, replaced, or disposed attempts as running', async () => {
+  const unknown = fixture();
+  await unknown.lifecycle.start(target('a'), false);
+  const unknownWaiting = unknown.lifecycle.waitForStart(target('a'));
+  unknown.launches[0].handle.state = 'unknown';
+  const snapshot = unknown.lifecycle.snapshot('repo/a');
+  await unknown.lifecycle.reconcile('repo/a', snapshot.generation);
+  await expect(unknownWaiting).resolves.toEqual({
+    ok: false,
+    state: 'unknown',
+  });
+
+  const replacement = fixture();
+  const releaseStop = deferred(),
+    stopEntered = deferred();
+  const originalStop = replacement.runtime.stop;
+  replacement.runtime.stop = async (...args) => {
+    if (args[0].key === 'repo/b') {
+      stopEntered.resolve();
+      await releaseStop.promise;
+    }
+    return originalStop(...args);
+  };
+  await replacement.lifecycle.start(target('a'), false);
+  await replacement.lifecycle.start(target('b'), false);
+  const replacedWaiting = replacement.lifecycle.waitForStart(target('b'));
+  const stopping = replacement.lifecycle.stop(target('b'));
+  await stopEntered.promise;
+  replacement.lifecycle.adopt(
+    target('b'),
+    { ownedGroup: false, pid: 999 },
+    {
+      container: false,
+      limits: null,
+      port: target('b').port,
+    }
+  );
+  await expect(replacedWaiting).resolves.toEqual({
+    ok: false,
+    state: 'unknown',
+  });
+  releaseStop.resolve();
+  await stopping;
+
+  const disposed = fixture();
+  await disposed.lifecycle.start(target('a'), false);
+  await disposed.lifecycle.start(target('b'), false);
+  const disposedWaiting = disposed.lifecycle.waitForStart(target('b'));
+  disposed.lifecycle.dispose();
+  await expect(disposedWaiting).resolves.toEqual({
+    ok: false,
+    state: 'unknown',
+  });
 });
 
 test('accepted background setup retains admission until its actual completion', async () => {
@@ -306,9 +411,7 @@ test('failure after spawn retains the registered handle and a failed Stop keeps 
   });
   expect((await f.lifecycle.start(target('b'), false)).queued).toBe(true);
   const stop = f.runtime.stop;
-  f.runtime.stop = () => {
-    return Promise.reject(new Error('exit unknown'));
-  };
+  f.runtime.stop = () => Promise.reject(new Error('exit unknown'));
   expect((await f.lifecycle.stop(target('a'))).ok).toBe(false);
   expect(f.lifecycle.status().active).toBe(1);
   expect(f.running.has('repo/b')).toBe(false);
@@ -386,9 +489,9 @@ test('a failed restart update releases confirmed-dead ownership and launches the
     f.lifecycle.snapshot('repo/a').generation
   );
   await f.lifecycle.start(target('b'), false);
-  const result = await f.lifecycle.restart(target('a'), () => {
-    return Promise.reject(new Error('environment write failed'));
-  });
+  const result = await f.lifecycle.restart(target('a'), () =>
+    Promise.reject(new Error('environment write failed'))
+  );
   expect(result).toMatchObject({ code: 'RESTART_FAILED', ok: false });
   expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
     phase: 'running',
@@ -611,8 +714,8 @@ test('critical storage refuses the actual bare and container launch without rese
       },
     });
     expect(await f.lifecycle.start(target('a'), container)).toMatchObject({
-      ok: false,
       code: 'STORAGE_LOW',
+      ok: false,
     });
     expect(f.launches).toHaveLength(0);
     expect(f.lifecycle.status().active).toBe(0);
@@ -624,8 +727,9 @@ test('queue promotion rechecks storage and Stop and removal remain available aft
   const f = fixture({
     controller: {
       assertStorage: async () => {
-        if (low)
+        if (low) {
           throw Object.assign(new Error('disk full'), { code: 'STORAGE_LOW' });
+        }
       },
     },
   });
@@ -635,9 +739,9 @@ test('queue promotion rechecks storage and Stop and removal remain available aft
   expect((await f.lifecycle.stop(target('a'))).ok).toBe(true);
   expect(f.launches).toHaveLength(1);
   expect(f.lifecycle.snapshot('repo/b')).toMatchObject({
+    lastError: { code: 'STORAGE_LOW' },
     phase: 'stopped',
     reserved: false,
-    lastError: { code: 'STORAGE_LOW' },
   });
   expect(
     (
@@ -654,8 +758,9 @@ test('a storage-denied restart preserves the exact running handle without Stop o
   const f = fixture({
     controller: {
       assertStorage: async () => {
-        if (low)
+        if (low) {
           throw Object.assign(new Error('disk full'), { code: 'STORAGE_LOW' });
+        }
       },
     },
   });
@@ -670,14 +775,14 @@ test('a storage-denied restart preserves the exact running handle without Stop o
     await f.lifecycle.restart(target('a'), async () => {
       changed = true;
     })
-  ).toMatchObject({ ok: false, code: 'STORAGE_LOW' });
+  ).toMatchObject({ code: 'STORAGE_LOW', ok: false });
   expect(changed).toBe(false);
   expect(f.launches).toHaveLength(1);
   expect(f.running.get('repo/a')).toBe(f.launches[0].handle);
   expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
-    pid: before.pid,
     generation: before.generation,
     phase: 'running',
+    pid: before.pid,
     reserved: true,
   });
 });
@@ -724,7 +829,7 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
       capacity: {
         refresh: async () => ({ available: true, cpus: 4, memMb: 8192 }),
       },
-      clock: { now: Date.now, setTimeout, clearTimeout },
+      clock: { clearTimeout, now: Date.now, setTimeout },
       runtime: {
         async launch(t, _spec, register) {
           let resolve;
@@ -762,9 +867,9 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
   const lifecycle = createWorktreeLifecycle({
     capacity: { refresh: async () => ({ available: true, ...capacity }) },
     clock: {
+      clearTimeout,
       now: () => (tick += 31_000),
       setTimeout: (task) => setTimeout(task, 10),
-      clearTimeout,
     },
     runtime: {
       async launch(t, _spec, register) {
@@ -786,7 +891,7 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
   });
   await lifecycle.start(makeTarget('timer-a'), true);
   await lifecycle.start(makeTarget('timer-b'), true);
-  capacity = { cpus: 4, memMb: 16384 };
+  capacity = { cpus: 4, memMb: 16_384 };
   for (let count = 0; count < 20 && launched.length < 2; count += 1) {
     await Bun.sleep(10);
   }

@@ -33,7 +33,12 @@ function rfc3339(d) {
   return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-async function fetchAllPages(baseUrl, params, headers) {
+export async function fetchAllPages(
+  baseUrl,
+  params,
+  headers,
+  { request = fetch } = {}
+) {
   const buckets = [];
   const seen = new Set();
   const signal = AbortSignal.timeout(15_000);
@@ -43,7 +48,10 @@ async function fetchAllPages(baseUrl, params, headers) {
     if (page) {
       p.set('page', page);
     }
-    const res = await fetch(`${baseUrl}?${p.toString()}`, { headers, signal });
+    const res = await request(`${baseUrl}?${p.toString()}`, {
+      headers,
+      signal,
+    });
     if (!res.ok) {
       throw new Error(
         `${res.status} ${res.statusText}: ${await res.text().catch(() => '')}`
@@ -109,9 +117,12 @@ function summarize(provider, buckets, dateOf, resultsOf, amountOf, labelOf) {
 // amount is in CENTS as a decimal string ("123.45" USD == $1.23) -- not
 // dollars, despite the decimal formatting looking like it could be either.
 
-async function anthropicCosts(adminKey) {
+export async function anthropicCosts(
+  adminKey,
+  { fetchPages = fetchAllPages } = {}
+) {
   const headers = { 'anthropic-version': '2023-06-01', 'x-api-key': adminKey };
-  const buckets = await fetchAllPages(
+  const buckets = await fetchPages(
     'https://api.anthropic.com/v1/organizations/cost_report',
     {
       'group_by[]': 'description',
@@ -136,9 +147,12 @@ async function anthropicCosts(adminKey) {
 // docs: raw openapi.yaml, CostsResult schema -- amount is {value, currency},
 // already in dollars, unlike Anthropic's cents-as-a-string.
 
-async function openaiCosts(adminKey) {
+export async function openaiCosts(
+  adminKey,
+  { fetchPages = fetchAllPages } = {}
+) {
   const headers = { Authorization: `Bearer ${adminKey}` };
-  const buckets = await fetchAllPages(
+  const buckets = await fetchPages(
     'https://api.openai.com/v1/organization/costs',
     {
       'group_by[]': 'line_item',
@@ -207,7 +221,7 @@ function budgetStatus(spent, limit) {
   return 'ok';
 }
 
-function computeBudgets(cfg, providers) {
+export function computeBudgets(cfg, providers) {
   const b = cfg.budgets;
   if (!b) {
     return null;
@@ -222,11 +236,11 @@ function computeBudgets(cfg, providers) {
       continue;
     }
     for (const key of Object.keys(spent)) {
-      if (!Number.isFinite(p[key])) {
+      if (Number.isFinite(p[key])) {
+        spent[key] += p[key];
+      } else {
         incomplete = true;
         spent[key] = Number.NaN;
-      } else {
-        spent[key] += p[key];
       }
     }
   }
@@ -245,13 +259,13 @@ function computeBudgets(cfg, providers) {
       incomplete,
       limit,
       spent: s,
-      status: !Number.isFinite(s)
-        ? 'incomplete'
-        : s >= limit
+      status: Number.isFinite(s)
+        ? s >= limit
           ? 'over'
           : incomplete
             ? 'incomplete'
-            : budgetStatus(s, limit),
+            : budgetStatus(s, limit)
+        : 'incomplete',
     };
   }
   return Object.keys(out).length ? out : null;

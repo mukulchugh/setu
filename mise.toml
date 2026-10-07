@@ -1,6 +1,5 @@
 [tools]
-# Pinned to the exact version this repo has been built/tested against all
-# session, not a floating range — `mise install` gets everyone (and every
-# CI run) the same bun, rather than "whatever happened to be on PATH."
+# The installer provisions Bun 1.3.14, and mise selects the same version in
+# this checkout. Compatibility coverage also includes Bun 1.3.4.
 # Bump deliberately, not silently, when there's a real reason to.
-bun = "1.3.4"
+bun = "1.3.14"

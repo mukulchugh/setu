@@ -4,8 +4,8 @@ import nativeFs from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertStorageHeadroom } from './host-health.js';
 import { isConnectionRefused } from './connection-refused.js';
+import { assertStorageHeadroom } from './host-health.js';
 import { observeProcessIdentity } from './process-observation.js';
 import { runUpdateTransaction } from './update-transaction.js';
 import { createWorkspaceState } from './workspace-state.js';
@@ -174,9 +174,9 @@ export function createUpdateCommand({
       await assertStorage(directory);
     } catch (error) {
       return {
-        ok: false,
         code: error.code || 'STORAGE_UNKNOWN',
         error: error.message,
+        ok: false,
         stage: 'preflight',
       };
     }
@@ -216,7 +216,12 @@ export function createUpdateCommand({
             return false;
           },
           inspectPortal,
-          install: () => run(process.execPath, ['install'], { cwd: directory }),
+          install: ({ frozenLockfile } = {}) =>
+            run(
+              process.execPath,
+              ['install', ...(frozenLockfile ? ['--frozen-lockfile'] : [])],
+              { cwd: directory }
+            ),
           link: () => run(process.execPath, ['link'], { cwd: directory }),
           operationId,
           quiesce: async (portal) => ({
@@ -227,12 +232,6 @@ export function createUpdateCommand({
             processId: portal.processId,
             processStartIdentity: portal.processStartIdentity,
           }),
-          reopen: (owner) =>
-            request('/api/update/reopen', {
-              coherent: true,
-              instanceId: owner.instanceId,
-              token: owner.token,
-            }),
           rebaseInProgress: async () => {
             for (const name of ['rebase-merge', 'rebase-apply']) {
               const path = (
@@ -246,6 +245,12 @@ export function createUpdateCommand({
             }
             return false;
           },
+          reopen: (owner) =>
+            request('/api/update/reopen', {
+              coherent: true,
+              instanceId: owner.instanceId,
+              token: owner.token,
+            }),
           restart,
           writeCheck: () =>
             state.update('config', (current) => ({

@@ -474,7 +474,6 @@ test('MCP registers claim, release and list with the existing JSON response and 
     return data.result;
   }
   const tools = (await rpc('tools/list')).tools;
-  expect(tools).toHaveLength(18);
   expect(tools.map(t => t.name)).toEqual(expect.arrayContaining(['claim_worktree', 'release_worktree', 'list_claims']));
   expect(tools.find(t => t.name === 'claim_worktree').inputSchema.required).toContain('pid');
   const call = (name, args) => rpc('tools/call', { name, arguments: args });

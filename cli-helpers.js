@@ -4,6 +4,14 @@ export function caddyfileText(workspace) {
   return `{\n  auto_https off\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
 }
 
+export function portalCaddyRoute(port) {
+  return `http://quivly.local {\n  reverse_proxy localhost:${port}\n}\n`;
+}
+
+export function hasPortalCaddyRoute(text, port) {
+  return text === portalCaddyRoute(port);
+}
+
 // Replaces an existing Setu block. The caller appends when no start marker exists.
 export function withSetuBlock(current, block, start, end) {
   const startAt = current.indexOf(start);
@@ -72,11 +80,11 @@ export function cursorConfigText(config, url) {
 export function startOutcome(response) {
   if (response.ok && response.queued) {
     return {
-      started: false,
-      queued: true,
       position: response.position,
+      queued: true,
       reason: response.reason,
+      started: false,
     };
   }
-  return { started: !!response.ok, queued: false };
+  return { queued: false, started: !!response.ok };
 }

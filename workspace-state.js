@@ -148,6 +148,14 @@ export function parseProjects(text) {
 }
 
 const definitions = {
+  // Runtime records below each belong to one module. They never live in the
+  // user's config file, which stays small and hand-editable.
+  agentSessions: {
+    file: '.setu-agent-sessions.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
   approvals: {
     coupled: true,
     file: 'sidecar-approvals.json',
@@ -159,6 +167,18 @@ const definitions = {
     file: 'archived-worktrees.json',
     initial: () => [],
     validate: (value) => Array.isArray(value) && value.every(object),
+  },
+  attention: {
+    file: '.setu-attention.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
+  cacheManifests: {
+    file: '.setu-cache-manifests.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
   },
   config: { initial: () => ({}), private: true, validate: object },
   customAgents: {
@@ -174,10 +194,27 @@ const definitions = {
           )
       ),
   },
+  dependencyViews: {
+    file: '.setu-dependency-views.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
   fileSync: {
     file: 'file-sync.json',
     initial: () => ({}),
     validate: (value) => perRepo(value, strings),
+  },
+  headlessRuns: {
+    file: '.setu-headless-runs.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
+  mcpActions: {
+    file: 'mcp-actions.json',
+    initial: () => ({}),
+    validate: object,
   },
   mcpServers: {
     file: 'mcp-servers.json',
@@ -198,6 +235,12 @@ const definitions = {
     initial: () => ({}),
     private: true,
     validate: (value) => object(value) && Object.values(value).every(object),
+  },
+  operationEvents: {
+    file: '.setu-operations.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
   },
   ports: {
     coupled: true,
@@ -245,6 +288,18 @@ const definitions = {
     coupled: true,
     file: '.setu-removals.json',
     forceMode: 0o600,
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
+  resourceAdmission: {
+    file: '.setu-admission.json',
+    initial: () => ({}),
+    private: true,
+    validate: object,
+  },
+  setupProgress: {
+    file: '.setu-setup-progress.json',
     initial: () => ({}),
     private: true,
     validate: object,
@@ -407,7 +462,7 @@ export function createWorkspaceState({
             } catch (probe) {
               alive = probe?.code !== 'ESRCH';
             }
-            stale = !alive ? inspected : undefined;
+            stale = alive ? undefined : inspected;
           }
         } catch {
           // A malformed, replaced or unreadable lease is never safe to steal.
@@ -457,7 +512,6 @@ export function createWorkspaceState({
       }
     };
     const lock = {
-      retained: false,
       owned,
       release() {
         if (owned()) {
@@ -496,6 +550,7 @@ export function createWorkspaceState({
           }
         }
       },
+      retained: false,
     };
     heldLocks.add(lock);
     return lock;

@@ -7,14 +7,16 @@ import { createHash } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
-  mkdirSync,
   lstatSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { cpus, homedir, totalmem } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createCommandRunner, renderDockerCompose } from './dev-runtime.js';
 import { assertStorageHeadroom } from './host-health.js';
 import {
@@ -45,7 +47,10 @@ export const CFG_PATH = join(HOME, '.setu.json');
 // writeSetuAgentMarkers drops into MANAGED PROJECTS below — same filename
 // stem, opposite commit semantics; see AGENTS.md's Conventions section.
 export const COSTS_CFG_PATH = join(HOME, '.setu-costs.json');
-export const SETU_DIR = join(HOME, '.setu');
+export const SETU_DIR = dirname(fileURLToPath(import.meta.url));
+export const PACKAGE_VERSION = JSON.parse(
+  readFileSync(join(SETU_DIR, 'package.json'), 'utf8')
+).version;
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
 export const HOSTS_TMP = '/tmp/setu-hosts';
@@ -125,7 +130,7 @@ export function requireConfig() {
   return c;
 }
 
-export function portalRequestError(req, address) {
+export function portalRequestError(req, address, port = PORTAL_PORT) {
   const local = (ip) =>
     ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1';
   if (!local(address)) {
@@ -137,9 +142,9 @@ export function portalRequestError(req, address) {
     return 'Remote proxy clients are not allowed';
   }
   const hosts = new Set([
-    `localhost:${PORTAL_PORT}`,
-    `127.0.0.1:${PORTAL_PORT}`,
-    `[::1]:${PORTAL_PORT}`,
+    `localhost:${port}`,
+    `127.0.0.1:${port}`,
+    `[::1]:${port}`,
     'quivly.local',
     'quivly.local:80',
   ]);
@@ -325,7 +330,24 @@ export async function writeEnvrc(wtDir, port, appUrl, redirectUri) {
       `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`
     )
   );
-  spawnSync('direnv', ['allow', wtDir], { stdio: 'ignore', timeout: 5000 });
+  await allowDirenvAsync(wtDir);
+}
+
+export async function allowDirenvAsync(
+  wtDir,
+  { spawn = (args, options) => Bun.spawn(args, options) } = {}
+) {
+  try {
+    const proc = spawn(['direnv', 'allow', wtDir], {
+      stderr: 'ignore',
+      stdin: 'ignore',
+      stdout: 'ignore',
+      timeout: 5000,
+    });
+    await proc.exited;
+  } catch {
+    // direnv is optional, as with the synchronous CLI helper it replaces.
+  }
 }
 
 export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
@@ -402,6 +424,39 @@ export function reloadCaddy(
       run('sudo', ['-n', CADDY_BIN, 'reload', '--config', caddyfile], {
         stdio: 'ignore',
         timeout: 5000,
+      });
+      return true;
+    } catch {
+      console.warn(
+        `⚠  caddy reload failed — run: sudo ${CADDY_BIN} reload --config ${caddyfile}`
+      );
+      return false;
+    }
+  });
+}
+
+export async function reloadCaddyAsync(
+  workspace,
+  {
+    state = workspaceState(workspace),
+    run = async (args, { timeoutMs }) => {
+      const proc = Bun.spawn(args, {
+        stderr: 'ignore',
+        stdin: 'ignore',
+        stdout: 'ignore',
+        timeout: timeoutMs,
+      });
+      if ((await proc.exited) !== 0) {
+        throw new Error('caddy reload failed');
+      }
+    },
+  } = {}
+) {
+  return state.withRouting(async () => {
+    const caddyfile = join(workspace, 'Caddyfile');
+    try {
+      await run(['sudo', '-n', CADDY_BIN, 'reload', '--config', caddyfile], {
+        timeoutMs: 5000,
       });
       return true;
     } catch {
@@ -551,46 +606,6 @@ export function listActivePorts() {
   return results;
 }
 
-// Async sibling of listActivePorts — same parsing, sourced from spawnText
-// (which already tolerates lsof's exit-1-on-success quirk by never
-// throwing). portal.js's hot paths use this; cli.js keeps the sync version.
-export async function listActivePortsAsync() {
-  const out = await spawnText([
-    'lsof',
-    '-i',
-    'TCP:3000-3999',
-    '-i',
-    'TCP:8288-9287',
-    '-sTCP:LISTEN',
-    '-nP',
-    '-F',
-    'pcn',
-  ]);
-  const results = [];
-  const seen = new Set();
-  let cur = {};
-  for (const line of out.split('\n')) {
-    if (line.startsWith('p')) {
-      cur = { pid: line.slice(1) };
-    } else if (line.startsWith('c')) {
-      cur.cmd = line.slice(1);
-    } else if (line.startsWith('n')) {
-      const m = line.match(/:(\d+)$/);
-      if (!m) {
-        continue;
-      }
-      // Same IPv4/IPv6 dual-socket dedup as listActivePorts above.
-      const key = `${cur.pid}:${m[1]}`;
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      results.push({ cmd: cur.cmd, pid: cur.pid, port: +m[1] });
-    }
-  }
-  return results;
-}
-
 // cwd of a live process, via lsof — used to verify a port's actual listener
 // belongs to the worktree the registry claims it does (setu doctor/prune).
 export function processCwd(pid) {
@@ -630,7 +645,7 @@ export const AGENT_CLIS = {
 };
 
 export function commandExists(bin) {
-  return spawnSync('which', [bin], { stdio: 'ignore' }).status === 0;
+  return Boolean(Bun.which(bin));
 }
 
 // Only send -pgid when pid IS the group leader (pgid === pid) — same guard
@@ -659,28 +674,6 @@ export function killGroup(pid, signal = 'TERM') {
   try {
     execFileSync('kill', [`-${signal}`, '--', target], { stdio: 'ignore' });
     return true;
-  } catch {
-    return false;
-  }
-}
-
-// Async sibling of killGroup — same pgid-then-kill shape, Bun.spawn instead
-// of execFileSync so a stop/remove request doesn't block the whole portal.
-export async function killGroupAsync(pid, signal = 'TERM') {
-  let pgid = pid;
-  const out = (
-    await spawnText(['ps', '-o', 'pgid=', '-p', String(pid)])
-  ).trim();
-  if (out) {
-    pgid = Number.parseInt(out, 10);
-  }
-  const target = pgid === pid ? `-${pgid}` : String(pid);
-  try {
-    const proc = Bun.spawn(['kill', `-${signal}`, '--', target], {
-      stderr: 'ignore',
-      stdout: 'ignore',
-    });
-    return (await proc.exited) === 0;
   } catch {
     return false;
   }
@@ -838,11 +831,11 @@ export function workspaceInventoryRegistry(workspace) {
     ...registrations.map((entry) => entry.repo),
   ]);
   return {
-    registrations,
     projects: [...repos].map((repo) => {
       validateWorktreeNames(repo, 'main');
       return { repo, repoDir: join(workspace, `${repo}.git`) };
     }),
+    registrations,
   };
 }
 
@@ -1206,7 +1199,9 @@ export function ensureSetuExcludes(repoDir) {
   try {
     current = readFileSync(exclude, 'utf8');
   } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
     mkdirSync(dirname(exclude), { recursive: true });
   }
   const existing = new Set(current.split(/\r?\n/));
@@ -1395,8 +1390,13 @@ export async function composeProjectAliveAsync(project) {
 }
 
 // Teardown failures must keep the worktree tracked and prevent deletion.
-export async function composeDownAsync(project, composeFile, extraArgs = []) {
-  const proc = Bun.spawn(
+export async function composeDownAsync(
+  project,
+  composeFile,
+  extraArgs = [],
+  { spawn = (...args) => Bun.spawn(...args) } = {}
+) {
+  const proc = spawn(
     [
       'docker',
       'compose',
@@ -1479,7 +1479,49 @@ export async function writeDockerCompose(
 }
 
 export function agentComposePath(wtDir) {
-  return join(wtDir, 'docker-compose.setu-agent.yml');
+  const id = createHash('sha1').update(wtDir).digest('hex').slice(0, 12);
+  return join(dirname(wtDir), `.setu-agent-compose-${id}.yml`);
+}
+
+function agentGitMounts(wtDir, registeredBareRepoDir) {
+  const gitFile = join(wtDir, '.git');
+  const gitPointer = readFileSync(gitFile, 'utf8').match(
+    /^gitdir:\s*(.+)\s*$/m
+  )?.[1];
+  if (!gitPointer) {
+    throw new Error(`Could not identify the Git admin directory for ${wtDir}`);
+  }
+  const adminDir = resolve(wtDir, gitPointer);
+  const canonicalBare = realpathSync(registeredBareRepoDir);
+  const canonicalAdmin = realpathSync(adminDir);
+  const adminRelative = relative(
+    join(canonicalBare, 'worktrees'),
+    canonicalAdmin
+  );
+  if (
+    !adminRelative ||
+    adminRelative.startsWith('..') ||
+    isAbsolute(adminRelative)
+  ) {
+    throw new Error(
+      'Git admin directory is outside the registered bare repository'
+    );
+  }
+  const commonDir = readFileSync(join(adminDir, 'commondir'), 'utf8').trim();
+  const bareRepoDir = resolve(adminDir, commonDir);
+  if (realpathSync(bareRepoDir) !== canonicalBare) {
+    throw new Error(
+      'Git common directory does not match the registered bare repository'
+    );
+  }
+  const checkoutGitFile = resolve(
+    adminDir,
+    readFileSync(join(adminDir, 'gitdir'), 'utf8').trim()
+  );
+  if (realpathSync(checkoutGitFile) !== realpathSync(gitFile)) {
+    throw new Error('Git admin directory does not belong to this worktree');
+  }
+  return { adminDir, bareRepoDir };
 }
 
 // Agent-container sibling of writeDockerCompose, for the short-lived headless
@@ -1525,12 +1567,12 @@ export async function writeAgentCompose(
   // into the bare repo. Mounting only `wtDir:/workspace` (fine for
   // writeDockerCompose — `bun run dev` never touches git) leaves that
   // pointer dangling inside the container: nothing at that path, git
-  // resolution fails on the first command. The bare repo has to be mounted
-  // at the *identical* host path so the pointer resolves unchanged, and
-  // read-write because `git commit` writes objects/refs into that shared
-  // dir — read-only would turn every commit inside the container into a
-  // permission error.
-  const bareRepoDir = `${c.workspace}/${repo}.git`;
+  // resolution fails on the first command. Validate that pointer against the
+  // registered bare repository before mounting its own admin directory.
+  const { adminDir, bareRepoDir } = agentGitMounts(
+    wtDir,
+    join(c.workspace, `${repo}.git`)
+  );
   // node_modules MUST be a container-local named volume, exactly as
   // writeDockerCompose does it — and for a sharper reason here. The worktree
   // is bind-mounted read-write, so a `bun install` run *inside* the Linux
@@ -1549,7 +1591,11 @@ export async function writeAgentCompose(
     `      - ${wtDir}:/workspace`,
     '      - node_modules:/workspace/node_modules',
     `      - ${bunCacheDir(c.workspace)}:/bun-cache`,
-    `      - ${bareRepoDir}:${bareRepoDir}`,
+    `      - ${bareRepoDir}:${bareRepoDir}:ro`,
+    `      - ${adminDir}:${adminDir}`,
+    `      - ${bareRepoDir}/objects:${bareRepoDir}/objects`,
+    `      - ${bareRepoDir}/refs:${bareRepoDir}/refs`,
+    `      - ${bareRepoDir}/logs:${bareRepoDir}/logs`,
   ];
   // Credential mounts are forced read-only regardless of what the caller
   // passed in `readonly` — a writable credential mount would let a
@@ -1625,8 +1671,14 @@ export async function writeAgentCompose(
 export function writerClaimPaths(workspace, cwd = process.cwd()) {
   const candidates = [cwd];
   if (workspace) {
-    candidates.push(...portEntries(workspace).map(e => join(workspace, e.repo, e.name)));
-    candidates.push(...Object.keys(loadProjects(workspace)).map(repo => join(workspace, `${repo}.git`)));
+    candidates.push(
+      ...portEntries(workspace).map((e) => join(workspace, e.repo, e.name))
+    );
+    candidates.push(
+      ...Object.keys(loadProjects(workspace)).map((repo) =>
+        join(workspace, `${repo}.git`)
+      )
+    );
   }
   return discoverWriterWorktrees(candidates);
 }
@@ -1721,6 +1773,35 @@ export function baseBranchRef(repoDir) {
     : `origin/${git(repoDir, ['symbolic-ref', '--short', 'HEAD']).trim()}`;
 }
 
+async function runLocalGit(repoDir, args) {
+  const proc = Bun.spawn(['git', '-C', repoDir, ...args], {
+    stderr: 'ignore',
+    stdin: 'ignore',
+    stdout: 'pipe',
+  });
+  const [stdout, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    throw new Error(`git ${args.join(' ')} failed`);
+  }
+  return stdout.trim();
+}
+
+export async function baseBranchRefAsync(repoDir, { run = runLocalGit } = {}) {
+  for (const ref of ['refs/heads/staging', 'refs/remotes/origin/staging']) {
+    try {
+      await run(repoDir, ['show-ref', '--verify', '--quiet', ref]);
+      return 'origin/staging';
+    } catch {
+      // A missing local or remote staging ref falls through to HEAD, as in
+      // branchExists() above.
+    }
+  }
+  return `origin/${(await run(repoDir, ['symbolic-ref', '--short', 'HEAD'])).trim()}`;
+}
+
 // Merges the worktree's resolved base (same one branchMetadata's ahead/behind
 // already compares against) into the worktree's own branch — "sync with
 // staging" in the UI. Deliberately clean-only, by explicit decision: a merge
@@ -1733,12 +1814,12 @@ export async function syncWithBase(
   wtDir,
   repoDir,
   {
-    resolveBase = baseBranchRef,
+    resolveBase = baseBranchRefAsync,
     runGit = gitFetchAsync,
     exists = existsSync,
   } = {}
 ) {
-  const base = resolveBase(repoDir);
+  const base = await resolveBase(repoDir);
   const branchName = base.replace(/^origin\//, '');
   // A detached worktree has no branch name; it cannot be the base branch.
   const checkedOut = (
@@ -1968,7 +2049,7 @@ export async function createWorktree(
     const mainEnv = envLocalPath(repo, join(c.workspace, repo, 'main'));
     const wtEnv = envLocalPath(repo, wtDir);
     if (existsSync(mainEnv) && !existsSync(wtEnv)) {
-      spawnSync('ln', ['-sf', mainEnv, wtEnv], { stdio: 'ignore' });
+      linkWorktreeEnv(mainEnv, wtEnv);
     }
 
     const mainDir = join(c.workspace, repo, 'main');
@@ -1976,7 +2057,7 @@ export async function createWorktree(
 
     await workspaceState(c.workspace).withRouting(async () => {
       await syncHosts(c.workspace);
-      await reloadCaddy(c.workspace);
+      await reloadCaddyAsync(c.workspace);
     });
 
     return {
@@ -1986,6 +2067,17 @@ export async function createWorktree(
       wtDir,
     };
   });
+}
+
+// The old `ln -sf` result was deliberately ignored. Keep setup non-fatal when
+// a concurrent creator wins the destination path, without deleting that path.
+export function linkWorktreeEnv(mainEnv, wtEnv, { link = symlinkSync } = {}) {
+  try {
+    link(mainEnv, wtEnv);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Removes worktree + registry entries + caddy snippet + hosts. Stopping dev
@@ -2292,13 +2384,16 @@ async function batchMap(items, size, fn) {
 // today, so this doesn't try to. timeoutMs is opt-in per call; omitted
 // entirely for calls that should never be cut off (e.g. the sweep find walk,
 // which can legitimately take multiple seconds over a full $HOME).
-export async function spawnText(args, { timeoutMs } = {}) {
+export async function spawnText(
+  args,
+  { timeoutMs, spawn = (...command) => Bun.spawn(...command) } = {}
+) {
   try {
     const opts = { stderr: 'ignore', stdout: 'pipe' };
     if (timeoutMs) {
       opts.timeout = timeoutMs;
     }
-    const proc = Bun.spawn(args, opts);
+    const proc = spawn(args, opts);
     const text = await new Response(proc.stdout).text();
     await proc.exited;
     return text.trim();

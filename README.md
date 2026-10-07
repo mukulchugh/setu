@@ -35,36 +35,69 @@ setu doctor     # checks every layer — dnsmasq, caddy, sudoers, tunnel, worktr
 
 ## Commands
 
+`--json` is accepted by the CLI parser. These are the command-specific flags.
+
+```text
+setu setup [--name X --workspace PATH --zone DOMAIN --engine orbstack|docker|colima|skip --yes]
+setu doctor [--json]
+setu init <gh-org>/<repo> [label]
+setu sweep [--import NAME]
+setu new <repo> <branch> [--tunnel --start --container|--bare]
+setu rm <repo> <branch> [--force] [--operation-id ID]
+setu ls [repo] | setu status
+setu start <repo> <branch> [--container|--bare]
+setu stop <repo> <branch>
+setu prune [--force]
+setu fetch <repo>
+setu portal [stop]
+setu mcp install <client> | setu mcp install --all | setu mcp status
+setu tunnel <repo> <branch> [stop]
+setu sync <repo> <branch>
+setu trigger <repo> <branch> [stop]
+setu logs <repo> <branch> [--type TYPE --lines N]
+setu diff <repo> <branch> [--verbose]
+setu ports
+setu pr create|ready|status <repo> <branch>
+setu storage [inspect <repo> <branch> | inspect --store ID]
+setu operations [repo branch] [--since ISO --limit N]
+setu sessions [list [repo branch] | end <repo> <branch> --session ID --checkout FILE|-]
+setu caches prepare <repo> <branch>
+setu caches execute <repo> <branch> --manifest ID --confirmation TOKEN
+setu caches execute <repo> <branch> --retry FILE|-
+setu admission
+setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout FILE|- --attempt ID]
+setu attention [list [repo branch] | focus <repo> <branch> --session ID --checkout FILE|-]
+setu headless list [repo branch]
+setu headless start <repo> <branch> --prompt-file FILE|- [--model NAME --budget USD --wall-clock-ms N --output-bytes N]
+setu headless resume <repo> <branch> --run ID --prompt-file FILE|- [--model NAME --budget USD --wall-clock-ms N --output-bytes N]
+setu headless cancel <repo> <branch> --run ID --checkout FILE|-
+setu dependencies [status [repo branch] | verify|repair <repo> <branch>]
+setu shared-caches
+setu workflows list|runs <repo> <branch>
+setu workflows dispatch <repo> <branch> --workflow ID --ref REF --inputs FILE|- [--confirmation TOKEN]
+setu actions list | save --input FILE|- | preflight --action ID --input FILE|- | invoke --action ID --input FILE|- --confirmation TOKEN
+setu adopt <repo> <branch> --path LINKED_CHECKOUT
+setu review handoff <repo> <branch> --session ID --checkout FILE|- --artifact FILE|- --findings FILE|-
+setu path <repo> <branch> | setu cd <repo> <branch>
+setu update [--restart] [--include-untracked]
+setu version | setu help
+setu claim [worktree] --agent NAME --session ID --task TEXT [--pid PID]
+setu release [worktree] --session ID | setu claims | setu claim-check <path> --session ID
 ```
-setu setup [--name x --yes]       First-time onboarding
-setu doctor [--json]              Layer-by-layer health check
 
-setu init  quivly/quivly-app      Clone repo + create main worktree
-setu new   <repo> <branch>        Create worktree (auto port + local domain)
-setu new   <repo> <branch> --tunnel   ...and take the public URL
-setu new   <repo> <branch> --start    ...and start its dev server
-setu rm    <repo> <branch>        Remove a clean worktree through the running portal
-setu rm    <repo> <branch> --force  Discard local changes and remove
-                                   (a worktree named main is never removed)
-setu rm    <repo> <branch> --operation-id <id>  Retry only that pending cleanup
+`setu start` and `setu new --start` can be accepted into a queue. Check
+worktree state before calling the dev server running. `rm --force`, `prune
+--force` request destructive behavior. Cache execution requires the user to
+confirm the reviewed manifest and submit its returned token; possession of the
+token is not approval. An uncertain removal must be inspected and resumed only
+with its returned operation ID. `update` and `prune` are CLI-only. Settings are
+web/API-only and have no CLI or MCP command.
 
-setu cd    <repo> <branch>        cd into worktree
-setu ls    [repo] [--json]        List worktrees + running state
-setu start <repo> <branch>        Start dev server — sticky default: stays whatever mode this worktree has run as before, containerized if it's new (via the portal; queues past the concurrency cap)
-setu start <repo> <branch> --container  Force containerized, even on a worktree that's always been bare
-setu start <repo> <branch> --bare       Force bare, even on a worktree that's containerized before
-setu stop  <repo> <branch>        Stop dev server (or cancel it if still queued)
-setu prune [--force]              Find/kill dev servers running outside the registry
-setu fetch <repo>                 git fetch --all
-setu tunnel <repo> <branch>       Point the public URL at this worktree
-setu tunnel <repo> <branch> stop  Release it
-setu trigger <repo> <branch> [stop]  Start or stop Trigger through the running portal
-
-setu portal                       Start web UI at http://quivly.local
-setu portal stop                  Stop portal
-setu update [--restart]            Guarded update on branch main; explicit restart authorization
-setu version                      Version + commit
-```
+The complete local HTTP method/path inventory, per-operation target shapes,
+confirmation and recovery requirements, front-door support, and MCP tool input
+shapes are in [AGENTS.md](./AGENTS.md#complete-interface-contract). The tables
+are maintained against the exported portal route catalog rather than a second
+hand-maintained API list.
 
 ## Raycast extension
 

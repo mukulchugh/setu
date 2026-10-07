@@ -1,9 +1,23 @@
 import { expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   createDeploymentGuard,
   createDeploymentLauncher,
   createProviderResolver,
+  installedDeployTool,
 } from './deployment-guard.js';
+import { createPortalOperationOutcomes } from './portal-operation-outcomes.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 
 function fixture(options = {}) {
@@ -51,6 +65,7 @@ function fixture(options = {}) {
       await options.beforeResolve?.();
       return { destination, launch: { args: ['bound', destination.id] } };
     },
+    revision: async () => ({ dirty: false, head: 'a'.repeat(40), known: true }),
     startOperation: (target, launch) =>
       lifecycle.startOperation(target, 'deploy', launch),
     target: () => target,
@@ -75,6 +90,60 @@ function fixture(options = {}) {
     request,
   };
 }
+
+test('production confirmation binds the real HEAD commit and dirty state', async () => {
+  const wtDir = mkdtempSync(join(tmpdir(), 'setu-deploy-head-'));
+  const git = (args) =>
+    execFileSync('git', args, { cwd: wtDir, encoding: 'utf8' });
+  git(['init']);
+  git(['config', 'user.email', 'test@example.invalid']);
+  git(['config', 'user.name', 'Test']);
+  writeFileSync(join(wtDir, 'file.txt'), 'first\n');
+  git(['add', 'file.txt']);
+  git(['commit', '-m', 'first']);
+  const target = { key: 'repo/topic', name: 'topic', repo: 'repo', wtDir };
+  let launches = 0;
+  const guard = createDeploymentGuard({
+    branch: async () => 'main',
+    deploymentState: () => null,
+    identity: async () => ({ known: true }),
+    launch: async () => {
+      launches += 1;
+      return { ok: true };
+    },
+    operation: () => null,
+    resolveProvider: async () => ({
+      destination: { environment: 'production', id: 'target', label: 'target' },
+      launch: { command: ['never'] },
+    }),
+    startOperation: async (_target, work) => work(),
+    target: () => target,
+  });
+  const request = {
+    name: 'topic',
+    provider: 'vercel',
+    repo: 'repo',
+    target: 'production',
+  };
+  const confirmation = await guard.preflight(request);
+  expect(confirmation.expectedContext.revision).toMatchObject({
+    dirty: false,
+    known: true,
+  });
+  writeFileSync(join(wtDir, 'file.txt'), 'second\n');
+  git(['add', 'file.txt']);
+  git(['commit', '-m', 'second']);
+  expect(
+    await guard.dispatch({
+      ...request,
+      expectedContext: confirmation.expectedContext,
+    })
+  ).toMatchObject({
+    code: 'DEPLOY_CONTEXT_CHANGED',
+    ok: false,
+  });
+  expect(launches).toBe(0);
+});
 
 test('production needs the exact preflight context and holds admission through completion', async () => {
   const f = fixture();
@@ -362,9 +431,7 @@ test('failed output reading waits for confirmed exit before releasing deployment
       exited,
       stdout: {
         getReader: () => ({
-          read: () => {
-            return Promise.reject(new Error('pipe failed'));
-          },
+          read: () => Promise.reject(new Error('pipe failed')),
           releaseLock: readFailed,
         }),
       },
@@ -394,6 +461,15 @@ test('provider result handling retains Netlify site checks and Convex success wi
   const stores = { convex: new Map(), netlify: new Map() },
     spawns = [];
   let output = '{"site_id":"unexpected","url":"https://wrong.invalid"}';
+  const recorded = [];
+  const outcomes = createPortalOperationOutcomes({
+    events: {
+      record: async (event) => {
+        recorded.push(event);
+        return { ok: true };
+      },
+    },
+  });
   const launcher = createDeploymentLauncher({
     appendLog: () => {
       /* No side effect is needed in this fixture. */
@@ -401,6 +477,7 @@ test('provider result handling retains Netlify site checks and Convex success wi
     closeLog: () => {
       /* No side effect is needed in this fixture. */
     },
+    env: { CONVEX_DEPLOY_KEY: 'inherited-key', PATH: '/fixture/bin' },
     now: () => 1,
     openLog: () => 20,
     spawn: (command, options) => {
@@ -425,7 +502,12 @@ test('provider result handling retains Netlify site checks and Convex success wi
     cwd: '/checkout',
     linkedSiteId: 'expected',
   });
-  await first.completion;
+  const handle = await outcomes.accept({ kind: 'deploy' });
+  expect(await outcomes.watch(handle, first.completion)).toMatchObject({
+    code: 'DEPLOY_FAILED',
+    ok: false,
+  });
+  expect(recorded.at(-1).state).toBe('failed');
   expect(stores.netlify.get('repo/topic')).toMatchObject({
     deploying: false,
     url: null,
@@ -434,15 +516,79 @@ test('provider result handling retains Netlify site checks and Convex success wi
   output = 'Deployment complete';
   const second = await launcher(
     { ...request, provider: 'convex', target: 'production' },
-    { command: ['/installed/convex', 'deploy'], cwd: '/checkout' }
+    {
+      command: ['/installed/convex', 'deploy'],
+      cwd: '/checkout',
+      env: { CONVEX_DEPLOY_KEY: 'project-key' },
+    }
   );
-  await second.completion;
+  await expect(second.completion).resolves.toMatchObject({ ok: true });
   expect(stores.convex.get('repo/topic')).toMatchObject({
     deploying: false,
     ok: true,
   });
   expect(spawns[1].command).toEqual(['/installed/convex', 'deploy']);
   expect(spawns[1].options.stdin).toBe('ignore');
+  expect(spawns[1].options.env).toEqual({
+    CONVEX_DEPLOY_KEY: 'project-key',
+    PATH: '/fixture/bin',
+  });
+});
+
+test('deployment preflight resolves an installed monorepo CLI without executing it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-deploy-tool-'));
+  try {
+    const app = join(root, 'apps', 'web');
+    const bin = join(root, 'node_modules', '.bin');
+    const pkg = join(root, 'node_modules', 'convex');
+    mkdirSync(app, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(
+      join(pkg, 'package.json'),
+      JSON.stringify({ name: 'convex', version: '1.42.0' })
+    );
+    const executable = join(pkg, 'cli.js');
+    writeFileSync(executable, '#!/bin/sh\nexit 99\n');
+    chmodSync(executable, 0o755);
+    symlinkSync(executable, join(bin, 'convex'));
+    const installed = await installedDeployTool(
+      'convex',
+      { checkoutRoot: root, wtDir: app },
+      { which: () => null }
+    );
+    expect(installed).toEqual({
+      executable: realpathSync(executable),
+      version: '1.42.0',
+    });
+    const resolver = createProviderResolver({
+      convexDeployKey: async () => ({
+        value: 'preview:team:project|private-test-key',
+      }),
+      tool: (provider, checkout) =>
+        installedDeployTool(provider, checkout, { which: () => null }),
+    });
+    const resolved = await resolver(
+      { provider: 'convex', target: 'topic' },
+      { checkoutRoot: root, wtDir: app }
+    );
+    expect(resolved.launch).toMatchObject({
+      command: [realpathSync(executable), 'deploy', '--preview-name', 'topic'],
+      cwd: app,
+      env: { CONVEX_DEPLOY_KEY: 'preview:team:project|private-test-key' },
+    });
+    expect(
+      JSON.stringify({
+        binding: resolved.binding,
+        destination: resolved.destination,
+      })
+    ).not.toContain('private-test-key');
+    expect(
+      await installedDeployTool('convex', { wtDir: app }, { which: () => null })
+    ).toBeNull();
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test('a log-close error after spawn still retains completion ownership', async () => {
@@ -585,7 +731,7 @@ test('unknown provider inspection command completion remains unknown to the life
   ).rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
 });
 
-test('Netlify keeps explicit preview without enabling fallback-prone production, and Convex remains unsupported', async () => {
+test('Netlify binds production and explicit aliases to its linked site, and Convex remains refused without a verified key identity', async () => {
   let probes = 0;
   const resolver = createProviderResolver({
     readJson: () =>
@@ -614,11 +760,70 @@ test('Netlify keeps explicit preview without enabling fallback-prone production,
   expect(result.launch.linkedSiteId).toBe(
     '11111111-2222-3333-4444-555555555555'
   );
-  await expect(
-    resolver({ provider: 'netlify', target: 'production' }, {})
-  ).rejects.toMatchObject({ code: 'DEPLOY_TARGET_UNVERIFIED' });
+  const production = await resolver(
+    { provider: 'netlify', target: 'production' },
+    { wtDir: '/checkout' }
+  );
+  expect(production.destination).toMatchObject({
+    environment: 'production',
+    id: '11111111-2222-3333-4444-555555555555',
+  });
+  expect(production.launch.command).toContain('--prod');
+  const alias = await resolver(
+    { provider: 'netlify', target: 'review-42' },
+    { wtDir: '/checkout' }
+  );
+  expect(alias.destination).toMatchObject({
+    environment: 'custom',
+    label: '11111111-2222-3333-4444-555555555555 alias review-42',
+  });
+  expect(alias.launch.command).toContain('--alias');
+  expect(alias.launch.command).toContain('review-42');
   await expect(
     resolver({ provider: 'convex', target: 'preview' }, {})
   ).rejects.toMatchObject({ code: 'DEPLOY_TARGET_UNVERIFIED' });
   expect(probes).toBe(0);
+});
+
+test('Convex binds production keys and explicit preview names without provider discovery', async () => {
+  const resolver = createProviderResolver({
+    convexDeployKey: async () => ({
+      value: 'preview:team-one:project-one|secret',
+    }),
+    readJson: async () => ({}),
+    run: async () => {
+      throw new Error('no discovery');
+    },
+    tool: async () => ({ executable: '/installed/convex', version: '1.0.0' }),
+  });
+  const preview = await resolver(
+    { provider: 'convex', target: 'review-42' },
+    { wtDir: '/checkout' }
+  );
+  expect(preview.destination).toMatchObject({
+    environment: 'custom',
+    id: 'team-one/project-one/review-42',
+  });
+  expect(preview.launch.command).toEqual([
+    '/installed/convex',
+    'deploy',
+    '--preview-name',
+    'review-42',
+  ]);
+  const production = createProviderResolver({
+    convexDeployKey: async () => ({
+      value: 'prod:qualified-jaguar-123|secret',
+    }),
+    readJson: async () => ({}),
+    run: async () => ({}),
+    tool: async () => ({ executable: '/installed/convex', version: '1.0.0' }),
+  });
+  expect(
+    (
+      await production(
+        { provider: 'convex', target: 'production' },
+        { wtDir: '/checkout' }
+      )
+    ).launch.command
+  ).toEqual(['/installed/convex', 'deploy']);
 });

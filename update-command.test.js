@@ -163,7 +163,7 @@ test('low or unknown storage refuses update before any Git, portal, or install e
     };
     expect(
       await createUpdateCommand(options).update({ restartAuthorized: true })
-    ).toMatchObject({ ok: false, code, stage: 'preflight' });
+    ).toMatchObject({ code, ok: false, stage: 'preflight' });
     expect(calls).toEqual([]);
     expect(fs.existsSync(`${options.repoDir}.setu-update.lock`)).toBe(false);
   }
@@ -172,19 +172,20 @@ test('low or unknown storage refuses update before any Git, portal, or install e
 test('update rechecks storage before installation and does not stop the old portal when it runs low', async () => {
   const { options, calls } = adapters(fixture());
   options.assertStorage = async () => {
-    if (calls.includes('rebase origin/main'))
+    if (calls.includes('rebase origin/main')) {
       throw Object.assign(new Error('Storage ran low'), {
         code: 'STORAGE_LOW',
       });
+    }
   };
   expect(
     await createUpdateCommand(options).update({ restartAuthorized: true })
   ).toMatchObject({
-    ok: false,
-    code: 'STORAGE_LOW',
-    stage: 'install',
     admissionClosed: true,
+    code: 'STORAGE_LOW',
     dependenciesChanged: false,
+    ok: false,
+    stage: 'install',
   });
   expect(calls).not.toContain('install');
   expect(calls).not.toContain('/api/update/stop');
@@ -351,7 +352,7 @@ test('installer delegates existing checkout to guarded updater and preserves non
   fs.writeFileSync(join(repo, 'update-command.js'), '// fixture entrypoint');
   fs.writeFileSync(
     join(bin, 'bun'),
-    '#!/bin/sh\nprintf "guarded updater: %s\\n" "$*"\nexit 42\n',
+    '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "1.3.14\\n"; exit 0; fi\nprintf "guarded updater: %s\\n" "$*"\nexit 42\n',
     { mode: 0o755 }
   );
   const result = spawnSync(
@@ -376,12 +377,24 @@ test('installer delegates existing checkout to guarded updater and preserves non
 
 test('installer refuses an older checkout before invoking a mutating updater', () => {
   const root = fixture(),
-    repo = join(root, 'repo');
+    repo = join(root, 'repo'),
+    bin = join(root, 'bin');
   fs.mkdirSync(repo);
+  fs.mkdirSync(bin);
+  fs.writeFileSync(join(bin, 'bun'), '#!/bin/sh\nprintf "1.3.14\\n"\n', {
+    mode: 0o755,
+  });
   const result = spawnSync(
     'bash',
     [new URL('./install.sh', import.meta.url).pathname],
-    { encoding: 'utf8', env: { ...process.env, SETU_INSTALL_DIR: repo } }
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        SETU_INSTALL_DIR: repo,
+      },
+    }
   );
   expect(result.status).toBe(1);
   expect(result.stdout).toContain('no guarded updater');

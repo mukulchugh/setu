@@ -87,9 +87,7 @@ test('invalid force refuses before a request', async () => {
   const outcome = await runRemoveCommand(
     { force: 'true', name: 'topic', repo: 'r' },
     {
-      request: () => {
-        return Promise.reject(new Error('must not dispatch'));
-      },
+      request: () => Promise.reject(new Error('must not dispatch')),
       stderr: () => {
         /* No side effect is needed in this fixture. */
       },
@@ -147,6 +145,7 @@ test('the removal transport preserves structured HTTP refusal instead of throwin
       fetch: async (url, options) => {
         sent.push({
           body: JSON.parse(options.body),
+          headers: options.headers,
           redirect: options.redirect,
           url,
         });
@@ -159,6 +158,7 @@ test('the removal transport preserves structured HTTP refusal instead of throwin
   expect(sent).toEqual([
     {
       body: { force: true, name: 'topic', repo: 'r' },
+      headers: { 'content-type': 'application/json', 'x-setu-source': 'cli' },
       redirect: 'error',
       url: 'http://127.0.0.1:2999/api/remove',
     },

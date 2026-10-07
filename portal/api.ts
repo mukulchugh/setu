@@ -7,7 +7,10 @@ export async function post(url: string, body: unknown) {
   try {
     const r = await fetch(url, {
       body: JSON.stringify(body),
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-setu-source': 'ui',
+      },
       method: 'POST',
     });
     const result = await r.json();
@@ -18,9 +21,9 @@ export async function post(url: string, body: unknown) {
       (!r.ok && result.ok)
     ) {
       return {
-        ok: false,
-        networkUncertain: true,
         error: 'Outcome not confirmed. Refresh status before trying again.',
+        networkUncertain: true,
+        ok: false,
       };
     }
     return result;

@@ -1,3 +1,7 @@
+import { constants } from 'node:fs';
+import { access, readFile, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+
 const issue = (code, error) => Object.assign(new Error(error), { code });
 const failure = (error) => ({
   code: error.code ?? 'DEPLOY_PREFLIGHT_FAILED',
@@ -19,6 +23,92 @@ function stable(value) {
 }
 const same = (left, right) =>
   JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+
+// Inspect installed files only. Preflight must never download or run a CLI.
+export async function installedDeployTool(
+  provider,
+  checkout = {},
+  { which = Bun.which } = {}
+) {
+  if (!['vercel', 'netlify', 'convex'].includes(provider)) {
+    return null;
+  }
+  const candidates = [];
+  if (checkout.wtDir) {
+    let directory = resolve(checkout.wtDir);
+    const root = resolve(checkout.checkoutRoot ?? checkout.wtDir);
+    while (true) {
+      candidates.push(join(directory, 'node_modules', '.bin', provider));
+      const parent = dirname(directory);
+      if (directory === root || parent === directory) {
+        break;
+      }
+      directory = parent;
+    }
+  }
+  const global = which(provider);
+  if (global) {
+    candidates.push(global);
+  }
+  const packageName = provider === 'netlify' ? 'netlify-cli' : provider;
+  for (const candidate of candidates) {
+    let executable;
+    try {
+      executable = await realpath(candidate);
+      await access(executable, constants.X_OK);
+    } catch {
+      continue;
+    }
+    let directory = dirname(executable);
+    for (let depth = 0; depth < 10; depth += 1) {
+      try {
+        const pkg = JSON.parse(
+          await readFile(join(directory, 'package.json'), 'utf8')
+        );
+        if (
+          pkg.name === packageName &&
+          typeof pkg.version === 'string' &&
+          pkg.version
+        ) {
+          return { executable, version: pkg.version };
+        }
+      } catch {
+        // A package may be above its bin directory.
+      }
+      const parent = dirname(directory);
+      if (parent === directory) {
+        break;
+      }
+      directory = parent;
+    }
+  }
+  return null;
+}
+
+async function checkoutRevision(checkout) {
+  try {
+    const run = (args) =>
+      Bun.spawn(args, {
+        cwd: checkout.wtDir,
+        stderr: 'ignore',
+        stdout: 'pipe',
+      });
+    const headProcess = run(['git', 'rev-parse', '--verify', 'HEAD']);
+    const dirtyProcess = run(['git', 'status', '--porcelain']);
+    const [headCode, dirtyCode, head, dirty] = await Promise.all([
+      headProcess.exited,
+      dirtyProcess.exited,
+      new Response(headProcess.stdout).text(),
+      new Response(dirtyProcess.stdout).text(),
+    ]);
+    const value = head.trim();
+    return headCode === 0 && dirtyCode === 0 && /^[0-9a-f]{40,64}$/.test(value)
+      ? { dirty: dirty.length > 0, head: value, known: true }
+      : { known: false };
+  } catch {
+    return { known: false };
+  }
+}
 
 async function boundedOutput(stream) {
   if (!stream) {
@@ -44,6 +134,7 @@ async function boundedOutput(stream) {
 }
 
 export function createDeploymentLauncher({
+  env = process.env,
   stores,
   now,
   spawn,
@@ -51,6 +142,7 @@ export function createDeploymentLauncher({
   closeLog,
   appendLog,
   tailError,
+  onCompletion,
 }) {
   return function launch(request, binding) {
     const { provider, repo, name, target } = request,
@@ -85,7 +177,7 @@ export function createDeploymentLauncher({
     try {
       proc = spawn(binding.command, {
         cwd: binding.cwd,
-        ...(binding.env ? { env: binding.env } : {}),
+        ...(binding.env ? { env: { ...env, ...binding.env } } : {}),
         stderr: fd ?? 'pipe',
         stdin: 'ignore',
         stdout: 'pipe',
@@ -227,6 +319,11 @@ export function createDeploymentLauncher({
           ...(provider === 'convex' ? { ok } : {}),
         });
       }
+      return {
+        ok,
+        ...(error ? { code: 'DEPLOY_FAILED', error } : {}),
+        ...(url && ok ? { url } : {}),
+      };
     })().catch((error) => {
       if (error.code !== 'OPERATION_UNKNOWN' && store.get(key) === entry) {
         store.set(key, {
@@ -238,14 +335,20 @@ export function createDeploymentLauncher({
       }
       throw error;
     });
+    onCompletion?.({ completion, request });
     return { completion, result: { deploying: true, ok: true, target } };
   };
 }
 
-export function createProviderResolver({ readJson, tool, run }) {
+export function createProviderResolver({
+  readJson,
+  tool,
+  run,
+  convexDeployKey = () => null,
+}) {
   return async function resolveProvider(request, checkout) {
     const { provider, target } = request;
-    if (provider === 'netlify' && target === 'preview') {
+    if (provider === 'netlify') {
       const installed = await tool(provider, checkout);
       if (!installed?.executable) {
         throw issue(
@@ -268,15 +371,24 @@ export function createProviderResolver({ readJson, tool, run }) {
           'This checkout needs a Netlify site link before preview deployment.'
         );
       }
+      const production = target === 'production';
       return {
         binding: {
           executable: installed.executable,
           version: installed.version,
         },
         destination: {
-          environment: 'preview',
+          environment: production
+            ? 'production'
+            : target === 'preview'
+              ? 'preview'
+              : 'custom',
           id: link.siteId,
-          label: link.siteId,
+          label: production
+            ? `${link.siteId} production`
+            : target === 'preview'
+              ? link.siteId
+              : `${link.siteId} alias ${target}`,
         },
         launch: {
           command: [
@@ -285,9 +397,68 @@ export function createProviderResolver({ readJson, tool, run }) {
             '--json',
             '--site',
             link.siteId,
+            ...(production
+              ? ['--prod']
+              : target === 'preview'
+                ? []
+                : ['--alias', target]),
           ],
           cwd: checkout.wtDir,
           linkedSiteId: link.siteId,
+        },
+      };
+    }
+    if (provider === 'convex') {
+      const installed = await tool(provider, checkout);
+      const key = await convexDeployKey(checkout);
+      const value = typeof key?.value === 'string' ? key.value : null;
+      const prod = value?.match(/^prod:([a-z0-9-]+)\|.+$/);
+      const preview = value?.match(/^preview:([a-z0-9-]+):([a-z0-9-]+)\|.+$/);
+      if (!(installed?.executable && (prod || preview))) {
+        throw issue(
+          'DEPLOY_TARGET_UNVERIFIED',
+          'Convex requires a supported production or preview deploy key with a verified target identity. No deployment was started.'
+        );
+      }
+      if (target === 'production' && !prod) {
+        throw issue(
+          'DEPLOY_TARGET_UNVERIFIED',
+          'A Convex production target requires a production deploy key.'
+        );
+      }
+      if (target !== 'production' && !preview) {
+        throw issue(
+          'DEPLOY_TARGET_UNVERIFIED',
+          'A Convex custom target requires a preview deploy key and an explicit preview name.'
+        );
+      }
+      if (target === 'preview') {
+        throw issue(
+          'DEPLOY_TARGET_UNVERIFIED',
+          'Select an explicit custom preview name; inferred preview targets are not allowed.'
+        );
+      }
+      const destination = prod
+        ? { environment: 'production', id: prod[1], label: prod[1] }
+        : {
+            environment: 'custom',
+            id: `${preview[1]}/${preview[2]}/${target}`,
+            label: `${preview[1]}/${preview[2]} ${target}`,
+          };
+      return {
+        binding: {
+          executable: installed.executable,
+          version: installed.version,
+        },
+        destination,
+        launch: {
+          command: [
+            installed.executable,
+            'deploy',
+            ...(preview ? ['--preview-name', target] : []),
+          ],
+          cwd: checkout.wtDir,
+          env: { CONVEX_DEPLOY_KEY: value },
         },
       };
     }
@@ -295,8 +466,8 @@ export function createProviderResolver({ readJson, tool, run }) {
       throw issue(
         'DEPLOY_TARGET_UNVERIFIED',
         provider === 'netlify'
-          ? 'Netlify destination binding is not verified: its CLI can create a fallback site. Production is disabled until a fail-closed adapter is available.'
-          : 'Convex deployment requires a source-verified installed CLI and exact deployment-key binding. Configure that supported adapter before deploying.'
+          ? 'Netlify destination binding is not verified.'
+          : 'Convex deployment is refused: this machine has no source-verified Convex CLI target binding or deployment-key identity. No deployment was started.'
       );
     }
     if (!['preview', 'production'].includes(target)) {
@@ -406,6 +577,7 @@ export function createDeploymentGuard({
   resolveProvider,
   startOperation,
   launch,
+  revision = checkoutRevision,
   validate = () => Promise.resolve(),
 }) {
   async function resolve(request, admitted = false) {
@@ -444,6 +616,13 @@ export function createDeploymentGuard({
         'The actual Git branch is unavailable; select a branch before deployment'
       );
     }
+    const beforeRevision = await revision(checkout);
+    if (!beforeRevision?.known) {
+      throw issue(
+        'DEPLOY_REVISION_UNKNOWN',
+        'The checkout commit or dirty state is unavailable; refresh preflight before deployment'
+      );
+    }
     const resolved = await resolveProvider(request, checkout);
     if (
       !(
@@ -461,7 +640,8 @@ export function createDeploymentGuard({
     }
     if (
       !same(before, await identity(checkout)) ||
-      actualBranch !== (await branch(checkout))
+      actualBranch !== (await branch(checkout)) ||
+      !same(beforeRevision, await revision(checkout))
     ) {
       throw issue(
         'DEPLOY_CONTEXT_CHANGED',
@@ -488,6 +668,7 @@ export function createDeploymentGuard({
       name: request.name,
       provider: request.provider,
       repo: request.repo,
+      revision: beforeRevision,
       target: request.target,
     };
     return {

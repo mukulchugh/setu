@@ -40,6 +40,11 @@ import { PortsPage } from './components/ports-page';
 import { checksTone, type PrChecks } from './components/pr-status';
 import { RelativeTime, relativeTime } from './components/relative-time';
 import {
+  GithubWorkflowControls,
+  PrReviewHandoff,
+  WorktreeResourceControls,
+} from './components/resource-controls';
+import {
   DiscoverProjectsSection,
   McpSection,
   RaycastSection,
@@ -94,13 +99,13 @@ import {
   DropdownMenuTrigger,
 } from './ui/dropdown-menu';
 import { type ToastItem, ToastStack } from './ui/toast';
-import { useSavedDraft } from './use-saved-draft';
 import {
   fileSyncPatterns,
   quoteShellPath,
   sidecarArguments,
   sidecarNameError,
 } from './ui-helpers';
+import { useSavedDraft } from './use-saved-draft';
 import { readArray, readJson, useVisiblePoll } from './use-visible-poll';
 import {
   lifecycleControl,
@@ -157,7 +162,7 @@ export type ConvexDeployStatus = {
   phase?: string;
   ok: boolean;
   error: string | null;
-  target: 'preview' | 'production';
+  target: string;
   startedAt: number;
 } | null;
 
@@ -258,8 +263,8 @@ export interface Worktree {
   triggerActive: boolean;
   tunnelOn: boolean;
   tunnelRunning: boolean;
-  wtDir?: string;
   vercelDeploy: DeployStatus;
+  wtDir?: string;
 }
 type PrState = 'open' | 'merged' | 'closed' | 'draft';
 // One record per removed worktree, a history entry, not a live worktree.
@@ -601,7 +606,9 @@ function CreateModal({
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
-      if (closeTimer.current !== null) clearTimeout(closeTimer.current);
+      if (closeTimer.current !== null) {
+        clearTimeout(closeTimer.current);
+      }
     },
     []
   );
@@ -661,7 +668,7 @@ function CreateModal({
     // same onClose the old backdrop-click handler used to call directly.
     <Dialog
       onOpenChange={(o: boolean) => {
-        if (!o && !busy) {
+        if (!(o || busy)) {
           onClose();
         }
       }}
@@ -819,7 +826,9 @@ function AddProjectModal({
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
-      if (closeTimer.current !== null) clearTimeout(closeTimer.current);
+      if (closeTimer.current !== null) {
+        clearTimeout(closeTimer.current);
+      }
     },
     []
   );
@@ -871,7 +880,7 @@ function AddProjectModal({
     // see its own comment for why `open` is a literal `true` here.
     <Dialog
       onOpenChange={(o: boolean) => {
-        if (!o && !busy) {
+        if (!(o || busy)) {
           onClose();
         }
       }}
@@ -1110,7 +1119,11 @@ const LIFECYCLE_ICON: Record<
 > = {
   'Cancel queue': { path: tablerClock.path, tone: 'amber' },
   'Needs attention': { path: tablerAlertTriangle.path, tone: 'red' },
-  'Retry Stop': { filled: true, path: tablerPlayerStopFilled.path, tone: 'red' },
+  'Retry Stop': {
+    filled: true,
+    path: tablerPlayerStopFilled.path,
+    tone: 'red',
+  },
   Stop: { filled: true, path: tablerPlayerStopFilled.path, tone: 'red' },
   'Stopping…': { path: tablerRefresh.path, spin: true, tone: 'zinc' },
 };
@@ -1327,7 +1340,8 @@ function WorktreeActions({
           </DropdownMenuItem>
           {w.name === 'main' && (
             <p class="menu-help">
-              The main worktree holds shared local files such as .env.local. Remove the project instead.
+              The main worktree holds shared local files such as .env.local.
+              Remove the project instead.
             </p>
           )}
         </DropdownMenuContent>
@@ -1547,6 +1561,8 @@ type PrReviewRun = {
   dirtyAfter: boolean | null;
 } | null;
 type PrReviewArtifact = {
+  checkoutIdentity?: unknown;
+  findingRecords?: Record<string, unknown>[];
   snapshot: string;
   generatedAt: string;
   headSha: string;
@@ -1712,6 +1728,27 @@ function PrReviewSection({
                   </div>
                 );
               })}
+            <PrReviewHandoff
+              artifacts={PR_REVIEW_SKILLS.flatMap((skill) => {
+                const artifact = status.artifacts[skill];
+                return artifact?.htmlFile
+                  ? [
+                      {
+                        checkoutIdentity: artifact.checkoutIdentity,
+                        findingRecords: artifact.findingRecords,
+                        headSha: artifact.headSha,
+                        prNumber: status.pr?.number ?? 0,
+                        skill,
+                        snapshot: artifact.snapshot,
+                        stale: artifact.stale,
+                      },
+                    ]
+                  : [];
+              })}
+              name={w.name}
+              repo={w.repo}
+              toast={toast}
+            />
           </div>
         ) : (
           <p class="text-xs text-zinc-400">
@@ -1945,12 +1982,9 @@ function convexDeployText(d: ConvexDeployStatus): string {
   return 'Not deployed';
 }
 
-// Same "icon button opens a picker" shape as DeployMenu above, but not built
-// on the DEPLOY_PROVIDER record -- convex only ever has two targets (no
-// named-custom-target option makes sense for it, see deployToConvex's own
-// comment in portal.js), so a dedicated two-item menu reads more directly
-// than forcing convex into a three-provider abstraction built for a third
-// option it doesn't have.
+// Convex production is explicit, while preview deployments require a named
+// preview target. The deployment preflight remains the authority for key and
+// destination binding before the existing confirmation dialog can submit.
 function ConvexDeployMenu({
   w,
   deploy,
@@ -1958,10 +1992,10 @@ function ConvexDeployMenu({
 }: {
   w: Worktree;
   deploy: ConvexDeployStatus;
-  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+  onConvexDeploy: (w: Worktree, target: string) => void;
 }) {
   const openingDialog = useRef(false);
-  function choose(target: 'preview' | 'production') {
+  function choose(target: string) {
     openingDialog.current = true;
     onConvexDeploy(w, target);
   }
@@ -2017,8 +2051,15 @@ function ConvexDeployMenu({
       <DropdownMenuContent
         finalFocus={() => (openingDialog.current ? false : true)}
       >
-        <DropdownMenuItem onClick={() => choose('preview')}>
-          Deploy preview
+        <DropdownMenuItem
+          onClick={() => {
+            const target = window.prompt('Named Convex preview target:');
+            if (target?.trim()) {
+              choose(target.trim());
+            }
+          }}
+        >
+          Deploy named preview…
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => choose('production')}>
           Deploy production
@@ -2048,7 +2089,7 @@ function ConvexSection({
     type: string,
     returnFocus?: HTMLElement | null
   ) => void;
-  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+  onConvexDeploy: (w: Worktree, target: string) => void;
 }) {
   const deploy = w.convexDeploy;
   return (
@@ -2226,16 +2267,21 @@ function WorktreeCard({
             </Badge>
           )}
           {w.dirty === null ? (
-            <Badge tip="The working tree status could not be checked" tone="amber">
-              changes unknown
-            </Badge>
-          ) : w.dirty > 0 && (
             <Badge
-              tip={`${w.dirty} uncommitted change${(w.dirty ?? 0) > 1 ? 's' : ''}`}
+              tip="The working tree status could not be checked"
               tone="amber"
             >
-              {w.dirty} dirty
+              changes unknown
             </Badge>
+          ) : (
+            w.dirty > 0 && (
+              <Badge
+                tip={`${w.dirty} uncommitted change${(w.dirty ?? 0) > 1 ? 's' : ''}`}
+                tone="amber"
+              >
+                {w.dirty} dirty
+              </Badge>
+            )
           )}
         </div>
         <div
@@ -2864,7 +2910,7 @@ function WorktreePage({
   onAct: (url: string, w: Worktree) => void;
   onStart: (w: Worktree, force?: 'container' | 'bare') => void;
   onDeploy: (w: Worktree, provider: DeployProvider, target: string) => void;
-  onConvexDeploy: (w: Worktree, target: 'preview' | 'production') => void;
+  onConvexDeploy: (w: Worktree, target: string) => void;
   onOpenLogs: (
     repo: string,
     name: string,
@@ -3102,6 +3148,10 @@ function WorktreePage({
 
       <GithubActionsSection onRefresh={onRefresh} toast={toast} w={w} />
 
+      <GithubWorkflowControls name={w.name} repo={w.repo} toast={toast} />
+
+      <WorktreeResourceControls name={w.name} repo={w.repo} toast={toast} />
+
       <Section id="sidecars" title="Sidecars">
         <p class="mb-3 text-xs text-zinc-600 dark:text-zinc-300">
           <a
@@ -3183,8 +3233,8 @@ function WorktreePage({
             <StatusDot tone={w.tunnelRunning ? 'emerald' : 'zinc'} />
             <span>Tunnel</span>
             <button
-              class="text-xs text-zinc-500 hover:underline"
               aria-label={`${w.tunnelOn ? 'Disable' : 'Enable'} tunnel for ${w.repo}/${w.name}`}
+              class="text-xs text-zinc-500 hover:underline"
               disabled={tunnelBusy}
               onClick={() =>
                 onAct(
@@ -3270,7 +3320,8 @@ function WorktreePage({
       </button>
       {w.name === 'main' && (
         <p class="mt-1 text-xs text-zinc-500">
-          The main worktree holds shared local files such as .env.local. Remove the project instead.
+          The main worktree holds shared local files such as .env.local. Remove
+          the project instead.
         </p>
       )}
     </div>
@@ -3524,19 +3575,19 @@ function RepoPage({
     refresh: loadPrs,
   } = useVisiblePoll(prUrl, null, async (signal) => {
     const result = await readJson<RepoPrsResponse>(prUrl, signal);
-    if (!result || !Array.isArray(result.prs)) {
+    if (!(result && Array.isArray(result.prs))) {
       throw new Error('Invalid PR response');
     }
     return result;
   });
   const repoWorktrees = worktrees.filter((w) => w.repo === repo);
   const list = projectWorktrees(repoWorktrees, {
+    ahead: false,
+    dirty: false,
+    page: stoppedPage,
     project: 'all',
     search: stoppedSearch,
-    dirty: false,
-    ahead: false,
     sort: 'recent',
-    page: stoppedPage,
   });
 
   return (
@@ -3616,11 +3667,11 @@ function RepoPage({
         <WorktreeList
           agents={agents}
           emptyMessage={
-            !loaded
-              ? 'Loading worktrees…'
-              : stoppedSearch
+            loaded
+              ? stoppedSearch
                 ? 'No stopped worktrees match this search.'
                 : 'No stopped worktrees in this project.'
+              : 'Loading worktrees…'
           }
           gridMode={false}
           items={list.pageRows}
@@ -4516,12 +4567,12 @@ function SettingsPage({
                 </Button>
               </div>
               <p class="mt-1 text-[11px] text-zinc-400">
-                Newline-separated glob patterns. Matching gitignored
-                files are copied (not symlinked, unlike .env.local) from the
-                main worktree into every newly created worktree, so each one
-                gets its own editable copy. Patterns resolve against the main
-                worktree's root, not an app subdir — for quivly-app include the
-                subdir, e.g. apps/quivly-app/.env.development.local.
+                Newline-separated glob patterns. Matching gitignored files are
+                copied (not symlinked, unlike .env.local) from the main worktree
+                into every newly created worktree, so each one gets its own
+                editable copy. Patterns resolve against the main worktree's
+                root, not an app subdir — for quivly-app include the subdir,
+                e.g. apps/quivly-app/.env.development.local.
               </p>
             </div>
           ) : (
@@ -4541,8 +4592,8 @@ function SettingsPage({
           {draftStatus(agentDraft)}
           {customAgents.map((a, i) => (
             <CustomAgentRow
-              disabled={!agentDraft.loaded}
               a={a}
+              disabled={!agentDraft.loaded}
               index={i}
               key={i}
               onChange={(next) =>
@@ -4971,16 +5022,21 @@ function App() {
     returnFocus: HTMLElement | null;
   } | null>(null);
   const openLogs = useCallback(
-    (repo: string, name: string, type: string, returnFocus?: HTMLElement | null) =>
+    (
+      repo: string,
+      name: string,
+      type: string,
+      returnFocus?: HTMLElement | null
+    ) =>
       setLogView({
-        repo,
         name,
-        type,
+        repo,
         returnFocus:
           returnFocus ??
           (document.activeElement instanceof HTMLElement
             ? document.activeElement
             : null),
+        type,
       }),
     []
   );
@@ -5192,7 +5248,9 @@ function App() {
         if (tunnelBusy) {
           return;
         }
-        const owner = worktrees.find((row) => row.tunnelOn && row.key !== w.key);
+        const owner = worktrees.find(
+          (row) => row.tunnelOn && row.key !== w.key
+        );
         if (
           owner &&
           !confirm(
@@ -5332,9 +5390,14 @@ function App() {
     if (cleanupBusy.current.has(entry.operationId)) {
       return;
     }
-    if (!entry.removed && !confirm(
-      `Retry removal of "${entry.name}"? Its checkout still exists, so this reruns the git removal stage.`
-    )) {
+    if (
+      !(
+        entry.removed ||
+        confirm(
+          `Retry removal of "${entry.name}"? Its checkout still exists, so this reruns the git removal stage.`
+        )
+      )
+    ) {
       return;
     }
     cleanupBusy.current.add(entry.operationId);
@@ -5425,7 +5488,7 @@ function App() {
   function deploy(w: Worktree, provider: DeployProvider, target: string) {
     beginDeployment(w, provider, target);
   }
-  function convexDeploy(w: Worktree, target: 'preview' | 'production') {
+  function convexDeploy(w: Worktree, target: string) {
     beginDeployment(w, 'convex', target);
   }
 
@@ -5486,7 +5549,7 @@ function App() {
               name={logView.name}
               onClose={() => setLogView(null)}
               repo={logView.repo}
-            returnFocus={logView.returnFocus}
+              returnFocus={logView.returnFocus}
             />
           )}
           {commandOpen && (
@@ -5704,18 +5767,18 @@ function App() {
           }
           subtitle={
             loaded && (
-            <div class="flex flex-col gap-3">
-              <PortalStatus
-                activeCount={running.length}
-                loaded={loaded}
-                status={status}
-              />
-              <p class="max-w-xl text-xs text-zinc-400 dark:text-zinc-500">
-                Parallel branches, dedicated dev servers, sidecars, and synced
-                environments. One bridge for every feature an agent is building
-                at once.
-              </p>
-            </div>
+              <div class="flex flex-col gap-3">
+                <PortalStatus
+                  activeCount={running.length}
+                  loaded={loaded}
+                  status={status}
+                />
+                <p class="max-w-xl text-xs text-zinc-400 dark:text-zinc-500">
+                  Parallel branches, dedicated dev servers, sidecars, and synced
+                  environments. One bridge for every feature an agent is
+                  building at once.
+                </p>
+              </div>
             )
           }
           title={<span class="wordmark">setu</span>}
@@ -5723,266 +5786,272 @@ function App() {
 
         {!loaded && <InitialLoad />}
         {loaded && (
-        <>
-        <div class="rail-divider mb-8" />
-        <div class="flex flex-col items-start gap-6 lg:flex-row">
-          <WorkspaceSidebar
-            dark={dark}
-            filter={filter}
-            onAhead={setOnlyAhead}
-            onDirty={setOnlyDirty}
-            onFilter={setFilter}
-            onFollow={followRoute}
-            onJump={openCommand}
-            onlyAhead={onlyAhead}
-            onlyDirty={onlyDirty}
-            onSort={setSortKey}
-            onTheme={() => setDark(!dark)}
-            onToggle={() => setFiltersOpen(!filtersOpen)}
-            onView={setView}
-            open={filtersOpen}
-            projects={projects}
-            sortKey={sortKey}
-            view={view}
-          >
-            <div class="hidden lg:block">
-              <TriviaCard />
-            </div>
-          </WorkspaceSidebar>
-        <div class="w-full min-w-0 flex-1">
+          <>
+            <div class="rail-divider mb-8" />
+            <div class="flex flex-col items-start gap-6 lg:flex-row">
+              <WorkspaceSidebar
+                dark={dark}
+                filter={filter}
+                onAhead={setOnlyAhead}
+                onDirty={setOnlyDirty}
+                onFilter={setFilter}
+                onFollow={followRoute}
+                onJump={openCommand}
+                onlyAhead={onlyAhead}
+                onlyDirty={onlyDirty}
+                onSort={setSortKey}
+                onTheme={() => setDark(!dark)}
+                onToggle={() => setFiltersOpen(!filtersOpen)}
+                onView={setView}
+                open={filtersOpen}
+                projects={projects}
+                sortKey={sortKey}
+                view={view}
+              >
+                <div class="hidden lg:block">
+                  <TriviaCard />
+                </div>
+              </WorkspaceSidebar>
+              <div class="w-full min-w-0 flex-1">
+                <section aria-labelledby="active-work" class="mb-8">
+                  <div class="mb-4">
+                    <h2
+                      class="section-anchor board-mono font-bold text-[11px] text-zinc-400"
+                      id="active-work"
+                      tabIndex={-1}
+                    >
+                      Active work{loaded ? ` (${running.length})` : ''}
+                    </h2>
+                    <p class="mt-1 text-xs text-zinc-600 dark:text-zinc-300">
+                      All projects · always shown
+                      {loaded && running.length > 0 && (
+                        <span>
+                          {' · '}
+                          {(
+                            [
+                              'running',
+                              'starting',
+                              'stopping',
+                              'queued',
+                              'attention',
+                            ] as const
+                          )
+                            .map((state) => {
+                              const count = running.filter(
+                                (w) => worktreeState(w) === state
+                              ).length;
+                              return count
+                                ? `${count} ${state === 'attention' ? 'need attention' : state}`
+                                : '';
+                            })
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                  <WorktreeList
+                    agents={agents}
+                    emptyMessage={
+                      loaded
+                        ? 'No active or queued worktrees'
+                        : 'Loading worktrees…'
+                    }
+                    gridMode={view === 'grid'}
+                    items={running}
+                    onAct={act}
+                    onDeploy={deploy}
+                    onOpenLogs={openLogs}
+                    onOpenTool={openTool}
+                    onRemove={remove}
+                    onStart={start}
+                    pendingStart={pendingStart.current}
+                    toast={toast}
+                  />
+                </section>
 
-          <section aria-labelledby="active-work" class="mb-8">
-            <div class="mb-4">
-              <h2
-                class="section-anchor board-mono font-bold text-[11px] text-zinc-400"
-                id="active-work"
-                tabIndex={-1}
-              >
-                Active work{loaded ? ` (${running.length})` : ''}
-              </h2>
-              <p class="mt-1 text-xs text-zinc-600 dark:text-zinc-300">
-                All projects · always shown
-                {loaded && running.length > 0 && (
-                  <span>
-                    {' · '}
-                    {(
-                      [
-                        'running',
-                        'starting',
-                        'stopping',
-                        'queued',
-                        'attention',
-                      ] as const
-                    )
-                      .map((state) => {
-                        const count = running.filter(
-                          (w) => worktreeState(w) === state
-                        ).length;
-                        return count
-                          ? `${count} ${state === 'attention' ? 'need attention' : state}`
-                          : '';
-                      })
-                      .filter(Boolean)
-                      .join(' · ')}
-                  </span>
-                )}
-              </p>
-            </div>
-            <WorktreeList
-              agents={agents}
-              emptyMessage={
-                loaded ? 'No active or queued worktrees' : 'Loading worktrees…'
-              }
-              gridMode={view === 'grid'}
-              items={running}
-              onAct={act}
-              onDeploy={deploy}
-              onOpenLogs={openLogs}
-              onOpenTool={openTool}
-              onRemove={remove}
-              onStart={start}
-              pendingStart={pendingStart.current}
-              toast={toast}
-            />
-          </section>
+                <PendingCleanup
+                  busy={cleanupRunning}
+                  entries={status?.pendingRemovals ?? []}
+                  onCancel={cancelRemoval}
+                  onRetry={retryCleanup}
+                />
+                <div class="rail-divider mb-8" />
+                <section aria-labelledby="stopped-worktrees">
+                  <div class="mb-4">
+                    <h2
+                      class="board-mono font-bold text-[11px] text-zinc-400"
+                      id="stopped-worktrees"
+                    >
+                      Stopped worktrees
+                    </h2>
+                    <p
+                      class="mt-1 text-xs text-zinc-600 dark:text-zinc-300"
+                      id="filter-scope"
+                    >
+                      {loaded && `${rest.length} of ${stoppedTotal} shown. `}
+                      Filters apply to stopped worktrees. Active work above
+                      always includes all projects.
+                    </p>
+                  </div>
+                  <div class="relative mb-3">
+                    <label class="sr-only" htmlFor="stopped-search">
+                      Search stopped worktrees
+                    </label>
+                    <svg
+                      aria-hidden="true"
+                      class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-zinc-500 dark:text-zinc-400"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2.25"
+                      viewBox="0 0 24 24"
+                    >
+                      <path d={tablerSearch.path} />
+                    </svg>
+                    <input
+                      aria-describedby="filter-scope"
+                      autoComplete="off"
+                      class="w-full rounded-none border border-white/75 bg-white/60 py-2.5 pr-3 pl-9 text-sm text-zinc-800 placeholder-zinc-600 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/5 dark:text-zinc-100 dark:placeholder-zinc-400"
+                      id="stopped-search"
+                      onInput={(e) => setSearch(e.currentTarget.value)}
+                      placeholder="Search stopped worktrees by name, repo, or label…"
+                      value={search}
+                    />
+                  </div>
+                  {hasFilters && (
+                    <fieldset
+                      aria-label="Active stopped-worktree filters"
+                      class="mb-3 flex min-w-0 flex-wrap items-center gap-2"
+                    >
+                      {filter !== 'all' && (
+                        <button
+                          aria-label={`Clear project filter ${filter}`}
+                          class="filter-chip"
+                          onClick={() => setFilter('all')}
+                          type="button"
+                        >
+                          Project:{' '}
+                          {projects.find((p) => p.name === filter)?.label ??
+                            filter}{' '}
+                          <span aria-hidden="true">×</span>
+                        </button>
+                      )}
+                      {onlyDirty && (
+                        <button
+                          aria-label="Clear uncommitted changes filter"
+                          class="filter-chip"
+                          onClick={() => setOnlyDirty(false)}
+                          type="button"
+                        >
+                          Uncommitted changes <span aria-hidden="true">×</span>
+                        </button>
+                      )}
+                      {onlyAhead && (
+                        <button
+                          aria-label="Clear ahead of base filter"
+                          class="filter-chip"
+                          onClick={() => setOnlyAhead(false)}
+                          type="button"
+                        >
+                          Ahead of base <span aria-hidden="true">×</span>
+                        </button>
+                      )}
+                      {search.trim() && (
+                        <button
+                          aria-label="Clear search filter"
+                          class="filter-chip max-w-full break-words"
+                          onClick={() => setSearch('')}
+                          type="button"
+                        >
+                          Search: {search} <span aria-hidden="true">×</span>
+                        </button>
+                      )}
+                      <Button
+                        compact
+                        onClick={clearFilters}
+                        variant="secondary"
+                      >
+                        Clear filters
+                      </Button>
+                    </fieldset>
+                  )}
+                  <WorktreeList
+                    agents={agents}
+                    emptyMessage={
+                      loaded
+                        ? hasFilters
+                          ? 'No stopped worktrees match these filters.'
+                          : 'No stopped worktrees. Create a worktree to begin.'
+                        : 'Loading worktrees…'
+                    }
+                    gridMode={view === 'grid'}
+                    items={filtered}
+                    onAct={act}
+                    onDeploy={deploy}
+                    onOpenLogs={openLogs}
+                    onOpenTool={openTool}
+                    onRemove={remove}
+                    onStart={start}
+                    pendingStart={pendingStart.current}
+                    toast={toast}
+                  />
+                  {loaded && rest.length > 0 && (
+                    <p class="mt-4 text-xs text-zinc-600 dark:text-zinc-300">
+                      Showing {currentPage * PAGE_SIZE + 1} to{' '}
+                      {Math.min((currentPage + 1) * PAGE_SIZE, rest.length)} of{' '}
+                      {rest.length} matching stopped worktrees
+                    </p>
+                  )}
+                  <Pagination
+                    onPage={setPage}
+                    page={currentPage}
+                    pageCount={pageCount}
+                  />
+                </section>
 
-          <PendingCleanup
-            busy={cleanupRunning}
-            entries={status?.pendingRemovals ?? []}
-            onCancel={cancelRemoval}
-            onRetry={retryCleanup}
-          />
-          <div class="rail-divider mb-8" />
-          <section aria-labelledby="stopped-worktrees">
-            <div class="mb-4">
-              <h2
-                class="board-mono font-bold text-[11px] text-zinc-400"
-                id="stopped-worktrees"
-              >
-                Stopped worktrees
-              </h2>
-              <p
-                class="mt-1 text-xs text-zinc-600 dark:text-zinc-300"
-                id="filter-scope"
-              >
-                {loaded && `${rest.length} of ${stoppedTotal} shown. `}
-                Filters apply to stopped worktrees. Active work above always
-                includes all projects.
-              </p>
+                <div class="rail-divider mt-10 mb-4" />
+                <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
+                  <a
+                    class="flex w-fit items-center gap-2 transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                    href="https://mukulchugh.com"
+                    rel="noopener"
+                    target="_blank"
+                  >
+                    <img
+                      alt=""
+                      class="h-4 w-4 rounded-none"
+                      height={16}
+                      src={MUKUL_LOGO_URI}
+                      width={16}
+                    />
+                    Created by Mukul Chugh
+                  </a>
+                  <div class="flex items-center gap-4">
+                    <a
+                      class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                      href="/help"
+                      onClick={(e: MouseEvent) => {
+                        e.preventDefault();
+                        navigate('/help');
+                      }}
+                    >
+                      Help &amp; guide
+                    </a>
+                    <a
+                      class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                      href="https://github.com/mukulchugh/setu"
+                      rel="noopener"
+                      target="_blank"
+                    >
+                      Contribute on GitHub
+                    </a>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="relative mb-3">
-              <label class="sr-only" htmlFor="stopped-search">
-                Search stopped worktrees
-              </label>
-              <svg
-                aria-hidden="true"
-                class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-zinc-500 dark:text-zinc-400"
-                fill="none"
-                stroke="currentColor"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2.25"
-                viewBox="0 0 24 24"
-              >
-                <path d={tablerSearch.path} />
-              </svg>
-              <input
-                aria-describedby="filter-scope"
-                autoComplete="off"
-                class="w-full rounded-none border border-white/75 bg-white/60 py-2.5 pr-3 pl-9 text-sm text-zinc-800 placeholder-zinc-600 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/5 dark:text-zinc-100 dark:placeholder-zinc-400"
-                id="stopped-search"
-                onInput={(e) => setSearch(e.currentTarget.value)}
-                placeholder="Search stopped worktrees by name, repo, or label…"
-                value={search}
-              />
-            </div>
-            {hasFilters && (
-              <fieldset
-                aria-label="Active stopped-worktree filters"
-                class="mb-3 flex min-w-0 flex-wrap items-center gap-2"
-              >
-                {filter !== 'all' && (
-                  <button
-                    aria-label={`Clear project filter ${filter}`}
-                    class="filter-chip"
-                    onClick={() => setFilter('all')}
-                    type="button"
-                  >
-                    Project:{' '}
-                    {projects.find((p) => p.name === filter)?.label ?? filter}{' '}
-                    <span aria-hidden="true">×</span>
-                  </button>
-                )}
-                {onlyDirty && (
-                  <button
-                    aria-label="Clear uncommitted changes filter"
-                    class="filter-chip"
-                    onClick={() => setOnlyDirty(false)}
-                    type="button"
-                  >
-                    Uncommitted changes <span aria-hidden="true">×</span>
-                  </button>
-                )}
-                {onlyAhead && (
-                  <button
-                    aria-label="Clear ahead of base filter"
-                    class="filter-chip"
-                    onClick={() => setOnlyAhead(false)}
-                    type="button"
-                  >
-                    Ahead of base <span aria-hidden="true">×</span>
-                  </button>
-                )}
-                {search.trim() && (
-                  <button
-                    aria-label="Clear search filter"
-                    class="filter-chip max-w-full break-words"
-                    onClick={() => setSearch('')}
-                    type="button"
-                  >
-                    Search: {search} <span aria-hidden="true">×</span>
-                  </button>
-                )}
-                <Button compact onClick={clearFilters} variant="secondary">
-                  Clear filters
-                </Button>
-              </fieldset>
-            )}
-            <WorktreeList
-              agents={agents}
-              emptyMessage={
-                loaded
-                  ? hasFilters
-                    ? 'No stopped worktrees match these filters.'
-                    : 'No stopped worktrees. Create a worktree to begin.'
-                  : 'Loading worktrees…'
-              }
-              gridMode={view === 'grid'}
-              items={filtered}
-              onAct={act}
-              onDeploy={deploy}
-              onOpenLogs={openLogs}
-              onOpenTool={openTool}
-              onRemove={remove}
-              onStart={start}
-              pendingStart={pendingStart.current}
-              toast={toast}
-            />
-            {loaded && rest.length > 0 && (
-              <p class="mt-4 text-xs text-zinc-600 dark:text-zinc-300">
-                Showing {currentPage * PAGE_SIZE + 1} to{' '}
-                {Math.min((currentPage + 1) * PAGE_SIZE, rest.length)} of{' '}
-                {rest.length} matching stopped worktrees
-              </p>
-            )}
-            <Pagination
-              onPage={setPage}
-              page={currentPage}
-              pageCount={pageCount}
-            />
-          </section>
-
-          <div class="rail-divider mt-10 mb-4" />
-          <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
-            <a
-              class="flex w-fit items-center gap-2 transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-              href="https://mukulchugh.com"
-              rel="noopener"
-              target="_blank"
-            >
-              <img
-                alt=""
-                class="h-4 w-4 rounded-none"
-                height={16}
-                src={MUKUL_LOGO_URI}
-                width={16}
-              />
-              Created by Mukul Chugh
-            </a>
-            <div class="flex items-center gap-4">
-              <a
-                class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-                href="/help"
-                onClick={(e: MouseEvent) => {
-                  e.preventDefault();
-                  navigate('/help');
-                }}
-              >
-                Help &amp; guide
-              </a>
-              <a
-                class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-                href="https://github.com/mukulchugh/setu"
-                rel="noopener"
-                target="_blank"
-              >
-                Contribute on GitHub
-              </a>
-            </div>
-          </div>
-        </div>
-        </div>
-        </>
+          </>
         )}
 
         {(createOpen || recreatePrefill) && (
@@ -6013,7 +6082,7 @@ function App() {
             name={logView.name}
             onClose={() => setLogView(null)}
             repo={logView.repo}
-              returnFocus={logView.returnFocus}
+            returnFocus={logView.returnFocus}
           />
         )}
         {commandOpen && (

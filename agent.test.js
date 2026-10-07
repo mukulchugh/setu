@@ -37,6 +37,20 @@ async function collect(chunks) {
   return lines;
 }
 
+async function collectBounded(chunks, limit) {
+  const enc = new TextEncoder();
+  const stream = (function* gen() {
+    for (const c of chunks) {
+      yield enc.encode(c);
+    }
+  })();
+  const lines = [];
+  await pumpLines(stream, (line, details) => lines.push({ details, line }), {
+    maxBytes: limit,
+  });
+  return lines;
+}
+
 const failures = [];
 async function check(what, fn) {
   try {
@@ -92,6 +106,17 @@ await check('survives a multi-byte char split across chunks', async () => {
   assert.deepEqual(got, ['café']);
 });
 
+await check(
+  'bounds a huge newline-free partial line before parsing it',
+  async () => {
+    const lines = await collectBounded(['α'.repeat(10_000)], 31);
+    assert.equal(lines.length, 1);
+    assert.ok(Buffer.byteLength(lines[0].line) <= 31);
+    assert.equal(lines[0].details.truncated, true);
+    assert.doesNotMatch(lines[0].line, /�/);
+  }
+);
+
 console.log('boundedTail');
 
 await check('keeps everything under the limit', () => {
@@ -111,10 +136,13 @@ await check('drops from the head, keeps the tail', () => {
   assert.ok(!s.includes('aaaaa'), `head not dropped: ${s}`);
 });
 
-await check('never drops the only entry, even oversized', () => {
+await check('bounds an oversized single write to its UTF-8 tail', () => {
   const t = boundedTail(4);
   t.push('a-very-long-single-write');
-  assert.equal(t.toString(), 'a-very-long-single-write');
+  assert.equal(t.toString(), 'rite');
+  const unicode = boundedTail(5);
+  unicode.push('αβγ');
+  assert.equal(unicode.toString(), 'βγ');
 });
 
 await check('counts bytes, not characters', () => {

@@ -6,7 +6,7 @@ export async function requestPortalMutation(
 ) {
   const response = await send(url, {
     body: JSON.stringify(body),
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-setu-source': 'cli' },
     method: 'POST',
     redirect: 'error',
     signal: AbortSignal.timeout(5 * 60_000),
