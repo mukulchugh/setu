@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { PACKAGE_VERSION } from './lib.js';
 import { readLogTail } from './log-tail.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
@@ -47,24 +48,67 @@ function toolJson(response) {
 }
 
 const TOOL_NAMES = [
+  'adopt_worktree',
+  'cancel_headless_run',
+  'claim_worktree',
   'create_pr',
   'create_worktree',
+  'dispatch_github_workflow',
+  'disable_tunnel',
+  'end_agent_session',
+  'enable_tunnel',
+  'execute_worktree_cache_cleanup',
+  'get_doctor',
   'get_diff',
+  'get_resource_admission',
   'get_logs',
+  'get_setup_progress',
+  'get_workspace_storage',
   'get_pr_review_status',
+  'get_sidecar_logs',
+  'focus_agent_session',
+  'inspect_workspace_storage',
+  'handoff_review_findings',
+  'invoke_mcp_action',
+  'list_agent_sessions',
+  'list_attention',
+  'list_claims',
+  'list_dependency_sharing',
+  'list_github_runs',
+  'list_github_workflows',
+  'list_headless_runs',
+  'list_mcp_actions',
+  'list_operations',
   'list_ports',
   'list_projects',
   'list_repo_prs',
+  'list_shared_caches',
+  'list_sidecars',
   'list_worktrees',
   'pr_ready',
+  'plan_dependency_repair',
+  'preflight_mcp_action',
+  'prepare_worktree_cache_cleanup',
+  'release_worktree',
   'remove_worktree',
+  'resume_headless_run',
+  'retry_setup',
   'run_pr_review',
+  'save_mcp_action',
+  'start_convex',
+  'start_headless_run',
+  'start_inngest',
   'start_worktree',
+  'start_trigger',
+  'stop_convex',
+  'stop_inngest',
   'stop_worktree',
+  'stop_trigger',
   'sync_worktree',
+  'verify_dependency_sharing',
 ];
 
-test('inbound MCP initializes and discovers all 15 existing tools without invoking a backend', async () => {
+test('inbound MCP initializes and discovers every supported tool without invoking a backend', async () => {
   initMcpServer({});
   const initialized = await requestMcp('initialize', {
     capabilities: {},
@@ -72,11 +116,12 @@ test('inbound MCP initializes and discovers all 15 existing tools without invoki
     protocolVersion: '2025-06-18',
   });
   expect(initialized.result.serverInfo.name).toBe('setu');
+  expect(initialized.result.serverInfo.version).toBe(PACKAGE_VERSION);
   expect(initialized.result.instructions).toContain('sticky per-worktree');
   expect(initialized.result.instructions).toContain('real API budget');
   const discovered = await requestMcp('tools/list');
   expect(discovered.result.tools.map((tool) => tool.name).sort()).toEqual(
-    TOOL_NAMES
+    TOOL_NAMES.slice().sort()
   );
   const schema = Object.fromEntries(
     discovered.result.tools.map((tool) => [tool.name, tool.inputSchema])
@@ -89,6 +134,117 @@ test('inbound MCP initializes and discovers all 15 existing tools without invoki
     'pr-brief',
   ]);
   expect(schema.pr_ready.required.sort()).toEqual(['name', 'ready', 'repo']);
+  expect(schema.claim_worktree.required.sort()).toEqual([
+    'agent',
+    'name',
+    'pid',
+    'repo',
+    'session',
+    'task',
+  ]);
+});
+
+test('MCP runtime tools forward portal operations and preserve mutation recovery fields', async () => {
+  const calls = [];
+  const accepted = { ok: true, operationId: 'op-runtime', queued: false };
+  initMcpServer({
+    adoptWorktree: (...args) => {
+      calls.push(['adoptWorktree', ...args]);
+      return accepted;
+    },
+    disableTunnel: (...args) => {
+      calls.push(['disableTunnel', ...args]);
+      return accepted;
+    },
+    doctorReport: () => [{ name: 'portal', ok: true }],
+    enableTunnel: (...args) => {
+      calls.push(['enableTunnel', ...args]);
+      return accepted;
+    },
+    getSidecarLogs: (...args) => {
+      calls.push(['getSidecarLogs', ...args]);
+      return { lines: ['ready'], state: 'ok' };
+    },
+    listSidecars: (...args) => {
+      calls.push(['listSidecars', ...args]);
+      return [{ active: true, approved: true, name: 'worker' }];
+    },
+    startConvex: (...args) => {
+      calls.push(['startConvex', ...args]);
+      return accepted;
+    },
+    startInngest: (...args) => {
+      calls.push(['startInngest', ...args]);
+      return accepted;
+    },
+    startTrigger: (...args) => {
+      calls.push(['startTrigger', ...args]);
+      return accepted;
+    },
+    stopConvex: (...args) => {
+      calls.push(['stopConvex', ...args]);
+      return accepted;
+    },
+    stopInngest: (...args) => {
+      calls.push(['stopInngest', ...args]);
+      return accepted;
+    },
+    stopTrigger: (...args) => {
+      calls.push(['stopTrigger', ...args]);
+      return accepted;
+    },
+  });
+
+  for (const name of [
+    'enable_tunnel',
+    'disable_tunnel',
+    'start_inngest',
+    'stop_inngest',
+    'start_trigger',
+    'stop_trigger',
+    'start_convex',
+    'stop_convex',
+  ]) {
+    const response = await callTool(name, { name: 'topic', repo: 'r' });
+    expect(response.result.structuredContent).toEqual(accepted);
+  }
+  expect(
+    (
+      await callTool('adopt_worktree', {
+        name: 'topic',
+        path: '/workspace/r/topic',
+        repo: 'r',
+      })
+    ).result.structuredContent
+  ).toEqual(accepted);
+  expect(
+    toolJson(await callTool('list_sidecars', { name: 'topic', repo: 'r' }))
+  ).toEqual([{ active: true, approved: true, name: 'worker' }]);
+  expect(
+    (
+      await callTool('get_sidecar_logs', {
+        name: 'topic',
+        repo: 'r',
+        sidecar: 'worker',
+      })
+    ).result.structuredContent
+  ).toEqual({ lines: ['ready'], state: 'ok' });
+  expect(toolJson(await callTool('get_doctor'))).toEqual([
+    { name: 'portal', ok: true },
+  ]);
+  expect(calls).toEqual([
+    ['enableTunnel', 'r', 'topic'],
+    ['disableTunnel', 'r', 'topic'],
+    ['startInngest', 'r', 'topic'],
+    ['stopInngest', 'r', 'topic'],
+    ['startTrigger', 'r', 'topic'],
+    ['stopTrigger', 'r', 'topic'],
+    ['startConvex', 'r', 'topic'],
+    ['stopConvex', 'r', 'topic'],
+    ['adoptWorktree', 'r', 'topic', '/workspace/r/topic'],
+    ['listSidecars', 'r', 'topic'],
+    ['getSidecarLogs', 'r', 'topic', 'worker', 150],
+  ]);
 });
 
 test('MCP exact retry returns complete partial removal as structured tool error', async () => {

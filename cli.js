@@ -12,10 +12,28 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import * as fsPromises from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { createCliApi } from './cli-api.js';
 import {
+  caddyfileText,
+  cursorConfigText,
+  hasCodexServerTable,
+  hasIdentifiableWorktreeCwd,
+  hasPortalCaddyRoute,
+  portalCaddyRoute,
+  pruneCandidates,
+  startOutcome,
+  sudoRuleCovers,
+  withSetuBlock,
+} from './cli-helpers.js';
+import { dependencySharingForTarget } from './dependency-sharing.js';
+import { createHostHealth } from './host-health.js';
+import {
+  AGENT_CLIS,
   activePid,
   BREW_PREFIX,
   CADDY_BIN,
@@ -55,42 +73,27 @@ import {
   tunnelCredentials,
   tunnelEnabled,
   workspaceState,
+  writerClaimPaths,
 } from './lib.js';
+import { createOperationEvents } from './operation-events.js';
 import {
   requestPortalMutation,
   requestRemoval,
   runRemoveCommand,
 } from './remove-command.js';
+import { createResourceAdmission } from './resource-admission.js';
+import { createSetupProgress } from './setup-progress.js';
 import { runTriggerCommand } from './trigger-command.js';
 import { createUpdateCommand, describeUpdate } from './update-command.js';
-import { dependencySharingForTarget } from './dependency-sharing.js';
 import {
   createAndInstallWorktree,
   installWorktreeDependencies,
 } from './workspace-setup.js';
 import { releaseHeldLocks } from './workspace-state.js';
-import {
-  caddyfileText,
-  cursorConfigText,
-  hasIdentifiableWorktreeCwd,
-  hasCodexServerTable,
-  pruneCandidates,
-  startOutcome,
-  sudoRuleCovers,
-  withSetuBlock,
-} from './cli-helpers.js';
 
 const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
-const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
 
-process.on('SIGINT', () => {
-  releaseHeldLocks();
-  process.exit(130);
-});
-process.on('SIGTERM', () => {
-  releaseHeldLocks();
-  process.exit(143);
-});
+const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
 
 function cfg() {
   try {
@@ -129,6 +132,9 @@ function fail(label) {
 }
 function die(msg) {
   console.error(`${Y}error:${R} ${msg}`);
+  if (dispatching) {
+    throw Object.assign(new Error(msg), { exitCode: 1 });
+  }
   process.exit(1);
 }
 
@@ -145,7 +151,7 @@ function step(n, total, label) {
 
 // ── args ──────────────────────────────────────────────────────────────────────
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = [],
     flags = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -168,96 +174,140 @@ function parseArgs(argv) {
 
 // ── router ────────────────────────────────────────────────────────────────────
 
-const [, , cmdRaw, ...rest] = process.argv;
-const cmd = { '--version': 'version', '-v': 'version' }[cmdRaw] ?? cmdRaw;
-const { args, flags } = parseArgs(rest);
-const asJson = !!flags.json;
+let args = [];
+let flags = {};
+let asJson = false;
+let cliApi = createCliApi();
+let cliReadFile = readFileSync;
+let dispatching = false;
+let newCommandOverrides = {};
+let localCommandOverrides = {};
 
-// Passive staleness nudge — never on `path`/`cd` (the shell wrapper consumes stdout) or meta commands.
-// Removal and Trigger must reach the portal before causing local side effects.
-if (
-  ![
-    'rm',
-    'trigger',
-    'path',
-    'cd',
-    'update',
-    'setup',
-    'version',
-    'help',
-    undefined,
-  ].includes(cmd)
+export const commandHandlers = {
+  actions: cmdActions,
+  admission: cmdAdmission,
+  adopt: cmdAdopt,
+  attention: cmdAttention,
+  caches: cmdCaches,
+  cd: cmdCd,
+  dependencies: cmdDependencies,
+  diff: cmdDiff,
+  doctor: cmdDoctor,
+  fetch: cmdFetch,
+  headless: cmdHeadless,
+  help: cmdHelp,
+  init: cmdInit,
+  logs: cmdLogs,
+  ls: cmdLs,
+  mcp: cmdMcp,
+  new: cmdNew,
+  operations: cmdOperations,
+  path: cmdPath,
+  portal: cmdPortal,
+  ports: cmdPorts,
+  pr: cmdPr,
+  prune: cmdPrune,
+  review: cmdReview,
+  rm: cmdRm,
+  sessions: cmdSessions,
+  setup: cmdSetup,
+  'setup-progress': cmdSetupProgress,
+  'shared-caches': cmdSharedCaches,
+  start: cmdStart,
+  status: cmdLs,
+  stop: cmdStop,
+  storage: cmdStorage,
+  sweep: cmdSweep,
+  sync: cmdSync,
+  trigger: cmdTrigger,
+  tunnel: cmdTunnel,
+  update: cmdUpdate,
+  version: cmdVersion,
+  workflows: cmdWorkflows,
+};
+
+export async function runCli(
+  argv = process.argv.slice(2),
+  { localCommand, newCommand, request, readFile } = {}
 ) {
-  await updateNudge();
-}
+  const previousApi = cliApi;
+  const previousReadFile = cliReadFile;
+  const previousDispatching = dispatching;
+  const previousNewCommandOverrides = newCommandOverrides;
+  const previousLocalCommandOverrides = localCommandOverrides;
+  const injectedRequest =
+    typeof request === 'function' || !!newCommand || !!localCommand;
+  if (request) {
+    cliApi = createCliApi({ request });
+  }
+  if (readFile) {
+    cliReadFile = readFile;
+  }
+  if (newCommand) {
+    newCommandOverrides = newCommand;
+  }
+  if (localCommand) {
+    localCommandOverrides = localCommand;
+  }
+  dispatching = true;
+  try {
+    process.exitCode = 0;
+    const [cmdRaw, ...rest] = argv;
+    const cmd = { '--version': 'version', '-v': 'version' }[cmdRaw] ?? cmdRaw;
+    ({ args, flags } = parseArgs(rest));
+    asJson = !!flags.json;
 
-switch (cmd) {
-  case 'setup':
-    await cmdSetup();
-    break;
-  case 'new':
-    await cmdNew();
-    break;
-  case 'rm':
-    await cmdRm();
-    break;
-  case 'ls':
-    await cmdLs();
-    break;
-  case 'init':
-    await cmdInit();
-    break;
-  case 'sweep':
-    await cmdSweep();
-    break;
-  case 'status':
-    await cmdLs();
-    break;
-  case 'start':
-    await cmdStart();
-    break;
-  case 'stop':
-    await cmdStop();
-    break;
-  case 'prune':
-    await cmdPrune();
-    break;
-  case 'portal':
-    await cmdPortal();
-    break;
-  case 'mcp':
-    await cmdMcp();
-    break;
-  case 'tunnel':
-    await cmdTunnel();
-    break;
-  case 'sync':
-    await cmdSync();
-    break;
-  case 'trigger':
-    await cmdTrigger();
-    break;
-  case 'fetch':
-    await cmdFetch();
-    break;
-  case 'path':
-    await cmdPath();
-    break;
-  case 'cd':
-    await cmdCd();
-    break;
-  case 'update':
-    await cmdUpdate();
-    break;
-  case 'doctor':
-    await cmdDoctor();
-    break;
-  case 'version':
-    cmdVersion();
-    break;
-  default:
-    cmdHelp();
-    break;
+    // Writer claims intentionally bypass the update nudge.
+    if (['claim', 'release', 'claims', 'claim-check'].includes(cmd)) {
+      const { runWriterCommand } = await import('./writer-claims-cli.js');
+      process.exitCode = await runWriterCommand(cmd, rest);
+      return process.exitCode;
+    }
+
+    const handler = commandHandlers[cmd];
+    if (!handler) {
+      if (cmd === undefined) {
+        cmdHelp();
+        return 0;
+      }
+      console.error(`${Y}error:${R} Unknown command '${cmd}'. Run: setu help`);
+      process.exitCode = 1;
+      return 1;
+    }
+
+    if (
+      !(
+        injectedRequest ||
+        [
+          'rm',
+          'trigger',
+          'path',
+          'cd',
+          'update',
+          'setup',
+          'version',
+          'help',
+          undefined,
+        ].includes(cmd)
+      )
+    ) {
+      await updateNudge();
+    }
+    await handler();
+    return process.exitCode ?? 0;
+  } catch (error) {
+    if (error?.exitCode === 1) {
+      process.exitCode = 1;
+      return 1;
+    }
+    throw error;
+  } finally {
+    cliApi = previousApi;
+    cliReadFile = previousReadFile;
+    newCommandOverrides = previousNewCommandOverrides;
+    localCommandOverrides = previousLocalCommandOverrides;
+    dispatching = previousDispatching;
+  }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -327,7 +377,10 @@ function writeAtomic(path, text) {
 // Not every call site wants this: some warn and continue instead of dying,
 // so those stay on portalRequest directly.
 async function portalCall(path, body, failMsg) {
-  const res = await portalRequest(path, body).catch((e) => ({
+  const res = await (body === undefined
+    ? cliApi.get(path)
+    : cliApi.post(path, body)
+  ).catch((e) => ({
     error: String(e),
     ok: false,
   }));
@@ -367,12 +420,13 @@ async function ensurePortal(c) {
   });
 }
 
-function autoInstall(wtDir, sharing, stdio) {
+function autoInstall(wtDir, sharing, stdio, options = {}) {
   return installWorktreeDependencies(wtDir, {
     exists: existsSync,
     run: spawnSync,
     sharing,
     ...(stdio ? { stdio } : {}),
+    ...options,
   });
 }
 
@@ -663,6 +717,14 @@ async function cmdSetup() {
       );
     }
   });
+  await workspaceState(input.workspace).withRouting(async () => {
+    installedStateValue(
+      await workspaceState(input.workspace).replaceText(
+        join(input.workspace, 'caddy.d', 'portal.caddy'),
+        portalCaddyRoute(PORTAL_PORT)
+      )
+    );
+  });
   done();
 
   spin('caddy service');
@@ -681,6 +743,7 @@ async function cmdSetup() {
       fail('failed — run: brew services restart caddy');
     }
   }
+  await reloadCaddy(input.workspace);
   console.log();
 
   // 5. Passwordless sudo — rules must match EXACTLY what lib.js runs
@@ -773,32 +836,129 @@ async function cmdNew() {
       'Usage: setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json]'
     );
   }
-  const c = cfg();
+  const deps = newCommandOverrides;
+  const c = (deps.config ?? cfg)();
   const withTunnel = !!flags.tunnel;
+  const target = { name, repo };
+  const operationId = (
+    deps.operationId ?? (() => `setup-${crypto.randomUUID()}`)
+  )();
+  let state;
+  let events;
+  let outcomeRecorded = true;
+  const recordOutcome = async (stateName, code) => {
+    try {
+      const recorded = await events?.record({
+        ...(code ? { code } : {}),
+        at: Date.now(),
+        id: operationId,
+        kind: 'setup',
+        operationId,
+        source: 'cli',
+        state: stateName,
+        target,
+      });
+      if (recorded?.ok !== true) {
+        outcomeRecorded = false;
+      }
+    } catch {
+      outcomeRecorded = false;
+    }
+  };
+  const outcomeMetadata = () => ({
+    operationId,
+    ...(outcomeRecorded ? {} : { outcomeRecorded: false }),
+  });
+  const reportFailure = async (result, stateName) => {
+    await recordOutcome(stateName, result.code);
+    process.exitCode = 1;
+    if (asJson) {
+      console.log(JSON.stringify({ ...result, ...outcomeMetadata() }));
+    } else {
+      console.error(`${Y}error:${R} ${result.code}: ${result.error}`);
+    }
+  };
+  const failureState = (result) =>
+    result?.state === 'unknown' ||
+    String(result?.code ?? '').endsWith('UNKNOWN')
+      ? 'unknown'
+      : 'failed';
 
   let res;
   try {
-    const sharing = dependencySharingForTarget(c, repo, name);
-    res = await createAndInstallWorktree({
-      create: (options) => createWorktree(c, repo, name, options),
+    const sharing = (
+      deps.dependencySharingForTarget ?? dependencySharingForTarget
+    )(c, repo, name);
+    state = (deps.workspaceState ?? workspaceState)(c.workspace);
+    events = (deps.createOperationEvents ?? createOperationEvents)({ state });
+    const admission = (deps.createResourceAdmission ?? createResourceAdmission)(
+      {
+        hostHealth: (deps.createHostHealth ?? createHostHealth)(c.workspace),
+        state,
+      }
+    );
+    const progress = (deps.createSetupProgress ?? createSetupProgress)({
+      newAttemptId: () => crypto.randomUUID(),
+      state,
+    });
+    const logLocation = join(c.workspace, 'logs', repo, name, 'setup.log');
+    await recordOutcome('accepted');
+    res = await (deps.createAndInstallWorktree ?? createAndInstallWorktree)({
+      admission,
+      checkoutIdentity: async (wtDir) => {
+        const identity = await (
+          deps.inspectCheckoutIdentity ?? inspectCheckoutIdentity
+        )({ repoDir: join(c.workspace, `${repo}.git`), wtDir }, fsPromises);
+        if (!identity.known) {
+          throw Object.assign(new Error(identity.reason), {
+            code: 'CHECKOUT_IDENTITY_UNKNOWN',
+          });
+        }
+        return identity;
+      },
+      create: (options) =>
+        (deps.createWorktree ?? createWorktree)(c, repo, name, options),
       enableTunnel: async () => {
-        await ensureTunnel(c, repo, name);
+        await (deps.ensureTunnel ?? ensureTunnel)(c, repo, name);
         return publicDomain(c);
       },
-      install: (wtDir) =>
-        autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined),
+      install: (wtDir, setup) =>
+        autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined, {
+          ...setup,
+          state,
+        }),
+      logLocation,
       name,
+      operationId,
+      progress,
       repo,
-      state: workspaceState(c.workspace),
+      state,
+      target,
       tunnel: withTunnel,
+      withTarget: (lockedTarget, task) =>
+        state.withTargets([lockedTarget], task),
     });
   } catch (e) {
-    die(e.message);
+    const result = {
+      ...(e?.recovery === undefined ? {} : { recovery: e.recovery }),
+      code: e?.code ?? 'SETUP_FAILED',
+      error: e?.message ?? String(e),
+      ok: false,
+    };
+    await reportFailure(result, failureState(result));
+    return;
   }
+
+  if (res?.ok === false) {
+    await reportFailure(res, failureState(res));
+    return;
+  }
+
+  await recordOutcome('completed');
 
   let started = false;
   if (flags.start) {
-    await ensurePortal(c);
+    await (deps.ensurePortal ?? ensurePortal)(c);
     const startBody = { name, repo };
     if (flags.container) {
       startBody.container = true;
@@ -809,9 +969,9 @@ async function cmdNew() {
     // the portal's sticky default naturally resolves to the intended global
     // default (container) here — same call shape as `setu start`, not a
     // special case.
-    const startRes = await portalRequest('/api/start', startBody).catch(
-      (e) => ({ error: String(e), ok: false })
-    );
+    const startRes = await cliApi
+      .post('/api/start', startBody)
+      .catch((e) => ({ error: String(e), ok: false }));
     const outcome = startOutcome(startRes);
     started = outcome.started;
     if (!started) {
@@ -828,7 +988,7 @@ async function cmdNew() {
   }
 
   if (asJson) {
-    console.log(JSON.stringify({ ...res, started }));
+    console.log(JSON.stringify({ ...res, started, ...outcomeMetadata() }));
     return;
   }
   console.log(`\n  ${G}✓${R} worktree  ${res.wtDir}`);
@@ -917,6 +1077,49 @@ async function cmdStop() {
   ok(`stopped ${repo}/${name}`);
 }
 
+function createLocalWorkspaceOperation(c, kind, target = null) {
+  const deps = localCommandOverrides;
+  const operationId = (
+    deps.operationId ?? ((name) => `${name}-${crypto.randomUUID()}`)
+  )(kind);
+  let events;
+  try {
+    const state = (deps.workspaceState ?? workspaceState)(c.workspace);
+    events = (deps.createOperationEvents ?? createOperationEvents)({ state });
+  } catch {
+    // Recording must not prevent the requested local operation.
+  }
+  const record = async (state, code) => {
+    try {
+      await events?.record({
+        ...(code ? { code } : {}),
+        at: Date.now(),
+        id: operationId,
+        kind,
+        operationId,
+        source: 'cli',
+        state,
+        target,
+      });
+    } catch {
+      // The child outcome remains authoritative if recording is unavailable.
+    }
+  };
+  return { record };
+}
+
+function operationFailureState(error) {
+  return String(error?.code ?? '').endsWith('UNKNOWN') ? 'unknown' : 'failed';
+}
+
+function importFailureState(error) {
+  return ['REMOVAL_PENDING', 'STORAGE_LOW', 'STORAGE_UNKNOWN'].includes(
+    error?.code
+  )
+    ? 'failed'
+    : 'unknown';
+}
+
 // ── setu prune [--force] ──────────────────────────────────────────────────────
 // Finds dev-server processes that are listening but not in setu's own registry —
 // the "orb" pattern found in production: a worktree fully running and consuming
@@ -924,12 +1127,13 @@ async function cmdStop() {
 // about what .ports already has. Dry-run by default; --force actually kills.
 
 async function cmdPrune() {
-  const c = cfg();
-  const active = listActivePorts();
-  const orphans = pruneCandidates(
-    portEntries(c.workspace),
+  const deps = localCommandOverrides;
+  const c = (deps.config ?? cfg)();
+  const active = (deps.listActivePorts ?? listActivePorts)();
+  const orphans = (deps.pruneCandidates ?? pruneCandidates)(
+    (deps.portEntries ?? portEntries)(c.workspace),
     active,
-    processCwd,
+    deps.processCwd ?? processCwd,
     c.workspace
   );
 
@@ -953,6 +1157,10 @@ async function cmdPrune() {
     return;
   }
 
+  const operation = createLocalWorkspaceOperation(c, 'prune');
+  await operation.record('accepted');
+  let failures = 0;
+
   // Raw single-pid kill, not killGroup() (lib.js): these pids come from a
   // live lsof scan, not anything setu spawned, so there's no spawn record to
   // say whether the pid owns its own process group. killGroup would still
@@ -962,12 +1170,20 @@ async function cmdPrune() {
   // job). A raw single-pid kill matches exactly what --force authorized.
   for (const p of orphans) {
     try {
-      execFileSync('kill', [p.pid]);
+      (deps.execFileSync ?? execFileSync)('kill', [p.pid]);
       ok(`killed pid ${p.pid} (:${p.port})`);
     } catch (e) {
+      failures += 1;
       fail(`pid ${p.pid}: ${e.message}`);
     }
   }
+  if (failures) {
+    const code = failures === orphans.length ? 'PRUNE_FAILED' : 'PRUNE_PARTIAL';
+    await operation.record('failed', code);
+    process.exitCode = 1;
+    return;
+  }
+  await operation.record('completed');
 }
 
 // ── setu ls [repo] [--json] ───────────────────────────────────────────────────
@@ -1010,21 +1226,33 @@ async function cmdInit() {
   if (!slug) {
     die('Usage: setu init quivly/quivly-app [label]');
   }
-  const c = cfg();
+  const deps = localCommandOverrides;
+  const c = (deps.config ?? cfg)();
   const repo = slug.split('/').pop();
 
   if (!existsSync(join(c.workspace, `${repo}.git`))) {
     console.log(`  Cloning ${slug}...`);
   }
+  const operation = createLocalWorkspaceOperation(c, 'import', {
+    name: 'main',
+    repo,
+  });
+  await operation.record('accepted');
   try {
-    await importRepo(c, {
+    await (deps.importRepo ?? importRepo)(c, {
       label,
       name: repo,
       remoteUrl: `git@github.com:${slug}.git`,
     });
   } catch (e) {
-    die(e.message);
+    const state = importFailureState(e);
+    await operation.record(
+      state,
+      state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
+    );
+    die(`${e?.code ? `${e.code}: ` : ''}${e.message}`);
   }
+  await operation.record('completed');
 
   args.length = 0;
   args.push(repo, 'main');
@@ -1037,7 +1265,8 @@ async function cmdInit() {
 // until --import is passed.
 
 async function cmdSweep() {
-  const c = cfg();
+  const deps = localCommandOverrides;
+  const c = (deps.config ?? cfg)();
   // Not just cosmetic: a $HOME with old clones sitting on iCloud Drive can
   // take a while on a cold cache (each git call is capped, see
   // SWEEP_GIT_TIMEOUT_MS in lib.js, but a few dozen capped calls still add
@@ -1045,7 +1274,7 @@ async function cmdSweep() {
   if (!asJson) {
     spin(`Scanning ${HOME} for git repos`);
   }
-  const candidates = discoverRepos(HOME);
+  const candidates = (deps.discoverRepos ?? discoverRepos)(HOME);
   if (!asJson) {
     done();
   }
@@ -1097,15 +1326,26 @@ async function cmdSweep() {
   }
 
   console.log(`  Importing ${name} from ${cand.remoteUrl}...`);
+  const operation = createLocalWorkspaceOperation(c, 'import', {
+    name: 'main',
+    repo: cand.name,
+  });
+  await operation.record('accepted');
   try {
-    await importRepo(c, {
+    await (deps.importRepo ?? importRepo)(c, {
       label: cand.name,
       name: cand.name,
       remoteUrl: cand.remoteUrl,
     });
   } catch (e) {
-    die(e.message);
+    const state = importFailureState(e);
+    await operation.record(
+      state,
+      state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
+    );
+    die(`${e?.code ? `${e.code}: ` : ''}${e.message}`);
   }
+  await operation.record('completed');
   ok(`imported ${name} into ${c.workspace}/${name}.git, worktree main ready`);
 }
 
@@ -1139,10 +1379,10 @@ async function cmdPortal() {
 // ── setu mcp install <target> ─────────────────────────────────────────────────
 // Setu's own MCP server (mcp-server.js) is mounted at /mcp on the portal
 // regardless of which client connects to it -- this just registers that one
-// URL with whichever client's own config file/format expects it. Claude Code
-// isn't handled here: it already has a real installable plugin at
-// claude-plugin/ (a marketplace-installable package, not a config-file edit),
-// so that path is pointed at below rather than duplicated.
+// URL with whichever client's own config file/format expects it. Codex and
+// Cursor are configured by editing their files; Claude Code, Grok and OpenCode
+// through their own `mcp add` commands. Claude Code also has the installable
+// plugin in claude-plugin/.
 
 // TOML, confirmed against OpenAI's own config reference (developers.openai.com/codex/config-reference):
 // mcp_servers.<id> with a bare `url` field selects Streamable HTTP -- no
@@ -1152,8 +1392,11 @@ async function cmdPortal() {
 // addition; a new top-level table appended at file end is valid TOML
 // regardless of what's above it, and the regex guard below makes this safe
 // to re-run without duplicating the block.
-function mcpInstallCodex() {
-  const dir = process.env.CODEX_HOME || join(HOME, '.codex');
+export function mcpInstallCodex({
+  home = HOME,
+  codexHome = process.env.CODEX_HOME,
+} = {}) {
+  const dir = codexHome || join(home, '.codex');
   const path = join(dir, 'config.toml');
   mkdirSync(dir, { recursive: true });
   const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
@@ -1177,8 +1420,8 @@ function mcpInstallCodex() {
 // plugin schema which requires one. Real parse+merge here (not an append),
 // since JSON.parse/stringify make it safe to preserve whatever else is
 // already in this file, unlike the TOML case above.
-function mcpInstallCursor() {
-  const dir = join(HOME, '.cursor');
+export function mcpInstallCursor({ home = HOME } = {}) {
+  const dir = join(home, '.cursor');
   const path = join(dir, 'mcp.json');
   mkdirSync(dir, { recursive: true });
   let conf = {};
@@ -1202,21 +1445,150 @@ function mcpInstallCursor() {
   console.log('  Restart Cursor (or reload its MCP servers) to pick it up.');
 }
 
+function mcpInstallCli(bin, argv) {
+  const result = spawnSync(bin, argv, { stdio: 'inherit' });
+  if (result.status !== 0) {
+    die(`${bin} did not confirm the Setu MCP server was added`);
+  }
+}
+
+// A client that already lists the server is left alone, so a second run and
+// `--all` never fail on "already exists".
+function mcpInstallViaClient(id, argv) {
+  if (mcpClientStatus(id) === 'configured') {
+    ok(`Already configured in ${id}`);
+    return;
+  }
+  mcpInstallCli(AGENT_CLIS[id].bin, argv);
+  ok(`Added Setu MCP server to ${id}`);
+}
+
+function mcpInstallClaude() {
+  mcpInstallViaClient('claude', [
+    'mcp',
+    'add',
+    '--transport',
+    'http',
+    '--scope',
+    'user',
+    'setu',
+    MCP_URL,
+  ]);
+}
+
+function mcpInstallGrok() {
+  mcpInstallViaClient('grok', [
+    'mcp',
+    'add',
+    '--transport',
+    'http',
+    '--scope',
+    'user',
+    'setu',
+    MCP_URL,
+  ]);
+}
+
+function mcpInstallOpenCode() {
+  mcpInstallViaClient('opencode', ['mcp', 'add', 'setu', '--url', MCP_URL]);
+}
+
+const verifiedMcpInstallers = {
+  claude: mcpInstallClaude,
+  codex: mcpInstallCodex,
+  cursor: mcpInstallCursor,
+  grok: mcpInstallGrok,
+  opencode: mcpInstallOpenCode,
+};
+
+function genericMcpConfig(target) {
+  console.log(
+    `${target} could not be verified on this machine. Add this Streamable HTTP MCP entry using its configuration UI or documentation:\n` +
+      `${JSON.stringify({ mcpServers: { setu: { type: 'http', url: MCP_URL } } }, null, 2)}`
+  );
+}
+
+function codexConfigured() {
+  const path = join(
+    process.env.CODEX_HOME || join(HOME, '.codex'),
+    'config.toml'
+  );
+  return existsSync(path) && hasCodexServerTable(readFileSync(path, 'utf8'));
+}
+
+function cursorConfigured() {
+  const path = join(HOME, '.cursor', 'mcp.json');
+  if (!existsSync(path)) {
+    return false;
+  }
+  try {
+    return !!JSON.parse(readFileSync(path, 'utf8')).mcpServers?.setu;
+  } catch {
+    return false;
+  }
+}
+
+function mcpClientStatus(id) {
+  const { bin } = AGENT_CLIS[id];
+  if (!commandExists(bin)) {
+    return 'unknown';
+  }
+  const result = spawnSync(bin, ['mcp', 'list'], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return 'unknown';
+  }
+  return `${result.stdout ?? ''}\n${result.stderr ?? ''}`.includes('setu')
+    ? 'configured'
+    : 'not configured';
+}
+
+function mcpStatus() {
+  for (const id of Object.keys(AGENT_CLIS)) {
+    if (id === 'codex') {
+      console.log(
+        `codex: ${codexConfigured() ? 'configured' : mcpClientStatus(id)}`
+      );
+    } else if (id === 'cursor') {
+      console.log(
+        `cursor: ${cursorConfigured() ? 'configured' : mcpClientStatus(id)}`
+      );
+    } else if (verifiedMcpInstallers[id]) {
+      console.log(`${id}: ${mcpClientStatus(id)}`);
+    } else {
+      console.log(`${id}: unknown`);
+    }
+  }
+}
+
 async function cmdMcp() {
-  const [sub, target] = args;
+  const [sub, targetArg] = args;
+  const target = targetArg ?? (flags.all ? '--all' : undefined);
+  if (sub === 'status' && !target) {
+    mcpStatus();
+    return;
+  }
   if (sub !== 'install' || !target) {
-    die('Usage: setu mcp install <codex|cursor>');
+    die('Usage: setu mcp install <client|--all> | setu mcp status');
   }
-  if (target === 'codex') {
-    return mcpInstallCodex();
+  if (target === '--all') {
+    for (const [id, install] of Object.entries(verifiedMcpInstallers)) {
+      if (
+        ['codex', 'cursor'].includes(id) ||
+        commandExists(AGENT_CLIS[id].bin)
+      ) {
+        install();
+      }
+    }
+    return;
   }
-  if (target === 'cursor') {
-    return mcpInstallCursor();
+  if (verifiedMcpInstallers[target]) {
+    return verifiedMcpInstallers[target]();
+  }
+  if (Object.hasOwn(AGENT_CLIS, target)) {
+    return genericMcpConfig(target);
   }
   die(
-    `Unknown target '${target}'. Supported: codex, cursor.\n` +
-      `  Claude Code: claude --plugin-dir ${PKG_DIR}claude-plugin (already packaged, see claude-plugin/).\n` +
-      `  Anything else with its own MCP client: point it at ${MCP_URL} (Streamable HTTP, no auth) in whatever config format it expects.`
+    `Unknown target '${target}'. Supported: ${Object.keys(AGENT_CLIS).join(', ')}, --all.`
   );
 }
 
@@ -1297,6 +1669,682 @@ async function cmdTrigger() {
   process.exitCode = outcome.exitCode;
 }
 
+// ── setu logs / diff / ports / pr ────────────────────────────────────────────
+
+function portalQuery(path, values) {
+  return cliApi.get(path, values);
+}
+
+async function readPortal(path, values, failure) {
+  try {
+    return await portalQuery(path, values);
+  } catch (error) {
+    die(error.message || failure);
+  }
+}
+
+async function cmdLogs() {
+  const [repo, name] = args;
+  if (!(repo && name)) {
+    die(
+      'Usage: setu logs <repo> <branch> [--type dev|inngest|trigger|...] [--lines N] [--json]'
+    );
+  }
+  const lines = flags.lines === undefined ? undefined : Number(flags.lines);
+  if (lines !== undefined && (!Number.isInteger(lines) || lines < 1)) {
+    die('--lines must be a positive integer');
+  }
+  const result = await readPortal(
+    '/api/logs',
+    { n: lines, name, repo, type: flags.type },
+    'logs failed'
+  );
+  console.log(
+    asJson ? JSON.stringify(result, null, 2) : (result.lines ?? []).join('\n')
+  );
+}
+
+async function cmdDiff() {
+  const [repo, name] = args;
+  if (!(repo && name)) {
+    die('Usage: setu diff <repo> <branch> [--verbose] [--json]');
+  }
+  const result = await readPortal('/api/diff', { name, repo }, 'diff failed');
+  if (asJson || flags.verbose) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(
+    `${repo}/${name} against ${result.base}: ${result.committed?.totalFiles ?? 0} committed file(s), ${result.uncommitted?.totalFiles ?? 0} uncommitted file(s)`
+  );
+}
+
+async function cmdPorts() {
+  const result = await readPortal('/api/ports', {}, 'ports failed');
+  if (asJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  for (const port of result) {
+    console.log(
+      `:${port.port}  pid ${port.pid ?? 'unknown'}  ${port.cmd ?? ''}`.trim()
+    );
+  }
+}
+
+async function cmdPr() {
+  const [action, repo, name] = args;
+  if (!(repo && name && ['create', 'ready', 'status'].includes(action))) {
+    die('Usage: setu pr create|ready|status <repo> <branch> [--json]');
+  }
+  if (action === 'status') {
+    const result = await readPortal(
+      '/api/pr-review/status',
+      { name, repo },
+      'PR status failed'
+    );
+    console.log(
+      asJson ? JSON.stringify(result, null, 2) : JSON.stringify(result)
+    );
+    return;
+  }
+  const result = await portalCall(
+    action === 'create' ? '/api/pr/create' : '/api/pr/ready',
+    action === 'create' ? { name, repo } : { name, ready: true, repo },
+    `PR ${action} failed`
+  );
+  console.log(
+    asJson
+      ? JSON.stringify(result, null, 2)
+      : `PR ${action} accepted for ${repo}/${name}`
+  );
+}
+
+function target() {
+  const [repo, name] = args;
+  if (!(repo && name)) {
+    die('repo and branch are required');
+  }
+  return { name, repo };
+}
+
+function validateCommand({ allowedFlags = [], argCounts, usage }) {
+  if (!argCounts.includes(args.length)) {
+    die(`Usage: ${usage}`);
+  }
+  validateFlags(allowedFlags, usage);
+}
+
+function validateFlags(allowedFlags, usage) {
+  for (const flag of Object.keys(flags)) {
+    if (!['json', ...allowedFlags].includes(flag)) {
+      die(`Usage: ${usage}`);
+    }
+  }
+}
+
+function optionalFlag(name) {
+  if (flags[name] === undefined) {
+    return;
+  }
+  return requireFlag(name);
+}
+
+function requireFlag(name) {
+  const value = flags[name];
+  if (typeof value !== 'string' || !value) {
+    die(`--${name} is required`);
+  }
+  return value;
+}
+
+function jsonInput(name = 'input') {
+  const source = requireFlag(name);
+  const text =
+    source === '-' ? cliReadFile(0, 'utf8') : cliReadFile(source, 'utf8');
+  try {
+    return JSON.parse(text);
+  } catch {
+    die(`--${name} must contain JSON`);
+  }
+}
+
+function textInput(name) {
+  const source = requireFlag(name);
+  return source === '-' ? cliReadFile(0, 'utf8') : cliReadFile(source, 'utf8');
+}
+
+function checkoutIdentity() {
+  const value = jsonInput('checkout');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    die('--checkout must contain a checkout identity JSON object');
+  }
+  return value;
+}
+
+function positiveNumber(
+  name,
+  { integer = false, maximum = Number.POSITIVE_INFINITY } = {}
+) {
+  if (flags[name] === undefined) {
+    return;
+  }
+  const value = Number(flags[name]);
+  if (
+    !Number.isFinite(value) ||
+    value <= 0 ||
+    value > maximum ||
+    (integer && !Number.isInteger(value))
+  ) {
+    die(
+      `--${name} must be a positive${integer ? ' integer' : ' number'} no greater than ${maximum}`
+    );
+  }
+  return value;
+}
+
+async function apiResult(call) {
+  try {
+    const result = await call();
+    if (
+      !result ||
+      result.ok === false ||
+      result.state === 'unknown' ||
+      String(result.code ?? '').endsWith('UNKNOWN')
+    ) {
+      const error =
+        result?.error ?? result?.code ?? 'Portal action was not accepted';
+      if (asJson) {
+        console.log(JSON.stringify(result));
+      } else {
+        console.error(JSON.stringify({ ...result, error }, null, 2));
+      }
+      process.exitCode = 1;
+      return null;
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } catch (error) {
+    const result = {
+      code: 'PORTAL_UNAVAILABLE',
+      error: error.message,
+      ok: false,
+    };
+    if (asJson) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.error(JSON.stringify(result, null, 2));
+    }
+    process.exitCode = 1;
+    return null;
+  }
+}
+
+async function cmdStorage() {
+  validateCommand({
+    allowedFlags: ['store'],
+    argCounts: [0, 1, 3],
+    usage:
+      'setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!action) {
+    validateFlags(
+      [],
+      'setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]'
+    );
+    return apiResult(() => cliApi.get('/api/workspace-storage'));
+  }
+  if (action !== 'inspect') {
+    die(
+      'Usage: setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]'
+    );
+  }
+  const storeId = optionalFlag('store');
+  if (storeId !== undefined && (repo || name)) {
+    die('storage inspect accepts either <repo> <branch> or --store <id>');
+  }
+  if (storeId === undefined) {
+    validateFlags([], 'setu storage inspect <repo> <branch> [--json]');
+  }
+  const body = storeId ? { storeId } : { name, repo };
+  if (!(body.storeId || (body.repo && body.name))) {
+    die('storage inspect requires <repo> <branch> or --store <id>');
+  }
+  return apiResult(() => cliApi.post('/api/workspace-storage/inspect', body));
+}
+
+async function cmdOperations() {
+  validateCommand({
+    allowedFlags: ['limit', 'since'],
+    argCounts: [0, 2],
+    usage: 'setu operations [repo branch] [--since <ISO> --limit <N>] [--json]',
+  });
+  const [repo, name] = args;
+  return apiResult(() =>
+    cliApi.get('/api/operations', {
+      limit: positiveNumber('limit', { integer: true }),
+      name,
+      repo,
+      since: optionalFlag('since'),
+    })
+  );
+}
+
+async function cmdSessions() {
+  validateCommand({
+    allowedFlags: ['checkout', 'session'],
+    argCounts: [0, 1, 3],
+    usage:
+      'setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!action) {
+    return apiResult(() => cliApi.get('/api/agent-sessions'));
+  }
+  if (action === 'list') {
+    validateFlags([], 'setu sessions list [repo branch] [--json]');
+    if ((repo && !name) || (!repo && name)) {
+      die('Usage: setu sessions list [repo branch] [--json]');
+    }
+    return apiResult(() => cliApi.get('/api/agent-sessions', { name, repo }));
+  }
+  if (action !== 'end') {
+    die(
+      'Usage: setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <identity>] [--json]'
+    );
+  }
+  return apiResult(() =>
+    cliApi.post('/api/agent-sessions/end', {
+      checkoutIdentity: checkoutIdentity(),
+      name,
+      repo,
+      sessionId: requireFlag('session'),
+    })
+  );
+}
+
+async function cmdCaches() {
+  validateCommand({
+    allowedFlags: ['confirmation', 'manifest', 'retry'],
+    argCounts: [3],
+    usage:
+      'setu caches prepare <repo> <branch> | execute <repo> <branch> --manifest <id> --confirmation <token> [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!(['prepare', 'execute'].includes(action) && repo && name)) {
+    die(
+      'Usage: setu caches prepare <repo> <branch> | execute <repo> <branch> --manifest <id> --confirmation <token> [--json]'
+    );
+  }
+  const body = { name, repo };
+  if (action === 'execute') {
+    const retry = flags.retry === undefined ? undefined : jsonInput('retry');
+    if (retry !== undefined && flags.confirmation !== undefined) {
+      die('Use either --confirmation or --retry, not both');
+    }
+    if (retry !== undefined && flags.manifest !== undefined) {
+      die('Use either --manifest or --retry, not both');
+    }
+    if (
+      retry !== undefined &&
+      !(
+        retry &&
+        typeof retry === 'object' &&
+        typeof retry.manifestId === 'string' &&
+        typeof retry.retryId === 'string'
+      )
+    ) {
+      die('--retry must contain {"manifestId":"...","retryId":"..."}');
+    }
+    Object.assign(body, {
+      confirmation: retry ?? requireFlag('confirmation'),
+      manifestId: retry?.manifestId ?? requireFlag('manifest'),
+    });
+  } else {
+    validateFlags([], 'setu caches prepare <repo> <branch> [--json]');
+  }
+  return apiResult(() => cliApi.post(`/api/worktree-cache/${action}`, body));
+}
+
+async function cmdAdmission() {
+  validateCommand({ argCounts: [0], usage: 'setu admission [--json]' });
+  return apiResult(() => cliApi.get('/api/resource-admission'));
+}
+
+async function cmdSetupProgress() {
+  validateCommand({
+    allowedFlags: ['attempt', 'checkout'],
+    argCounts: [0, 1, 3],
+    usage:
+      'setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id>] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!action || action === 'list') {
+    validateFlags([], 'setu setup-progress list [repo branch] [--json]');
+    if ((repo && !name) || (!repo && name)) {
+      die('Usage: setu setup-progress list [repo branch] [--json]');
+    }
+    return apiResult(() =>
+      cliApi.get('/api/setup-progress', {
+        name: action ? name : undefined,
+        repo: action ? repo : undefined,
+      })
+    );
+  }
+  if (action !== 'retry' || !(repo && name)) {
+    die(
+      'Usage: setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <identity> --attempt <id>] [--json]'
+    );
+  }
+  return apiResult(() =>
+    cliApi.post('/api/setup-progress/retry', {
+      attemptId: requireFlag('attempt'),
+      checkoutIdentity: checkoutIdentity(),
+      name,
+      repo,
+    })
+  );
+}
+
+async function cmdAttention() {
+  validateCommand({
+    allowedFlags: ['checkout', 'session'],
+    argCounts: [0, 1, 3],
+    usage:
+      'setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!action || action === 'list') {
+    validateFlags([], 'setu attention list [repo branch] [--json]');
+    if ((repo && !name) || (!repo && name)) {
+      die('Usage: setu attention list [repo branch] [--json]');
+    }
+    return apiResult(() =>
+      cliApi.get('/api/attention', {
+        name: action ? name : undefined,
+        repo: action ? repo : undefined,
+      })
+    );
+  }
+  if (action !== 'focus' || !(repo && name)) {
+    die(
+      'Usage: setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <identity>] [--json]'
+    );
+  }
+  return apiResult(() =>
+    cliApi.post('/api/attention/focus', {
+      checkoutIdentity: checkoutIdentity(),
+      name,
+      repo,
+      sessionId: requireFlag('session'),
+    })
+  );
+}
+
+function headlessLimits() {
+  const model = optionalFlag('model');
+  if (model !== undefined && !/^[a-zA-Z0-9._-]{1,128}$/.test(model)) {
+    die('--model must be a valid headless model name');
+  }
+  return {
+    maxBudgetUsd: positiveNumber('budget', { maximum: 2 }),
+    model,
+    outputBytes: positiveNumber('output-bytes', {
+      integer: true,
+      maximum: 64 * 1024,
+    }),
+    wallClockMs: positiveNumber('wall-clock-ms', {
+      integer: true,
+      maximum: 60 * 60 * 1000,
+    }),
+  };
+}
+
+async function cmdHeadless() {
+  validateCommand({
+    allowedFlags: [
+      'budget',
+      'checkout',
+      'model',
+      'output-bytes',
+      'prompt-file',
+      'run',
+      'wall-clock-ms',
+    ],
+    argCounts: [0, 1, 3],
+    usage:
+      'setu headless list [repo branch] | start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] | cancel <repo> <branch> --run <id> --checkout <file|-> | resume <repo> <branch> --run <id> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!action || action === 'list') {
+    validateFlags([], 'setu headless list [repo branch] [--json]');
+    if ((repo && !name) || (!repo && name)) {
+      die('Usage: setu headless list [repo branch] [--json]');
+    }
+    return apiResult(() =>
+      cliApi.get('/api/headless-runs', {
+        name: action ? name : undefined,
+        repo: action ? repo : undefined,
+      })
+    );
+  }
+  if (!(repo && name && ['start', 'cancel', 'resume'].includes(action))) {
+    die(
+      'Usage: setu headless list [repo branch] | start <repo> <branch> --prompt-file <file|-> [--model M --budget N --wall-clock-ms N --output-bytes N] | cancel <repo> <branch> --run <id> --checkout <identity> | resume <repo> <branch> --run <id> --prompt-file <file|-> [--model M --budget N --wall-clock-ms N --output-bytes N] [--json]'
+    );
+  }
+  const body = { name, repo };
+  if (action === 'cancel') {
+    validateFlags(
+      ['checkout', 'run'],
+      'setu headless cancel <repo> <branch> --run <id> --checkout <file|-> [--json]'
+    );
+    Object.assign(body, {
+      checkoutIdentity: checkoutIdentity(),
+      runId: requireFlag('run'),
+    });
+  } else {
+    validateFlags(
+      action === 'resume'
+        ? [
+            'budget',
+            'model',
+            'output-bytes',
+            'prompt-file',
+            'run',
+            'wall-clock-ms',
+          ]
+        : ['budget', 'model', 'output-bytes', 'prompt-file', 'wall-clock-ms'],
+      action === 'resume'
+        ? 'setu headless resume <repo> <branch> --run <id> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]'
+        : 'setu headless start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]'
+    );
+    Object.assign(
+      body,
+      headlessLimits(),
+      { prompt: textInput('prompt-file') },
+      action === 'resume' ? { runId: requireFlag('run') } : {}
+    );
+  }
+  return apiResult(() => cliApi.post(`/api/headless-runs/${action}`, body));
+}
+
+async function cmdDependencies() {
+  validateCommand({
+    argCounts: [0, 1, 2, 3],
+    usage:
+      'setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]',
+  });
+  let [action, repo, name] = args;
+  if (args.length === 2) {
+    [repo, name] = args;
+    action = 'status';
+  } else if (!action) {
+    action = 'status';
+  }
+  if (action === 'status') {
+    return apiResult(() =>
+      cliApi.get('/api/dependency-sharing', { name, repo })
+    );
+  }
+  if (!(['verify', 'repair'].includes(action) && repo && name)) {
+    die(
+      'Usage: setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]'
+    );
+  }
+  return apiResult(() =>
+    cliApi.post(`/api/dependency-sharing/${action}`, { name, repo })
+  );
+}
+
+async function cmdSharedCaches() {
+  validateCommand({ argCounts: [0], usage: 'setu shared-caches [--json]' });
+  return apiResult(() => cliApi.get('/api/shared-caches'));
+}
+
+async function cmdWorkflows() {
+  validateCommand({
+    allowedFlags: ['confirmation', 'inputs', 'ref', 'workflow'],
+    argCounts: [3],
+    usage:
+      'setu workflows list|runs <repo> <branch> | dispatch <repo> <branch> --workflow <id> --ref <ref> --inputs <file|-> [--confirmation <token>] [--json]',
+  });
+  const [action, repo, name] = args;
+  if (!(['list', 'runs', 'dispatch'].includes(action) && repo && name)) {
+    die(
+      'Usage: setu workflows list|runs <repo> <branch> | dispatch <repo> <branch> --workflow <id> --ref <ref> --inputs <file|-> [--confirmation <token>] [--json]'
+    );
+  }
+  if (action !== 'dispatch') {
+    validateFlags([], `setu workflows ${action} <repo> <branch> [--json]`);
+    return apiResult(() =>
+      cliApi.get(`/api/github/${action === 'list' ? 'workflows' : 'runs'}`, {
+        name,
+        repo,
+      })
+    );
+  }
+  return apiResult(() =>
+    cliApi.post('/api/github/dispatch', {
+      confirmation: optionalFlag('confirmation'),
+      inputs: jsonInput('inputs'),
+      name,
+      ref: requireFlag('ref'),
+      repo,
+      workflow: requireFlag('workflow'),
+    })
+  );
+}
+
+async function cmdActions() {
+  validateCommand({
+    allowedFlags: ['action', 'confirmation', 'input'],
+    argCounts: [1],
+    usage:
+      'setu actions list | save --input <file|-> | preflight --action <id> --input <file|-> | invoke --action <id> --input <file|-> --confirmation <token> [--json]',
+  });
+  const [action] = args;
+  if (action === 'list') {
+    validateFlags([], 'setu actions list [--json]');
+    return apiResult(() => cliApi.get('/api/mcp-actions'));
+  }
+  if (!['save', 'preflight', 'invoke'].includes(action)) {
+    die(
+      'Usage: setu actions list | save --input <file|-> | preflight --action <id> --input <file|-> | invoke --action <id> --input <file|-> --confirmation <token> [--json]'
+    );
+  }
+  validateFlags(
+    action === 'save'
+      ? ['input']
+      : action === 'preflight'
+        ? ['action', 'input']
+        : ['action', 'confirmation', 'input'],
+    action === 'save'
+      ? 'setu actions save --input <file|-> [--json]'
+      : action === 'preflight'
+        ? 'setu actions preflight --action <id> --input <file|-> [--json]'
+        : 'setu actions invoke --action <id> --input <file|-> --confirmation <token> [--json]'
+  );
+  const body =
+    action === 'save'
+      ? jsonInput()
+      : {
+          actionId: requireFlag('action'),
+          input: jsonInput(),
+          ...(action === 'invoke'
+            ? { confirmation: requireFlag('confirmation') }
+            : {}),
+        };
+  return apiResult(() => cliApi.post(`/api/mcp-actions/${action}`, body));
+}
+
+async function cmdAdopt() {
+  validateCommand({
+    allowedFlags: ['path'],
+    argCounts: [2],
+    usage: 'setu adopt <repo> <branch> --path <linked-checkout> [--json]',
+  });
+  const { repo, name } = target();
+  return apiResult(() =>
+    cliApi.post('/api/worktrees/adopt', {
+      name,
+      path: requireFlag('path'),
+      repo,
+    })
+  );
+}
+
+async function cmdReview() {
+  validateCommand({
+    allowedFlags: ['artifact', 'checkout', 'findings', 'session'],
+    argCounts: [3],
+    usage:
+      'setu review handoff <repo> <branch> --session <id> --checkout <file|-> --artifact <file|-> --findings <file|-> [--json]',
+  });
+  const [action, repo, name] = args;
+  if (action !== 'handoff' || !(repo && name)) {
+    die(
+      'Usage: setu review handoff <repo> <branch> --session <id> --checkout <file|-> --artifact <file|-> --findings <file|-> [--json]'
+    );
+  }
+  const artifact = jsonInput('artifact'),
+    findings = jsonInput('findings');
+  if (
+    !(
+      artifact &&
+      typeof artifact === 'object' &&
+      !Array.isArray(artifact) &&
+      typeof artifact.headSha === 'string' &&
+      Number.isInteger(artifact.prNumber)
+    )
+  ) {
+    die('--artifact must contain review metadata with headSha and prNumber');
+  }
+  if (
+    !(
+      Array.isArray(findings) &&
+      findings.length &&
+      findings.every(
+        (finding) =>
+          finding && typeof finding === 'object' && !Array.isArray(finding)
+      )
+    )
+  ) {
+    die('--findings must contain a nonempty JSON array of selected records');
+  }
+  return apiResult(() =>
+    cliApi.post('/api/pr-review/handoff', {
+      artifact,
+      checkoutIdentity: checkoutIdentity(),
+      findings,
+      name,
+      repo,
+      sessionId: requireFlag('session'),
+    })
+  );
+}
+
 // ── setu fetch <repo> ─────────────────────────────────────────────────────────
 
 async function cmdFetch() {
@@ -1304,12 +2352,25 @@ async function cmdFetch() {
   if (!repo) {
     die('Usage: setu fetch <repo>');
   }
-  const c = cfg();
-  execFileSync(
-    'git',
-    ['-C', join(c.workspace, `${repo}.git`), 'fetch', '--all', '--prune'],
-    { stdio: 'inherit' }
-  );
+  const deps = localCommandOverrides;
+  const c = (deps.config ?? cfg)();
+  const operation = createLocalWorkspaceOperation(c, 'fetch');
+  await operation.record('accepted');
+  try {
+    (deps.execFileSync ?? execFileSync)(
+      'git',
+      ['-C', join(c.workspace, `${repo}.git`), 'fetch', '--all', '--prune'],
+      { stdio: 'inherit' }
+    );
+  } catch (error) {
+    const state = operationFailureState(error);
+    await operation.record(
+      state,
+      state === 'unknown' ? 'FETCH_UNKNOWN' : 'FETCH_FAILED'
+    );
+    die(`${error?.code ? `${error.code}: ` : ''}${error.message}`);
+  }
+  await operation.record('completed');
 }
 
 // ── setu path <repo> <branch> ────────────────────────────────────────────────
@@ -1462,6 +2523,7 @@ function composeProjectStates(rawPsOutput) {
 async function cmdDoctor() {
   const c = loadConfig();
   const workspace = c.workspace ?? '';
+  const { writerClaimChecks } = await import('./writer-claims.js');
 
   // Shared across multiple checks below — fetch once, not once per check.
   // Bun.spawn (via spawnText), not execFileSync/spawnSync: checks run
@@ -1538,6 +2600,17 @@ async function cmdDoctor() {
       fix: 'brew services restart caddy',
       name: 'caddy admin API (:2019)',
       ok: caddyAdmin,
+    }),
+    async () => ({
+      fix: 'setu setup',
+      name: 'quivly.local portal route',
+      ok:
+        !!workspace &&
+        existsSync(join(workspace, 'caddy.d', 'portal.caddy')) &&
+        hasPortalCaddyRoute(
+          readFileSync(join(workspace, 'caddy.d', 'portal.caddy'), 'utf8'),
+          PORTAL_PORT
+        ),
     }),
     // `setu start` containerizes by default now (real memory/CPU cap) — a
     // missing runtime isn't merely informational, it means plain `setu start`
@@ -1837,10 +2910,11 @@ async function cmdDoctor() {
       .then(() => true)
       .catch(() => false),
   }));
+  checkThunks.push(async () => writerClaimChecks(writerClaimPaths(workspace)));
 
-  const checks = (await Promise.all(checkThunks.map((fn) => fn()))).map(
-    (r) => ({ ...r, ok: !!r.ok })
-  );
+  const checks = (await Promise.all(checkThunks.map((fn) => fn())))
+    .flat()
+    .map((r) => ({ ...r, ok: !!r.ok }));
 
   if (asJson) {
     console.log(JSON.stringify(checks, null, 2));
@@ -1906,19 +2980,114 @@ function cmdHelp() {
                                       aborts and reports what would conflict, never leaves it mid-merge)
     setu trigger <repo> <branch>     Start Trigger through the running portal
     setu trigger <repo> <branch> stop     Stop Trigger through the running portal
+    setu logs  <repo> <branch> [--type dev|inngest|trigger|...] [--lines N] [--json]
+    setu diff  <repo> <branch> [--verbose] [--json]
+    setu ports [--json]             List active local ports through the portal
+    setu pr create|ready|status <repo> <branch> [--json]
+
+  ${C}Workspace operations${R}
+    setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]
+    setu operations [repo branch] [--since <ISO> --limit <N>] [--json]
+    setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu caches prepare <repo> <branch> [--json]
+    setu caches execute <repo> <branch> --manifest <id> --confirmation <token> [--json]
+    setu caches execute <repo> <branch> --retry <file|-> [--json]
+                                      Retry input contains the returned manifestId and retryId
+    setu admission [--json]
+    setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id>] [--json]
+    setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu headless list [repo branch] [--json]
+    setu headless start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]
+    setu headless cancel <repo> <branch> --run <id> --checkout <file|-> [--json]
+    setu headless resume <repo> <branch> --run <id> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]
+    setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]
+    setu shared-caches [--json]
+    setu workflows list|runs <repo> <branch> [--json]
+    setu workflows dispatch <repo> <branch> --workflow <id> --ref <ref> --inputs <file|-> [--confirmation <token>] [--json]
+    setu actions list [--json]
+    setu actions save --input <file|-> [--json]
+    setu actions preflight --action <id> --input <file|-> [--json]
+    setu actions invoke --action <id> --input <file|-> --confirmation <token> [--json]
+    setu adopt <repo> <branch> --path <linked-checkout> [--json]
+    setu review handoff <repo> <branch> --session <id> --checkout <file|-> --artifact <file|-> --findings <file|-> [--json]
 
   ${C}Portal${R}
     setu portal                      Start web UI at http://quivly.local
     setu portal stop                 Stop portal
 
+  ${C}Writer claims${R}
+    setu claim [worktree] --agent X --session Y --task "..." [--pid N] [--json]
+                                      Claim or refresh this session's writer slot (default: cwd)
+    setu release [worktree] --session Y [--json]   Release only this session's claim
+    setu claims [--json]             List active claims across known worktrees
+    setu claim-check <path> --session Y [--json]  Read-only hook check: 0 allowed, 2 blocked
+
   ${C}MCP — let an agent drive Setu directly${R}
     setu mcp install codex           Register Setu's MCP server in ~/.codex/config.toml
     setu mcp install cursor          Register Setu's MCP server in ~/.cursor/mcp.json
-                                      Claude Code: claude --plugin-dir <setu>/claude-plugin (already packaged)
+    setu mcp install <client>        Configure a supported local agent client
+    setu mcp install --all           Configure every verified installed client
+    setu mcp status                  List each client as configured, not configured, or unknown
 
   ${C}Meta${R}
     setu update [--restart] [--include-untracked]  Update setu safely
     setu version                     Show version + commit
     setu help                        Show this
 `);
+}
+
+export {
+  cmdActions,
+  cmdAdmission,
+  cmdAdopt,
+  cmdAttention,
+  cmdCaches,
+  cmdCd,
+  cmdDependencies,
+  cmdDiff,
+  cmdDoctor,
+  cmdFetch,
+  cmdHeadless,
+  cmdHelp,
+  cmdInit,
+  cmdLogs,
+  cmdLs,
+  cmdMcp,
+  cmdNew,
+  cmdOperations,
+  cmdPath,
+  cmdPortal,
+  cmdPorts,
+  cmdPr,
+  cmdPrune,
+  cmdReview,
+  cmdRm,
+  cmdSessions,
+  cmdSetup,
+  cmdSetupProgress,
+  cmdSharedCaches,
+  cmdStart,
+  cmdStop,
+  cmdStorage,
+  cmdSweep,
+  cmdSync,
+  cmdTrigger,
+  cmdTunnel,
+  cmdUpdate,
+  cmdVersion,
+  cmdWorkflows,
+};
+
+// Entry point. This stays the last statement in the file: runCli must not run
+// before every top-level constant above has been initialised.
+if (import.meta.main) {
+  process.on('SIGINT', () => {
+    releaseHeldLocks();
+    process.exit(130);
+  });
+  process.on('SIGTERM', () => {
+    releaseHeldLocks();
+    process.exit(143);
+  });
+  await runCli();
 }

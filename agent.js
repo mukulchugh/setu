@@ -257,34 +257,87 @@ export function applyBudgetGuard(agentId, provider, maxBudgetUsd) {
 export function boundedTail(limit) {
   const parts = [];
   let bytes = 0;
+  const utf8Tail = (text) => {
+    const tail = Buffer.from(text).subarray(-limit);
+    for (let offset = 0; offset < tail.length; offset += 1) {
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(
+          tail.subarray(offset)
+        );
+      } catch {
+        // The cap may split a multi-byte character. Drop only its incomplete
+        // prefix, never return replacement characters in structured output.
+      }
+    }
+    return '';
+  };
   return {
     push(s) {
       parts.push(s);
       bytes += Buffer.byteLength(s);
-      while (bytes > limit && parts.length > 1) {
-        bytes -= Buffer.byteLength(parts.shift());
+      while (bytes > limit) {
+        if (parts.length > 1) {
+          bytes -= Buffer.byteLength(parts.shift());
+          continue;
+        }
+        const trimmed = utf8Tail(parts[0]);
+        bytes = Buffer.byteLength(trimmed);
+        parts[0] = trimmed;
       }
     },
     toString: () => parts.join(''),
   };
 }
 
-export async function pumpLines(stream, onChunk) {
+export async function pumpLines(
+  stream,
+  onChunk,
+  { maxBytes = MAX_TAIL_BYTES } = {}
+) {
   const decoder = new TextDecoder();
   let buf = '';
-  for await (const chunk of stream) {
-    buf += decoder.decode(chunk, { stream: true });
+  let truncated = false;
+  const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : 1;
+  const cap = () => {
+    if (Buffer.byteLength(buf) <= limit) {
+      return;
+    }
+    const tail = Buffer.from(buf).subarray(-limit);
+    for (let offset = 0; offset < tail.length; offset += 1) {
+      try {
+        buf = new TextDecoder('utf-8', { fatal: true }).decode(
+          tail.subarray(offset)
+        );
+        truncated = true;
+        return;
+      } catch {
+        // The retained tail starts partway through a UTF-8 character.
+      }
+    }
+    buf = '';
+    truncated = true;
+  };
+  const drain = () => {
     let nl = buf.indexOf('\n');
     while (nl !== -1) {
-      onChunk(buf.slice(0, nl));
+      onChunk(buf.slice(0, nl), { truncated });
       buf = buf.slice(nl + 1);
+      truncated = false;
       nl = buf.indexOf('\n');
     }
+  };
+  for await (const chunk of stream) {
+    buf += decoder.decode(chunk, { stream: true });
+    cap();
+    drain();
   }
+  buf += decoder.decode();
+  cap();
+  drain();
   // Trailing partial line — a stream-json run that dies mid-write still has its
   // last (possibly diagnostic) bytes here, so don't drop them.
   if (buf) {
-    onChunk(buf);
+    onChunk(buf, { truncated });
   }
 }
 

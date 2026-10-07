@@ -165,15 +165,27 @@ test('low storage after rebase never prevents restoring the exact recovery stash
   });
   expect(s.calls).toContain(`stash apply --index ${s.stash}`);
   expect(result).toMatchObject({
-    ok: false,
+    admissionClosed: false,
     code: 'STORAGE_LOW',
+    dependenciesChanged: false,
+    ok: false,
     stage: 'install',
     stashId: s.stash,
-    admissionClosed: false,
-    dependenciesChanged: false,
   });
   expect(s.calls).not.toContain('install');
   expect(s.calls).not.toContain('restart');
+});
+
+test('update installation explicitly requires the frozen lockfile', async () => {
+  const s = scenario();
+  let installOptions;
+  s.deps.install = async (options) => {
+    installOptions = options;
+  };
+  await expect(runUpdateTransaction(s.deps)).resolves.toMatchObject({
+    ok: true,
+  });
+  expect(installOptions).toEqual({ frozenLockfile: true });
 });
 
 test('unreviewed untracked work refuses before quiescence or source mutation', async () => {
@@ -260,9 +272,7 @@ test('busy quiescence reopens only unchanged source and does no update work', as
 
 test('a lost reopen response reports unknown admission instead of claiming it stayed closed', async () => {
   const s = scenario({ busy: true, portal: 'ready' });
-  s.deps.reopen = () => {
-    return Promise.reject(new Error('response lost'));
-  };
+  s.deps.reopen = () => Promise.reject(new Error('response lost'));
   expect(
     await runUpdateTransaction(s.deps, { restartAuthorized: true })
   ).toMatchObject({ admissionClosed: null, ok: false });

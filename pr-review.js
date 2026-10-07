@@ -144,59 +144,138 @@ export function reviewRunStatus(repo, name) {
   return runs.get(`${repo}/${name}`) ?? null;
 }
 
-// Mirrors publish_gate.py's own regexes (read directly from the installed
-// plugin at ~/.claude/plugins/cache/mukulchugh-skills/pr-walkthrough/1.4.0/
-// hooks/publish_gate.py, not assumed) as far as a prefix-glob permission
-// pattern can. --disallowedTools matches by PREFIX only, confirmed
-// empirically: a real `gh api --help`/`git push --help` invocation is
-// reliably denied by `Bash(gh api*)`/`Bash(git push*)`, but a pattern with a
-// wildcard in the MIDDLE of the string (`Bash(gh api * --method POST*)`,
-// the original design here) silently fails to match at all — verified with
-// the same canary method, twice, before shipping this list. Because a
-// prefix-only pattern can't selectively allow `gh api` GETs while blocking
-// POST/PATCH/PUT/DELETE, this blocks `gh api` entirely rather than trying
-// to (silently, incorrectly) discriminate by method — the skill's own
-// SKILL.md never references a raw `gh api` call, only `gh pr`-shaped ones,
-// so nothing here is lost. This is the PRIMARY guard against GH/git write
-// commands, not a backup: Step 0 found permission-mode alone doesn't gate
-// Bash for commands its built-in classifier doesn't judge as risky (a
-// harmless command ran unconfirmed under every mode tested), and the
-// plugin's own hook only fires while a pending-review marker happens to
-// exist.
-const DISALLOWED_BASH = [
-  'Bash(gh pr review*)',
-  'Bash(gh pr comment*)',
-  'Bash(gh pr merge*)',
-  'Bash(gh pr close*)',
-  'Bash(gh pr edit*)',
-  'Bash(gh pr ready*)',
-  'Bash(gh pr create*)',
-  'Bash(gh release*)',
-  'Bash(gh repo*)',
-  'Bash(gh workflow*)',
-  'Bash(gh secret*)',
-  'Bash(gh issue*)',
-  'Bash(gh api*)',
-  'Bash(git push*)',
-  'Bash(git commit*)',
-  'Bash(git reset*)',
-  'Bash(git rebase*)',
-  'Bash(git merge*)',
-  'Bash(git checkout*)',
-  'Bash(git branch -D*)',
-  'Bash(git tag*)',
-];
+// The old deny patterns were verified empirically to match only a PREFIX:
+// `Bash(git push*)` worked, while a wildcard in the middle did not. That
+// evidence still matters here: a permissive prefix such as `Bash(git status
+// *)` would also accept a compound command. The per-call PreToolUse guard
+// below parses the full command and fails closed against its read-only list;
+// it is the primary Bash guard, not permission mode or the plugin hook.
+const REVIEW_GUARD = new URL('./pr-review-guard.js', import.meta.url).pathname;
 
-function claudeArgs(skill, slug, prNumber) {
+export function reviewBashAllowed(command) {
+  if (
+    typeof command !== 'string' ||
+    !command.trim() ||
+    /[;&|`$<>\\'"\n\r]/.test(command)
+  ) {
+    return false;
+  }
+  const words = command.trim().split(/\s+/);
+  const flagsOnly = (values, allowed) =>
+    values.every((word) => !word.startsWith('-') || allowed.has(word));
+  if (words[0] === 'git') {
+    const flags = {
+      diff: new Set([
+        '--cached',
+        '--stat',
+        '--name-only',
+        '--name-status',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--',
+      ]),
+      log: new Set(['--oneline', '--decorate', '--']),
+      'ls-files': new Set(['--cached', '--others', '--exclude-standard', '--']),
+      'rev-parse': new Set(['--verify', '--quiet']),
+      show: new Set([
+        '--stat',
+        '--name-only',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--',
+      ]),
+      status: new Set([
+        '--porcelain',
+        '--short',
+        '--untracked-files=no',
+        '--untracked-files=normal',
+        '--untracked-files=all',
+      ]),
+    };
+    if (flags[words[1]]) {
+      const values = words.slice(2);
+      if (!flagsOnly(values, flags[words[1]])) {
+        return false;
+      }
+      const separator = values.indexOf('--');
+      const options = separator < 0 ? values : values.slice(0, separator);
+      return (
+        !['diff', 'show'].includes(words[1]) ||
+        (options.includes('--no-ext-diff') && options.includes('--no-textconv'))
+      );
+    }
+    return (
+      words.length === 3 &&
+      words[1] === 'branch' &&
+      words[2] === '--show-current'
+    );
+  }
+  if (words[0] === 'gh') {
+    return (
+      words[1] === 'pr' &&
+      ['view', 'diff', 'checks'].includes(words[2]) &&
+      flagsOnly(words.slice(3), new Set(['--json', '--jq', '--repo']))
+    );
+  }
+  if (words[0] === 'pwd') {
+    return words.length === 1;
+  }
+  if (words[0] === 'rg') {
+    return flagsOnly(
+      words.slice(1),
+      new Set(['--line-number', '--glob', '--files', '--hidden'])
+    );
+  }
+  if (words[0] === 'grep') {
+    return flagsOnly(
+      words.slice(1),
+      new Set(['-n', '-r', '--line-number', '--recursive'])
+    );
+  }
+  if (words[0] === 'ls') {
+    return flagsOnly(words.slice(1), new Set(['-a', '-l', '-la', '--all']));
+  }
+  if (['cat', 'head', 'tail', 'wc'].includes(words[0])) {
+    return flagsOnly(words.slice(1), new Set(['-n', '-l', '-w', '-c']));
+  }
+  return false;
+}
+
+export function buildDeepReviewArgs(skill, slug, prNumber) {
+  const reportDir = `${DATA_ROOT}/${SKILL_DIR[skill]}/${slug}/pr-${prNumber}`;
+  const settings = JSON.stringify({
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            { args: [REVIEW_GUARD, 'bash'], command: 'bun', type: 'command' },
+          ],
+          matcher: 'Bash',
+        },
+        {
+          hooks: [
+            {
+              args: [REVIEW_GUARD, 'write', reportDir],
+              command: 'bun',
+              type: 'command',
+            },
+          ],
+          matcher: 'Write',
+        },
+      ],
+    },
+  });
   return [
     '-p',
-    `/${skill} ${slug}#${prNumber}`,
+    `/${skill} ${slug}#${prNumber}\nFor git diff or git show, include both --no-ext-diff and --no-textconv.`,
     '--permission-mode',
     'acceptEdits',
     '--tools',
-    'Read,Grep,Glob,Bash,Write,Task',
-    '--disallowedTools',
-    ...DISALLOWED_BASH,
+    'Read,Grep,Glob,Bash,Write',
+    '--settings',
+    settings,
+    '--permission-prompts',
+    'none',
     '--output-format',
     'stream-json',
     '--verbose',
@@ -226,6 +305,14 @@ function parseResult(logText) {
           costUsd: d.total_cost_usd ?? null,
           isError: !!d.is_error,
           subtype: d.subtype ?? null,
+          valid:
+            typeof d.is_error === 'boolean' &&
+            (d.total_cost_usd == null ||
+              (typeof d.total_cost_usd === 'number' &&
+                Number.isFinite(d.total_cost_usd))) &&
+            (d.subtype === undefined ||
+              d.subtype === null ||
+              typeof d.subtype === 'string'),
         };
       }
     } catch {
@@ -233,7 +320,7 @@ function parseResult(logText) {
     }
     break;
   }
-  return { costUsd: null, isError: true, subtype: null };
+  return { costUsd: null, isError: true, subtype: null, valid: false };
 }
 
 // wtDir/slug/prNumber/logFd/logPath/spawnText are all resolved by the
@@ -245,11 +332,22 @@ export function runDeepReview(
   repo,
   name,
   skill,
-  { wtDir, slug, prNumber, logFd, logPath, spawnText, onCompletion }
+  {
+    wtDir,
+    slug,
+    prNumber,
+    logFd,
+    logPath,
+    spawnText,
+    onCompletion,
+    spawn = Bun.spawn,
+    readLog = readFileSync,
+    closeLog = closeSync,
+  }
 ) {
   const key = `${repo}/${name}`;
   if (runs.get(key)?.running) {
-    closeSync(logFd);
+    closeLog(logFd);
     return {
       error: 'a pr-review run is already in flight for this worktree',
       ok: false,
@@ -288,57 +386,172 @@ export function runDeepReview(
     const setsEqual = (a, b) =>
       a.size === b.size && [...a].every((l) => b.has(l));
 
+    const failed = (code, error) => ({ code, error, ok: false });
+    const updateRun = ({ costUsd = null, dirtyAfter, error, exitCode }) => {
+      const current = runs.get(key);
+      runs.set(key, {
+        costUsd,
+        dirtyAfter,
+        error,
+        exitCode,
+        running: false,
+        skill,
+        startedAt: current?.startedAt ?? Date.now(),
+      });
+    };
+    const unknownExit = () =>
+      Object.assign(
+        new Error('The review process exit could not be confirmed.'),
+        {
+          code: 'OPERATION_UNKNOWN',
+        }
+      );
     const before = await snapshot();
-    const proc = Bun.spawn(['claude', ...claudeArgs(skill, slug, prNumber)], {
-      cwd: wtDir,
-      stderr: logFd,
-      stdin: 'ignore',
-      stdout: logFd,
-      timeout: RUN_TIMEOUT_MS,
-    });
-    await proc.exited;
+    const proc = spawn(
+      ['claude', ...buildDeepReviewArgs(skill, slug, prNumber)],
+      {
+        cwd: wtDir,
+        stderr: logFd,
+        stdin: 'ignore',
+        stdout: logFd,
+        timeout: RUN_TIMEOUT_MS,
+      }
+    );
+    let exitCode;
+    try {
+      exitCode = await proc?.exited;
+    } catch {
+      throw unknownExit();
+    }
+    if (!Number.isInteger(exitCode) || exitCode < 0) {
+      throw unknownExit();
+    }
     const timedOut = proc.signalCode === 'SIGTERM';
-    const after = await snapshot();
+    let after;
+    try {
+      after = await snapshot();
+    } catch {
+      updateRun({
+        dirtyAfter: null,
+        error: 'Tracked-file review output could not be checked.',
+        exitCode: 'error',
+      });
+      return failed(
+        'REVIEW_STATUS_FAILED',
+        'Tracked-file review output could not be checked.'
+      );
+    }
     const dirtyAfter = !setsEqual(before, after);
 
     if (timedOut) {
-      runs.set(key, {
-        costUsd: null,
+      updateRun({
         dirtyAfter,
         error: 'timed out after 20 minutes',
         exitCode: 'timeout',
-        running: false,
-        skill,
-        startedAt: runs.get(key).startedAt,
       });
-      return;
+      return failed('REVIEW_TIMEOUT', 'Review timed out after 20 minutes.');
+    }
+    if (exitCode !== 0 || proc.signalCode) {
+      updateRun({
+        dirtyAfter,
+        error: 'Claude Code exited with a nonzero status.',
+        exitCode: 'error',
+      });
+      return failed(
+        'REVIEW_EXIT_FAILED',
+        'Claude Code exited with a nonzero status.'
+      );
     }
     let text = '';
     try {
-      text = readFileSync(logPath, 'utf8');
+      text = readLog(logPath, 'utf8');
     } catch {
-      // Empty input produces an error result when the report cannot be read.
+      updateRun({
+        dirtyAfter,
+        error: 'Review output could not be read.',
+        exitCode: 'error',
+      });
+      return failed('REVIEW_LOG_INVALID', 'Review output could not be read.');
     }
-    const { costUsd, isError, subtype } = parseResult(text);
-    runs.set(key, {
-      costUsd,
-      dirtyAfter,
-      error: isError ? (subtype ?? 'run failed') : null,
-      exitCode: isError ? 'error' : 'success',
-      running: false,
-      skill,
-      startedAt: runs.get(key).startedAt,
-    });
+    const { costUsd, isError, subtype, valid } = parseResult(text);
+    if (!valid) {
+      updateRun({
+        costUsd,
+        dirtyAfter,
+        error: 'Review output has no valid terminal result.',
+        exitCode: 'error',
+      });
+      return failed(
+        'REVIEW_LOG_INVALID',
+        'Review output has no valid terminal result.'
+      );
+    }
+    if (isError) {
+      const error = subtype ?? 'run failed';
+      updateRun({ costUsd, dirtyAfter, error, exitCode: 'error' });
+      return failed('REVIEW_FAILED', error);
+    }
+    if (dirtyAfter) {
+      updateRun({
+        costUsd,
+        dirtyAfter,
+        error: 'Review changed tracked files.',
+        exitCode: 'error',
+      });
+      return failed('REVIEW_DIRTY_OUTPUT', 'Review changed tracked files.');
+    }
+    updateRun({ costUsd, dirtyAfter, error: null, exitCode: 'success' });
+    return { ok: true };
   })()
     .catch((error) => {
+      if (error?.code === 'OPERATION_UNKNOWN') {
+        runs.set(key, {
+          ...runs.get(key),
+          error: 'The review process exit could not be confirmed.',
+          exitCode: null,
+          running: true,
+        });
+        throw error;
+      }
       runs.set(key, {
         ...runs.get(key),
-        error: String(error),
+        error: 'Claude Code could not be launched.',
         exitCode: 'error',
         running: false,
       });
+      return {
+        code: 'REVIEW_LAUNCH_FAILED',
+        error: 'Claude Code could not be launched.',
+        ok: false,
+      };
     })
-    .finally(() => closeSync(logFd));
+    .then(
+      (result) => {
+        try {
+          closeLog(logFd);
+        } catch {
+          runs.set(key, {
+            ...runs.get(key),
+            error: 'Review log could not be closed.',
+            exitCode: 'error',
+          });
+          return {
+            code: 'REVIEW_LOG_CLOSE_FAILED',
+            error: 'Review log could not be closed.',
+            ok: false,
+          };
+        }
+        return result;
+      },
+      (error) => {
+        try {
+          closeLog(logFd);
+        } catch {
+          /* Unknown process ownership takes precedence over cleanup. */
+        }
+        throw error;
+      }
+    );
 
   onCompletion?.(completion);
 

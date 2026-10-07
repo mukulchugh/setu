@@ -1,16 +1,107 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readPortalStatus } from './portal-status.js';
+import { createResourceAdmission } from './resource-admission.js';
+import { createSetupProgress } from './setup-progress.js';
 import {
   cloneBareRepository,
+  createAndInstallWorktree,
   installWorktreeDependencies,
   prepareWorktreeCheckout,
   startWorktreeSetupInstall,
+  withSetupAdmission,
 } from './workspace-setup.js';
+import { createWorkspaceState } from './workspace-state.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
+
+function durableFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'setu-setup-wiring-'));
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace);
+  return {
+    dispose: () => rmSync(root, { force: true, recursive: true }),
+    root,
+    state: createWorkspaceState({
+      configPath: join(root, 'config.json'),
+      setuDir: root,
+      workspaceRoot: workspace,
+    }),
+    workspace,
+  };
+}
+
+function testAdmission(state) {
+  return createResourceAdmission({
+    hostHealth: async () => ({
+      availableBytes: 30 * 1024 ** 3,
+      state: 'ready',
+    }),
+    limits: { lowStorageFloorBytes: 0 },
+    now: () => Date.now(),
+    observeProcess: async (pid) => ({
+      processId: pid,
+      processStartIdentity: `test-${pid}`,
+      state: 'alive',
+    }),
+    state,
+  });
+}
+
+function sharedFixture() {
+  const f = durableFixture();
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  const storeRoot = join(f.root, 'store');
+  mkdirSync(wtDir, { recursive: true });
+  mkdirSync(storeRoot, { mode: 0o700 });
+  writeFileSync(join(wtDir, 'package.json'), '{}');
+  writeFileSync(join(wtDir, 'bun.lock'), '{}');
+  writeFileSync(join(wtDir, 'bunfig.toml'), '[install]\nlinker = "isolated"\n');
+  const executable = join(f.root, 'bun-fixture');
+  writeFileSync(
+    executable,
+    '#!/bin/sh\nprintf \'["1.3.14","darwin","arm64"]\\n\'\n',
+    { mode: 0o700 }
+  );
+  return {
+    ...f,
+    sharing: {
+      enabled: true,
+      executable,
+      storeIdentity: {
+        device: statSync(storeRoot).dev,
+        mountPath: realpathSync(f.root),
+      },
+      storeRoot: realpathSync(storeRoot),
+      version: '1.3.14',
+      workspaceRoot: f.workspace,
+    },
+    wtDir,
+  };
+}
+
+function consumerFor(wtDir) {
+  return {
+    bunVersion: '1.3.14',
+    checkout: realpathSync(wtDir),
+    linkerMode: 'isolated',
+    lockfileHash: createHash('sha256')
+      .update(readFileSync(join(wtDir, 'bun.lock')))
+      .digest('hex'),
+    platformNamespace: 'darwin-arm64-bun-1.3.14',
+  };
+}
 
 function setupFixture(manifest) {
   let finish,
@@ -90,7 +181,7 @@ test('low storage refuses both dependency installers before logs or processes an
   };
   f.deps.assertStorage = assertStorage;
   try {
-    expect(await f.create()).toMatchObject({ ok: false, code: 'STORAGE_LOW' });
+    expect(await f.create()).toMatchObject({ code: 'STORAGE_LOW', ok: false });
     expect(f.effects).toEqual([]);
     expect(f.context.ready).toBe(false);
     expect(f.leases()).toBe(0);
@@ -266,6 +357,647 @@ test('a setup log-close error after spawn cannot release the running installer',
     f.finish(0);
     await f.lifecycle.waitForOperation(f.target);
     f.lifecycle.dispose();
+  }
+});
+
+test('setup admission serializes competing installs before target locking and retains unknown leases', async () => {
+  const f = durableFixture();
+  const admission = testAdmission(f.state);
+  const target = { name: 'topic', repo: 'repo' };
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let locks = 0;
+  let leasesWhenLocked = 0;
+  const withTarget = async (_target, task) => {
+    leasesWhenLocked = (await admission.status()).leases.length;
+    locks += 1;
+    try {
+      return await task();
+    } finally {
+      locks -= 1;
+    }
+  };
+  try {
+    const first = await withSetupAdmission({
+      admission,
+      operationId: 'setup-one',
+      target,
+      task: async () => ({ completion: held, result: { ok: true } }),
+      withTarget,
+    });
+    expect(first.result).toEqual({ ok: true });
+    expect(leasesWhenLocked).toBe(1);
+    expect(locks).toBe(0);
+    await expect(
+      withSetupAdmission({
+        admission,
+        operationId: 'setup-two',
+        target: { name: 'other', repo: 'repo' },
+        task: async () => ({ ok: true }),
+        withTarget,
+      })
+    ).resolves.toMatchObject({ code: 'INSTALL_IN_PROGRESS', ok: false });
+    expect(locks).toBe(0);
+    release();
+    await first.completion;
+    expect((await admission.status()).leases).toEqual([]);
+
+    const failedStart = await withSetupAdmission({
+      admission,
+      operationId: 'setup-failed',
+      target,
+      task: async () => ({
+        completion: Promise.reject(new Error('installer failed')),
+        result: { ok: true },
+      }),
+      withTarget,
+    });
+    await expect(failedStart.completion).rejects.toThrow('installer failed');
+    expect((await admission.status()).leases).toEqual([]);
+
+    const unknownStart = await withSetupAdmission({
+      admission,
+      operationId: 'setup-unknown',
+      target,
+      task: async () => ({
+        completion: Promise.reject(
+          Object.assign(new Error('unconfirmed'), { code: 'OPERATION_UNKNOWN' })
+        ),
+        result: { ok: true },
+      }),
+      withTarget,
+    });
+    expect(unknownStart.result).toEqual({ ok: true });
+    await expect(unknownStart.completion).rejects.toMatchObject({
+      code: 'OPERATION_UNKNOWN',
+    });
+    const unknown = await admission.status();
+    expect(unknown.leases).toMatchObject([
+      { kind: 'install', operationId: 'setup-unknown' },
+    ]);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('setup admission releases an exact lease once without masking completion failures', async () => {
+  const f = durableFixture();
+  const raw = testAdmission(f.state);
+  let releases = 0;
+  const admission = {
+    admit: (...args) => raw.admit(...args),
+    release: async (...args) => {
+      releases += 1;
+      return raw.release(...args);
+    },
+  };
+  const target = { name: 'topic', repo: 'repo' };
+  try {
+    let finish;
+    const held = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const lifecycleStart = await withSetupAdmission({
+      admission,
+      operationId: 'lifecycle-holder',
+      target,
+      task: async () => ({ completion: held, result: { ok: true } }),
+      withTarget: async (_target, task) => task(),
+    });
+    finish();
+    await lifecycleStart.completion;
+    expect(releases).toBe(1);
+
+    const failure = new Error('known child failure');
+    await expect(
+      withSetupAdmission({
+        admission,
+        operationId: 'cli-direct-lock',
+        target,
+        task: async () => ({
+          completion: Promise.reject(failure),
+          result: { ok: true },
+        }),
+        withTarget: async (_target, task) => {
+          const launched = await task();
+          await launched.completion;
+          return launched;
+        },
+      })
+    ).rejects.toBe(failure);
+    expect(releases).toBe(2);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('unknown portal child outcomes retain admission when durable progress persistence fails', async () => {
+  for (const mode of ['exited', 'group-stop']) {
+    const f = durableFixture();
+    const rawProgress = createSetupProgress({
+      newAttemptId: () => `attempt-${mode}`,
+      now: () => 1,
+      state: f.state,
+    });
+    const progress = {
+      ...rawProgress,
+      finish: async () => {
+        throw new Error('progress write unavailable');
+      },
+    };
+    const admission = testAdmission(f.state);
+    const target = { name: `topic-${mode}`, repo: 'repo' };
+    const wtDir = join(f.workspace, 'repo', target.name);
+    mkdirSync(wtDir, { recursive: true });
+    writeFileSync(join(wtDir, 'package.json'), '{}');
+    let resolveExit, rejectExit;
+    const exited = new Promise((resolve, reject) => {
+      resolveExit = resolve;
+      rejectExit = reject;
+    });
+    try {
+      const started = await withSetupAdmission({
+        admission,
+        operationId: `unknown-${mode}`,
+        target,
+        task: () =>
+          startWorktreeSetupInstall(
+            {
+              ready: false,
+              res: { localDom: 'topic.local', port: 3301, wtDir },
+            },
+            {
+              assertStorage: async () => {},
+              checkoutIdentity: realpathSync(wtDir),
+              closeLog: () => {},
+              exists: (path) => path === join(wtDir, 'package.json'),
+              logLocation: join(f.root, 'setup.log'),
+              openLog: () => 1,
+              progress,
+              spawn: () => ({ exited, pid: 712 }),
+              stopProcess: async () => {
+                if (mode === 'group-stop') {
+                  throw new Error('cannot observe group');
+                }
+              },
+              target,
+            }
+          ),
+        withTarget: async (_target, task) => task(),
+      });
+      if (mode === 'exited') {
+        rejectExit(new Error('exit observation rejected'));
+      } else {
+        resolveExit(0);
+      }
+      await expect(started.completion).rejects.toMatchObject({
+        code: 'OPERATION_UNKNOWN',
+        recovery: { progress: { message: 'progress write unavailable' } },
+      });
+      expect((await admission.status()).leases).toMatchObject([
+        { operationId: `unknown-${mode}` },
+      ]);
+    } finally {
+      f.dispose();
+    }
+  }
+});
+
+test('known log launch failures finish durable setup and close failure waits for child proof', async () => {
+  for (const mode of ['open', 'spawn', 'close']) {
+    const f = durableFixture();
+    const target = { name: `topic-${mode}`, repo: 'repo' };
+    const wtDir = join(f.workspace, 'repo', target.name);
+    mkdirSync(wtDir, { recursive: true });
+    writeFileSync(join(wtDir, 'package.json'), '{}');
+    const progress = createSetupProgress({
+      newAttemptId: () => `attempt-${mode}`,
+      now: () => 1,
+      state: f.state,
+    });
+    let finish;
+    const exited = new Promise((resolve) => {
+      finish = resolve;
+    });
+    try {
+      const options = {
+        assertStorage: async () => {},
+        checkoutIdentity: realpathSync(wtDir),
+        closeLog: () => {
+          if (mode === 'close') {
+            throw new Error('close failed');
+          }
+        },
+        exists: (path) => path === join(wtDir, 'package.json'),
+        logLocation: join(f.root, 'setup.log'),
+        openLog: () => {
+          if (mode === 'open') {
+            throw new Error('open failed');
+          }
+          return 1;
+        },
+        progress,
+        spawn: () => {
+          if (mode === 'spawn') {
+            throw new Error('spawn failed');
+          }
+          return { exited, pid: 811 };
+        },
+        stopProcess: async () => {},
+        target,
+      };
+      if (mode === 'close') {
+        const started = await startWorktreeSetupInstall(
+          { ready: false, res: { localDom: 'topic.local', port: 3301, wtDir } },
+          options
+        );
+        expect(progress.get(target)).toMatchObject({ state: 'running' });
+        finish(0);
+        await expect(started.completion).rejects.toThrow('log descriptor');
+      } else {
+        await expect(
+          startWorktreeSetupInstall(
+            {
+              ready: false,
+              res: { localDom: 'topic.local', port: 3301, wtDir },
+            },
+            options
+          )
+        ).rejects.toThrow(`${mode} failed`);
+      }
+      expect(progress.get(target)).toMatchObject({
+        outcome: 'failed',
+        state: 'failed',
+      });
+    } finally {
+      f.dispose();
+    }
+  }
+});
+
+test('shared setup refuses corrupt consumers and unsafe views without invoking an install', async () => {
+  for (const scenario of [
+    'malformed',
+    'invalid-consumer',
+    'replaced',
+    'unknown',
+  ]) {
+    const f = sharedFixture();
+    const calls = [];
+    const consumerPath = join(f.workspace, '.setu-dependency-views.json');
+    try {
+      if (scenario === 'malformed') {
+        writeFileSync(consumerPath, JSON.stringify({ consumers: [] }));
+      } else if (scenario === 'invalid-consumer') {
+        writeFileSync(
+          consumerPath,
+          JSON.stringify({ consumers: { [realpathSync(f.wtDir)]: {} } })
+        );
+      } else {
+        const consumer = consumerFor(f.wtDir);
+        if (scenario === 'unknown') {
+          consumer.lockfileHash = '0'.repeat(64);
+        }
+        await f.state.update('dependencyViews', () => ({
+          consumers: { [consumer.checkout]: consumer },
+        }));
+        if (scenario === 'replaced') {
+          mkdirSync(join(f.wtDir, 'node_modules'));
+        }
+      }
+      const malformed = ['malformed', 'invalid-consumer'].includes(scenario);
+      const before = malformed ? readFileSync(consumerPath, 'utf8') : null;
+      const error = await installWorktreeDependencies(f.wtDir, {
+        assertStorage: async () => {},
+        exists: (path) => path === join(f.wtDir, 'package.json'),
+        run: (...args) => {
+          calls.push(args);
+          return { status: 0 };
+        },
+        sharing: f.sharing,
+        state: f.state,
+      }).then(
+        () => null,
+        (cause) => cause
+      );
+      expect(error?.code, scenario).toBe(
+        malformed ? 'DEPENDENCY_VIEW_UNKNOWN' : 'DEPENDENCY_VIEW_UNSAFE'
+      );
+      expect(calls).toEqual([]);
+      if (before) {
+        expect(readFileSync(consumerPath, 'utf8')).toBe(before);
+      }
+    } finally {
+      f.dispose();
+    }
+  }
+});
+
+test('an absent dependency consumer document is a legitimate fresh shared install', async () => {
+  const f = sharedFixture();
+  const calls = [];
+  try {
+    await installWorktreeDependencies(f.wtDir, {
+      assertStorage: async () => {},
+      exists: (path) => path === join(f.wtDir, 'package.json'),
+      run: (...args) => {
+        calls.push(args);
+        return { status: 0 };
+      },
+      sharing: f.sharing,
+      state: f.state,
+    });
+    expect(calls).toHaveLength(1);
+    expect(f.state.read('dependencyViews')).toMatchObject({
+      consumers: { [realpathSync(f.wtDir)]: consumerFor(f.wtDir) },
+    });
+  } finally {
+    f.dispose();
+  }
+});
+
+test('reviewed retry runs its exact durable attempt once and rejects forged contexts before effects', async () => {
+  const f = durableFixture();
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  writeFileSync(join(wtDir, 'package.json'), '{}');
+  const target = { name: 'topic', repo: 'repo' };
+  const identity = realpathSync(wtDir);
+  let attempt = 0;
+  const progress = createSetupProgress({
+    newAttemptId: () => `attempt-${++attempt}`,
+    now: () => attempt,
+    state: f.state,
+  });
+  let firstDone, secondDone;
+  const firstExit = new Promise((resolve) => {
+    firstDone = resolve;
+  });
+  const secondExit = new Promise((resolve) => {
+    secondDone = resolve;
+  });
+  let launches = 0;
+  const common = {
+    assertStorage: async () => {},
+    checkoutIdentity: identity,
+    closeLog: () => {},
+    exists: (path) => path === join(wtDir, 'package.json'),
+    logLocation: join(f.root, 'setup.log'),
+    openLog: () => 1,
+    progress,
+    spawn: () => ({
+      exited: launches++ === 0 ? firstExit : secondExit,
+      pid: 900 + launches,
+    }),
+    stopProcess: async () => {},
+    target,
+  };
+  const context = {
+    ready: false,
+    res: { localDom: 'topic.local', port: 3301, wtDir },
+  };
+  try {
+    const first = await startWorktreeSetupInstall(context, common);
+    await progress.recover();
+    const reviewed = progress.get(target);
+    const retry = await progress.retry({
+      attemptId: reviewed.attemptId,
+      checkoutIdentity: identity,
+      logLocation: common.logLocation,
+      stage: 'preparing',
+      target,
+    });
+    expect(retry).toMatchObject({
+      ok: true,
+      record: { attemptId: 'attempt-2' },
+    });
+    await expect(
+      startWorktreeSetupInstall(context, {
+        ...common,
+        setupAttempt: { ...retry.record, attemptId: 'attempt-1' },
+      })
+    ).rejects.toMatchObject({ code: 'SETUP_ATTEMPT_MISMATCH' });
+    expect(launches).toBe(1);
+    const second = await startWorktreeSetupInstall(context, {
+      ...common,
+      setupAttempt: retry.record,
+    });
+    expect(launches).toBe(2);
+    firstDone(0);
+    await expect(first.completion).rejects.toMatchObject({
+      code: 'SETUP_ATTEMPT_MISMATCH',
+    });
+    secondDone(0);
+    await second.completion;
+    expect(progress.get(target)).toMatchObject({
+      attemptId: 'attempt-2',
+      state: 'completed',
+    });
+  } finally {
+    f.dispose();
+  }
+});
+
+test('durable retry rejects an old completion and completes only its new attempt', async () => {
+  const f = durableFixture();
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  writeFileSync(join(wtDir, 'package.json'), '{}');
+  const target = { name: 'topic', repo: 'repo' };
+  const identity = realpathSync(wtDir);
+  let nextAttempt = 0;
+  const progress = createSetupProgress({
+    newAttemptId: () => `attempt-${++nextAttempt}`,
+    now: () => nextAttempt,
+    state: f.state,
+  });
+  const starts = [];
+  const launch = () => {
+    let done;
+    const exited = new Promise((resolve) => {
+      done = resolve;
+    });
+    return { done, exited, pid: 400 + starts.length };
+  };
+  const options = () => ({
+    assertStorage: async () => {},
+    checkoutIdentity: identity,
+    closeLog: () => {},
+    exists: (path) => path === join(wtDir, 'package.json'),
+    logLocation: join(f.root, 'setup.log'),
+    openLog: () => 1,
+    progress,
+    spawn: () => {
+      const process = launch();
+      starts.push(process);
+      return process;
+    },
+    stopProcess: async () => {},
+    target,
+  });
+  const context = {
+    ready: false,
+    res: { localDom: 'topic.local', port: 3301, wtDir },
+  };
+  try {
+    const first = await startWorktreeSetupInstall(context, options());
+    expect(progress.get(target)).toMatchObject({
+      attemptId: 'attempt-1',
+      state: 'running',
+    });
+    await progress.recover();
+    const second = await startWorktreeSetupInstall(context, options());
+    expect(progress.get(target)).toMatchObject({
+      attemptId: 'attempt-2',
+      state: 'running',
+    });
+    starts[0].done(0);
+    await expect(first.completion).rejects.toMatchObject({
+      code: 'SETUP_ATTEMPT_MISMATCH',
+    });
+    expect(progress.get(target)).toMatchObject({
+      attemptId: 'attempt-2',
+      state: 'running',
+    });
+    starts[1].done(0);
+    await second.completion;
+    expect(progress.get(target)).toMatchObject({
+      attemptId: 'attempt-2',
+      outcome: 'completed',
+    });
+  } finally {
+    f.dispose();
+  }
+});
+
+test('CLI create retains admission when both install outcome and progress persistence are unknown', async () => {
+  const f = durableFixture();
+  const admission = testAdmission(f.state);
+  const target = { name: 'topic', repo: 'repo' };
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  const progress = {
+    ...createSetupProgress({
+      newAttemptId: () => 'cli-attempt',
+      state: f.state,
+    }),
+    finish: async () => {
+      throw new Error('progress write unavailable');
+    },
+  };
+  try {
+    await expect(
+      createAndInstallWorktree({
+        admission,
+        checkoutIdentity: async () => realpathSync(wtDir),
+        create: async () => ({ wtDir }),
+        install: async () => {
+          throw Object.assign(new Error('child outcome unknown'), {
+            code: 'OPERATION_UNKNOWN',
+          });
+        },
+        logLocation: join(f.root, 'setup.log'),
+        operationId: 'cli-unknown',
+        ...target,
+        progress,
+        state: f.state,
+      })
+    ).rejects.toMatchObject({
+      code: 'OPERATION_UNKNOWN',
+      recovery: { progress: { message: 'progress write unavailable' } },
+    });
+    expect((await admission.status()).leases).toMatchObject([
+      { operationId: 'cli-unknown' },
+    ]);
+    expect(progress.get(target).state).toBe('running');
+  } finally {
+    f.dispose();
+  }
+});
+
+test('completed create retry does not reinstall or move tunnel ownership', async () => {
+  const f = durableFixture();
+  const target = { name: 'topic', repo: 'repo' };
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  const identity = realpathSync(wtDir);
+  const progress = createSetupProgress({
+    newAttemptId: () => 'attempt-one',
+    now: () => 1,
+    state: f.state,
+  });
+  await progress.start({
+    checkoutIdentity: identity,
+    logLocation: 'setup.log',
+    stage: 'completed',
+    target,
+  });
+  await progress.finish({
+    attemptId: 'attempt-one',
+    checkoutIdentity: identity,
+    outcome: 'completed',
+    target,
+  });
+  let installs = 0;
+  let tunnels = 0;
+  try {
+    const result = await createAndInstallWorktree({
+      checkoutIdentity: async () => identity,
+      create: async () => ({ wtDir }),
+      enableTunnel: async () => {
+        tunnels += 1;
+        return 'public.example';
+      },
+      install: async () => {
+        installs += 1;
+      },
+      logLocation: 'setup.log',
+      name: target.name,
+      progress,
+      repo: target.repo,
+      state: f.state,
+      tunnel: true,
+    });
+    expect(result).toMatchObject({ setup: 'ready', wtDir });
+    expect(installs).toBe(0);
+    expect(tunnels).toBe(0);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('ordinary opt-out remains an ordinary install and failed shared setup records no consumer', async () => {
+  const f = durableFixture();
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  writeFileSync(join(wtDir, 'package.json'), '{}');
+  const calls = [];
+  try {
+    await installWorktreeDependencies(wtDir, {
+      assertStorage: async () => {},
+      exists: (path) => path === join(wtDir, 'package.json'),
+      run: (...args) => {
+        calls.push(args);
+        return { status: 0 };
+      },
+      sharing: { enabled: false },
+      state: f.state,
+    });
+    expect(calls[0].slice(0, 2)).toEqual(['bun', ['install']]);
+    await expect(
+      installWorktreeDependencies(wtDir, {
+        assertStorage: async () => {},
+        exists: (path) => path === join(wtDir, 'package.json'),
+        run: () => ({ status: 0 }),
+        sharing: { enabled: true },
+        state: f.state,
+      })
+    ).rejects.toThrow('Dependency sharing requires explicit Bun');
+    expect(f.state.read('dependencyViews')).toEqual({});
+  } finally {
+    f.dispose();
   }
 });
 

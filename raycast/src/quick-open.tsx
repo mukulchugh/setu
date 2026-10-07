@@ -25,7 +25,7 @@ function matches(w: Worktree, needle: string): boolean {
 }
 
 export default function Command(
-  props: LaunchProps<{ arguments: Arguments.QuickOpen }>,
+  props: LaunchProps<{ arguments: { query?: string } }>,
 ) {
   const { data, isLoading, error, revalidate } = useCachedPromise(
     listWorktrees,

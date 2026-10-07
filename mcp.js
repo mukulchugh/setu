@@ -77,6 +77,29 @@ export function mcpStatuses() {
   return Object.fromEntries(serverStatus.entries());
 }
 
+export async function callConnectedMcpTool(serverId, name, args) {
+  const active = activeClients.get(serverId);
+  if (!active?.client) {
+    return {
+      code: 'MCP_SERVER_NOT_CONNECTED',
+      error: 'The MCP server is not connected',
+      ok: false,
+    };
+  }
+  try {
+    return {
+      ok: true,
+      result: await active.client.callTool({ arguments: args, name }),
+    };
+  } catch {
+    return {
+      code: 'MCP_TOOL_CALL_FAILED',
+      error: 'The connected MCP server did not complete the tool call',
+      ok: false,
+    };
+  }
+}
+
 export function mcpHasOwnedWork() {
   return (
     connectingOrAuthorizing > 0 ||

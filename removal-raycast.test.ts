@@ -19,11 +19,17 @@ mock.module('@raycast/api', () => ({
     Style: { Animated: 'animated', Failure: 'failure', Success: 'success' },
   },
 }));
-mock.module('@raycast/utils', () => ({
-  useCachedPromise: () => {
-    throw new Error('UI hook must not run in adapter test');
-  },
-}));
+mock.module(
+  Bun.resolveSync(
+    '@raycast/utils',
+    new URL('./raycast/src/', import.meta.url).pathname
+  ),
+  () => ({
+    useCachedPromise: () => {
+      throw new Error('UI hook must not run in adapter test');
+    },
+  })
+);
 const { removeWorktree, getStatus, listWorktrees } = await import(
   './raycast/src/lib/api'
 );

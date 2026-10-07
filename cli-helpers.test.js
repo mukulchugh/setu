@@ -1,9 +1,11 @@
-import { test, expect } from 'bun:test';
+import { expect, test } from 'bun:test';
 import {
   caddyfileText,
   cursorConfigText,
-  hasIdentifiableWorktreeCwd,
   hasCodexServerTable,
+  hasIdentifiableWorktreeCwd,
+  hasPortalCaddyRoute,
+  portalCaddyRoute,
   pruneCandidates,
   startOutcome,
   sudoRuleCovers,
@@ -14,6 +16,15 @@ test('caddyfileText uses a valid multiline global options block', () => {
   expect(caddyfileText('/tmp/a workspace')).toBe(
     '{\n  auto_https off\n}\nimport /tmp/a workspace/caddy.d/*.caddy\n'
   );
+});
+
+test('portalCaddyRoute keeps quivly.local on the portal port', () => {
+  const route = portalCaddyRoute(2999);
+  expect(route).toBe(
+    'http://quivly.local {\n  reverse_proxy localhost:2999\n}\n'
+  );
+  expect(hasPortalCaddyRoute(route, 2999)).toBe(true);
+  expect(hasPortalCaddyRoute(route, 3000)).toBe(false);
 });
 
 test('withSetuBlock preserves text after a start marker without an end marker', () => {
@@ -79,14 +90,14 @@ test('Codex quoted MCP tables are recognized and Cursor config must be an object
 
 test('startOutcome distinguishes queued starts from actual starts', () => {
   expect(
-    startOutcome({ ok: true, queued: true, position: 2, reason: 'concurrency' })
+    startOutcome({ ok: true, position: 2, queued: true, reason: 'concurrency' })
   ).toEqual({
-    started: false,
-    queued: true,
     position: 2,
+    queued: true,
     reason: 'concurrency',
+    started: false,
   });
-  expect(startOutcome({ ok: true })).toEqual({ started: true, queued: false });
+  expect(startOutcome({ ok: true })).toEqual({ queued: false, started: true });
 });
 
 test('the container port-forwarding helper cwd cannot identify a worktree', () => {

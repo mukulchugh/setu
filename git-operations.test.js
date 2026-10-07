@@ -46,9 +46,7 @@ test('marker staging retains unknown completion while known staging failures rem
       })
     ).rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
     await writeSetuAgentMarkers('fixture', directory, {
-      stage: () => {
-        return Promise.reject(new Error('known stage failure'));
-      },
+      stage: () => Promise.reject(new Error('known stage failure')),
     });
   } finally {
     await rm(directory, { recursive: true });
@@ -80,6 +78,27 @@ test('unknown Sync merge completion propagates without launching status or abort
     ['status', '--porcelain'],
     ['merge', 'origin/staging', '--no-edit'],
   ]);
+});
+
+test('sync accepts an async base resolver for portal request paths', async () => {
+  const calls = [];
+  const runGit = async (_dir, args) => {
+    calls.push(args);
+    if (args[0] === 'status') {
+      return '';
+    }
+    if (args[0] === 'symbolic-ref') {
+      return args.includes('--quiet') ? 'topic\n' : 'main\n';
+    }
+    return '';
+  };
+  await expect(
+    syncWithBase('/isolated/checkout', '/isolated/repo.git', {
+      resolveBase: async () => 'origin/staging',
+      runGit,
+    })
+  ).resolves.toEqual({ base: 'origin/staging', ok: true });
+  expect(calls).toContainEqual(['merge', 'origin/staging', '--no-edit']);
 });
 
 test('a known conflicting merge reports unchanged only after its abort has completed', async () => {

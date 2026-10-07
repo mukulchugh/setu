@@ -121,7 +121,7 @@ async function post(
   try {
     res = await fetch(`${portalUrl()}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-setu-source": "raycast" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
       redirect: "error",

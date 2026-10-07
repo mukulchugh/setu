@@ -2,6 +2,7 @@
 // does not manage. It helps reuse an existing checkout and review cleanup
 // risks; it never creates, adopts, stops or removes anything.
 import { useState } from 'preact/hooks';
+import { post } from '../api';
 import {
   type InventoryRow,
   readInventory,
@@ -89,17 +90,45 @@ function Counts({ inventory }: { inventory: WorkspaceInventory }) {
 function InventoryItem({
   row,
   gates,
+  onAdopted,
   onCopyPath,
   onOpenWorktree,
+  toast,
 }: {
   row: InventoryRow;
   gates: Map<string, string>;
+  onAdopted: () => void;
   onCopyPath: (path: string) => void;
   onOpenWorktree: (repo: string, name: string) => void;
+  toast: (msg: string, tone?: Tone) => void;
 }) {
+  const [adoptionReview, setAdoptionReview] = useState(false);
+  const [adopting, setAdopting] = useState(false);
   const runtime = runtimeLabel(row);
   const { name } = row;
   const title = name ?? row.branch ?? 'Detached HEAD';
+  async function adopt() {
+    if (!(name && adoptionReview) || adopting) {
+      return;
+    }
+    setAdopting(true);
+    const result = await post('/api/worktrees/adopt', {
+      name,
+      path: row.path,
+      repo: row.repo,
+    });
+    setAdopting(false);
+    if (result.ok) {
+      toast('Existing checkout adopted without an install.', 'emerald');
+      setAdoptionReview(false);
+      onAdopted();
+    } else {
+      toast(
+        `✗ Adoption was not confirmed: ${result.error ?? 'unknown error'}`,
+        'red'
+      );
+    }
+  }
   return (
     <li class="flex min-w-0 flex-col gap-2 border-zinc-200/60 border-b px-4 py-4 last:border-0 dark:border-white/10">
       <div class="flex min-w-0 flex-wrap items-baseline gap-2">
@@ -164,6 +193,33 @@ function InventoryItem({
             Open in Setu
           </Button>
         )}
+        {!row.registered &&
+          name &&
+          (adoptionReview ? (
+            <span class="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+              Review this exact existing checkout. Adoption does not install or
+              remove files.
+              <Button compact disabled={adopting} onClick={adopt}>
+                {adopting ? 'Adopting…' : 'Confirm adoption'}
+              </Button>
+              <Button
+                compact
+                disabled={adopting}
+                onClick={() => setAdoptionReview(false)}
+                variant="secondary"
+              >
+                Cancel
+              </Button>
+            </span>
+          ) : (
+            <Button
+              compact
+              onClick={() => setAdoptionReview(true)}
+              variant="secondary"
+            >
+              Review adoption
+            </Button>
+          ))}
       </div>
       <details class="text-sm">
         <summary class="min-h-11 cursor-pointer py-2 text-zinc-700 dark:text-zinc-200">
@@ -344,9 +400,11 @@ export function InventoryPage({
                   <InventoryItem
                     gates={gates}
                     key={row.id}
+                    onAdopted={refresh}
                     onCopyPath={copyPath}
                     onOpenWorktree={onOpenWorktree}
                     row={row}
+                    toast={toast}
                   />
                 ))}
             </ul>

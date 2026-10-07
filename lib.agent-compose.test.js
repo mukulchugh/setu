@@ -1,16 +1,24 @@
 // lib.agent-compose.test.js — `bun lib.agent-compose.test.js`. No framework.
 //
 // Covers writeAgentCompose's required divergences from writeDockerCompose: the
-// bare-repo git mount (read-write, identical host path — the part that's
-// fatal to get wrong, see lib.js's comment above writeAgentCompose), forced
-// read-only credential mounts, restart:"no" instead of on-failure:3, the
-// agent/dev-server project-name split, and engine-capacity clamping. Also
-// parses the emitted YAML structurally to catch a duplicate mapping key —
-// the exact class of bug that previously broke writeDockerCompose's PORT env
-// var and makes Docker reject the whole file outright.
+// linked-worktree Git mounts, forced read-only credential mounts,
+// restart:"no" instead of on-failure:3, the agent/dev-server project-name
+// split, and engine-capacity clamping. Also parses the emitted YAML
+// structurally to catch a duplicate mapping key — the exact class of bug that
+// previously broke writeDockerCompose's PORT env var and makes Docker reject
+// the whole file outright.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -37,14 +45,96 @@ async function check(what, fn) {
   }
 }
 
-// Fresh fake workspace per call — writeAgentCompose writes into
-// `<workspace>/<repo>/<name>/`, which has to exist on disk first (mirrors how
-// createWorktree already leaves it by the time either compose writer runs).
+// Fresh fake workspace per call. The linked-worktree `.git` file identifies
+// the per-worktree Git admin directory that an agent may write.
 function fakeWorktree(repo = 'repo', name = 'feat-x') {
   const workspace = mkdtempSync(join(tmpdir(), 'setu-agent-compose-'));
   const wtDir = join(workspace, repo, name);
+  const bareRepoDir = join(workspace, `${repo}.git`);
+  const adminDir = join(bareRepoDir, 'worktrees', name);
   mkdirSync(wtDir, { recursive: true });
-  return { c: { workspace }, name, repo, workspace, wtDir };
+  mkdirSync(join(bareRepoDir, 'objects'), { recursive: true });
+  mkdirSync(join(bareRepoDir, 'refs'), { recursive: true });
+  mkdirSync(join(bareRepoDir, 'logs'), { recursive: true });
+  mkdirSync(join(bareRepoDir, 'hooks'), { recursive: true });
+  mkdirSync(adminDir, { recursive: true });
+  writeFileSync(join(bareRepoDir, 'config'), '');
+  writeFileSync(join(wtDir, '.git'), `gitdir: ${adminDir}\n`);
+  writeFileSync(join(adminDir, 'commondir'), '../..\n');
+  writeFileSync(join(adminDir, 'gitdir'), `${join(wtDir, '.git')}\n`);
+  return {
+    adminDir,
+    bareRepoDir,
+    c: { workspace },
+    name,
+    repo,
+    workspace,
+    wtDir,
+  };
+}
+
+function git(directory, args) {
+  return execFileSync('git', ['-C', directory, ...args], {
+    encoding: 'utf8',
+  });
+}
+
+function realWorktree() {
+  const workspace = mkdtempSync(join(tmpdir(), 'setu-agent-real-compose-'));
+  const bareRepoDir = join(workspace, 'repo.git');
+  const seedDir = join(workspace, 'seed');
+  const wtDir = join(workspace, 'repo', 'topic');
+  execFileSync('git', ['init', '--bare', bareRepoDir]);
+  execFileSync('git', ['init', '--initial-branch=main', seedDir]);
+  git(seedDir, ['config', 'user.email', 'test@example.com']);
+  git(seedDir, ['config', 'user.name', 'Test']);
+  writeFileSync(join(seedDir, 'seed.txt'), 'seed\n');
+  git(seedDir, ['add', '.']);
+  git(seedDir, ['commit', '-m', 'seed']);
+  git(seedDir, ['remote', 'add', 'origin', bareRepoDir]);
+  git(seedDir, ['push', 'origin', 'main']);
+  execFileSync('git', [
+    '--git-dir',
+    bareRepoDir,
+    'symbolic-ref',
+    'HEAD',
+    'refs/heads/main',
+  ]);
+  execFileSync('git', [
+    '--git-dir',
+    bareRepoDir,
+    'worktree',
+    'add',
+    '-b',
+    'topic',
+    wtDir,
+    'main',
+  ]);
+  execFileSync('git', [
+    '--git-dir',
+    bareRepoDir,
+    'pack-refs',
+    '--all',
+    '--prune',
+  ]);
+  git(wtDir, ['config', 'user.email', 'test@example.com']);
+  git(wtDir, ['config', 'user.name', 'Test']);
+  writeFileSync(join(wtDir, 'commit.txt'), 'commit after packed refs\n');
+  git(wtDir, ['add', 'commit.txt']);
+  git(wtDir, ['commit', '-m', 'commit after packed refs']);
+  const adminDir = readFileSync(join(wtDir, '.git'), 'utf8').match(
+    /^gitdir:\s*(.+)\s*$/m
+  )?.[1];
+  assert.ok(adminDir, 'linked worktree must have a gitdir pointer');
+  return {
+    adminDir,
+    bareRepoDir,
+    c: { workspace },
+    name: 'topic',
+    repo: 'repo',
+    workspace,
+    wtDir,
+  };
 }
 
 // Splits the emitted YAML into indentation-scoped mapping blocks (a stack of
@@ -146,25 +236,65 @@ await check(
 console.log('writeAgentCompose — git mounts');
 
 await check(
-  'bare repo is mounted read-write at its identical host path',
+  'a real packed linked worktree retains read-only common Git metadata with exact writable overlays',
   async () => {
-    const { c, repo, name, wtDir, workspace } = fakeWorktree();
+    const { adminDir, bareRepoDir, c, repo, name, wtDir, workspace } =
+      realWorktree();
     const path = await writeAgentCompose(c, repo, name, {});
     assert.equal(path, agentComposePath(wtDir));
-    const yaml = readFileSync(path, 'utf8');
-    const bareRepoDir = `${workspace}/${repo}.git`;
-    const line = yaml.split('\n').find((l) => l.includes(`- ${bareRepoDir}:`));
-    assert.ok(line, `no bare-repo mount line found in:\n${yaml}`);
-    assert.equal(
-      line.trim(),
-      `- ${bareRepoDir}:${bareRepoDir}`,
-      'host and container paths for the bare repo mount must be identical'
-    );
     assert.ok(
-      !line.endsWith(':ro'),
-      `bare repo mount must be read-write, got: ${line}`
+      !path.startsWith(`${wtDir}/`),
+      `agent compose file must stay outside the worktree: ${path}`
+    );
+    const yaml = readFileSync(path, 'utf8');
+    assert.ok(existsSync(join(bareRepoDir, 'HEAD')));
+    assert.ok(existsSync(join(bareRepoDir, 'packed-refs')));
+    assert.ok(existsSync(join(bareRepoDir, 'info')));
+    assert.ok(existsSync(join(bareRepoDir, 'refs', 'heads', 'topic')));
+    assert.ok(existsSync(join(bareRepoDir, 'logs', 'refs', 'heads', 'topic')));
+    assert.ok(
+      yaml.includes(
+        `- ${realpathSync(bareRepoDir)}:${realpathSync(bareRepoDir)}:ro`
+      ),
+      `common Git metadata must be read-only:\n${yaml}`
+    );
+    for (const path of [
+      adminDir,
+      `${realpathSync(bareRepoDir)}/objects`,
+      `${realpathSync(bareRepoDir)}/refs`,
+      `${realpathSync(bareRepoDir)}/logs`,
+    ]) {
+      assert.ok(
+        yaml.includes(`- ${path}:${path}`),
+        `missing writable ${path}:\n${yaml}`
+      );
+    }
+    assert.ok(
+      !yaml.includes(
+        `- ${realpathSync(bareRepoDir)}:${realpathSync(bareRepoDir)}\n`
+      ),
+      `common Git root must not be writable:\n${yaml}`
     );
     rmSync(workspace, { force: true, recursive: true });
+  }
+);
+
+await check(
+  'a forged worktree gitdir pointer is refused before any mount is written',
+  async () => {
+    const { c, repo, name, wtDir, workspace } = realWorktree();
+    try {
+      const forged = join(workspace, 'forged-admin');
+      mkdirSync(forged);
+      writeFileSync(join(wtDir, '.git'), `gitdir: ${forged}\n`);
+      await assert.rejects(
+        writeAgentCompose(c, repo, name, {}),
+        /Git admin directory|gitdir/i
+      );
+      assert.ok(!existsSync(agentComposePath(wtDir)));
+    } finally {
+      rmSync(workspace, { force: true, recursive: true });
+    }
   }
 );
 

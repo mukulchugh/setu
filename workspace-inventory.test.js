@@ -1,8 +1,13 @@
 import { expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { workspaceInventoryRegistry } from './lib.js';
+import { createPortalRuntime } from './portal.js';
+import { createWorktreeAdoption } from './portal-adoption.js';
 import {
   createWorkspaceInventory,
   parseLinkedWorktrees,
@@ -34,6 +39,230 @@ const registered = (name, repo = 'r') => ({
 });
 const project = (repo = 'r') => ({ repo, repoDir: `/workspace/${repo}.git` });
 const directory = async () => ({ isDirectory: () => true });
+
+function adoptionFixture(overrides = {}) {
+  const calls = [];
+  const records = {};
+  let port = null;
+  const adoption = createWorktreeAdoption({
+    assignPort: async (...args) => {
+      calls.push(['assignPort', ...args]);
+      port = 3201;
+      return port;
+    },
+    expectedPath: (repo, name) => `/workspace/${repo}/${name}`,
+    inspectIdentity: async () => ({
+      checkoutPath: '/workspace/r/topic',
+      known: true,
+    }),
+    isLinkedWorktree: async (...args) => {
+      calls.push(['isLinkedWorktree', ...args]);
+      return true;
+    },
+    isRegisteredProject: (repo) => repo === 'r',
+    readRecords: async () => structuredClone(records),
+    registeredPort: () => port,
+    validateTarget: (repo, name, path) => ({
+      name,
+      repo,
+      wtDir: `/workspace/${repo}/${name}`,
+      ...(path === `/workspace/${repo}/${name}` ? {} : { invalid: true }),
+    }),
+    withRecords: (task) => task(),
+    withTarget: (_target, task) => task(),
+    writeRecords: async (next) => {
+      for (const key of Object.keys(records)) {
+        delete records[key];
+      }
+      Object.assign(records, structuredClone(next));
+    },
+    writeRouting: async (...args) => {
+      calls.push(['writeRouting', ...args]);
+      return { ok: true };
+    },
+    ...overrides,
+  });
+  return { adoption, calls, records };
+}
+
+test('adoption verifies a managed linked checkout before allocating its port and routing', async () => {
+  const { adoption, calls } = adoptionFixture();
+  expect(
+    await adoption.adopt({
+      name: 'topic',
+      path: '/workspace/r/topic',
+      repo: 'r',
+    })
+  ).toEqual({
+    name: 'topic',
+    ok: true,
+    path: '/workspace/r/topic',
+    port: 3201,
+    repo: 'r',
+  });
+  expect(calls).toEqual([
+    ['isLinkedWorktree', 'r', '/workspace/r/topic'],
+    ['isLinkedWorktree', 'r', '/workspace/r/topic'],
+    ['assignPort', 'r', 'topic'],
+    ['writeRouting', 'r', 'topic', 3201],
+  ]);
+});
+
+test('adoption refuses unregistered projects, registered names, unknown identities and non-linked paths', async () => {
+  expect(
+    await adoptionFixture().adoption.adopt({
+      name: 'topic',
+      path: '/workspace/other/topic',
+      repo: 'other',
+    })
+  ).toMatchObject({ code: 'PROJECT_NOT_REGISTERED', ok: false });
+  expect(
+    await adoptionFixture({ registeredPort: () => 3200 }).adoption.adopt({
+      name: 'topic',
+      path: '/workspace/r/topic',
+      repo: 'r',
+    })
+  ).toMatchObject({ code: 'WORKTREE_ALREADY_REGISTERED', ok: false });
+  expect(
+    await adoptionFixture({
+      inspectIdentity: async () => ({ known: false }),
+    }).adoption.adopt({
+      name: 'topic',
+      path: '/workspace/r/topic',
+      repo: 'r',
+    })
+  ).toMatchObject({ code: 'CHECKOUT_IDENTITY_UNKNOWN', ok: false });
+  expect(
+    await adoptionFixture({
+      isLinkedWorktree: async () => false,
+    }).adoption.adopt({
+      name: 'topic',
+      path: '/workspace/r/topic',
+      repo: 'r',
+    })
+  ).toMatchObject({ code: 'WORKTREE_NOT_LINKED', ok: false });
+  expect(
+    await adoptionFixture().adoption.adopt({
+      name: 'topic',
+      path: '/outside/topic',
+      repo: 'r',
+    })
+  ).toMatchObject({ code: 'ADOPTION_PATH_INVALID', ok: false });
+});
+
+test('adoption retains exact identity for hosts and Caddy recovery without reallocating the port', async () => {
+  const results = [
+    {
+      code: 'ADOPTION_HOSTS_PENDING',
+      error: 'Hosts routing could not be applied',
+      ok: false,
+    },
+    {
+      code: 'ADOPTION_CADDY_PENDING',
+      error: 'Caddy routing could not be reloaded',
+      ok: false,
+    },
+    { ok: true },
+  ];
+  const { adoption, calls, records } = adoptionFixture({
+    writeRouting: async (...args) => {
+      calls.push(['writeRouting', ...args]);
+      return results.shift();
+    },
+  });
+  const input = { name: 'topic', path: '/workspace/r/topic', repo: 'r' };
+  await expect(adoption.adopt(input)).resolves.toMatchObject({
+    code: 'ADOPTION_HOSTS_PENDING',
+    ok: false,
+    port: 3201,
+  });
+  expect(records['r/topic']).toMatchObject({ name: 'topic', repo: 'r' });
+  await expect(adoption.adopt(input)).resolves.toMatchObject({
+    code: 'ADOPTION_CADDY_PENDING',
+    ok: false,
+    port: 3201,
+  });
+  await expect(adoption.adopt(input)).resolves.toMatchObject({
+    ok: true,
+    port: 3201,
+  });
+  expect(records).toEqual({});
+  expect(calls.filter(([name]) => name === 'assignPort')).toHaveLength(1);
+});
+
+test('adoption rejects a replacement checkout before publishing or retrying a registration', async () => {
+  let observations = 0;
+  const { adoption, calls } = adoptionFixture({
+    inspectIdentity: async () => {
+      observations += 1;
+      return {
+        checkoutPath: '/workspace/r/topic',
+        known: true,
+        marker: observations === 1 ? 'first' : 'replacement',
+      };
+    },
+  });
+  await expect(
+    adoption.adopt({ name: 'topic', path: '/workspace/r/topic', repo: 'r' })
+  ).resolves.toMatchObject({ code: 'ADOPTION_IDENTITY_CHANGED', ok: false });
+  expect(calls.some(([name]) => name === 'assignPort')).toBe(false);
+});
+
+test('adoption validates the target before reading or publishing registry state', async () => {
+  const { adoption, calls } = adoptionFixture({
+    validateTarget: () => {
+      throw new Error('invalid target');
+    },
+  });
+  await expect(
+    adoption.adopt({ name: '../topic', path: '/workspace/r/topic', repo: 'r' })
+  ).resolves.toMatchObject({ code: 'ADOPTION_TARGET_INVALID', ok: false });
+  expect(calls).toEqual([]);
+});
+
+test('adoption requires a real linked Git checkout with matching administration identity', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-adoption-'));
+  const bare = join(root, 'r.git');
+  const seed = join(root, 'seed');
+  const checkout = join(root, 'r', 'topic');
+  const git = (args, cwd) =>
+    execFileSync('git', args, { cwd, stdio: 'ignore' });
+  try {
+    git(['init', '--bare', bare]);
+    git(['clone', bare, seed]);
+    git(['config', 'user.email', 'test@example.invalid'], seed);
+    git(['config', 'user.name', 'Test'], seed);
+    writeFileSync(join(seed, 'README.md'), 'fixture\n');
+    git(['add', 'README.md'], seed);
+    git(['commit', '-m', 'fixture'], seed);
+    git(['push', 'origin', 'HEAD:main'], seed);
+    git(['symbolic-ref', 'HEAD', 'refs/heads/main'], bare);
+    git(['worktree', 'add', checkout, 'main'], bare);
+
+    const { adoption } = adoptionFixture({
+      inspectIdentity: (_repo, _name, wtDir) =>
+        inspectCheckoutIdentity({ repoDir: bare, wtDir }, fs),
+      isLinkedWorktree: async (_repo, path) =>
+        parseLinkedWorktrees(
+          execFileSync(
+            'git',
+            ['-C', bare, 'worktree', 'list', '--porcelain', '-z'],
+            { encoding: 'utf8' }
+          )
+        ).some((worktree) => worktree.path === path),
+      validateTarget: (repo, name) => ({ name, repo, wtDir: checkout }),
+    });
+    expect(
+      await adoption.adopt({ name: 'topic', path: checkout, repo: 'r' })
+    ).toMatchObject({
+      ok: true,
+      path: await fs.realpath(checkout),
+      port: 3201,
+    });
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
 
 function fixture(options = {}) {
   return createWorkspaceInventory({
@@ -330,24 +559,21 @@ test('actual registry adapter includes absent paths and orphaned projects withou
   }
 });
 
-// The portal is a server entrypoint. Evaluate only the actual read adapters;
-// importing that module would start the user's server and reconcile processes.
-const portal = readFileSync(new URL('./portal.js', import.meta.url), 'utf8');
-const declaration = (name) =>
-  portal.match(new RegExp(`^async function ${name}\\([^]*?^}`, 'm'))[0];
-
 test('portal GET route uses inventory; other routes and methods do not trigger it', async () => {
   let reads = 0;
-  const routes = Function(
-    'workspaceInventory',
-    `${declaration('worktreeRoutes')}; return worktreeRoutes;`
-  )({
-    read: () => {
-      reads += 1;
-      return { counts: { linked: 138, registered: 65 } };
+  const portal = await createPortalRuntime({
+    config: {
+      tunnel: 'fixture',
+      workspace: '/private/tmp/setu-inventory-route',
+    },
+    workspaceInventory: {
+      read: () => {
+        reads += 1;
+        return { counts: { linked: 138, registered: 65 } };
+      },
     },
   });
-  const response = await routes(
+  const response = await portal.internals.worktreeRoutes(
     new Request('http://localhost/api/workspace-inventory'),
     '/api/workspace-inventory',
     'GET'
@@ -356,10 +582,14 @@ test('portal GET route uses inventory; other routes and methods do not trigger i
     counts: { linked: 138, registered: 65 },
   });
   expect(
-    await routes(new Request('http://localhost/other'), '/other', 'GET')
+    await portal.internals.worktreeRoutes(
+      new Request('http://localhost/other'),
+      '/other',
+      'GET'
+    )
   ).toBeNull();
   expect(
-    await routes(
+    await portal.internals.worktreeRoutes(
       new Request('http://localhost/api/workspace-inventory', {
         method: 'PUT',
       }),
@@ -368,36 +598,47 @@ test('portal GET route uses inventory; other routes and methods do not trigger i
     )
   ).toBeNull();
   expect(reads).toBe(1);
+  await portal.dispose();
 });
 
-test('portal activity adapter preserves unknown listeners, supporting work and portal timestamps', async () => {
-  const deps = {
-    convexDevProcs: new Map(),
-    inngestProcs: new Map(),
-    lastSeenAt: new Map([['r/main', 123]]),
-    lifecycle: { operationStatus: () => null, snapshot: () => null },
-    listenerObservation: {
-      observation: () => ({ state: 'unknown' }),
-      read: async () => [{ port: 3000 }],
-    },
-    portEntries: () => [registered('main'), registered('feature/nested')],
-    queuePosition: (key) => (key === 'r/main' ? 1 : null),
-    sidecarProcs: new Map([['r/feature/nested/worker', {}]]),
-    triggerProcs: new Map(),
-    WORKSPACE: '/workspace',
+test('portal activity adapter retains unknown listeners, queued work, timestamps, and nested sidecars', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'setu-inventory-runtime-'));
+  const lifecycle = {
+    dispose() {},
+    operationStatus: () => null,
+    queueSnapshot: () => [{ key: 'r/main' }],
+    refreshCapacity: async () => ({}),
+    snapshot: () => null,
+    status: () => ({ max: 3 }),
   };
-  const read = Function(
-    ...Object.keys(deps),
-    `${declaration('readInventoryRuntime')};return readInventoryRuntime;`
-  )(...Object.values(deps));
-  const data = await read();
-  expect(data.get('r/main')).toMatchObject({
-    active: null,
-    lastPortalActivityAt: 123,
-  });
-  expect(data.get('r/main').operation).toEqual({
-    kind: 'start',
-    phase: 'queued',
-  });
-  expect(data.get('r/feature/nested').active).toBe(true);
+  try {
+    writeFileSync(
+      join(workspace, '.ports'),
+      'r/main:3000\nr/feature/nested:3001\n'
+    );
+    const portal = await createPortalRuntime({
+      config: { tunnel: 'fixture', workspace },
+      lifecycle,
+      listenerObservation: {
+        observation: () => ({ state: 'unknown' }),
+        read: async () => [{ port: 3000 }],
+      },
+    });
+    const state = portal.internals.runtimeState;
+    state.lastSeenAt.set('r/main', 123);
+    state.sidecarProcs.set('r/feature/nested/worker', {});
+    const data = await portal.internals.readInventoryRuntime();
+    expect(data.get('r/main')).toMatchObject({
+      active: null,
+      lastPortalActivityAt: 123,
+    });
+    expect(data.get('r/main').operation).toEqual({
+      kind: 'start',
+      phase: 'queued',
+    });
+    expect(data.get('r/feature/nested').active).toBe(true);
+    await portal.dispose();
+  } finally {
+    rmSync(workspace, { force: true, recursive: true });
+  }
 });

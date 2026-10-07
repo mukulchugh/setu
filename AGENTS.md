@@ -7,7 +7,8 @@ single shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) that one worktre
 **Debugging anything setu-related? Start with `setu doctor --json`.** It checks every layer
 (brew deps, dnsmasq, resolver, caddy, sudoers, cloudflared, git sync, worktree-registry
 hygiene, container runtime reachability, container memory budget vs. engine capacity, portal,
-container-mode worktrees whose container died without Setu stopping it — see Conventions)
+container-mode worktrees whose container died without Setu stopping it, stale writer
+claims, and changed writer baselines; see Conventions and Writer claims)
 and returns `[{name, ok, fix}]`. Exit code 0 = all healthy. Checks run concurrently, not
 sequentially — don't assume output order reflects check duration.
 
@@ -129,6 +130,97 @@ retained on purpose after an unknown outcome (`"retained": true` in the lock fil
 `setu doctor` lists retained locks and locks with a dead owner. The CLI and the portal
 release their locks on SIGINT and SIGTERM.
 
+## Writer claims
+
+Before editing, claim the worktree with your agent name, a unique session ID,
+and a short task. Keep the same session ID throughout the task. If using an
+agent hook, use the actual session ID supplied by that agent, so the hook and
+claim agree. Never reuse another agent's session ID.
+
+```sh
+setu claim /path/to/worktree --agent codex --session session-123 --task "Fix login redirect"
+# Refresh the heartbeat periodically during long tasks, for example every 30 minutes:
+setu claim /path/to/worktree --agent codex --session session-123 --task "Fix login redirect"
+# Release after finishing, including when abandoning the task:
+setu release /path/to/worktree --session session-123
+setu claims --json
+```
+
+`claim` and `release` default to the current directory. All four commands,
+including `claim-check`, accept `--json`. An agent name is 1 to 40 lowercase letters,
+digits or dashes, for example `claude-code`, `codex`, `cursor`, `opencode` or `human`.
+The CLI records its parent PID by default. If a short-lived
+shell launches the CLI, pass `--pid <agent-pid>` to record the long-lived local
+agent process instead. MCP's `claim_worktree` requires this PID explicitly.
+
+Claims live in `setu-writer.json` inside the worktree's own Git directory, so
+linked worktrees have separate claims. The file records `agent`, `session`,
+`task`, `pid`, `started_at`, `heartbeat`, `branch`, `head`, and `baseline`
+(`count` and SHA-256 `hash` of the exact `git status --porcelain` output).
+Branch and HEAD come from Git at claim time. Detached HEAD has a null branch;
+an unborn branch has a null HEAD. A same-session refresh preserves the original
+start time, branch, HEAD, and baseline, and updates the owner details and heartbeat.
+
+A different session is refused with the current owner's details and a suggestion
+to use `setu new <repo> <branch>`. Takeover is allowed only when the heartbeat is
+at least two hours old **and** the recorded PID no longer exists. A takeover result
+carries `tookOverFrom` (the previous agent, session, task and heartbeat), and the CLI warns
+that the tree may hold that owner's uncommitted work. `claim-check` by the owning session
+refreshes a heartbeat older than five minutes, so an agent that keeps checking keeps its
+claim. `claim-check` on a path outside any Git worktree succeeds with no claim. `release` only
+accepts the owning session, including for stale claims; `release --force` removes a claim
+file only when it cannot be read. A lock left by a killed process is recovered on the next
+claim, and `setu doctor` names such locks. Releasing an unclaimed
+worktree succeeds without changing ownership. `claims` lists active claims in
+the current repository and its sibling worktrees, plus registered Setu projects
+and worktrees. It does not scan arbitrary repositories across the machine.
+
+`setu doctor` reports stale claims, unreadable claim files, and changes to the
+starting baseline. A changed baseline is a prompt to review, not proof of another
+writer: the owner's own edits change it too. This status hash tracks changed paths
+and status codes, not file contents, so further edits to an already-modified file
+may leave it unchanged.
+
+Claim writes and releases share an exclusive `setu-writer.json.lock` and publish
+complete JSON snapshots atomically. If a process is killed during a claim operation,
+the lock may remain. Inspect the PID in that lock and remove only the lock after
+confirming that operation has exited. Do not delete a live owner's claim to bypass
+the refusal.
+
+For a PreToolUse command hook, call `setu claim-check <target-path> --session <id>`
+before allowing a write. Exit 0 permits the tool; exit 2 blocks it with an owner
+description on stderr. Errors also block. The check reads only the worktree
+location and claim file, without running status, refreshing a heartbeat, or
+contacting the portal. A stale claim held by another session still blocks until
+explicitly reclaimed or released. File paths, new files, nested directories, and
+symlinks are supported.
+
+An example user-managed PreToolUse script that reads the hook JSON on stdin:
+
+```js
+#!/usr/bin/env bun
+import { spawnSync } from 'child_process';
+import { resolve } from 'path';
+
+try {
+  const event = await Bun.stdin.json();
+  const target = resolve(event.cwd, event.tool_input?.file_path ?? '.');
+  const result = spawnSync('setu', ['claim-check', target, '--session', event.session_id], { stdio: 'inherit' });
+  process.exit(result.status === 0 ? 0 : 2);
+} catch {
+  console.error('Cannot check writer claim; verify the hook input and Setu installation.');
+  process.exit(2);
+}
+```
+
+Use this with write-capable tools such as Edit and Write. A shell or batch tool
+that can write to several worktrees needs a wrapper that checks each target;
+checking only its current directory cannot cover writes elsewhere. Claims are
+cooperative coordination and do not stop programs that bypass these checks.
+Setu does not install or change Claude or Codex hooks/settings. The MCP tools are
+`claim_worktree` (`repo`, `name`, `agent`, `session`, `task`, `pid`),
+`release_worktree` (`repo`, `name`, `session`), and `list_claims` (no arguments).
+
 ## Action log
 
 Every mutating `POST /api/*` request appends one JSON line to `~/workspace/logs/actions.log`
@@ -137,21 +229,17 @@ error?}`. GET routes aren't logged (reads, not actions — the list/status polls
 3 second intervals and would drown out everything else). Built specifically to close a real
 gap: a prior incident (a worktree silently switched from bare to a container mid-use) took
 correlating three separate external log sources by hand to root-cause, because portal.js
-logged nothing about its own requests anywhere retrievable. **`/mcp` is deliberately excluded**
-— it's a JSON-RPC envelope (repo/name live under `params.arguments`, not top-level) and a
-stateless response can be SSE-framed rather than plain JSON, so blindly extending the same
-wrapper would silently mis-log every MCP-driven action as successful regardless of its real
-outcome. An MCP-driven `create_worktree`/`remove_worktree`/etc. call today leaves no trace in
-this log — real, tracked gap, not yet solved.
+logged nothing about its own requests anywhere retrievable. `/mcp` is deliberately excluded
+from this plain request log because it is a JSON-RPC envelope and can be SSE-framed. Supported
+MCP mutations record durable operation outcomes instead; inspect `GET /api/operations` for
+those records.
 
 ## MCP server (localhost:2999/mcp) — let an agent drive Setu directly
 
 Same portal, same backend functions, a fourth front door (web UI / CLI / Raycast / MCP, in
-that order of age) — `mcp-server.js`'s 15 tools (`list_worktrees`, `create_worktree`,
-`start_worktree`, `stop_worktree`, `sync_worktree`, `remove_worktree`, `get_diff`, `get_logs`,
-`list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`,
-`create_pr`, `pr_ready`) call straight into portal.js's own functions in-process, not over
-HTTP — no self-fetch loopback. Streamable HTTP, stateless (fresh `McpServer` per request),
+that order of age). Tool registrations in `mcp-server.js` call straight into portal.js's own
+functions in-process, not over
+HTTP, with no self-fetch loopback. Streamable HTTP, stateless (fresh `McpServer` per request),
 DNS-rebinding protection on, no CORS. The portal binds `127.0.0.1`; HTTP, WebSocket and MCP requests share a loopback/Host/Origin guard. Local Caddy access works, forwarded remote clients are rejected. The server also sends a real `instructions` string on
 connect (MCP's own `InitializeResult.instructions` field) — architecture overview, tool
 groupings, and a concrete debugging workflow, not just per-tool descriptions in isolation.
@@ -295,3 +383,296 @@ Dirty counts are asynchronous metadata (`number | null`), refreshed at most once
 with four Git checks in flight. `null` means unknown. Removal always runs a fresh Git status.
 Warm listener and branch reads return cached data during refresh. Preserve lsof output on exit 1:
 multiple port selectors can print valid listeners and still return a nonzero status.
+
+## Complete interface contract
+
+This section is the current inventory. `H` means the local HTTP API, `W` the
+portal UI, `C` the CLI, `M` MCP, and `R` Raycast. An `H` entry is callable only
+through the loopback portal guard. GET targets are query parameters; POST targets
+are JSON. `T` means the registered target `{repo,name}`. A checkout identity is
+the complete server-provided identity object, passed back unchanged.
+
+Every mutation returns a known result or `{ok:false, code, error, ...recovery}`.
+`accepted` and `queued` do not mean a runtime is running. Preserve `unknown` and
+inspect the named status or durable record before retrying. HTTP records an
+`x-setu-source` value of `ui`, `cli`, or `raycast`, otherwise `portal`; MCP is
+recorded as `mcp`. Source is attribution, not authorization.
+
+### CLI
+
+`--json` is accepted by the CLI parser. The command-specific flags below are the
+ones that change behavior. `file|-` accepts a file or standard input. Flags that
+carry JSON must contain JSON.
+
+| Command | Flags and target | Operation and recovery |
+| --- | --- | --- |
+| `setup` | `--name`, `--workspace`, `--zone`, `--engine orbstack\|docker\|colima\|skip`, `--yes` | Provision local prerequisites and configuration. A Homebrew install requires a rerun. |
+| `doctor` | `--json` | Read concurrent local health checks and their fixes. |
+| `init <gh-org>/<repo> [label]` | none | Register a GitHub repository and create `main`; local import outcomes are durable. |
+| `new <repo> <branch>` | `--tunnel`, `--start`, `--container`, `--bare` | Create a worktree. `--start` can return queued; inspect worktree state. |
+| `rm <repo> <branch>` | `--force`, `--operation-id <id>` | Remove through the portal. Force requests destructive behavior and needs explicit approval. Retry only the returned operation ID after an uncertain result. |
+| `ls [repo]`, `status` | none | List registered worktrees; `status` aliases `ls`. |
+| `start <repo> <branch>` | `--container`, `--bare` | Request a dev-server start. Omit both for sticky mode. Queued is not running. |
+| `stop <repo> <branch>` | none | Stop or dequeue through a running portal. |
+| `prune` | `--force` | List unregistered workspace listeners. `--force` requests a single-pid kill and needs explicit approval. CLI only. |
+| `fetch <repo>` | none | Fetch the bare repository; durable local outcome. |
+| `sweep` | `--import <name>` | List unmanaged clones or explicitly import one. |
+| `portal [stop]` | none | Start or stop the local portal. |
+| `mcp install <client>` | `--all` | Configure a supported local MCP client. `mcp status` reads configuration status. |
+| `tunnel <repo> <branch> [stop]` | none | Move or release the one shared tunnel. |
+| `sync <repo> <branch>` | none | Cleanly merge the resolved base; a conflict is aborted. |
+| `trigger <repo> <branch> [stop]` | none | Start or stop Trigger through the portal. |
+| `logs <repo> <branch>` | `--type`, `--lines` | Read a bounded log tail. |
+| `diff <repo> <branch>` | `--verbose` | Read base and uncommitted diff information. |
+| `ports` | none | List listeners from the portal. |
+| `pr create\|ready\|status <repo> <branch>` | none | Create a PR, mark it ready, or read PR-review status. Creation is an external action. |
+| `storage [inspect <repo> <branch>]` | `--store <id>` | Read cached storage, or explicitly inspect one server-known target/store. |
+| `operations [repo branch]` | `--since`, `--limit` | Read durable operation outcomes. |
+| `sessions [list [repo branch]]` | `end <repo> <branch> --session <id> --checkout <file\|->` | List or end an exact owned session. Identity is mandatory for end. |
+| `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
+| `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
+| `admission` | none | Read resource-admission leases and limits. |
+| `setup-progress [list [repo branch]]` | `retry <repo> <branch> --checkout <file\|-> --attempt <id>` | Read durable setup or retry an exact attempt and identity. |
+| `attention [list [repo branch]]` | `focus <repo> <branch> --session <id> --checkout <file\|->` | Read normalized attention or focus an exact verified terminal. |
+| `headless list [repo branch]` | none | Read bounded headless-run records without prompts/output. |
+| `headless start <repo> <branch>` | `--prompt-file <file\|->`, `--model`, `--budget`, `--wall-clock-ms`, `--output-bytes` | Start bounded Claude Code headless work. Budget is at most 2 USD, wall clock at most one hour, output at most 64 KiB. No headless turn limit is defined. |
+| `headless resume <repo> <branch>` | `--run <id> --prompt-file <file\|->`, `--model`, `--budget`, `--wall-clock-ms`, `--output-bytes` | Resume the exact bounded Claude Code run. The same budget, wall-clock, and output limits apply. |
+| `headless cancel <repo> <branch>` | `--run <id> --checkout <file\|->` | Cancel only the exact owned run. |
+| `dependencies [status [repo branch]]` | `verify\|repair <repo> <branch>` | Read/verify a dependency view. Repair returns a plan and does not replace a view. |
+| `shared-caches` | none | Read shared cache catalog records. |
+| `workflows list\|runs <repo> <branch>` | none | Read GitHub workflow metadata/runs. |
+| `workflows dispatch <repo> <branch>` | `--workflow <id> --ref <ref> --inputs <file\|-> [--confirmation <token>]` | First request returns a token; submit that exact token only if the reviewed workflow/ref/inputs remain unchanged. |
+| `actions list` | none | Read saved connected-MCP actions. |
+| `actions save` | `--input <file\|->` | Save a reviewed connected-tool mapping. |
+| `actions preflight` | `--action <id> --input <file\|->` | Produce a token bound to the action revision and input. |
+| `actions invoke` | `--action <id> --input <file\|-> --confirmation <token>` | Invoke only the exact reviewed external-tool input. |
+| `adopt <repo> <branch>` | `--path <linked-checkout>` | Register an existing verified linked worktree without setup or start. |
+| `review handoff <repo> <branch>` | `--session <id> --checkout <file\|-> --artifact <file\|-> --findings <file\|->` | Paste selected records into an exact owned terminal without submitting text. |
+| `path <repo> <branch>`, `cd <repo> <branch>` | none | Print the registered worktree path; `cd` is normally a shell wrapper. |
+| `update` | `--restart`, `--include-untracked` | Run guarded Setu update. A running portal requires explicit `--restart`; this is CLI only. |
+| `version`, `help` | none | Print local version/commit or help. |
+| `claim [worktree]` | `--agent --session --task [--pid]` | Claim or refresh a writer slot. |
+| `release [worktree]` | `--session` | Release only the owning writer slot. |
+| `claims` | none | List known writer claims. |
+| `claim-check <path>` | `--session` | Read-only writer hook check; exit 2 blocks a write. |
+
+`settings` has no CLI or MCP command. Update and prune have no MCP, Raycast,
+or portal-button front door. Settings is web/API only. The update API routes are
+internal coordination for the guarded CLI update, not a separate update front door.
+
+### Portal HTTP API
+
+The table is complete and tested against `PORTAL_API_ROUTES`. `confirmation` in a
+row means a visible review must occur first. A returned token binds reviewed
+input; it does not authorize destructive or external work. Obtain explicit user
+confirmation after review, then submit the token. Editing workflow inputs, saved
+MCP action input, or deployment context invalidates its token. Deploy uses
+current preflight context and an installed, source-verified provider binding; it
+never downloads a provider tool to make a deployment possible.
+
+<!-- PORTAL_API_ROUTES_START -->
+| Method | Path | Operation, target, confirmation/recovery | Front doors |
+| --- | --- | --- | --- |
+| `GET` | `/api/agent-sessions` | `repo?`,`name?`; list durable sessions. | H W C M |
+| `POST` | `/api/agent-sessions/end` | T plus `sessionId`,`checkoutIdentity`; end only after owned PID/process-start identity is proven. | H W C M |
+| `GET` | `/api/agents` | List installed agent CLIs. | H W R |
+| `GET` | `/api/attention` | `repo?`,`name?`; list normalized attention events. | H W C M |
+| `POST` | `/api/attention/focus` | T plus `sessionId`,`checkoutIdentity`; focus only through an exact Ghostty terminal mapping. | H W C M |
+| `POST` | `/api/attention/hook` | Trusted provider hook payload only; unsupported payload remains unknown. | H W |
+| `POST` | `/api/convex/deploy` | T plus `target`,`expectedContext`; current preflight/binding required. | H W |
+| `POST` | `/api/convex/start` | T; start Convex development runtime. | H M |
+| `GET` | `/api/convex/status` | T query; read Convex deployment state. | H W |
+| `POST` | `/api/convex/stop` | T; stop Convex development runtime. | H M |
+| `GET` | `/api/costs` | Read configured provider spend aggregates. | H W |
+| `POST` | `/api/create` | `{repo,name,tunnel?}`; create worktree and durable setup. | H W M R |
+| `GET` | `/api/custom-agents` | Read configured custom agent entries. | H W |
+| `POST` | `/api/custom-agents` | Replace reviewed custom agent entries. | H W |
+| `GET` | `/api/dependency-sharing` | No input; read dependency-sharing views. | H W C M |
+| `POST` | `/api/dependency-sharing/repair` | T; return repair plan only, never convert a view. | H W C M |
+| `POST` | `/api/dependency-sharing/verify` | T; verify one view. | H W C M |
+| `GET` | `/api/deploy/preflight` | T plus `provider`,`target`; read fresh deployment context. | H W |
+| `GET` | `/api/diff` | T query; read base and worktree diff. | H W C M |
+| `GET` | `/api/file-sync-globs` | `repo`; read project file-sync globs. | H W |
+| `POST` | `/api/file-sync-globs` | `repo`,`globs`; replace project file-sync globs. | H W |
+| `GET` | `/api/github/runs` | T query; list bounded GitHub workflow runs. | H W C M |
+| `POST` | `/api/github/dispatch` | T plus `workflow`,`ref`,`inputs`,`confirmation?`; first response supplies review token. | H W C M |
+| `GET` | `/api/github/workflows` | T query; list verified dispatchable workflows. | H W C M |
+| `GET` | `/api/headless-runs` | `repo?`,`name?`; list without prompt/output. | H W C M |
+| `POST` | `/api/headless-runs/cancel` | T plus `runId`,`checkoutIdentity`; cancel exact owned run. | H W C M |
+| `POST` | `/api/headless-runs/resume` | T plus `runId`,`prompt`, limits; server obtains fresh identity. | H W C M |
+| `POST` | `/api/headless-runs/start` | T plus `prompt`, optional bounded model/limits. | H W C M |
+| `POST` | `/api/inngest/start` | T; start Inngest runtime. | H W M |
+| `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
+| `GET` | `/api/logs` | T query plus `type?`,`n?`; bounded log tail. | H W C M |
+| `GET` | `/api/mcp-servers` | Read connected MCP-server configuration/status. | H W |
+| `POST` | `/api/mcp-servers` | Save reviewed MCP-server configuration. | H W |
+| `POST` | `/api/mcp/connect` | Connect one configured server. | H W |
+| `POST` | `/api/mcp/disconnect` | Disconnect one configured server. | H W |
+| `GET` | `/api/mcp-actions` | List saved reviewed MCP actions. | H W C M |
+| `POST` | `/api/mcp-actions/invoke` | `actionId`,`input`,`confirmation`; exact preflight token required. | H W C M |
+| `POST` | `/api/mcp-actions/preflight` | `actionId`,`input`; returns token bound to current input/revision. | H W C M |
+| `POST` | `/api/mcp-actions/save` | Reviewed connected-tool mapping fields. | H W C M |
+| `GET` | `/api/mcp/oauth/callback/:serverId` | OAuth callback for the exact configured server ID. | H W |
+| `POST` | `/api/netlify/deploy` | T plus `target`,`expectedContext`; current preflight/binding required. | H W |
+| `GET` | `/api/netlify/status` | T query; read Netlify deployment status. | H W |
+| `POST` | `/api/open` | T plus `tool`; open a detected agent CLI/session. | H W R |
+| `GET` | `/api/operations` | `repo?`,`name?`,`since?`,`limit?`; read durable operation outcomes. | H W C M |
+| `GET` | `/api/ports` | List local listeners and registered ownership. | H W C M R |
+| `POST` | `/api/ports/kill` | `port`,`pid?`; exact current holder or registered stop path. | H W R |
+| `GET` | `/api/pr-review/artifact` | T query plus `skill`; serve latest report artifact. | H W |
+| `POST` | `/api/pr-review/run` | T plus `skill`; starts paid headless review, confirm user intent first. | H W M |
+| `POST` | `/api/pr-review/handoff` | T plus exact session/identity/artifact/findings and Ghostty mapping; paste only, no Enter. | H W C M |
+| `GET` | `/api/pr-review/status` | T query; read plugin/run/artifact state. | H W C M |
+| `POST` | `/api/pr/create` | T; push/open GitHub PR. External action. | H W C M |
+| `POST` | `/api/pr/ready` | T plus `ready`; toggle existing PR draft state. | H W C M |
+| `POST` | `/api/project/add` | `github`,`name?`,`label?`; register a project. | H W |
+| `POST` | `/api/project/remove` | `name`; remove a project registration only. | H W |
+| `GET` | `/api/projects` | List registered projects. | H W M R |
+| `GET` | `/api/resource-admission` | Read admission leases/limits. | H W C M |
+| `GET` | `/api/raycast/log` | Read Raycast bridge log. | H W R |
+| `POST` | `/api/raycast/start` | Start Raycast bridge/runtime. | H W R |
+| `GET` | `/api/raycast/status` | Read Raycast bridge/runtime status. | H W R |
+| `POST` | `/api/raycast/stop` | Stop Raycast bridge/runtime. | H W R |
+| `POST` | `/api/remove` | T plus `force?`,`operationId?`; force requests destructive behavior and needs approval. Retry only returned operation ID. | H W M R |
+| `POST` | `/api/remove/cancel` | `operationId`; cancel a pending removal before checkout removal. | H W |
+| `GET` | `/api/repo-prs` | `repo`; list open repository PRs. | H W M |
+| `GET` | `/api/settings` | Read web settings. | H W |
+| `POST` | `/api/settings` | Save web settings. | H W |
+| `GET` | `/api/setup-progress` | `repo?`,`name?`; list durable setup records. | H W C M |
+| `POST` | `/api/setup-progress/retry` | T plus `attemptId`,`checkoutIdentity`; retry exact recorded attempt. | H W C M |
+| `GET` | `/api/shared-caches` | List shared-cache catalog records. | H W C M |
+| `POST` | `/api/sidecar-approvals/approve` | `repo`,`name`,`command`,`args`; must match reviewed sidecar. | H W |
+| `GET` | `/api/sidecars` | `repo`; list project sidecars. | H W M |
+| `POST` | `/api/sidecars` | `repo`,`sidecars`; replace project sidecars. | H W |
+| `POST` | `/api/start` | T plus optional boolean `container`; omit for sticky mode. Accepted/queued requires observation. | H W C M R |
+| `GET` | `/api/status` | Read portal, host, pending-removal and runtime status. | H W R |
+| `POST` | `/api/stop` | T; stop/dequeue dev server and sidecars. | H W C M R |
+| `GET` | `/api/sweep` | Read import candidates. | H W |
+| `POST` | `/api/sweep/import` | `name`,`remoteUrl`,`label?`; import a discovered clone. | H W |
+| `POST` | `/api/sync` | T; clean base merge only. | H W C M R |
+| `POST` | `/api/trigger/start` | T; start Trigger runtime. | H W C M |
+| `POST` | `/api/trigger/stop` | T; stop Trigger runtime. | H W C M |
+| `POST` | `/api/tunnel/disable` | T; release shared tunnel. | H W C M |
+| `POST` | `/api/tunnel/enable` | T; move shared tunnel. | H W C M |
+| `GET` | `/api/update/capabilities` | Internal guarded-update capability check. | H |
+| `POST` | `/api/update/quiesce` | Internal guarded-update handoff. | H |
+| `POST` | `/api/update/reopen` | Internal guarded-update recovery. | H |
+| `POST` | `/api/update/stop` | Internal guarded-update stop. | H |
+| `POST` | `/api/vercel/deploy` | T plus `target`,`expectedContext`; current preflight/binding required. | H W |
+| `GET` | `/api/vercel/status` | T query; read Vercel deployment status. | H W |
+| `GET` | `/api/workspace-inventory` | Read discovered/registered worktree inventory. | H W |
+| `GET` | `/api/workspace-storage` | Read cached known-root storage observations only. | H W C M |
+| `POST` | `/api/workspace-storage/inspect` | T or `storeId`; explicit server-resolved inspection. | H W C M |
+| `POST` | `/api/worktree-cache/execute` | T plus `manifestId`,`confirmation`; execute only after user confirms the reviewed manifest. | H W C M |
+| `POST` | `/api/worktree-cache/prepare` | T; create the cleanup manifest for review. | H W C M |
+| `POST` | `/api/worktrees/adopt` | T plus verified linked-worktree `path`; no install/start. | H W C M |
+| `GET` | `/api/worktrees` | List worktrees; `snapshot=1` adds observations/status. | H W M R |
+| `GET` | `/api/worktrees/archived` | List archived worktrees. | H W |
+<!-- PORTAL_API_ROUTES_END -->
+
+### MCP tools
+
+MCP is a local, stateless HTTP server at `/mcp`; the portal must already be
+running. Tool mutations use the same target/identity/confirmation rules as the
+HTTP rows. `T` below is `{repo,name}`. A tool with `identity` needs the exact
+checkout identity. `review token` means preflight first and no edited input.
+
+| Tool | Input shape | Operation |
+| --- | --- | --- |
+| `claim_worktree`, `release_worktree`, `list_claims` | T plus claim owner fields; release session; none | Writer ownership, release, and listing. Claim needs agent/session/task/pid. |
+| `list_worktrees`, `list_projects`, `list_ports`, `get_doctor` | none | Read core local state. |
+| `create_worktree` | T, `tunnel?` | Create without starting. |
+| `adopt_worktree` | T, `path` | Verify and register linked checkout only. |
+| `start_worktree`, `stop_worktree` | T, `container?` for start | Start with sticky default or stop/dequeue. Observe queued outcomes. |
+| `enable_tunnel`, `disable_tunnel` | T | Move/release the shared tunnel. |
+| `start_inngest`, `stop_inngest`, `start_trigger`, `stop_trigger`, `start_convex`, `stop_convex` | T | Control first-class runtimes. |
+| `list_sidecars` | T | Read custom sidecar configuration/status. |
+| `get_sidecar_logs` | T, `sidecar`, `lines?` | Read a bounded sidecar log. |
+| `get_workspace_storage` | none | Read cached storage without scanning. |
+| `inspect_workspace_storage` | T, optional `storeId` | Explicitly inspect a server-known root. |
+| `list_operations`, `get_resource_admission` | optional target filters; none | Read outcomes/admission. |
+| `list_dependency_sharing` | T | Read one dependency-sharing view. |
+| `verify_dependency_sharing`, `plan_dependency_repair` | T | Verify one view or return a repair plan only. |
+| `list_shared_caches` | none | Read shared-cache catalog. |
+| `list_agent_sessions`, `end_agent_session` | target filters; T, `sessionId`, identity | Read sessions or end one only after owned process identity verification. |
+| `prepare_worktree_cache_cleanup`, `execute_worktree_cache_cleanup` | T; T, `manifestId`, user-confirmed review token | Review, obtain user confirmation, then perform exact generated-cache cleanup. Partial results return retry identity. |
+| `get_setup_progress`, `retry_setup` | target filters; T, `attemptId`, identity | Read/retry an exact durable setup attempt. |
+| `list_attention`, `focus_agent_session` | target filters; T, `sessionId`, identity | Read attention or focus only through an exact Ghostty terminal mapping. |
+| `handoff_review_findings` | T, `sessionId`, identity, artifact, findings | Paste through the exact Ghostty mapping without submission. |
+| `list_headless_runs`, `start_headless_run`, `cancel_headless_run`, `resume_headless_run` | target filters; T plus prompt/limits; cancel identity/run ID | Manage bounded Claude Code headless runs. |
+| `list_github_workflows`, `list_github_runs` | T | Read workflows/runs. |
+| `dispatch_github_workflow` | T, workflow/ref/inputs, `confirmation?` | First call returns a review token; edited input invalidates it. |
+| `list_mcp_actions`, `save_mcp_action`, `preflight_mcp_action`, `invoke_mcp_action` | none; mapping; action/input; action/input/token | Save, review, then invoke connected MCP tools. |
+| `sync_worktree` | T | Clean base merge only. |
+| `remove_worktree` | T, `force?`, `operationId?`, `reason?` | Destructive removal needs explicit approval; resume only returned operation ID. |
+| `get_diff`, `get_logs` | T, `verbose?`; T, `type?`, `lines?` | Read bounded diff/log output. |
+| `list_repo_prs` | `repo` | Read repository PRs. |
+| `get_pr_review_status`, `run_pr_review` | T; T, skill | Read or start paid fire-and-forget review after user approval. |
+| `create_pr`, `pr_ready` | T; T, `ready` | Create a PR or toggle draft/ready. |
+
+### State, setup, cleanup, attention, and deployment
+
+Runtime source and observation are separate. A registry/lifecycle record is a
+claim about known runtime state; a listener/container/process observation can be
+fresh, cached, or unknown. A failed observation preserves the last display but
+does not certify it. Unknown stays unknown and retains resource reservations
+until a supported recovery observation proves a result. Start completion waits
+for an observed `running` state or a known failed, stopped, cancelled, or unknown
+outcome. It does not infer success from acceptance or queue admission.
+
+Setup, sessions, headless runs, cache manifests, operation events, dependency
+views, and attention use durable state. End/cancel/focus/retry/handoff compares
+the reviewed checkout identity to a fresh observation. A restarted portal marks
+unfinished setup unknown until evidence recovers it. A durable session can be
+signalled only after ownership, PID start identity, and checkout are proven.
+Focus and handoff additionally require an exact terminal mapping.
+
+Generated-cache cleanup has a narrow manifest: only `.next/cache` and
+`.next/dev/cache/turbopack`, never `node_modules`, an env file, a symlink, or a
+special/linked file. The manifest records target, checkout identity, HEAD,
+registered/ownership/runtime snapshots, root entries with filesystem identity,
+and its immutable SHA-256 ID. Execution rechecks each condition. A partial
+result reports only `removedPaths` plus a new `retryId`; use it with the same
+manifest ID after a fresh review.
+
+Claude Code has trusted hook wiring. A launch token binds the owned session,
+checkout identity, and native session before it accepts `PermissionRequest`,
+`Notification:agent_needs_input`, or `Stop`. Codex has no native trusted-hook
+wiring. Setu can launch a managed Codex process and track its checkout, PID,
+and process-start ownership. Its normalized parser recognizes `PermissionRequest`
+and `Stop` shapes, which does not establish support for a native Codex hook.
+The native focus/paste adapter was derived from Ghostty 1.3.1's scripting
+dictionary/source. It needs an existing owned Ghostty terminal UUID and matching
+checkout; it never launches a terminal and returns an explicit
+unavailable/disabled/unknown result when proof is missing. No live Ghostty or
+provider acceptance run has been performed.
+
+Workflow dispatch and saved MCP actions bind their confirmation token to the
+exact reviewed fields. The user must approve the reviewed action before its
+token is submitted. Change the workflow/ref/inputs or action revision/input,
+then preflight again. Deployment binds an `expectedContext` from fresh preflight
+to the checkout identity, revision/dirty state, target, and provider binding.
+Vercel's reviewed adapter is 58.9.1 with exact project/team linkage; Netlify
+preview requires the exact linked site. Convex requires the source-verified
+installed CLI/deployment-key binding. An unavailable or unbound adapter is a
+refusal, never a fallback or an accepted deployment.
+
+### Runtime and dependency-sharing limits
+
+The package version is `0.2.0`; no release is implied by that source value.
+Setu provisions Bun 1.3.14 through `install.sh`; a source checkout uses
+`bun install --frozen-lockfile`. `mise.toml` selects Bun 1.3.14. Root typecheck
+and Raycast typecheck require the root dependencies `typescript`, `@raycast/api`,
+`@raycast/utils`, `@types/node`, and `@types/react`; do not rely on a Raycast
+`node_modules` symlink. Raycast itself is a manual local action:
+`cd raycast && bun install && bunx ray develop`.
+
+Native dependency sharing is source/fixture verified only for Bun 1.3.14 on
+macOS arm64, an explicitly opted-in fresh checkout, `[install] linker =
+"isolated"`, and a private 0700 store outside the workspace. Hoisted or
+unspecified linkers are explicitly incompatible. No Quivly rollout has happened.
+An existing `node_modules` is never replaced automatically. Dependency repair
+currently returns a plan. APFS copy-on-write and directory-size observations are
+observations, not a guarantee of physical reclaim. No server, browser,
+container, provider, or native-app acceptance was run for this documentation
+change.

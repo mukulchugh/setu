@@ -149,7 +149,7 @@ export async function runUpdateTransaction(
     stage = 'install';
     await deps.checkStorage?.();
     dependenciesChanged = true;
-    await deps.install();
+    await deps.install({ frozenLockfile: true });
     stage = 'link';
     await deps.link();
     stage = 'settings';
@@ -179,8 +179,8 @@ export async function runUpdateTransaction(
     };
   } catch (error) {
     const recovery = {
-      stashApplied: false,
       revisionRestored: false,
+      stashApplied: false,
       warnings: [],
     };
     if (stage === 'stash-create' && marker && !stashId) {

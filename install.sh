@@ -4,6 +4,22 @@
 set -e
 
 SETU_DIR="${SETU_INSTALL_DIR:-$HOME/.setu}"
+BUN_VERSION="1.3.14"
+
+ensure_bun() {
+  if [ "$(bun --version 2>/dev/null || true)" = "$BUN_VERSION" ]; then
+    return
+  fi
+  echo "Installing Bun $BUN_VERSION..."
+  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION"
+  export PATH="$HOME/.bun/bin:$PATH"
+  if [ "$(bun --version 2>/dev/null || true)" != "$BUN_VERSION" ]; then
+    echo "Bun $BUN_VERSION could not be installed."
+    exit 1
+  fi
+}
+
+ensure_bun
 
 # Existing checkouts must use the guarded updater before source/dependency edits.
 # An older checkout without the handshake cannot safely update its running portal.
@@ -13,12 +29,6 @@ if [ -e "$SETU_DIR" ]; then
     exit 1
   fi
   exec bun "$SETU_DIR/update-command.js" "$@"
-fi
-
-if ! command -v bun &>/dev/null; then
-  echo "Installing bun..."
-  curl -fsSL https://bun.sh/install | bash
-  export PATH="$HOME/.bun/bin:$PATH"
 fi
 
 clone_or_update() {
@@ -33,7 +43,7 @@ clone_or_update() {
 }
 
 clone_or_update
-cd "$SETU_DIR" && bun install && bun link
+cd "$SETU_DIR" && bun install --frozen-lockfile && bun link
 echo ""
 echo "✓ setu ready — run: setu setup   (or: setu setup --name <you> --yes for non-interactive)"
 echo "  setu setup also checks for Raycast and, if it's installed, prints the one manual"

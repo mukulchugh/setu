@@ -39,7 +39,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import z from 'zod/v4';
-import { PORTAL_PORT } from './lib.js';
+import { PACKAGE_VERSION, PORTAL_PORT } from './lib.js';
+import { WRITER_AGENT_NAME } from './writer-claims.js';
 
 // Populated by portal.js's initMcpServer() call, once, at startup — after
 // the functions it references are defined (safe regardless of call order
@@ -166,7 +167,9 @@ function boundedDiffText(value) {
   const output = structuredClone(value);
   const render = () => JSON.stringify(output, null, 2);
   let rendered = render();
-  if (Buffer.byteLength(rendered) <= DIFF_TEXT_BUDGET) return text(output);
+  if (Buffer.byteLength(rendered) <= DIFF_TEXT_BUDGET) {
+    return text(output);
+  }
   output.truncation = DIFF_TRUNCATION_MARKER;
   while (Buffer.byteLength((rendered = render())) > DIFF_TEXT_BUDGET) {
     const group = ['committed', 'uncommitted'].find(
@@ -201,6 +204,57 @@ function text(value) {
 // ── tool registration ───────────────────────────────────────────────────────
 
 function registerTools(server) {
+  server.registerTool(
+    'claim_worktree',
+    {
+      description:
+        'Claim the writer slot before editing a worktree. Repeat with the same session to refresh its heartbeat. A different session can take over only after two hours without a heartbeat and the owner PID has exited.',
+      inputSchema: {
+        agent: z.string().regex(WRITER_AGENT_NAME),
+        name: z.string(),
+        pid: z
+          .number()
+          .int()
+          .positive()
+          .describe('long-lived local agent process ID, not the portal PID'),
+        repo: z.string(),
+        session: z.string().min(1).max(200),
+        task: z.string().min(1).max(300),
+      },
+      title: 'Claim worktree writer slot',
+    },
+    ({ repo, name, ...owner }) =>
+      mutationResult(() => deps.claimWriter(repo, name, owner))
+  );
+
+  server.registerTool(
+    'release_worktree',
+    {
+      description:
+        'Release a worktree writer claim at the end of the task. Only the session holding it can release it.',
+      inputSchema: {
+        name: z.string(),
+        repo: z.string(),
+        session: z.string().min(1).max(200),
+      },
+      title: 'Release worktree writer slot',
+    },
+    ({ repo, name, session }) =>
+      mutationResult(() => deps.releaseWriter(repo, name, session))
+  );
+
+  server.registerTool(
+    'list_claims',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List active writer claims across known worktrees, including agent, session, task, owner PID, heartbeat, and starting git baseline. Stale claims are reported by setu doctor.',
+      inputSchema: {},
+      title: 'List writer claims',
+    },
+    async () => text(await deps.listWriterClaims())
+  );
+
   server.registerTool(
     'list_worktrees',
     {
@@ -238,6 +292,22 @@ function registerTools(server) {
   );
 
   server.registerTool(
+    'adopt_worktree',
+    {
+      description:
+        'Register an existing linked Git worktree without installing dependencies, starting a server, or changing files in the checkout. The path must be a verified worktree of the registered repo.',
+      inputSchema: {
+        name: z.string(),
+        path: z.string().min(1),
+        repo: z.string(),
+      },
+      title: 'Adopt an existing worktree',
+    },
+    ({ repo, name, path }) =>
+      mutationResult(() => deps.adoptWorktree(repo, name, path))
+  );
+
+  server.registerTool(
     'start_worktree',
     {
       description:
@@ -268,6 +338,447 @@ function registerTools(server) {
       title: 'Stop dev server',
     },
     ({ repo, name }) => mutationResult(() => deps.stopWorktree(repo, name))
+  );
+
+  server.registerTool(
+    'enable_tunnel',
+    {
+      description:
+        "Move Setu's one shared public tunnel URL to this registered worktree.",
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Move the shared tunnel',
+    },
+    ({ repo, name }) => mutationResult(() => deps.enableTunnel(repo, name))
+  );
+
+  server.registerTool(
+    'disable_tunnel',
+    {
+      description: 'Release the shared public tunnel from this worktree.',
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'Release the shared tunnel',
+    },
+    ({ repo, name }) => mutationResult(() => deps.disableTunnel(repo, name))
+  );
+
+  for (const [tool, title, action] of [
+    ['start_inngest', 'Start Inngest', 'startInngest'],
+    ['stop_inngest', 'Stop Inngest', 'stopInngest'],
+    ['start_trigger', 'Start Trigger.dev', 'startTrigger'],
+    ['stop_trigger', 'Stop Trigger.dev', 'stopTrigger'],
+    ['start_convex', 'Start Convex development', 'startConvex'],
+    ['stop_convex', 'Stop Convex development', 'stopConvex'],
+  ]) {
+    server.registerTool(
+      tool,
+      {
+        description: `${title} for a worktree through the portal runtime owner.`,
+        inputSchema: { name: z.string(), repo: z.string() },
+        title,
+      },
+      ({ repo, name }) => mutationResult(() => deps[action](repo, name))
+    );
+  }
+
+  server.registerTool(
+    'list_sidecars',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List the configured custom sidecars for a worktree, including approval and active state.',
+      inputSchema: { name: z.string(), repo: z.string() },
+      title: 'List worktree sidecars',
+    },
+    async ({ repo, name }) => text(await deps.listSidecars(repo, name))
+  );
+
+  server.registerTool(
+    'get_sidecar_logs',
+    {
+      annotations: { readOnlyHint: true },
+      description: "Read a configured sidecar's bounded recent log output.",
+      inputSchema: {
+        lines: z.number().int().positive().optional(),
+        name: z.string(),
+        repo: z.string(),
+        sidecar: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+      },
+      title: 'Get sidecar log tail',
+    },
+    ({ repo, name, sidecar, lines }) => {
+      const res = deps.getSidecarLogs(repo, name, sidecar, lines ?? 150);
+      return {
+        ...text(res.lines?.join('\n') ?? ''),
+        isError: res.state === 'read-error',
+        structuredContent: res,
+      };
+    }
+  );
+
+  server.registerTool(
+    'get_doctor',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'Read the portal health report without changing the machine.',
+      inputSchema: {},
+      title: 'Read portal doctor report',
+    },
+    async () => text(await deps.doctorReport())
+  );
+
+  const worktree = { name: z.string().min(1), repo: z.string().min(1) };
+  const identity = z.object({}).passthrough();
+  const readTools = [
+    [
+      'get_workspace_storage',
+      'Read cached workspace storage observations without scanning.',
+      'workspaceStorage',
+      {},
+    ],
+    [
+      'list_operations',
+      'List recorded portal operation outcomes.',
+      'operations',
+      {
+        limit: z.number().int().positive().max(200).optional(),
+        name: z.string().min(1).optional(),
+        repo: z.string().min(1).optional(),
+        since: z
+          .union([z.number().int().nonnegative(), z.string().datetime()])
+          .optional(),
+      },
+    ],
+    [
+      'get_resource_admission',
+      'Read current admission leases and limits.',
+      'admissionStatus',
+      {},
+    ],
+    [
+      'list_dependency_sharing',
+      'List read-only dependency sharing views.',
+      'dependencyViews',
+      worktree,
+    ],
+    [
+      'list_shared_caches',
+      'List configured shared cache catalog entries.',
+      'sharedCaches',
+      {},
+    ],
+    [
+      'list_agent_sessions',
+      'List managed coding terminal sessions.',
+      'agentSessions',
+      {
+        name: z.string().min(1).optional(),
+        repo: z.string().min(1).optional(),
+      },
+    ],
+    [
+      'get_setup_progress',
+      'Read durable setup progress records.',
+      'setupProgress',
+      {
+        name: z.string().min(1).optional(),
+        repo: z.string().min(1).optional(),
+      },
+    ],
+    [
+      'list_attention',
+      'Read normalized terminal attention events.',
+      'attention',
+      {
+        name: z.string().min(1).optional(),
+        repo: z.string().min(1).optional(),
+      },
+    ],
+    [
+      'list_headless_runs',
+      'List bounded headless runs without prompts or output.',
+      'headlessRuns',
+      {
+        name: z.string().min(1).optional(),
+        repo: z.string().min(1).optional(),
+      },
+    ],
+    [
+      'list_mcp_actions',
+      'List saved reviewed connected-MCP actions.',
+      'mcpActions',
+      {},
+    ],
+  ];
+  for (const [tool, description, action, inputSchema] of readTools) {
+    server.registerTool(
+      tool,
+      {
+        annotations: { readOnlyHint: true },
+        description,
+        inputSchema,
+        title: description,
+      },
+      async (input) => text(await deps[action](input))
+    );
+  }
+
+  server.registerTool(
+    'inspect_workspace_storage',
+    {
+      description:
+        'Inspect server-known storage roots for one registered worktree or store id.',
+      inputSchema: { ...worktree, storeId: z.string().min(1).optional() },
+      title: 'Inspect workspace storage',
+    },
+    (input) => mutationResult(() => deps.workspaceStorageInspect(input))
+  );
+  server.registerTool(
+    'verify_dependency_sharing',
+    {
+      description: 'Verify one registered worktree dependency sharing view.',
+      inputSchema: worktree,
+      title: 'Verify dependency sharing',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyVerify({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'plan_dependency_repair',
+    {
+      description:
+        'Return a dependency repair plan only; this never changes a view.',
+      inputSchema: worktree,
+      title: 'Plan dependency repair',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyRepair({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'end_agent_session',
+    {
+      description:
+        'End one exact owned coding session after checkout-identity confirmation.',
+      inputSchema: {
+        ...worktree,
+        checkoutIdentity: identity,
+        sessionId: z.string().min(1),
+      },
+      title: 'End coding session',
+    },
+    (input) =>
+      mutationResult(() => deps.endAgentSession({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'prepare_worktree_cache_cleanup',
+    {
+      description:
+        'Prepare a reviewable generated-cache cleanup manifest for an idle registered worktree.',
+      inputSchema: worktree,
+      title: 'Prepare cache cleanup',
+    },
+    (input) =>
+      mutationResult(() => deps.cachePrepare({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'execute_worktree_cache_cleanup',
+    {
+      annotations: { destructiveHint: true },
+      description:
+        'Execute only the reviewed cache manifest with its exact confirmation.',
+      inputSchema: {
+        ...worktree,
+        confirmation: z.union([
+          z.string().min(1),
+          z.object({ manifestId: z.string(), retryId: z.string() }),
+        ]),
+        manifestId: z.string().min(1),
+      },
+      title: 'Execute cache cleanup',
+    },
+    (input) =>
+      mutationResult(() => deps.cacheExecute({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'retry_setup',
+    {
+      description:
+        'Retry one exact durable setup attempt after checkout-identity confirmation.',
+      inputSchema: {
+        ...worktree,
+        attemptId: z.string().min(1),
+        checkoutIdentity: identity,
+      },
+      title: 'Retry setup',
+    },
+    (input) =>
+      mutationResult(() => deps.setupRetry({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'focus_agent_session',
+    {
+      description:
+        'Focus an existing verified native terminal session. Never launches a terminal.',
+      inputSchema: {
+        ...worktree,
+        checkoutIdentity: identity,
+        sessionId: z.string().min(1),
+      },
+      title: 'Focus coding terminal',
+    },
+    (input) =>
+      mutationResult(() => deps.attentionFocus({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'handoff_review_findings',
+    {
+      description:
+        'Paste a bounded editable review handoff into one exact existing managed terminal without submitting it.',
+      inputSchema: {
+        ...worktree,
+        artifact: z.string().min(1),
+        checkoutIdentity: identity,
+        findings: z.array(z.object({}).passthrough()).max(100),
+        sessionId: z.string().min(1),
+      },
+      title: 'Handoff review findings',
+    },
+    (input) =>
+      mutationResult(() => deps.handoffReview({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'start_headless_run',
+    {
+      description:
+        'Start a bounded Claude Code headless run in a registered worktree.',
+      inputSchema: {
+        ...worktree,
+        maxBudgetUsd: z.number().positive().optional(),
+        model: z.string().min(1).optional(),
+        outputBytes: z.number().int().positive().optional(),
+        prompt: z.string().min(1),
+        wallClockMs: z.number().int().positive().optional(),
+      },
+      title: 'Start headless run',
+    },
+    (input) => mutationResult(() => deps.headlessStart(input, 'mcp'))
+  );
+  server.registerTool(
+    'cancel_headless_run',
+    {
+      description:
+        'Cancel one exact owned headless run after checkout-identity confirmation.',
+      inputSchema: {
+        ...worktree,
+        checkoutIdentity: identity,
+        runId: z.string().min(1),
+      },
+      title: 'Cancel headless run',
+    },
+    (input) =>
+      mutationResult(() => deps.headlessCancel({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'resume_headless_run',
+    {
+      description:
+        'Resume a documented Claude run with a fresh server checkout identity.',
+      inputSchema: {
+        ...worktree,
+        maxBudgetUsd: z.number().positive().optional(),
+        model: z.string().min(1).optional(),
+        outputBytes: z.number().int().positive().optional(),
+        prompt: z.string().min(1),
+        runId: z.string().min(1),
+        wallClockMs: z.number().int().positive().optional(),
+      },
+      title: 'Resume headless run',
+    },
+    (input) => mutationResult(() => deps.headlessResume(input, 'mcp'))
+  );
+  server.registerTool(
+    'list_github_workflows',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List verified dispatchable GitHub workflows for a registered worktree.',
+      inputSchema: worktree,
+      title: 'List GitHub workflows',
+    },
+    (input) => mutationResult(() => deps.githubWorkflows(input))
+  );
+  server.registerTool(
+    'list_github_runs',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'List bounded GitHub workflow runs for a registered worktree branch.',
+      inputSchema: worktree,
+      title: 'List GitHub workflow runs',
+    },
+    (input) => mutationResult(() => deps.githubRuns(input))
+  );
+  server.registerTool(
+    'dispatch_github_workflow',
+    {
+      description:
+        'Dispatch one reviewed workflow at the exact current worktree branch.',
+      inputSchema: {
+        ...worktree,
+        confirmation: z.string().min(1).optional(),
+        inputs: z.record(z.string(), z.string()),
+        ref: z.string().min(1),
+        workflow: z.string().min(1),
+      },
+      title: 'Dispatch GitHub workflow',
+    },
+    (input) =>
+      mutationResult(() => deps.githubDispatch({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'save_mcp_action',
+    {
+      description:
+        'Save a reviewed action for one currently connected MCP tool.',
+      inputSchema: {
+        id: z.string().min(1).optional(),
+        inputSchema: z.object({}).passthrough(),
+        mutates: z.boolean(),
+        serverId: z.string().min(1),
+        title: z.string().min(1),
+        tool: z.string().min(1),
+      },
+      title: 'Save MCP action',
+    },
+    (input) => mutationResult(() => deps.saveMcpAction(input))
+  );
+  server.registerTool(
+    'preflight_mcp_action',
+    {
+      annotations: { readOnlyHint: true },
+      description:
+        'Review an exact saved MCP action input without invoking it.',
+      inputSchema: {
+        actionId: z.string().min(1),
+        input: z.object({}).passthrough(),
+      },
+      title: 'Preflight MCP action',
+    },
+    (input) => mutationResult(() => deps.preflightMcpAction(input))
+  );
+  server.registerTool(
+    'invoke_mcp_action',
+    {
+      description:
+        'Invoke one saved MCP action only with its exact reviewed confirmation.',
+      inputSchema: {
+        actionId: z.string().min(1),
+        confirmation: z.string().min(1),
+        input: z.object({}).passthrough(),
+      },
+      title: 'Invoke MCP action',
+    },
+    (input) => mutationResult(() => deps.invokeMcpAction(input, 'mcp'))
   );
 
   server.registerTool(
@@ -527,12 +1038,14 @@ function registerTools(server) {
 // response verbatim) -- not a tool, not per-call, the one place to brief an
 // agent on how this whole server fits together before it starts picking
 // tools one at a time from titles/descriptions alone.
-const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.quivly.local\` domain). This server is a full front door onto it — the same backend the web UI and CLI use, no capability gap.
+const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.quivly.local\` domain).
 
 TOOL GROUPS
+- Writer coordination: claim_worktree -> edit (refresh the same session periodically) -> release_worktree; list_claims shows current owners. Supply the local agent PID when claiming. If another session holds the claim, use a separate worktree.
 - Discovery (read-only, cheap, call these first): list_projects, list_worktrees, list_repo_prs, list_ports.
-- Lifecycle: create_worktree -> start_worktree -> ... -> stop_worktree / remove_worktree.
-- Debugging: get_logs, get_diff, list_ports, get_pr_review_status / run_pr_review.
+- Lifecycle: create_worktree -> start_worktree -> ... -> stop_worktree / remove_worktree. adopt_worktree registers a verified existing checkout without installing or starting it.
+- Runtime controls: enable_tunnel / disable_tunnel move or release the one shared public URL. start_inngest, start_trigger and start_convex (and their stop tools) own the first-class sidecars. list_sidecars and get_sidecar_logs cover configured custom sidecars.
+- Debugging: get_doctor, get_logs, get_diff, list_ports, get_pr_review_status / run_pr_review.
 - GitHub: create_pr, pr_ready, list_repo_prs.
 
 EFFICIENT USE
@@ -548,7 +1061,7 @@ EFFICIENT USE
 
 function buildServer() {
   const server = new McpServer(
-    { name: 'setu', version: '1.0.0' },
+    { name: 'setu', version: PACKAGE_VERSION },
     { instructions: INSTRUCTIONS }
   );
   registerTools(server);
