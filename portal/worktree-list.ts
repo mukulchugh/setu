@@ -90,7 +90,7 @@ export function projectWorktrees<T extends WorktreeListRow>(
   const allStopped = all.filter((w) => worktreeState(w) === 'stopped');
   const stopped = allStopped
     .filter((w) => options.project === 'all' || w.repo === options.project)
-    .filter((w) => !options.dirty || (w.dirty ?? 0) > 0)
+    .filter((w) => !options.dirty || w.dirty === null || w.dirty > 0)
     .filter((w) => !options.ahead || w.ahead > 0)
     .filter(
       (w) =>

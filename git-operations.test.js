@@ -74,6 +74,8 @@ test('unknown Sync merge completion propagates without launching status or abort
     })
   ).rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
   expect(calls).toEqual([
+    ['symbolic-ref', '--quiet', '--short', 'HEAD'],
+    ['symbolic-ref', '--short', 'HEAD'],
     ['fetch', 'origin', 'staging'],
     ['status', '--porcelain'],
     ['merge', 'origin/staging', '--no-edit'],

@@ -20,7 +20,7 @@ function scenario({
     git: async (args) => {
       calls.push(args.join(' '));
       if (args[0] === 'rev-parse') {
-        return head;
+        return args[1] === '--abbrev-ref' ? 'main' : head;
       }
       if (args[0] === 'diff') {
         return '';
@@ -44,6 +44,10 @@ function scenario({
           throw new Error('conflict');
         }
         head = updated;
+        return '';
+      }
+      if (args[0] === 'reset') {
+        head = original;
         return '';
       }
       if (args[0] === 'stash' && args[1] === 'list') {
@@ -128,7 +132,7 @@ test('restore conflict preserves exact recovery identity and stops before instal
     restartAuthorized: true,
   });
   expect(result).toMatchObject({
-    admissionClosed: true,
+    admissionClosed: false,
     before: s.original,
     ok: false,
     stage: 'restore',
@@ -137,7 +141,7 @@ test('restore conflict preserves exact recovery identity and stops before instal
   expect(s.calls).toContain(`stash apply --index ${s.stash}`);
   expect(
     s.calls.some((call) =>
-      ['install', 'link', 'restart', 'settings', 'reopen'].includes(call)
+      ['install', 'link', 'restart', 'settings'].includes(call)
     )
   ).toBe(false);
   expect(
@@ -165,7 +169,7 @@ test('low storage after rebase never prevents restoring the exact recovery stash
     code: 'STORAGE_LOW',
     stage: 'install',
     stashId: s.stash,
-    admissionClosed: true,
+    admissionClosed: false,
     dependenciesChanged: false,
   });
   expect(s.calls).not.toContain('install');
@@ -220,10 +224,8 @@ test.each(['fetch', 'stash', 'rebase', 'install', 'link'])(
     if (failAt === 'install') {
       expect(s.calls).not.toContain('link');
     }
-    if (failAt === 'fetch') {
+    if (['fetch', 'stash', 'rebase', 'install', 'link'].includes(failAt)) {
       expect(s.calls).toContain('reopen');
-    } else {
-      expect(s.calls).not.toContain('reopen');
     }
   }
 );
@@ -303,14 +305,14 @@ test('failed settings reconciliation blocks restart after install and reports un
   expect(
     await runUpdateTransaction(s.deps, { restartAuthorized: true })
   ).toMatchObject({
-    admissionClosed: true,
+    admissionClosed: false,
     code: 'STATE_RECONCILIATION_REQUIRED',
     dependenciesChanged: true,
     ok: false,
     stage: 'settings',
   });
   expect(s.calls).not.toContain('restart');
-  expect(s.calls).not.toContain('reopen');
+  expect(s.calls).toContain('reopen');
 });
 
 test('failed restart reports admission state as unknown instead of claiming old closure still holds', async () => {

@@ -37,6 +37,15 @@ export async function runUpdateTransaction(
     if (!validOid(before)) {
       fail('UPDATE_REVISION_UNKNOWN', 'Cannot establish the original revision');
     }
+    const branch = (
+      await deps.git(['rev-parse', '--abbrev-ref', 'HEAD'])
+    ).trim();
+    if (branch !== 'main') {
+      fail(
+        'UPDATE_BRANCH_UNSUPPORTED',
+        `Guarded update requires branch main; current branch is ${branch || 'unknown'}`
+      );
+    }
     if (
       (await deps.inProgress()) ||
       (await deps.git(['diff', '--name-only', '--diff-filter=U', '-z']))
@@ -169,6 +178,11 @@ export async function runUpdateTransaction(
       ...(saved.warning ? { warning: saved.warning } : {}),
     };
   } catch (error) {
+    const recovery = {
+      stashApplied: false,
+      revisionRestored: false,
+      warnings: [],
+    };
     if (stage === 'stash-create' && marker && !stashId) {
       try {
         stashId = await findOwnStash();
@@ -176,7 +190,65 @@ export async function runUpdateTransaction(
         /* Never claim an unverified backup. */
       }
     }
-    if (owner && !sourceChanged && !dependenciesChanged) {
+    // A failed restart leaves the new revision installed. Rolling the source
+    // back there would pair old code with the new dependencies.
+    const rollBack = sourceChanged && stage !== 'restart';
+    if (stage === 'restart') {
+      recovery.warnings.push(
+        'The new revision is installed but the portal restart was not confirmed. Start it with `setu portal`.'
+      );
+    }
+    if (rollBack) {
+      try {
+        if (await deps.rebaseInProgress?.()) {
+          await deps.git(['rebase', '--abort']);
+          recovery.rebaseAborted = true;
+        }
+      } catch {
+        recovery.warnings.push('The in-progress rebase could not be aborted.');
+      }
+      try {
+        let head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
+        // A verified recovery stash preserves the original working tree while
+        // reset returns source files installed by a completed rebase to before.
+        if (head !== before && (!marker || stashId)) {
+          await deps.git(['reset', '--hard', before]);
+          head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
+        }
+        recovery.revisionRestored = head === before;
+        if (!recovery.revisionRestored) {
+          recovery.warnings.push(
+            'HEAD could not be restored to the recorded original revision.'
+          );
+        }
+      } catch {
+        recovery.warnings.push(
+          'The original revision could not be confirmed after recovery.'
+        );
+      }
+      if (stashId) {
+        try {
+          const clean =
+            (await deps.git(['status', '--porcelain', '-z'])).length === 0;
+          if (clean) {
+            await deps.git(['stash', 'apply', '--index', stashId]);
+            recovery.stashApplied = true;
+          } else {
+            recovery.warnings.push(
+              'Recovery stash was retained because the working tree is not clean.'
+            );
+          }
+        } catch {
+          recovery.warnings.push(
+            'Recovery stash was retained but could not be reapplied cleanly.'
+          );
+        }
+      }
+    }
+    const checkoutRestored = rollBack
+      ? recovery.revisionRestored
+      : !(sourceChanged || dependenciesChanged);
+    if (owner && checkoutRestored && stage !== 'restart') {
       try {
         const result = await deps.reopen(owner, { coherent: true });
         admissionClosed =
@@ -184,6 +256,11 @@ export async function runUpdateTransaction(
       } catch {
         admissionClosed = null;
       }
+    }
+    if (dependenciesChanged && checkoutRestored) {
+      recovery.warnings.push(
+        'Dependencies may have changed; reinstall them before relying on this checkout.'
+      );
     }
     return {
       admissionClosed,
@@ -200,6 +277,7 @@ export async function runUpdateTransaction(
       sourceChanged,
       stage,
       stashId,
+      ...(sourceChanged ? { recovery } : {}),
     };
   }
 }

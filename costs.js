@@ -79,6 +79,9 @@ function summarize(provider, buckets, dateOf, resultsOf, amountOf, labelOf) {
     let dayCost = 0;
     for (const r of resultsOf(bucket)) {
       const usd = amountOf(r);
+      if (!Number.isFinite(usd)) {
+        throw new Error(`Invalid ${provider} cost amount`);
+      }
       dayCost += usd;
       totalCostUsd += usd;
       const label = labelOf(r) ?? 'other';
@@ -121,7 +124,10 @@ async function anthropicCosts(adminKey) {
     buckets,
     (b) => b.starting_at.slice(0, 10),
     (b) => b.results,
-    (r) => Number(r.amount) / 100,
+    (r) =>
+      r.amount === null || r.amount === undefined
+        ? Number.NaN
+        : Number(r.amount) / 100,
     (r) => r.model ?? r.description
   );
 }
@@ -148,7 +154,10 @@ async function openaiCosts(adminKey) {
     buckets,
     (b) => new Date(b.start_time * 1000).toISOString().slice(0, 10),
     (b) => b.results,
-    (r) => r.amount?.value ?? 0,
+    (r) =>
+      r.amount?.value === null || r.amount?.value === undefined
+        ? Number.NaN
+        : Number(r.amount.value),
     (r) => r.line_item
   );
 }
@@ -192,7 +201,7 @@ function budgetStatus(spent, limit) {
   if (spent >= limit) {
     return 'over';
   }
-  if (spent >= limit * 0.8) {
+  if (spent * 5 >= limit * 4) {
     return 'warning';
   }
   return 'ok';
@@ -204,7 +213,7 @@ function computeBudgets(cfg, providers) {
     return null;
   }
   const spent = { last1d: 0, last7d: 0, last30d: 0 };
-  const incomplete =
+  let incomplete =
     !providers.some((p) => p.configured && !p.error) ||
     providers.some((p) => p.configured && p.error) ||
     !!(cfg.gemini?.gcpProjectId && cfg.gemini?.bigQueryDataset);
@@ -212,9 +221,14 @@ function computeBudgets(cfg, providers) {
     if (!p.configured || p.error) {
       continue;
     }
-    spent.last1d += p.last1d ?? 0;
-    spent.last7d += p.last7d ?? 0;
-    spent.last30d += p.last30d ?? 0;
+    for (const key of Object.keys(spent)) {
+      if (!Number.isFinite(p[key])) {
+        incomplete = true;
+        spent[key] = Number.NaN;
+      } else {
+        spent[key] += p[key];
+      }
+    }
   }
   const periods = {
     daily: ['last1d', b.daily],
@@ -226,13 +240,14 @@ function computeBudgets(cfg, providers) {
     if (!Number.isFinite(limit) || limit <= 0) {
       continue;
     }
-    const s = round2(spent[key]);
+    const s = Number.isFinite(spent[key]) ? round2(spent[key]) : null;
     out[period] = {
       incomplete,
       limit,
       spent: s,
-      status:
-        s >= limit
+      status: !Number.isFinite(s)
+        ? 'incomplete'
+        : s >= limit
           ? 'over'
           : incomplete
             ? 'incomplete'

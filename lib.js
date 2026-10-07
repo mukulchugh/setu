@@ -8,6 +8,7 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  lstatSync,
   readFileSync,
   realpathSync,
   writeFileSync,
@@ -323,7 +324,7 @@ export async function writeEnvrc(wtDir, port, appUrl, redirectUri) {
       `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`
     )
   );
-  spawnSync('direnv', ['allow', wtDir], { stdio: 'ignore' });
+  spawnSync('direnv', ['allow', wtDir], { stdio: 'ignore', timeout: 5000 });
 }
 
 export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
@@ -481,7 +482,7 @@ export function getPort(workspace, repo, name) {
 
 export function activePid(port) {
   try {
-    return execFileSync('lsof', ['-i', `:${port}`, '-sTCP:LISTEN', '-t'], {
+    return execFileSync('lsof', ['-iTCP:' + port, '-sTCP:LISTEN', '-t'], {
       stdio: ['ignore', 'pipe', 'ignore'],
     })
       .toString()
@@ -497,7 +498,7 @@ export function activePid(port) {
 // see its own comment). cli.js keeps calling the sync version: a one-shot
 // foreground process has no concurrent requests to starve.
 export async function activePidAsync(port) {
-  return spawnText(['lsof', '-i', `:${port}`, '-sTCP:LISTEN', '-t']);
+  return spawnText(['lsof', '-iTCP:' + port, '-sTCP:LISTEN', '-t']);
 }
 
 // Covers app dev-server ports (3000-3999) and inngest sidecar ports (appPort+5288,
@@ -868,9 +869,23 @@ export function loadAllSidecars(workspace, repo) {
 }
 
 export function saveSidecars(workspace, repo, sidecars) {
+  const normalized = sidecars.map((sidecar) => {
+    const name = typeof sidecar.name === 'string' ? sidecar.name.trim() : '';
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      throw Object.assign(
+        new Error(
+          'Sidecar name must use only letters, numbers, underscores, or hyphens'
+        ),
+        {
+          code: 'SIDECAR_NAME_INVALID',
+        }
+      );
+    }
+    return { ...sidecar, name };
+  });
   return workspaceState(workspace).update('sidecars', (all) => ({
     ...all,
-    [repo]: sidecars,
+    [repo]: normalized,
   }));
 }
 
@@ -1171,7 +1186,36 @@ export async function registerProject(
       return { ...projects, [name]: { base, label: label || name, slug } };
     }
   );
+  const repoDir = join(workspace, `${name}.git`);
+  if (existsSync(repoDir)) {
+    ensureSetuExcludes(repoDir);
+  }
   return installedStateValue(result)[name].base;
+}
+
+export function ensureSetuExcludes(repoDir) {
+  const exclude = join(repoDir, 'info', 'exclude');
+  const generated = [
+    '.envrc',
+    'docker-compose.setu.yml',
+    'docker-compose.setu-agent.yml',
+    '.setu-migration-prompted',
+  ];
+  let current = '';
+  try {
+    current = readFileSync(exclude, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    mkdirSync(dirname(exclude), { recursive: true });
+  }
+  const existing = new Set(current.split(/\r?\n/));
+  const missing = generated.filter((entry) => !existing.has(entry));
+  if (missing.length) {
+    writeFileSync(
+      exclude,
+      `${current}${current && !current.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`
+    );
+  }
 }
 
 // ── containers (optional per-worktree, engine-agnostic) ──────────────────────
@@ -1686,6 +1730,26 @@ export async function syncWithBase(
 ) {
   const base = resolveBase(repoDir);
   const branchName = base.replace(/^origin\//, '');
+  // A detached worktree has no branch name; it cannot be the base branch.
+  const checkedOut = (
+    await runGit(wtDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(
+      () => ''
+    )
+  ).trim();
+  const defaultBranch = (
+    await runGit(repoDir, ['symbolic-ref', '--short', 'HEAD'])
+  ).trim();
+  if (
+    checkedOut &&
+    defaultBranch &&
+    (checkedOut === defaultBranch || checkedOut === branchName)
+  ) {
+    return {
+      code: 'SYNC_BASE_BRANCH',
+      error: 'Sync is not available on the repository base branch.',
+      ok: false,
+    };
+  }
   await runGit(wtDir, ['fetch', 'origin', branchName]);
 
   const dirty = (await runGit(wtDir, ['status', '--porcelain'])).trim();
@@ -1864,6 +1928,21 @@ export async function createWorktree(
       );
     }
 
+    const domain = localDomain(repo, name);
+    const collision = portEntries(c.workspace).find(
+      (entry) =>
+        (entry.repo !== repo || entry.name !== name) &&
+        localDomain(entry.repo, entry.name) === domain
+    );
+    if (collision) {
+      throw Object.assign(
+        new Error(
+          `Local domain ${domain} is already used by ${collision.repo}/${collision.name}`
+        ),
+        { code: 'DOMAIN_COLLISION' }
+      );
+    }
+
     await assertStorageHeadroom(c.workspace, readStorage);
     await prepareWorktreeCheckout(
       { exists: existsSync(wtDir), name, repoDir, wtDir },
@@ -1871,6 +1950,7 @@ export async function createWorktree(
         run: createCommandRunner((args, options) => Bun.spawn(args, options)),
       }
     );
+    ensureSetuExcludes(repoDir);
 
     const port = await assignPort(c.workspace, repo, name);
     await configureWorktreeEnv(c, repo, name, port, tunnel);
@@ -1890,7 +1970,7 @@ export async function createWorktree(
     });
 
     return {
-      localDom: localDomain(repo, name),
+      localDom: domain,
       port,
       pubDom: tunnel ? publicDomain(c) : null,
       wtDir,
@@ -1906,10 +1986,15 @@ export async function assertRemovableWorktree(
   name,
   { force = false } = {}
 ) {
-  const wtDir = managedWorktreePath(c.workspace, repo, name);
   if (typeof force !== 'boolean') {
     throw new Error('force must be a boolean');
   }
+  if (name === 'main') {
+    throw Object.assign(new Error('The main worktree cannot be removed.'), {
+      code: 'MAIN_WORKTREE',
+    });
+  }
+  const wtDir = managedWorktreePath(c.workspace, repo, name);
   if (force) {
     return;
   }
@@ -1920,9 +2005,64 @@ export async function assertRemovableWorktree(
     '--untracked-files=all',
   ]);
   if (dirty.trim()) {
-    throw new Error(
-      'Worktree has uncommitted changes or untracked files. Commit or stash them first; force removal permanently discards them.'
+    throw Object.assign(
+      new Error(
+        'Worktree has uncommitted changes or untracked files. Commit or stash them first; force removal permanently discards them.'
+      ),
+      { code: 'WORKTREE_DIRTY' }
     );
+  }
+  // `matching` reports an ignored directory such as node_modules as one entry.
+  // With --untracked-files=all git would walk every file inside it.
+  const ignored = await gitFetchAsync(wtDir, [
+    '--no-optional-locks',
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--ignored=matching',
+  ]);
+  const envFiles = ignored
+    .split('\0')
+    .filter((entry) => entry.startsWith('!! '))
+    .map((entry) => entry.slice(3))
+    .filter((path) => /^\.env/.test(path.split('/').at(-1)))
+    .filter((path) => !path.split('/').includes('node_modules'))
+    .filter((path) => {
+      try {
+        return lstatSync(join(wtDir, path)).isFile();
+      } catch {
+        return false;
+      }
+    });
+  if (envFiles.length) {
+    throw Object.assign(
+      new Error(
+        `Worktree has ignored local env file${envFiles.length === 1 ? '' : 's'}: ${envFiles.join(', ')}.`
+      ),
+      { code: 'WORKTREE_DIRTY' }
+    );
+  }
+  let detached = false;
+  try {
+    await gitFetchAsync(wtDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  } catch {
+    detached = true;
+  }
+  if (detached) {
+    const refs = (
+      await gitFetchAsync(wtDir, [
+        'for-each-ref',
+        '--contains',
+        'HEAD',
+        '--format=%(refname)',
+      ])
+    ).trim();
+    if (!refs) {
+      throw Object.assign(
+        new Error('Worktree is detached at a commit that no ref contains.'),
+        { code: 'WORKTREE_DIRTY' }
+      );
+    }
   }
 }
 
@@ -2277,7 +2417,7 @@ function setuAgentsSection(repo) {
   return (
     `${SETU_AGENTS_SECTION_MARKER}\n\n` +
     `This project's git worktrees, local dev domains, and dev servers are managed by [Setu](https://github.com/mukulchugh/setu) — don't run \`npm run dev\`/\`bun dev\` directly, use Setu so the portal keeps tracking the process.\n\n` +
-    `**If \`setu\` isn't installed:**\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash\nsetu setup\n\`\`\`\n\n` +
+    `**If \`setu\` isn't installed:**\n\`\`\`bash\ngh api repos/mukulchugh/setu/contents/install.sh -H "Accept: application/vnd.github.raw" | bash\nsetu setup\n\`\`\`\n\n` +
     `**Common commands** (run from anywhere):\n\`\`\`\nsetu ls ${repo}                    List this project's worktrees + running state\nsetu new ${repo} <branch>          Create a new worktree\nsetu start ${repo} <branch>        Start a worktree's dev server\nsetu stop  ${repo} <branch>        Stop it\nsetu cd    ${repo} <branch>        cd into the worktree\n\`\`\`\n\n` +
     `Live state (ports, domains, running status): \`setu ls ${repo} --json\`, or the portal API at \`http://localhost:${PORTAL_PORT}/api/worktrees\`.\n`
   );
@@ -2296,7 +2436,7 @@ export async function writeSetuAgentMarkers(
         {
           docs: 'https://github.com/mukulchugh/setu',
           install:
-            'curl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash',
+            'gh api repos/mukulchugh/setu/contents/install.sh -H "Accept: application/vnd.github.raw" | bash',
           managedBy: 'setu',
           portal: `http://localhost:${PORTAL_PORT}`,
           repo,

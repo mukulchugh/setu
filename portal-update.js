@@ -19,6 +19,14 @@ export function createPortalUpdateControl({
   processIdentity = {},
   hasSupportingWork = () => false,
   randomId = randomUUID,
+  ownerProcessAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== 'ESRCH';
+    }
+  },
 }) {
   const instanceId = randomId();
   let owner = null,
@@ -69,7 +77,21 @@ export function createPortalUpdateControl({
       );
     }
     if (owner) {
-      return refused('ADMISSION_CLOSED', 'Another cutover owns admission');
+      if (
+        Number.isSafeInteger(owner.ownerProcessId) &&
+        owner.ownerProcessId > 0 &&
+        !ownerProcessAlive(owner.ownerProcessId)
+      ) {
+        const stale = owner;
+        owner = null;
+        // reopen clears lifecycle admission before its asynchronous queue drain.
+        // A failed drain is still surfaced by the lifecycle's regular recovery.
+        lifecycle.reopen(stale.lifecycleToken, { coherent: true }).catch(() => {
+          /* The new owner will receive normal lifecycle admission results. */
+        });
+      } else {
+        return refused('ADMISSION_CLOSED', 'Another cutover owns admission');
+      }
     }
     const token = randomId();
     const result = lifecycle.quiesce();
@@ -79,6 +101,7 @@ export function createPortalUpdateControl({
     owner = {
       lifecycleToken: result.token,
       reopening: false,
+      ownerProcessId: body?.ownerProcessId,
       stopping: false,
       token,
     };

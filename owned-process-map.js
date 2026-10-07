@@ -17,3 +17,14 @@ export function watchOwnedProcessExit(map, key, entry, exited, observe) {
   }
   return Promise.resolve(exited).then(reconcile, reconcile);
 }
+
+export async function pruneDeadEntries(map, observe) {
+  const deleted = [];
+  for (const [key, entry] of map) {
+    if ((await observe(entry)) === 'dead' && map.get(key) === entry) {
+      map.delete(key);
+      deleted.push(key);
+    }
+  }
+  return deleted;
+}

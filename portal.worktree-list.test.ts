@@ -87,6 +87,13 @@ describe('worktree list scope', () => {
       );
     }
   });
+  test('unknown dirty state remains visible under the uncommitted filter', () => {
+    const result = projectWorktrees(
+      [row('unknown', { dirty: null }), row('clean')],
+      { ...options, dirty: true }
+    );
+    expect(result.pageRows.map((w) => w.name)).toEqual(['unknown']);
+  });
   test('stopped results alone are paginated at 18, counted and clamped', () => {
     const second = projectWorktrees([...operational, ...stopped], {
       ...options,

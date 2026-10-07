@@ -320,6 +320,82 @@ test('dirty rejection precedes persistence, runtime signals, volume removal and 
   expect(f.data.ports).toHaveLength(1);
 });
 
+test('an absent unregistered checkout skips clean and identity capture but clears registry and routing', async () => {
+  const f = fixture({
+    assertClean: async () => {
+      throw new Error('must not inspect a missing checkout');
+    },
+    capture: async () => {
+      throw new Error('must not capture a missing checkout');
+    },
+    observe: async (record) => ({
+      state: record.identity?.absent ? 'absent' : 'unknown',
+    }),
+  });
+  await expect(f.controller.remove(target)).resolves.toMatchObject({
+    ok: true,
+    removed: true,
+  });
+  expect(f.effects).toEqual(['routing']);
+  expect(f.data.ports).toEqual([]);
+});
+
+test('a pending intact checkout can be cancelled, but an in-flight removal cannot', async () => {
+  const f = fixture({
+    removeVolumes: async () => {
+      throw new Error('engine unavailable');
+    },
+  });
+  const pending = await f.controller.remove(target);
+  expect(pending).toMatchObject({ ok: false, removed: false });
+  await expect(f.controller.cancel(pending.operationId)).resolves.toEqual({
+    ok: true,
+  });
+  expect(f.data.removals).toEqual({});
+
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const active = fixture({
+    removeVolumes: async () => held,
+  });
+  const running = active.controller.remove(target);
+  while (!Object.keys(active.data.removals).length) {
+    await Promise.resolve();
+  }
+  const operationId = Object.keys(active.data.removals)[0];
+  await expect(active.controller.cancel(operationId)).resolves.toMatchObject({
+    code: 'REMOVAL_IN_FLIGHT',
+    ok: false,
+  });
+  release();
+  await running;
+});
+
+test('a retry whose checkout vanished completes pending idempotent teardown', async () => {
+  const f = fixture({
+    removeVolumes: async () => {
+      throw new Error('engine unavailable');
+    },
+  });
+  const pending = await f.controller.remove(target);
+  expect(pending).toMatchObject({ ok: false, removed: false });
+  f.setObservation('absent');
+  const retry = createRemovalController({
+    ...f.deps,
+    removeVolumes: async () => {
+      f.effects.push('volumes');
+    },
+  });
+  await expect(
+    retry.remove(target, { operationId: pending.operationId })
+  ).resolves.toMatchObject({ ok: true, removed: true });
+  expect(f.effects).toContain('volumes');
+  expect(f.effects).toContain('tunnel');
+  expect(f.effects).toContain('routing');
+});
+
 test('successful removal orders teardown before Git, archives once, and writes final marker before clearing reservation', async () => {
   const f = fixture();
   const result = await f.controller.remove(target);
@@ -679,6 +755,27 @@ test('production observation distinguishes original, replacement, absent checkou
     expect(await observeRemovalCheckout(record, t, { fs, run })).toEqual({
       state: 'absent',
     });
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
+test('absent-identity observation accepts a registry row when both checkout and bare repository are gone', async () => {
+  const root = await fs.mkdtemp(join(tmpdir(), 'setu-removal-gone-'));
+  try {
+    const t = {
+      ...target,
+      repoDir: join(root, 'missing.git'),
+      wtDir: join(root, 'missing', 'topic'),
+    };
+    await expect(
+      observeRemovalCheckout({ identity: { absent: true } }, t, {
+        fs,
+        run: async () => {
+          throw new Error('git must not be invoked when the bare repository is gone');
+        },
+      })
+    ).resolves.toEqual({ state: 'absent' });
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }

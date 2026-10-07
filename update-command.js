@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertStorageHeadroom } from './host-health.js';
+import { isConnectionRefused } from './connection-refused.js';
 import { observeProcessIdentity } from './process-observation.js';
 import { runUpdateTransaction } from './update-transaction.js';
 import { createWorkspaceState } from './workspace-state.js';
@@ -75,10 +76,7 @@ export function createUpdateCommand({
         ? value
         : { state: 'unknown' };
     } catch (error) {
-      if (
-        error.code === 'ECONNREFUSED' ||
-        error.cause?.code === 'ECONNREFUSED'
-      ) {
+      if (isConnectionRefused(error)) {
         return { state: 'absent' };
       }
       return { state: 'unknown' };
@@ -224,6 +222,7 @@ export function createUpdateCommand({
           quiesce: async (portal) => ({
             ...(await request('/api/update/quiesce', {
               instanceId: portal.instanceId,
+              ownerProcessId: process.pid,
             })),
             processId: portal.processId,
             processStartIdentity: portal.processStartIdentity,
@@ -234,6 +233,19 @@ export function createUpdateCommand({
               instanceId: owner.instanceId,
               token: owner.token,
             }),
+          rebaseInProgress: async () => {
+            for (const name of ['rebase-merge', 'rebase-apply']) {
+              const path = (
+                await git(['rev-parse', '--git-path', name])
+              ).trim();
+              if (
+                fs.existsSync(isAbsolute(path) ? path : join(directory, path))
+              ) {
+                return true;
+              }
+            }
+            return false;
+          },
           restart,
           writeCheck: () =>
             state.update('config', (current) => ({
@@ -257,6 +269,15 @@ export function describeUpdate(result) {
   }
   if (result.stashId) {
     lines.push(`Recovery stash retained: ${result.stashId}`);
+  }
+  if (result.recovery?.revisionRestored) {
+    lines.push('Original revision restored.');
+  }
+  if (result.recovery?.stashApplied) {
+    lines.push('Recovery stash reapplied; the stash was retained.');
+  }
+  for (const warning of result.recovery?.warnings ?? []) {
+    lines.push(`Recovery warning: ${warning}`);
   }
   if (result.warning) {
     lines.push(

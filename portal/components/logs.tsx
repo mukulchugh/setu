@@ -18,6 +18,7 @@ import {
 import { readJson, useVisiblePoll } from '../use-visible-poll';
 import { getWs } from '../ws';
 import { tablerCopy } from './icons';
+import { stripAnsiSgr } from '../ui-helpers';
 
 export const LOG_TABS = [
   'dev',
@@ -202,7 +203,7 @@ export function LogModal({
   const [copyStatus, setCopyStatus] = useState('');
   const read = useLogStream(repo, name, type);
   const { lines, preRef } = read;
-  const text = lines?.join('\n') ?? '';
+  const text = stripAnsiSgr(lines?.join('\n') ?? '');
   const tabs = [
     ...new Set([
       ...LOG_TABS,
@@ -353,7 +354,7 @@ export function LiveLog({
 }) {
   const read = useLogStream(repo, name, type);
   const { lines, preRef } = read;
-  const text = lines?.join('\n') ?? '';
+  const text = stripAnsiSgr(lines?.join('\n') ?? '');
   return (
     <>
       <div class="mb-2 flex flex-wrap items-center justify-between gap-2">

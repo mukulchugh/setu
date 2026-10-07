@@ -95,6 +95,12 @@ import {
 } from './ui/dropdown-menu';
 import { type ToastItem, ToastStack } from './ui/toast';
 import { useSavedDraft } from './use-saved-draft';
+import {
+  fileSyncPatterns,
+  quoteShellPath,
+  sidecarArguments,
+  sidecarNameError,
+} from './ui-helpers';
 import { readArray, readJson, useVisiblePoll } from './use-visible-poll';
 import {
   lifecycleControl,
@@ -243,6 +249,7 @@ export interface Worktree {
   pubDomain: string;
   queued?: boolean;
   queuePosition?: number | null;
+  queueReason?: 'concurrency' | 'container-capacity' | null;
   repo: string;
   sidecars: { name: string; active: boolean }[];
   slug: string;
@@ -251,6 +258,7 @@ export interface Worktree {
   triggerActive: boolean;
   tunnelOn: boolean;
   tunnelRunning: boolean;
+  wtDir?: string;
   vercelDeploy: DeployStatus;
 }
 type PrState = 'open' | 'merged' | 'closed' | 'draft';
@@ -276,6 +284,7 @@ interface Project {
 interface Sidecar {
   approved?: boolean;
   args?: string[];
+  argsText?: string;
   command: string;
   enabled?: boolean;
   env?: Record<string, string>;
@@ -458,6 +467,14 @@ function worktreeStatus(w: Worktree): { tone: Tone; text: string } {
   };
 }
 
+function queueWaitReason(w: Worktree): string | null {
+  return w.queued
+    ? w.queueReason === 'container-capacity'
+      ? 'waiting for container capacity'
+      : 'waiting for a free server slot'
+    : null;
+}
+
 // Shared by WorktreeCard and WorktreePage, same deploying/error/url/idle
 // tone and label logic, matching worktreeStatus's shape above. Provider-
 // agnostic on purpose: vercelDeploy and netlifyDeploy are the same shape,
@@ -551,7 +568,10 @@ function formatMem(mb: number, short = false): string {
 // Same "cd into this worktree" string used by both the card's copy button and
 // the detail page's "Copy cd command" action.
 function cdCommand(w: Worktree): string {
-  return `cd ~/workspace/${w.repo}/${w.name}`;
+  // A quoted tilde is not expanded by the shell, so quote only what follows it.
+  return w.wtDir
+    ? `cd ${quoteShellPath(w.wtDir)}`
+    : `cd ~/workspace/${quoteShellPath(`${w.repo}/${w.name}`)}`;
 }
 
 // initialRepo/initialName prefill the Recreate flow from an archived
@@ -559,12 +579,14 @@ function cdCommand(w: Worktree): string {
 // + Worktree button omits both and falls back to the first project / blank.
 function CreateModal({
   projects,
+  worktrees,
   initialRepo,
   initialName,
   onClose,
   onCreated,
 }: {
   projects: Project[];
+  worktrees: Worktree[];
   initialRepo?: string;
   initialName?: string;
   onClose: () => void;
@@ -604,6 +626,15 @@ function CreateModal({
     if (!name.trim()) {
       setStatus('Enter a branch name.');
       nameInputRef.current?.focus();
+      return;
+    }
+    const owner = tunnel ? worktrees.find((w) => w.tunnelOn) : undefined;
+    if (
+      owner &&
+      !confirm(
+        `Move the public tunnel from ${owner.repo}/${owner.name} to this new worktree? Both dev servers will restart.`
+      )
+    ) {
       return;
     }
     setBusy(true);
@@ -1287,9 +1318,18 @@ function WorktreeActions({
             About syncing with base
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onClick={() => onRemove(w)} tone="red">
+          <DropdownMenuItem
+            disabled={w.name === 'main'}
+            onClick={() => onRemove(w)}
+            tone="red"
+          >
             Remove worktree
           </DropdownMenuItem>
+          {w.name === 'main' && (
+            <p class="menu-help">
+              The main worktree holds shared local files such as .env.local. Remove the project instead.
+            </p>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </fieldset>
@@ -2020,6 +2060,7 @@ function ConvexSection({
           <span>{w.convexActive ? 'dev running' : 'dev stopped'}</span>
           {w.convexActive ? (
             <button
+              aria-label={`Stop Convex for ${w.repo}/${w.name}`}
               class="text-red-500 text-xs hover:underline"
               onClick={() => onAct('/api/convex/stop', w)}
               type="button"
@@ -2028,6 +2069,7 @@ function ConvexSection({
             </button>
           ) : (
             <button
+              aria-label={`Start Convex for ${w.repo}/${w.name}`}
               class="text-xs text-zinc-500 hover:underline"
               onClick={() => onAct('/api/convex/start', w)}
               type="button"
@@ -2036,6 +2078,7 @@ function ConvexSection({
             </button>
           )}
           <button
+            aria-label={`View Convex log for ${w.repo}/${w.name}`}
             class="text-xs text-zinc-500 hover:underline"
             onClick={() => onOpenLogs(w.repo, w.name, 'convex')}
             type="button"
@@ -2146,7 +2189,10 @@ function WorktreeCard({
             <StatusDot pulse={w.active} tone={statusTone} />
             <StatusFlap text={statusText} tone={statusTone} />
           </span>
-          {w.container && (
+          {queueWaitReason(w) && (
+            <span class="text-xs text-zinc-500">{queueWaitReason(w)}</span>
+          )}
+          {w.container && (w.active || w.starting) && (
             <Badge
               tip="Running in a container — real memory/CPU cap"
               tone="zinc"
@@ -2179,7 +2225,11 @@ function WorktreeCard({
               {formatMem(w.memMb, true)}
             </Badge>
           )}
-          {(w.dirty ?? 0) > 0 && (
+          {w.dirty === null ? (
+            <Badge tip="The working tree status could not be checked" tone="amber">
+              changes unknown
+            </Badge>
+          ) : w.dirty > 0 && (
             <Badge
               tip={`${w.dirty} uncommitted change${(w.dirty ?? 0) > 1 ? 's' : ''}`}
               tone="amber"
@@ -2604,10 +2654,12 @@ function PendingCleanup({
   entries,
   busy,
   onRetry,
+  onCancel,
 }: {
   entries: PendingRemoval[];
   busy: Set<string>;
   onRetry: (entry: PendingRemoval) => void;
+  onCancel: (entry: PendingRemoval) => void;
 }) {
   if (!entries.length) {
     return null;
@@ -2649,6 +2701,16 @@ function PendingCleanup({
                 ? 'Retrying cleanup…'
                 : 'Retry cleanup'}
             </Button>
+            {!entry.removed && (
+              <Button
+                class="self-start"
+                disabled={busy.has(entry.operationId)}
+                onClick={() => onCancel(entry)}
+                variant="secondary"
+              >
+                Cancel removal
+              </Button>
+            )}
           </div>
         ))}
       </div>
@@ -2793,6 +2855,7 @@ function WorktreePage({
   onRemove,
   onRefresh,
   toast,
+  tunnelBusy,
 }: {
   w: Worktree | undefined;
   loaded: boolean;
@@ -2812,6 +2875,7 @@ function WorktreePage({
   onRemove: (w: Worktree, reason?: 'manual' | 'merged') => void;
   onRefresh: () => void;
   toast: (msg: string, tone?: Tone) => void;
+  tunnelBusy: boolean;
 }) {
   // Distinguish "the initial /api/worktrees fetch hasn't resolved yet" (a
   // direct link or hard refresh always starts with an empty worktrees array)
@@ -2858,8 +2922,11 @@ function WorktreePage({
               <StatusDot pulse={w.active} tone={statusTone} />
               <StatusFlap text={statusText} tone={statusTone} />
             </span>
+            {queueWaitReason(w) && (
+              <span class="text-xs text-zinc-500">{queueWaitReason(w)}</span>
+            )}
             <Badge tone="zinc">{w.label}</Badge>
-            {w.container && (
+            {w.container && (w.active || w.starting) && (
               <Badge tip="Real memory/CPU cap enforced" tone="zinc">
                 container
               </Badge>
@@ -2896,6 +2963,7 @@ function WorktreePage({
           </span>
           <Button
             compact
+            disabled={w.name === 'main'}
             onClick={() => onRemove(w, 'merged')}
             variant="secondary"
           >
@@ -2996,7 +3064,7 @@ function WorktreePage({
             <div class="mb-0.5 text-xs text-zinc-400">Uncommitted changes</div>
             <div>
               {w.dirty == null ? (
-                'checking…'
+                'unknown'
               ) : (w.dirty ?? 0) > 0 ? (
                 <span class="text-signal-amber">{w.dirty} files</span>
               ) : (
@@ -3027,7 +3095,7 @@ function WorktreePage({
           names the resolved base per group ("since branching from <base>"),
           so this title doesn't repeat it. */}
       <Section title="Local diff">
-        <DiffViewer dirty={w.dirty ?? 0} name={w.name} repo={w.repo} />
+        <DiffViewer dirty={w.dirty} name={w.name} repo={w.repo} />
       </Section>
 
       <PrReviewSection onOpenLogs={onOpenLogs} toast={toast} w={w} />
@@ -3068,6 +3136,7 @@ function WorktreePage({
                   dashboard
                 </a>
                 <button
+                  aria-label={`Stop Inngest for ${w.repo}/${w.name}`}
                   class="text-red-500 text-xs hover:underline"
                   onClick={() => onAct('/api/inngest/stop', w)}
                   type="button"
@@ -3077,6 +3146,7 @@ function WorktreePage({
               </>
             ) : (
               <button
+                aria-label={`Start Inngest for ${w.repo}/${w.name}`}
                 class="text-xs text-zinc-500 hover:underline"
                 onClick={() => onAct('/api/inngest/start', w)}
                 type="button"
@@ -3091,6 +3161,7 @@ function WorktreePage({
             <span>trigger.dev</span>
             {w.triggerActive ? (
               <button
+                aria-label={`Stop trigger.dev for ${w.repo}/${w.name}`}
                 class="text-red-500 text-xs hover:underline"
                 onClick={() => onAct('/api/trigger/stop', w)}
                 type="button"
@@ -3099,6 +3170,7 @@ function WorktreePage({
               </button>
             ) : (
               <button
+                aria-label={`Start trigger.dev for ${w.repo}/${w.name}`}
                 class="text-xs text-zinc-500 hover:underline"
                 onClick={() => onAct('/api/trigger/start', w)}
                 type="button"
@@ -3112,6 +3184,8 @@ function WorktreePage({
             <span>Tunnel</span>
             <button
               class="text-xs text-zinc-500 hover:underline"
+              aria-label={`${w.tunnelOn ? 'Disable' : 'Enable'} tunnel for ${w.repo}/${w.name}`}
+              disabled={tunnelBusy}
               onClick={() =>
                 onAct(
                   w.tunnelOn ? '/api/tunnel/disable' : '/api/tunnel/enable',
@@ -3132,6 +3206,7 @@ function WorktreePage({
               <span>{s.name}</span>
               {s.active && (
                 <button
+                  aria-label={`View ${s.name} log for ${w.repo}/${w.name}`}
                   class="text-xs text-zinc-500 hover:underline"
                   onClick={() =>
                     onOpenLogs(w.repo, w.name, `sidecar-${s.name}`)
@@ -3187,11 +3262,17 @@ function WorktreePage({
 
       <button
         class="text-red-500 text-xs transition-colors duration-150 hover:text-red-700"
+        disabled={w.name === 'main'}
         onClick={() => onRemove(w)}
         type="button"
       >
-        Remove worktree
+        {w.name === 'main' ? 'Remove unavailable for main' : 'Remove worktree'}
       </button>
+      {w.name === 'main' && (
+        <p class="mt-1 text-xs text-zinc-500">
+          The main worktree holds shared local files such as .env.local. Remove the project instead.
+        </p>
+      )}
     </div>
   );
 }
@@ -3209,9 +3290,11 @@ function SidecarRow({
   onChange,
   onRemove,
   onApprove,
+  disabled = false,
 }: {
   s: Sidecar;
   index: number;
+  disabled?: boolean;
   onChange: (s: Sidecar) => void;
   onRemove: () => void;
   onApprove: () => void;
@@ -3228,6 +3311,7 @@ function SidecarRow({
         <input
           checked={s.enabled !== false}
           class="accent-current"
+          disabled={disabled}
           onChange={(e) => onChange({ ...s, enabled: e.currentTarget.checked })}
           style={{ accentColor: 'var(--color-accent)' }}
           type="checkbox"
@@ -3238,6 +3322,7 @@ function SidecarRow({
         Name
         <input
           class={`${inputCls} w-28 py-1 text-xs`}
+          disabled={disabled}
           onInput={(e) => onChange({ ...s, name: e.currentTarget.value })}
           value={s.name}
         />
@@ -3246,6 +3331,7 @@ function SidecarRow({
         Command
         <input
           class={`${inputCls} w-full py-1 font-mono text-xs`}
+          disabled={disabled}
           onInput={(e) => onChange({ ...s, command: e.currentTarget.value })}
           value={s.command}
         />
@@ -3254,13 +3340,14 @@ function SidecarRow({
         Arguments (space-separated)
         <input
           class={`${inputCls} w-full py-1 font-mono text-xs`}
+          disabled={disabled}
           onInput={(e) =>
             onChange({
               ...s,
-              args: e.currentTarget.value.split(' ').filter(Boolean),
+              argsText: e.currentTarget.value,
             })
           }
-          value={(s.args ?? []).join(' ')}
+          value={s.argsText ?? (s.args ?? []).join(' ')}
         />
       </label>
       {needsApproval && (
@@ -3273,6 +3360,7 @@ function SidecarRow({
           </Badge>
           <button
             class="text-emerald-600 text-xs hover:underline"
+            disabled={disabled}
             onClick={onApprove}
             type="button"
           >
@@ -3281,6 +3369,7 @@ function SidecarRow({
         </>
       )}
       <IconButton
+        disabled={disabled}
         onClick={onRemove}
         tip={`Remove sidecar ${s.name || index + 1}`}
         tone="red"
@@ -3302,9 +3391,11 @@ function CustomAgentRow({
   index,
   onChange,
   onRemove,
+  disabled = false,
 }: {
   a: CustomAgent;
   index: number;
+  disabled?: boolean;
   onChange: (a: CustomAgent) => void;
   onRemove: () => void;
 }) {
@@ -3317,6 +3408,7 @@ function CustomAgentRow({
         Label
         <input
           class={`${inputCls} w-28 py-1 text-xs`}
+          disabled={disabled}
           onInput={(e) => onChange({ ...a, label: e.currentTarget.value })}
           value={a.label}
         />
@@ -3325,12 +3417,14 @@ function CustomAgentRow({
         Command
         <input
           class={`${inputCls} w-full py-1 font-mono text-xs`}
+          disabled={disabled}
           onInput={(e) => onChange({ ...a, command: e.currentTarget.value })}
           placeholder="mytool --flag"
           value={a.command}
         />
       </label>
       <IconButton
+        disabled={disabled}
         onClick={onRemove}
         tip={`Remove custom agent ${a.label || index + 1}`}
         tone="red"
@@ -3777,14 +3871,29 @@ function SettingsPage({
           )
         : Promise.resolve([]),
     '/api/sidecars',
-    (rows) => ({ repo: sidecarRepo, sidecars: rows }),
+    (rows) => ({
+      repo: sidecarRepo,
+      sidecars: rows.map(({ argsText, ...row }) => ({
+        ...row,
+        args: sidecarArguments(argsText ?? (row.args ?? []).join(' ')),
+        name: row.name.trim(),
+      })),
+    }),
     (rows) =>
       rows.some((s) => !(s.name.trim() && s.command.trim()))
         ? 'Each sidecar needs a name and command.'
-        : new Set(rows.map((s) => s.name)).size === rows.length
-          ? null
-          : 'Sidecar names must be unique.',
-    (rows) => JSON.stringify(rows.map(({ approved, ...row }) => row))
+        : (rows.map((s) => sidecarNameError(s.name)).find(Boolean) ??
+          (new Set(rows.map((s) => s.name.trim())).size === rows.length
+            ? null
+            : 'Sidecar names must be unique.')),
+    (rows) =>
+      JSON.stringify(
+        rows.map(({ approved, argsText, ...row }) => ({
+          ...row,
+          args: sidecarArguments(argsText ?? (row.args ?? []).join(' ')),
+          name: row.name.trim(),
+        }))
+      )
   );
   const fileDraft = useSavedDraft<string>(
     fileSyncRepo,
@@ -3800,10 +3909,7 @@ function SettingsPage({
         : '',
     '/api/file-sync-globs',
     (text) => ({
-      globs: text
-        .split(/[,\n]/)
-        .map((g) => g.trim())
-        .filter(Boolean),
+      globs: fileSyncPatterns(text),
       repo: fileSyncRepo,
     })
   );
@@ -3991,7 +4097,7 @@ function SettingsPage({
   const saveSidecarsList = () => sidecarDraft.save();
   const saveFileSyncGlobsList = () => fileDraft.save();
   const saveCustomAgentsList = () => agentDraft.save();
-  async function approveSidecarRow(name: string) {
+  async function approveSidecarRow(sidecar: Sidecar) {
     if (sidecarDraft.dirty) {
       toast(
         'Save sidecar changes before approving the saved command.',
@@ -4001,7 +4107,14 @@ function SettingsPage({
     }
     const result = await postOrToast(
       '/api/sidecar-approvals/approve',
-      { name, repo: sidecarRepo },
+      {
+        args: sidecarArguments(
+          sidecar.argsText ?? (sidecar.args ?? []).join(' ')
+        ),
+        command: sidecar.command,
+        name: sidecar.name,
+        repo: sidecarRepo,
+      },
       toast,
       'approve failed'
     );
@@ -4290,9 +4403,10 @@ function SettingsPage({
               {draftStatus(sidecarDraft)}
               {sidecars.map((s, i) => (
                 <SidecarRow
+                  disabled={!sidecarDraft.loaded}
                   index={i}
                   key={i}
-                  onApprove={() => approveSidecarRow(s.name)}
+                  onApprove={() => approveSidecarRow(s)}
                   onChange={(next) =>
                     setSidecars((list) =>
                       list.map((x, j) =>
@@ -4308,6 +4422,7 @@ function SettingsPage({
               ))}
               <div class="flex flex-wrap items-center gap-3 pt-2">
                 <Button
+                  disabled={!sidecarDraft.loaded}
                   onClick={() =>
                     setSidecars((list) => [
                       ...list,
@@ -4382,6 +4497,7 @@ function SettingsPage({
               </label>
               <textarea
                 class={`${inputCls} w-full py-1 font-mono text-xs`}
+                disabled={!fileDraft.loaded}
                 id="file-sync-patterns"
                 onInput={(e) => setFileSyncText(e.currentTarget.value)}
                 placeholder="*.local.json&#10;config/local.json"
@@ -4400,7 +4516,7 @@ function SettingsPage({
                 </Button>
               </div>
               <p class="mt-1 text-[11px] text-zinc-400">
-                Comma or newline separated glob patterns. Matching gitignored
+                Newline-separated glob patterns. Matching gitignored
                 files are copied (not symlinked, unlike .env.local) from the
                 main worktree into every newly created worktree, so each one
                 gets its own editable copy. Patterns resolve against the main
@@ -4425,6 +4541,7 @@ function SettingsPage({
           {draftStatus(agentDraft)}
           {customAgents.map((a, i) => (
             <CustomAgentRow
+              disabled={!agentDraft.loaded}
               a={a}
               index={i}
               key={i}
@@ -4440,6 +4557,7 @@ function SettingsPage({
           ))}
           <div class="flex flex-wrap items-center gap-3 pt-2">
             <Button
+              disabled={!agentDraft.loaded}
               onClick={() =>
                 setCustomAgents((list) => [
                   ...list,
@@ -4869,6 +4987,7 @@ function App() {
   const [commandOpen, setCommandOpen] = useState(false);
   const pendingStart = useRef(new Set<string>());
   const startResponses = useRef(new Set<string>());
+  const [tunnelBusy, setTunnelBusy] = useState(false);
   const lifecycleFocus = useRef<{ key: string; label: string | null } | null>(
     null
   );
@@ -5068,15 +5187,37 @@ function App() {
 
   const act = useCallback(
     async (url: string, w: Worktree) => {
+      const enablingTunnel = url === '/api/tunnel/enable';
+      if (enablingTunnel) {
+        if (tunnelBusy) {
+          return;
+        }
+        const owner = worktrees.find((row) => row.tunnelOn && row.key !== w.key);
+        if (
+          owner &&
+          !confirm(
+            `Move the public tunnel from ${owner.repo}/${owner.name} to ${w.repo}/${w.name}? Both dev servers will restart.`
+          )
+        ) {
+          return;
+        }
+        setTunnelBusy(true);
+      }
       const result = await post(url, { name: w.name, repo: w.repo });
       recordOutcome(
         `${w.key}:${url}`,
         `${w.repo}/${w.name}: ${ACT_LABEL[url] ?? url.replace('/api/', '')}`,
         result
       );
+      for (const warning of result.warnings ?? []) {
+        toast(`⚠ ${warning}`, 'amber');
+      }
+      if (enablingTunnel) {
+        setTunnelBusy(false);
+      }
       refresh();
     },
-    [recordOutcome, refresh]
+    [recordOutcome, refresh, toast, tunnelBusy, worktrees]
   );
 
   // Used to be fire-and-forget — `{ok:true}` from /api/open only ever meant
@@ -5119,7 +5260,7 @@ function App() {
       }
       const res = await post('/api/start', body);
       recordOutcome(`${w.key}:start`, `${w.repo}/${w.name}: start`, res);
-      if (res?.ok) {
+      if (res?.ok && pendingStart.current.has(w.key)) {
         startResponses.current.add(w.key);
       } else {
         pendingStart.current.delete(w.key);
@@ -5134,15 +5275,23 @@ function App() {
         );
       }
       refresh();
+      startResponses.current.delete(w.key);
     },
     [recordOutcome, refresh, toast]
   );
 
   const remove = useCallback(
     async (w: Worktree, reason: 'manual' | 'merged' = 'manual') => {
+      if (w.name === 'main') {
+        toast(
+          '✗ The main worktree holds shared local files such as .env.local. Remove the project instead.',
+          'red'
+        );
+        return;
+      }
       if (
         !confirm(
-          `Remove worktree "${w.name}"? The branch is kept. Uncommitted or untracked files will block removal; commit or stash them first.`
+          `Remove worktree "${w.name}"? The branch is kept. Tracked, untracked, and ignored local files such as a real .env.local block removal. node_modules and build output are deleted.`
         )
       ) {
         return;
@@ -5176,11 +5325,16 @@ function App() {
       }
       refresh();
     },
-    [recordOutcome, refresh]
+    [recordOutcome, refresh, toast]
   );
 
   async function retryCleanup(entry: PendingRemoval) {
     if (cleanupBusy.current.has(entry.operationId)) {
+      return;
+    }
+    if (!entry.removed && !confirm(
+      `Retry removal of "${entry.name}"? Its checkout still exists, so this reruns the git removal stage.`
+    )) {
       return;
     }
     cleanupBusy.current.add(entry.operationId);
@@ -5213,6 +5367,28 @@ function App() {
             }
         );
       }
+      refresh();
+    } finally {
+      cleanupBusy.current.delete(entry.operationId);
+      setCleanupRunning(new Set(cleanupBusy.current));
+    }
+  }
+
+  async function cancelRemoval(entry: PendingRemoval) {
+    if (cleanupBusy.current.has(entry.operationId)) {
+      return;
+    }
+    cleanupBusy.current.add(entry.operationId);
+    setCleanupRunning(new Set(cleanupBusy.current));
+    try {
+      const result = await post('/api/remove/cancel', {
+        operationId: entry.operationId,
+      });
+      recordOutcome(
+        `cleanup:${entry.operationId}:cancel`,
+        `${entry.repo}/${entry.name}: cancel removal`,
+        result
+      );
       refresh();
     } finally {
       cleanupBusy.current.delete(entry.operationId);
@@ -5298,6 +5474,7 @@ function App() {
             onStart={start}
             pending={w ? pendingStart.current.has(w.key) : false}
             toast={toast}
+            tunnelBusy={tunnelBusy}
             w={w}
           />
           {logView && (
@@ -5632,6 +5809,7 @@ function App() {
           <PendingCleanup
             busy={cleanupRunning}
             entries={status?.pendingRemovals ?? []}
+            onCancel={cancelRemoval}
             onRetry={retryCleanup}
           />
           <div class="rail-divider mb-8" />
@@ -5817,6 +5995,7 @@ function App() {
             }}
             onCreated={refresh}
             projects={projects}
+            worktrees={worktrees}
           />
         )}
         {addProjectOpen && (

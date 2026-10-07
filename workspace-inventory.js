@@ -269,10 +269,14 @@ export function createWorkspaceInventory({
       checkedAt: now(),
       counts: {
         linked: complete ? observedLinked : null,
-        missing: inspected.filter((row) => row.presence === 'missing').length,
+        missing: complete
+          ? inspected.filter((row) => row.presence === 'missing').length
+          : null,
         observedLinked,
         registered: registrations.length,
-        unregistered: inspected.filter((row) => !row.registered).length,
+        unregistered: complete
+          ? inspected.filter((row) => !row.registered).length
+          : null,
       },
       repositories: discoveries.map(({ linked, ...repository }) => repository),
       rows: inspected,

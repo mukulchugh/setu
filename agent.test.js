@@ -17,6 +17,7 @@ import {
   INTERACTIVE_ONLY,
   pumpLines,
   resolveCredential,
+  runAgent,
 } from './agent.js';
 
 const UNKNOWN_AGENT = /unknown agent/;
@@ -187,6 +188,16 @@ await check('file-kind mounts are always read-only', () => {
 
 console.log('applyBudgetGuard');
 
+await check(
+  'runAgent rejects an invalid budget before loading a provider',
+  async () => {
+    await assert.rejects(
+      runAgent({ agentId: 'claude', maxBudgetUsd: Number.NaN }),
+      /finite positive/
+    );
+  }
+);
+
 // The exact suffix claudeCode's buildPrintCommand produces today (verified
 // live against @ai-hero/sandcastle's actual output, not the .d.ts alone):
 // prompt travels via stdin, never argv, and the command always ends in the
@@ -199,11 +210,23 @@ const TRAILING_SENTINEL_RE = / -p -$/;
 const RESUME_FORK_BUDGET_RE =
   /--resume 'abc-123' --fork-session --max-budget-usd 2 -p -$/;
 const DID_NOT_LAND_RE = /did not land/;
+const fixtureProvider = (command = 'claude --print -p -') => ({
+  buildPrintCommand: (opts) => ({
+    command:
+      opts.forkSession && opts.resumeSession
+        ? "claude --print --resume 'abc-123' --fork-session -p -"
+        : command,
+  }),
+  captureSessions: true,
+  name: 'fixture',
+  parseStreamLine: () => {},
+  sessionStorage: {},
+});
 
 await check('claude: flag lands and the -p - sentinel survives', () => {
   const { guarded, provider } = applyBudgetGuard(
     'claude',
-    AGENT_ADAPTERS.claude.agent('claude-opus-4-8'),
+    fixtureProvider(),
     DEFAULT_MAX_BUDGET_USD
   );
   assert.equal(guarded, true);
@@ -217,11 +240,7 @@ await check('claude: flag lands and the -p - sentinel survives', () => {
 });
 
 await check('claude: budget is overridable per run', () => {
-  const { provider } = applyBudgetGuard(
-    'claude',
-    AGENT_ADAPTERS.claude.agent('claude-opus-4-8'),
-    5
-  );
+  const { provider } = applyBudgetGuard('claude', fixtureProvider(), 5);
   const { command } = provider.buildPrintCommand(PRINT_OPTS);
   assert.match(command, BUDGET_5_RE);
 });
@@ -231,7 +250,7 @@ await check('claude: budget is overridable per run', () => {
 await check('claude: flag lands on the resume+fork path too', () => {
   const { provider } = applyBudgetGuard(
     'claude',
-    AGENT_ADAPTERS.claude.agent('claude-opus-4-8'),
+    fixtureProvider(),
     DEFAULT_MAX_BUDGET_USD
   );
   const { command } = provider.buildPrintCommand({
@@ -247,7 +266,7 @@ await check('claude: flag lands on the resume+fork path too', () => {
 // drive resume support. A naive rebuild (rather than a spread) would lose
 // these silently.
 await check('claude: wrapping preserves the rest of the provider', () => {
-  const raw = AGENT_ADAPTERS.claude.agent('claude-opus-4-8');
+  const raw = fixtureProvider();
   const { provider } = applyBudgetGuard('claude', raw, DEFAULT_MAX_BUDGET_USD);
   assert.equal(provider.name, raw.name);
   assert.equal(provider.captureSessions, raw.captureSessions);
@@ -263,7 +282,7 @@ await check('claude: wrapping preserves the rest of the provider', () => {
 // explicit checks rather than a loop -- matches this file's style and
 // keeps each assertion's own agent id in the failure output.
 await check('codex: unguarded and passed through unmodified', () => {
-  const raw = AGENT_ADAPTERS.codex.agent('gpt-5.4');
+  const raw = fixtureProvider('codex exec');
   const { guarded, provider } = applyBudgetGuard(
     'codex',
     raw,
@@ -274,7 +293,7 @@ await check('codex: unguarded and passed through unmodified', () => {
 });
 
 await check('opencode: unguarded and passed through unmodified', () => {
-  const raw = AGENT_ADAPTERS.opencode.agent('claude-opus-4-8');
+  const raw = fixtureProvider('opencode run');
   const { guarded, provider } = applyBudgetGuard(
     'opencode',
     raw,

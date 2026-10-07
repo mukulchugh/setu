@@ -127,6 +127,8 @@ function compactWorktree(w) {
 // full hunks are opt-in via `verbose`, still capped well below the UI's own
 // ceiling since a tool result isn't virtualized the way the web UI's list is.
 const DIFF_VERBOSE_FILE_CAP = 20;
+const DIFF_TEXT_BUDGET = 200 * 1024;
+const DIFF_TRUNCATION_MARKER = 'Output truncated at 200 KB.';
 
 function shapeDiffGroup(group, verbose) {
   if (!group) {
@@ -146,16 +148,42 @@ function shapeDiffGroup(group, verbose) {
         deletions: f.deletions,
         file: f.file,
       })),
+      ...(Array.isArray(group.untracked) ? { untracked: group.untracked } : {}),
     };
   }
   const shown = group.files.slice(0, DIFF_VERBOSE_FILE_CAP);
   return {
     ...base,
     files: shown,
+    ...(Array.isArray(group.untracked) ? { untracked: group.untracked } : {}),
     truncatedFileCount:
       Math.max(0, group.files.length - shown.length) +
       (group.truncatedFileCount ?? 0),
   };
+}
+
+function boundedDiffText(value) {
+  const output = structuredClone(value);
+  const render = () => JSON.stringify(output, null, 2);
+  let rendered = render();
+  if (Buffer.byteLength(rendered) <= DIFF_TEXT_BUDGET) return text(output);
+  output.truncation = DIFF_TRUNCATION_MARKER;
+  while (Buffer.byteLength((rendered = render())) > DIFF_TEXT_BUDGET) {
+    const group = ['committed', 'uncommitted'].find(
+      (key) => output[key]?.files?.length
+    );
+    if (group) {
+      output[group].files.pop();
+      continue;
+    }
+    const untracked = output.uncommitted?.untracked;
+    if (untracked?.length) {
+      untracked.pop();
+      continue;
+    }
+    return text({ truncation: DIFF_TRUNCATION_MARKER });
+  }
+  return text(output);
 }
 
 function text(value) {
@@ -351,7 +379,7 @@ function registerTools(server) {
     },
     async ({ repo, name, verbose }) => {
       const diff = await deps.computeDiff(repo, name);
-      return text({
+      return boundedDiffText({
         base: diff.base,
         baseResolved: diff.baseResolved,
         committed: shapeDiffGroup(diff.committed, !!verbose),
@@ -508,10 +536,10 @@ TOOL GROUPS
 - GitHub: create_pr, pr_ready, list_repo_prs.
 
 EFFICIENT USE
-- Always call list_worktrees before create_worktree. A branch that already has a worktree just needs start_worktree, not a duplicate create -- create_worktree is safe to call again for an existing worktree (no-ops onto it) but wastes a round trip and can mask that you're not looking at the worktree you think you are.
+- Always call list_worktrees before create_worktree. A branch that already has a worktree needs start_worktree, not another create_worktree call.
 - To debug "why isn't this worktree behaving as expected", in order: (1) list_worktrees for its current state (active/dirty/ahead-behind/container mode), (2) get_logs (type defaults to "dev") for the dev server's actual recent output, (3) get_diff to see what's really changed vs. its base branch rather than assuming, (4) list_ports if the dev server seems unreachable — a stale/crashed process can still hold the port.
-- get_diff defaults to stats + filenames only (LLM-sized, not the UI's full hunks) — pass verbose:true only when you actually need line-by-line detail, capped at 20 files even then.
-- A worktree literally named "main" is Setu's fixed slot for a project's primary line, not a real branch name — it never has a PR (create_pr will refuse it) and syncing/diffing it means "against its own history," not "against a feature branch."
+- get_diff defaults to stats + filenames only (LLM-sized, not the UI's full hunks) — pass verbose:true only when you actually need line-by-line detail, capped at 20 files and 200 KB total output.
+- A worktree literally named "main" is Setu's fixed slot for a project's primary line. sync_worktree refuses it. create_pr does not add a special main guard, so do not create a PR from main.
 - sync_worktree only ever performs a clean merge. A real conflict is detected and the merge is aborted automatically, worktree left exactly as it was — it does not attempt any conflict resolution, that's still your job afterward.
 - Omit the \`container\` param on start_worktree unless you specifically need to force a mode — omitting it uses the sticky per-worktree default (a worktree's own history, not a global setting), which is almost always what's wanted.
 - remove_worktree is destructive (uncommitted work is gone, and a container-backed worktree's node_modules volume too) but never deletes the git branch itself — the branch can always be recovered by creating a new worktree from it.

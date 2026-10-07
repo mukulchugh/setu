@@ -1,3 +1,5 @@
+import { isConnectionRefused } from './connection-refused.js';
+
 export async function runTriggerCommand(
   { repo, name, action = 'start', json = false },
   io
@@ -31,9 +33,7 @@ export async function runTriggerCommand(
     }
     return finish(result, 0);
   } catch (error) {
-    const refused = ['ECONNREFUSED', 'ConnectionRefused'].includes(
-      error?.code ?? error?.cause?.code
-    );
+    const refused = isConnectionRefused(error);
     const result = {
       code: refused ? 'PORTAL_REQUIRED' : 'TRIGGER_OUTCOME_UNKNOWN',
       error: refused

@@ -179,8 +179,9 @@ export class SetuOAuthProvider {
 
 async function connectStdioServer(server) {
   setStatus(server.id, { error: null, status: 'connecting', stderrTail: [] });
+  let transport;
   try {
-    const transport = new StdioClientTransport({
+    transport = new StdioClientTransport({
       args: server.args ?? [],
       command: server.command,
       env: server.env,
@@ -212,6 +213,13 @@ async function connectStdioServer(server) {
     activeClients.set(server.id, { client, transport });
     setStatus(server.id, { error: null, status: 'connected', tools });
   } catch (e) {
+    if (activeClients.get(server.id)?.transport === transport) {
+      activeClients.delete(server.id);
+    }
+    ownedStdio.delete(transport);
+    try {
+      await transport?.close?.();
+    } catch {}
     setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }
@@ -220,6 +228,7 @@ async function connectStdioServer(server) {
 
 async function connectHttpServer(server, workspace) {
   setStatus(server.id, { error: null, status: 'connecting' });
+  let transport;
   try {
     if (server.httpAuthMode === 'oauth') {
       // Resolve the issuer before constructing the provider -- see
@@ -234,7 +243,7 @@ async function connectHttpServer(server, workspace) {
       );
       await attemptOAuthConnect(server, provider);
     } else {
-      const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+      transport = new StreamableHTTPClientTransport(new URL(server.url), {
         requestInit: server.headers ? { headers: server.headers } : undefined,
       });
       transport.onclose = () => {
@@ -258,6 +267,12 @@ async function connectHttpServer(server, workspace) {
       setStatus(server.id, { error: null, status: 'connected', tools });
     }
   } catch (e) {
+    if (activeClients.get(server.id)?.transport === transport) {
+      activeClients.delete(server.id);
+    }
+    try {
+      await transport?.close?.();
+    } catch {}
     setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }
@@ -314,6 +329,12 @@ async function attemptOAuthConnect(server, provider) {
     // begin with) -- clear it so a stale, already-consumed transport doesn't
     // linger in the map past its one legitimate use.
     pendingAuth.delete(server.id);
+    if (activeClients.get(server.id)?.transport === transport) {
+      activeClients.delete(server.id);
+    }
+    try {
+      await transport.close?.();
+    } catch {}
     setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
   }
 }

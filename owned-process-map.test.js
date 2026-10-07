@@ -1,6 +1,9 @@
 import { expect, test } from 'bun:test';
 import { createDevRuntime } from './dev-runtime.js';
-import { watchOwnedProcessExit } from './owned-process-map.js';
+import {
+  pruneDeadEntries,
+  watchOwnedProcessExit,
+} from './owned-process-map.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 
 test('sidecar parent exit retains alive or unknown group ownership and blocks cutover', async () => {
@@ -79,4 +82,16 @@ test('a delayed old sidecar observation cannot delete replacement ownership', as
   finish('dead');
   await completion;
   expect(map.get('r/topic')).toBe(replacement);
+});
+
+test('pruneDeadEntries deletes only entries whose current observation is dead', async () => {
+  const map = new Map([
+    ['dead', { state: 'dead' }],
+    ['alive', { state: 'alive' }],
+    ['unknown', { state: 'unknown' }],
+  ]);
+  await expect(
+    pruneDeadEntries(map, async (entry) => entry.state)
+  ).resolves.toEqual(['dead']);
+  expect([...map.keys()]).toEqual(['alive', 'unknown']);
 });

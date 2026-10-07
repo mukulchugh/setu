@@ -19,6 +19,7 @@
 // --print mode (undocumented, confirmed via a hard CLI error).
 
 import { closeSync, readFileSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { HOME } from './lib.js';
 
 const RUN_TIMEOUT_MS = 20 * 60 * 1000; // wall-clock cap on a single run
@@ -54,6 +55,15 @@ export function detectPrWalkthroughPlugin(wtDir) {
 const SKILL_DIR = { 'pr-brief': 'briefs', 'pr-walkthrough': 'reviews' };
 const DATA_ROOT = `${HOME}/.local/share/pr-walkthrough`;
 
+function plainPathSegment(value) {
+  return (
+    typeof value === 'string' &&
+    value !== '.' &&
+    value !== '..' &&
+    /^[^/\\]+$/.test(value)
+  );
+}
+
 // slug is "owner/repo" (same format REPO_META[repo].slug already uses).
 // Reads latest.json (which snapshot is current) then that snapshot's own
 // manifest.json — NOT guide.json/brief.json, which run 10-20MB on a real PR
@@ -70,6 +80,9 @@ export function findLatestArtifact(slug, prNumber, skill, currentHeadSha) {
   try {
     latest = JSON.parse(readFileSync(`${base}/latest.json`, 'utf8'));
   } catch {
+    return null;
+  }
+  if (!plainPathSegment(latest.snapshot)) {
     return null;
   }
 
@@ -96,10 +109,26 @@ export function findLatestArtifact(slug, prNumber, skill, currentHeadSha) {
 // ever runs (portal.js's artifact route allowlists it) — repeated here as a
 // guard since this resolves a real filesystem path.
 export function artifactHtmlPath(slug, prNumber, skill, snapshot, htmlFile) {
-  if (!(SKILL_DIR[skill] && htmlFile)) {
+  if (
+    !(
+      SKILL_DIR[skill] &&
+      plainPathSegment(snapshot) &&
+      plainPathSegment(htmlFile)
+    )
+  ) {
     return null;
   }
-  return `${DATA_ROOT}/${SKILL_DIR[skill]}/${slug}/pr-${prNumber}/${snapshot}/${htmlFile}`;
+  const dataDir = resolve(DATA_ROOT, SKILL_DIR[skill], slug, `pr-${prNumber}`);
+  const path = resolve(dataDir, snapshot, htmlFile);
+  const pathRelative = relative(dataDir, path);
+  if (
+    pathRelative === '..' ||
+    pathRelative.startsWith('../') ||
+    isAbsolute(pathRelative)
+  ) {
+    return null;
+  }
+  return path;
 }
 
 // ── deep review runs ─────────────────────────────────────────────────────────
@@ -137,9 +166,25 @@ export function reviewRunStatus(repo, name) {
 const DISALLOWED_BASH = [
   'Bash(gh pr review*)',
   'Bash(gh pr comment*)',
-  'Bash(gh issue create*)',
+  'Bash(gh pr merge*)',
+  'Bash(gh pr close*)',
+  'Bash(gh pr edit*)',
+  'Bash(gh pr ready*)',
+  'Bash(gh pr create*)',
+  'Bash(gh release*)',
+  'Bash(gh repo*)',
+  'Bash(gh workflow*)',
+  'Bash(gh secret*)',
+  'Bash(gh issue*)',
   'Bash(gh api*)',
   'Bash(git push*)',
+  'Bash(git commit*)',
+  'Bash(git reset*)',
+  'Bash(git rebase*)',
+  'Bash(git merge*)',
+  'Bash(git checkout*)',
+  'Bash(git branch -D*)',
+  'Bash(git tag*)',
 ];
 
 function claudeArgs(skill, slug, prNumber) {

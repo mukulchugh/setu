@@ -46,7 +46,10 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
     pending.current.add(port.port);
     setBusy(new Set(pending.current));
     try {
-      const result = await post('/api/ports/kill', { port: port.port });
+      const result = await post('/api/ports/kill', {
+        pid: Number(port.pid),
+        port: port.port,
+      });
       setActionError(
         result.ok
           ? null

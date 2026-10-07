@@ -423,7 +423,13 @@ test('MCP diff defaults to filenames and bounds verbose hunks independently for 
           totalFiles: 27,
           truncatedFileCount: 4,
         },
-        uncommitted: { additions: 23, deletions: 0, files, totalFiles: 23 },
+        uncommitted: {
+          additions: 23,
+          deletions: 0,
+          files,
+          totalFiles: 23,
+          untracked: ['new-file.ts'],
+        },
       };
     },
   });
@@ -439,6 +445,7 @@ test('MCP diff defaults to filenames and bounds verbose hunks independently for 
     deletions: 0,
     file: 'file-0.ts',
   });
+  expect(summary.uncommitted.untracked).toEqual(['new-file.ts']);
   const verbose = toolJson(
     await callTool('get_diff', { name: 'a', repo: 'r', verbose: true })
   );
@@ -449,10 +456,48 @@ test('MCP diff defaults to filenames and bounds verbose hunks independently for 
   expect(verbose.committed.truncatedFileCount).toBe(7);
   expect(verbose.uncommitted.files).toHaveLength(20);
   expect(verbose.uncommitted.truncatedFileCount).toBe(3);
+  expect(verbose.uncommitted.untracked).toEqual(['new-file.ts']);
   expect(calls).toEqual([
     ['r', 'a'],
     ['r', 'a'],
   ]);
+});
+
+test('MCP diff caps verbose text at 200 KiB with an explicit marker', async () => {
+  initMcpServer({
+    computeDiff: () => ({
+      base: 'origin/main',
+      baseResolved: true,
+      committed: {
+        additions: 1,
+        deletions: 0,
+        files: Array.from({ length: 20 }, (_, i) => ({
+          additions: 1,
+          deletions: 0,
+          file: `large-${i}.txt`,
+          hunks: [{ lines: ['x'.repeat(20_000)] }],
+        })),
+        totalFiles: 20,
+      },
+      uncommitted: {
+        additions: 0,
+        deletions: 0,
+        files: [],
+        totalFiles: 0,
+        untracked: ['new.txt'],
+      },
+    }),
+  });
+  const response = await callTool('get_diff', {
+    name: 'a',
+    repo: 'r',
+    verbose: true,
+  });
+  const text = response.result.content[0].text;
+  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(200 * 1024);
+  expect(JSON.parse(text)).toMatchObject({
+    truncation: 'Output truncated at 200 KB.',
+  });
 });
 
 test('MCP logs use the production reader with a 256 KiB window and 2000 line ceiling', async () => {
@@ -664,7 +709,13 @@ test('MCP Stop cancels the actual lifecycle queue so a later vacancy cannot laun
           repo: 'r',
         })
       )
-    ).toEqual({ container: false, ok: true, position: 1, queued: true });
+    ).toEqual({
+      container: false,
+      ok: true,
+      position: 1,
+      queued: true,
+      reason: 'concurrency',
+    });
     expect(lifecycle.queueSnapshot().map((entry) => entry.key)).toEqual([
       'r/b',
     ]);

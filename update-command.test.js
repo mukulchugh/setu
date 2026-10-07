@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createUpdateCommand, runUpdateCli } from './update-command.js';
@@ -126,7 +127,9 @@ function adapters(
       if (action[0] === 'rev-parse') {
         return action[1] === '--git-path'
           ? join(repoDir, '.git', action[2])
-          : head;
+          : action[1] === '--abbrev-ref'
+            ? 'main'
+            : head;
       }
       if (
         ['diff', 'ls-files', 'status', 'fetch', 'install', 'link'].includes(
@@ -299,6 +302,45 @@ test('unreadable policy storage is refused before Git mutation or quiescence', a
   ).rejects.toMatchObject({ code: 'STATE_CORRUPT' });
   expect(calls).toEqual([]);
 });
+
+test('a real refused loopback fetch is classified as an absent portal', async () => {
+  const server = net.createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+  } catch (error) {
+    if (['EACCES', 'EPERM'].includes(error?.code)) {
+      return; // This sandbox denies loopback listeners; CI exercises the fetch below.
+    }
+    throw error;
+  }
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  const root = fixture();
+  const command = createUpdateCommand({
+    configPath: join(root, 'config.json'),
+    portalUrl: `http://127.0.0.1:${port}`,
+    repoDir: root,
+  });
+  await expect(command.inspectPortal()).resolves.toEqual({ state: 'absent' });
+});
+
+test.each(['ECONNREFUSED', 'ConnectionRefused'])(
+  'both refused error spellings classify the update portal as absent: %s',
+  async (code) => {
+    const root = fixture();
+    const command = createUpdateCommand({
+      configPath: join(root, 'config.json'),
+      fetchImpl: async () => {
+        throw Object.assign(new Error('refused'), { code });
+      },
+      repoDir: root,
+    });
+    await expect(command.inspectPortal()).resolves.toEqual({ state: 'absent' });
+  }
+);
 
 test('installer delegates existing checkout to guarded updater and preserves nonzero failure without downstream install', () => {
   const root = fixture(),

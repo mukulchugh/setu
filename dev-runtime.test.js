@@ -190,7 +190,9 @@ test('adopted listeners signal only the exact PID and every sidecar stop settles
   await Promise.resolve();
   expect(completed).toBe(false);
   settle();
-  await expect(stopping).rejects.toThrow('sidecar exit unknown');
+  await expect(stopping).resolves.toEqual({
+    warnings: ['sidecar exit unknown'],
+  });
   expect(completed).toBe(true);
   expect(f.signals).toEqual([[303, 'SIGTERM']]);
 });
@@ -215,7 +217,7 @@ test('unresolved boot ownership without a PID never becomes a confirmed dead run
   ).toBe('unknown');
   await expect(
     f.runtime.stop(t, { observedState: 'unknown', pid: null })
-  ).rejects.toThrow('ownership is unknown');
+  ).rejects.toThrow(`process on port ${t.port}`);
 });
 
 test('a replaced adopted PID is never signalled', async () => {
@@ -318,4 +320,65 @@ test('a delayed command leaves unrelated reads responsive and preserves bounded 
     stdout: 'x'.repeat(16),
     truncated: true,
   });
+});
+
+test('command success with truncated stderr does not report truncated stdout', async () => {
+  const run = createCommandRunner((args, options) => Bun.spawn(args, options));
+  const result = await run(
+    [process.execPath, '-e', "process.stderr.write('x'.repeat(9000))"],
+    { maxOutputBytes: 16 }
+  );
+  expect(result).toMatchObject({
+    code: 0,
+    stderrTruncated: true,
+    truncated: false,
+  });
+});
+
+test('a placeholder handle observes a fresh discovery result and Stop gives a port-specific recovery action', async () => {
+  const f = platform({ discover: () => Promise.resolve({ state: 'dead' }) });
+  expect(
+    await f.runtime.observe(t, { observedState: 'unknown', pid: null })
+  ).toBe('dead');
+  const unknown = platform({
+    discover: () => Promise.resolve({ state: 'unknown' }),
+  });
+  await expect(
+    unknown.runtime.stop(t, { observedState: 'unknown', pid: null })
+  ).rejects.toThrow(`process on port ${t.port}`);
+});
+
+test('a gone owned process group is never signalled after its first ESRCH probe', async () => {
+  const f = platform();
+  const handle = { ownedGroup: true, pid: 303 };
+  expect(await f.runtime.observe(t, handle)).toBe('dead');
+  expect(handle.groupGone).toBe(true);
+  f.alive.add(303);
+  await f.runtime.stopProcess(handle);
+  expect(f.signals).toEqual([]);
+});
+
+test('a successful main Stop returns rejected sidecars as warnings', async () => {
+  const f = platform({
+    sidecarStops: [() => Promise.reject(new Error('Trigger could not stop'))],
+  });
+  f.alive.add(303);
+  await expect(
+    f.runtime.stop(t, { ownedGroup: false, pid: 303 })
+  ).resolves.toEqual({ warnings: ['Trigger could not stop'] });
+});
+
+test('restart lifecycle calls runtime without sidecars', async () => {
+  const f = platform();
+  let handle;
+  await f.runtime.launch(
+    t,
+    { container: false, limits: null, port: t.port, project: t.project },
+    (value) => {
+      handle = value;
+    },
+    { sidecars: false }
+  );
+  await f.runtime.stop(t, handle, { sidecars: false });
+  expect(f.signals).toEqual([[-101, 'SIGTERM']]);
 });

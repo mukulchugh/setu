@@ -73,9 +73,10 @@ export function createCommandRunner(spawn) {
     return {
       code,
       stderr: stderr.text,
+      stderrTruncated: stderr.truncated,
       stdout: stdout.text,
       timedOut: !!proc.signalCode,
-      truncated: stdout.truncated || stderr.truncated,
+      truncated: stdout.truncated,
     };
   };
 }
@@ -139,6 +140,9 @@ export function createDevRuntime({
   verifyHandle = async () => true,
 }) {
   function processState(handle) {
+    if (handle?.ownedGroup && handle.groupGone) {
+      return 'dead';
+    }
     if (!handle?.pid) {
       return 'dead';
     }
@@ -146,18 +150,22 @@ export function createDevRuntime({
       signal(handle.ownedGroup ? -handle.pid : handle.pid, 0);
       return 'alive';
     } catch (error) {
-      return error.code === 'ESRCH' ? 'dead' : 'unknown';
+      if (error.code === 'ESRCH') {
+        if (handle.ownedGroup) {
+          handle.groupGone = true;
+        }
+        return 'dead';
+      }
+      return 'unknown';
     }
   }
   async function observe(_target, handle) {
-    if (!handle) {
-      return 'unknown';
-    }
     if (
-      !(handle.pid || handle.container) &&
-      handle.observedState === 'unknown'
+      !handle ||
+      (!(handle.pid || handle.container) && handle.observedState === 'unknown')
     ) {
-      return 'unknown';
+      // Sidecar entries are observed without a target; nothing to rediscover.
+      return _target ? (await discover(_target)).state : 'unknown';
     }
     const wrapper = processState(handle);
     if (
@@ -228,7 +236,12 @@ export function createDevRuntime({
       );
     }
   }
-  async function launch(target, spec, registerHandle) {
+  async function launch(
+    target,
+    spec,
+    registerHandle,
+    { sidecars = true } = {}
+  ) {
     const prepared = spec.container
       ? await prepareContainer(target, spec)
       : await prepareBare(target, spec);
@@ -271,10 +284,10 @@ export function createDevRuntime({
     } finally {
       await closeLog(fd);
     }
-    const skippedSidecars = await startSidecars(target);
+    const skippedSidecars = sidecars ? await startSidecars(target) : [];
     return { skippedSidecars };
   }
-  async function stop(target, suppliedHandle) {
+  async function stop(target, suppliedHandle, { sidecars = true } = {}) {
     let handle = suppliedHandle;
     if (
       !handle ||
@@ -286,7 +299,7 @@ export function createDevRuntime({
         (found.state === 'alive' && !found.handle)
       ) {
         throw new Error(
-          'Runtime ownership is unknown; Stop requires reconciliation.'
+          `Setu could not identify the process on port ${target.port}. If nothing is running there, press Stop again. Otherwise stop it from Active ports, then press Stop.`
         );
       }
       handle = found.handle ?? null;
@@ -306,14 +319,20 @@ export function createDevRuntime({
           );
         }
       })(),
-      ...sidecarStops.map((stopSidecar) =>
-        Promise.resolve().then(() => stopSidecar(target))
-      ),
+      ...(sidecars
+        ? sidecarStops.map((stopSidecar) =>
+            Promise.resolve().then(() => stopSidecar(target))
+          )
+        : []),
     ]);
-    const failure = results.find((result) => result.status === 'rejected');
-    if (failure) {
-      throw failure.reason;
+    if (results[0].status === 'rejected') {
+      throw results[0].reason;
     }
+    const warnings = results
+      .slice(1)
+      .filter((result) => result.status === 'rejected')
+      .map((result) => String(result.reason?.message ?? result.reason));
+    return { warnings };
   }
   return Object.freeze({ launch, observe, stop, stopProcess });
 }

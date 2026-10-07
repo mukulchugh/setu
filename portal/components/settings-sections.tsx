@@ -422,6 +422,7 @@ export function McpSection({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [serverBusy, setServerBusy] = useState<Set<string>>(new Set());
   const [saveError, setSaveError] = useState<string | null>(null);
   const savePending = useRef(false);
   const writer = useRef<ReturnType<
@@ -538,33 +539,74 @@ export function McpSection({
   }
 
   async function connect(id: string) {
-    await postOrToast('/api/mcp/connect', { id }, toast, 'connect failed');
-    load();
+    if (serverBusy.has(id)) return;
+    setServerBusy((busy) => new Set(busy).add(id));
+    try {
+      await postOrToast('/api/mcp/connect', { id }, toast, 'connect failed');
+      load();
+    } finally {
+      setServerBusy((busy) => {
+        const next = new Set(busy);
+        next.delete(id);
+        return next;
+      });
+    }
   }
-  async function disconnect(id: string) {
-    const result = await postOrToast(
-      '/api/mcp/disconnect',
-      { id },
-      toast,
-      'disconnect failed'
-    );
-    load();
-    return result;
+  async function disconnect(id: string, preserveBusy = false) {
+    if (serverBusy.has(id) && !preserveBusy) return { ok: false };
+    if (!preserveBusy) {
+      setServerBusy((busy) => new Set(busy).add(id));
+    }
+    try {
+      const result = await postOrToast(
+        '/api/mcp/disconnect',
+        { id },
+        toast,
+        'disconnect failed'
+      );
+      load();
+      return result;
+    } finally {
+      if (!preserveBusy) {
+        setServerBusy((busy) => {
+          const next = new Set(busy);
+          next.delete(id);
+          return next;
+        });
+      }
+    }
   }
   async function remove(s: McpServer) {
-    await saveList(async (rows) => {
-      const current = rows.find((row) => row.id === s.id);
-      if (current && current.status !== 'disconnected') {
-        const result = await disconnect(s.id);
-        if (!result.ok) {
-          throw new Error(
-            result.error ||
-              'Disconnect could not be confirmed; the saved server is kept.'
-          );
+    if (
+      serverBusy.has(s.id) ||
+      !confirm(
+        `Remove MCP server "${s.name}"? Its saved configuration, including any static header, will be removed.`
+      )
+    ) {
+      return;
+    }
+    setServerBusy((busy) => new Set(busy).add(s.id));
+    try {
+      await saveList(async (rows) => {
+        const current = rows.find((row) => row.id === s.id);
+        if (current && current.status !== 'disconnected') {
+          const result = await disconnect(s.id, true);
+          if (!result.ok) {
+            throw new Error(
+              result.error ||
+                'Disconnect could not be confirmed; the saved server is kept.'
+            );
+          }
         }
-      }
-      return rows.filter((row) => row.id !== s.id);
-    });
+        return rows.filter((row) => row.id !== s.id);
+      });
+    } finally {
+      setServerBusy((busy) => {
+        const next = new Set(busy);
+        next.delete(s.id);
+        return next;
+      });
+    }
   }
   function toggleExpanded(id: string) {
     setExpanded((s) => {
@@ -753,6 +795,7 @@ export function McpSection({
                     {s.status === 'disconnected' || s.status === 'error' ? (
                       <Button
                         compact
+                        disabled={serverBusy.has(s.id)}
                         onClick={() => connect(s.id)}
                         variant="secondary"
                       >
@@ -761,6 +804,7 @@ export function McpSection({
                     ) : (
                       <Button
                         compact
+                        disabled={serverBusy.has(s.id)}
                         onClick={() => disconnect(s.id)}
                         variant="secondary"
                       >
@@ -768,7 +812,8 @@ export function McpSection({
                       </Button>
                     )}
                     <IconButton
-                      disabled={saving || failed}
+                      disabled={saving || failed || serverBusy.has(s.id)}
+                      label={`Remove MCP server ${s.name}`}
                       onClick={() => remove(s)}
                       tip="Remove server"
                       tone="red"

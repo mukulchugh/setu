@@ -7,6 +7,17 @@ import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
 // One async chain must never invert the documented routing -> workspace -> document order.
 const lockContext = new AsyncLocalStorage();
+const heldLocks = new Set();
+
+// Signal handlers cannot await the async lock scope, so every acquired lease is
+// also tracked here. Retained target leases intentionally survive process exit.
+export function releaseHeldLocks() {
+  for (const lock of [...heldLocks]) {
+    if (!lock.retained) {
+      lock.release();
+    }
+  }
+}
 
 const stateCauseCodes = new Set([
   'ENOSPC',
@@ -380,6 +391,31 @@ export function createWorkspaceState({
             error.code
           );
         }
+        let stale;
+        try {
+          const inspected = fs.lstatSync(path);
+          const metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const ownerPid = metadata?.pid;
+          if (
+            Number.isSafeInteger(ownerPid) &&
+            ownerPid > 0 &&
+            metadata?.retained !== true
+          ) {
+            let alive = true;
+            try {
+              process.kill(ownerPid, 0);
+            } catch (probe) {
+              alive = probe?.code !== 'ESRCH';
+            }
+            stale = !alive ? inspected : undefined;
+          }
+        } catch {
+          // A malformed, replaced or unreadable lease is never safe to steal.
+        }
+        if (stale) {
+          unlinkOwned(path, stale);
+          continue;
+        }
         const remaining = deadline - now();
         if (remaining <= 0) {
           throw new StateError('STATE_BUSY', name, 'lock-timeout');
@@ -420,14 +456,49 @@ export function createWorkspaceState({
         return false;
       }
     };
-    return {
+    const lock = {
+      retained: false,
       owned,
       release() {
         if (owned()) {
           unlinkOwned(path, identity);
         }
+        heldLocks.delete(lock);
+      },
+      retain() {
+        if (!owned()) {
+          return false;
+        }
+        let fd;
+        try {
+          fd = fs.openSync(path, 'r+');
+          if (!sameFile(fs.fstatSync(fd), identity)) {
+            return false;
+          }
+          const metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
+          if (metadata?.nonce !== owner) {
+            return false;
+          }
+          fs.ftruncateSync(fd, 0);
+          writeAll(fd, `${JSON.stringify({ ...metadata, retained: true })}\n`);
+          fs.fsyncSync(fd);
+          lock.retained = true;
+          return true;
+        } catch {
+          return false;
+        } finally {
+          if (fd !== undefined) {
+            try {
+              fs.closeSync(fd);
+            } catch {
+              /* A retained lease remains owned even if close confirmation fails. */
+            }
+          }
+        }
       },
     };
+    heldLocks.add(lock);
+    return lock;
   }
   async function withLock(path, rank, name, work, orderKey = path) {
     const held = lockContext.getStore() ?? [];
@@ -451,6 +522,9 @@ export function createWorkspaceState({
       // Keep only its target lease for diagnosed recovery; short metadata locks
       // still release. A dead owner PID is deliberately not permission to steal.
       retain = rank === 10 && error?.code === 'OPERATION_UNKNOWN';
+      if (retain && !lock.retain()) {
+        retain = false;
+      }
       throw error;
     } finally {
       if (!retain) {
@@ -845,7 +919,59 @@ export function createWorkspaceState({
     };
     return withDocuments([def], (scope) => scope.replace('generated', text));
   }
+  function inspectLocks() {
+    const paths = [];
+    if (workspaceRoot && isAbsolute(workspaceRoot)) {
+      paths.push({
+        kind: 'state',
+        path: join(workspaceRoot, '.setu-state.lock'),
+      });
+      try {
+        for (const name of fs.readdirSync(workspaceRoot)) {
+          if (/^\.setu-target-[a-f0-9]{64}\.lock$/.test(name)) {
+            paths.push({ kind: 'target', path: join(workspaceRoot, name) });
+          }
+        }
+      } catch {
+        /* Inspection is best-effort and leaves unreadable roots unreported. */
+      }
+    }
+    if (setuDir && isAbsolute(setuDir)) {
+      paths.push({
+        kind: 'routing',
+        path: join(setuDir, '.setu-routing.lock'),
+      });
+      paths.push({ kind: 'update', path: `${setuDir}.setu-update.lock` });
+    }
+    return paths.flatMap(({ kind, path }) => {
+      let metadata;
+      try {
+        if (!fs.lstatSync(path).isFile()) {
+          return [];
+        }
+        metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
+      } catch (error) {
+        return error?.code === 'ENOENT'
+          ? []
+          : [{ alive: null, kind, path, pid: null, retained: false }];
+      }
+      const pid = Number.isSafeInteger(metadata?.pid) ? metadata.pid : null;
+      let alive = null;
+      if (pid !== null && pid > 0) {
+        try {
+          process.kill(pid, 0);
+          alive = true;
+        } catch (error) {
+          alive = error?.code === 'ESRCH' ? false : null;
+        }
+      }
+      return [
+        { alive, kind, path, pid, retained: metadata?.retained === true },
+      ];
+    });
+  }
   return {
+    inspectLocks,
     read,
     replace: (name, value) => update(name, () => value),
     replaceText,

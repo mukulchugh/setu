@@ -6,10 +6,10 @@ Workspace bridge for Quivly engineers — git worktrees, local `.quivly.local` d
 
 ## Install
 
-Only real prerequisite is [Homebrew](https://brew.sh) — `setu setup` installs everything else itself: `bun` (via `install.sh`, if missing), `caddy`/`cloudflared`/`dnsmasq`/`direnv`/`gh`, authenticates `gh` if needed, and offers to install a container engine if none is running (`setu start` containerizes by default — real memory/CPU caps). Missing Homebrew too? `setu setup` installs that first, then asks you to re-run the same command once (a fresh process is needed to pick up its own new PATH correctly).
+Prerequisites are [Homebrew](https://brew.sh) and a signed-in GitHub CLI (`gh auth login`), because this repository is private. `setu setup` installs everything else itself: `bun` (via `install.sh`, if missing), `caddy`/`cloudflared`/`dnsmasq`/`direnv`/`gh`, authenticates `gh` if needed, and offers to install a container engine if none is running (`setu start` containerizes by default — real memory/CPU caps). Missing Homebrew too? `setu setup` installs that first, then asks you to re-run the same command once (a fresh process is needed to pick up its own new PATH correctly).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mukulchugh/setu/main/install.sh | bash
+gh api repos/mukulchugh/setu/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
 setu setup
 ```
 
@@ -45,6 +45,7 @@ setu new   <repo> <branch> --tunnel   ...and take the public URL
 setu new   <repo> <branch> --start    ...and start its dev server
 setu rm    <repo> <branch>        Remove a clean worktree through the running portal
 setu rm    <repo> <branch> --force  Discard local changes and remove
+                                   (a worktree named main is never removed)
 setu rm    <repo> <branch> --operation-id <id>  Retry only that pending cleanup
 
 setu cd    <repo> <branch>        cd into worktree
@@ -61,7 +62,7 @@ setu trigger <repo> <branch> [stop]  Start or stop Trigger through the running p
 
 setu portal                       Start web UI at http://quivly.local
 setu portal stop                  Stop portal
-setu update [--restart]            Guarded update; explicit restart authorization
+setu update [--restart]            Guarded update on branch main; explicit restart authorization
 setu version                      Version + commit
 ```
 
@@ -76,6 +77,8 @@ cd raycast && bun install && bunx ray develop
 ```
 
 Requires `setu portal` to be running — the extension has an explicit "portal isn't running" state rather than failing silently.
+
+A removal without `--force` refuses tracked or untracked changes, ignored local env files that are real files (a symlinked `.env.local` is fine), and commits that only a detached HEAD holds. A worktree named `main` is never removed, because it holds the real `.env.local` the others link to. Setu's own generated files are git-excluded automatically and do not count.
 
 Removal can finish deleting a checkout while later cleanup fails. Setu reports `removed: true` with an operation ID and pending steps, keeps the port reserved, and shows recovery independently of the deleted card. Retry with that exact ID. After an unconfirmed network response, refresh status before trying again. An unknown process or checkout identity blocks destructive work; it does not authorize deleting an owner lock.
 

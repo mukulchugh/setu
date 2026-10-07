@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { sharedDependencyInstall } from './dependency-sharing.js';
 import { assertStorageHeadroom } from './host-health.js';
@@ -116,6 +117,7 @@ export async function installWorktreeDependencies(
     assertStorage = assertStorageHeadroom,
     sharing,
     assertStoreStorage,
+    stdio = 'inherit',
   }
 ) {
   let command = dependencyInstallCommand(wtDir, exists);
@@ -130,7 +132,7 @@ export async function installWorktreeDependencies(
   command = shared?.command ?? command;
   const result = run(...command, {
     cwd: wtDir,
-    stdio: 'inherit',
+    stdio,
     ...(shared ? { env: shared.env } : {}),
   });
   if (!Number.isInteger(result?.status) && result?.pid > 0 && !result.signal) {
@@ -252,10 +254,30 @@ export async function prepareWorktreeCheckout(
   };
   await git(['fetch', '--all', '--prune']);
   await git(['worktree', 'prune']);
+  const list = await git(['worktree', 'list', '--porcelain']);
   if (exists) {
+    // git records real paths; the workspace itself may sit behind a symlink.
+    const real = (path) => {
+      try {
+        return realpathSync(path);
+      } catch {
+        return resolve(path);
+      }
+    };
+    const linked = list
+      .trim()
+      .split('\n\n')
+      .some((entry) => {
+        const path = entry.match(/^worktree (.+)$/m)?.[1];
+        return !!path && real(path) === real(wtDir);
+      });
+    if (!linked) {
+      throw new Error(
+        `Existing path '${wtDir}' is not a linked worktree of this repository`
+      );
+    }
     return;
   }
-  const list = await git(['worktree', 'list', '--porcelain']);
   for (const entry of list.trim().split('\n\n')) {
     const path = entry.match(/^worktree (.+)$/m)?.[1];
     const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];

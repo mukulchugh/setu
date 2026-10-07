@@ -9,8 +9,10 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import readline from 'node:readline';
 import {
@@ -66,9 +68,29 @@ import {
   createAndInstallWorktree,
   installWorktreeDependencies,
 } from './workspace-setup.js';
+import { releaseHeldLocks } from './workspace-state.js';
+import {
+  caddyfileText,
+  cursorConfigText,
+  hasIdentifiableWorktreeCwd,
+  hasCodexServerTable,
+  pruneCandidates,
+  startOutcome,
+  sudoRuleCovers,
+  withSetuBlock,
+} from './cli-helpers.js';
 
-const PKG_DIR = new URL('.', import.meta.url).pathname;
+const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
 const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
+
+process.on('SIGINT', () => {
+  releaseHeldLocks();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  releaseHeldLocks();
+  process.exit(143);
+});
 
 function cfg() {
   try {
@@ -103,7 +125,7 @@ function ok(label) {
   console.log(`  ${G}✓${R} ${label}`);
 }
 function fail(label) {
-  process.stdout.write(`${Y}✗ ${label}${R}\n`);
+  process.stderr.write(`${Y}✗ ${label}${R}\n`);
 }
 function die(msg) {
   console.error(`${Y}error:${R} ${msg}`);
@@ -294,6 +316,12 @@ function sudoTee(content, dest, mode) {
   }
 }
 
+function writeAtomic(path, text) {
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, text);
+  renameSync(temp, path);
+}
+
 // Collapses the `.catch(e => ({ok:false,error:String(e)}))` -> `if (!res.ok)
 // die(...)` pattern repeated across most portalRequest call sites below.
 // Not every call site wants this: some warn and continue instead of dying,
@@ -339,11 +367,12 @@ async function ensurePortal(c) {
   });
 }
 
-function autoInstall(wtDir, sharing) {
+function autoInstall(wtDir, sharing, stdio) {
   return installWorktreeDependencies(wtDir, {
     exists: existsSync,
     run: spawnSync,
     sharing,
+    ...(stdio ? { stdio } : {}),
   });
 }
 
@@ -358,17 +387,17 @@ async function cmdSetup() {
   if (!commandExists('brew')) {
     spin('Homebrew');
     try {
-      // The exact one-liner brew.sh itself publishes — `bash -c` parses its
-      // own argument as a real command line, so the $(...) inside undergoes
-      // command substitution the same way it would typed at a prompt.
-      execFileSync(
-        '/bin/bash',
+      const installer = execFileSync(
+        'curl',
         [
-          '-c',
-          '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)',
+          '-fsSL',
+          'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh',
         ],
-        { stdio: 'inherit' }
+        { encoding: 'utf8' }
       );
+      // As the published one-liner does: the script is bash's -c argument, so
+      // stdin stays the terminal and the installer can ask for a password.
+      execFileSync('/bin/bash', ['-c', installer], { stdio: 'inherit' });
       done();
     } catch {
       die(
@@ -629,7 +658,7 @@ async function cmdSetup() {
       installedStateValue(
         await workspaceState(input.workspace).replaceText(
           caddyfile,
-          `{ auto_https off }\nimport ${input.workspace}/caddy.d/*.caddy\n`
+          caddyfileText(input.workspace)
         )
       );
     }
@@ -694,14 +723,7 @@ async function cmdSetup() {
     // Setup can create the shell configuration when no readable file exists.
   }
   if (current.includes(START)) {
-    const si = current.indexOf(START),
-      ei = current.indexOf(END);
-    writeFileSync(
-      zshrc,
-      current.slice(0, si) +
-        block +
-        (ei === -1 ? '' : current.slice(ei + END.length))
-    );
+    writeFileSync(zshrc, withSetuBlock(current, block, START, END));
   } else {
     appendFileSync(zshrc, `\n${block}\n`);
   }
@@ -763,7 +785,8 @@ async function cmdNew() {
         await ensureTunnel(c, repo, name);
         return publicDomain(c);
       },
-      install: (wtDir) => autoInstall(wtDir, sharing),
+      install: (wtDir) =>
+        autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined),
       name,
       repo,
       state: workspaceState(c.workspace),
@@ -789,9 +812,18 @@ async function cmdNew() {
     const startRes = await portalRequest('/api/start', startBody).catch(
       (e) => ({ error: String(e), ok: false })
     );
-    started = !!startRes.ok;
+    const outcome = startOutcome(startRes);
+    started = outcome.started;
     if (!started) {
-      fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
+      if (outcome.queued) {
+        console.log(
+          `  ${GR}○${R} dev server queued at position ${outcome.position} (${outcome.reason})`
+        );
+      } else {
+        fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
+        process.exitCode = 1;
+      }
+      Object.assign(res, outcome);
     }
   }
 
@@ -864,9 +896,13 @@ async function cmdStart() {
     body.container = false;
   }
   const res = await portalCall('/api/start', body, 'start failed');
-  ok(
-    `started ${repo}/${name}${res.queued ? ' (queued)' : res.container ? ' (containerized)' : ' (bare)'}`
-  );
+  if (res.queued) {
+    ok(`queued ${repo}/${name} at position ${res.position} (${res.reason})`);
+  } else {
+    ok(
+      `started ${repo}/${name}${res.container ? ' (containerized)' : ' (bare)'}`
+    );
+  }
 }
 
 async function cmdStop() {
@@ -875,8 +911,7 @@ async function cmdStop() {
     die('Usage: setu stop <repo> <branch>');
   }
   if (!portalPid()) {
-    console.log('Portal not running — nothing to stop.');
-    return;
+    die('PORTAL_REQUIRED: Portal must be running to stop a worktree.');
   }
   await portalCall('/api/stop', { name, repo }, 'stop failed');
   ok(`stopped ${repo}/${name}`);
@@ -890,9 +925,13 @@ async function cmdStop() {
 
 async function cmdPrune() {
   const c = cfg();
-  const known = new Set(portEntries(c.workspace).map((e) => e.port));
   const active = listActivePorts();
-  const orphans = active.filter((p) => !known.has(p.port));
+  const orphans = pruneCandidates(
+    portEntries(c.workspace),
+    active,
+    processCwd,
+    c.workspace
+  );
 
   if (!orphans.length) {
     ok('nothing to prune');
@@ -1114,15 +1153,15 @@ async function cmdPortal() {
 // regardless of what's above it, and the regex guard below makes this safe
 // to re-run without duplicating the block.
 function mcpInstallCodex() {
-  const dir = join(HOME, '.codex');
+  const dir = process.env.CODEX_HOME || join(HOME, '.codex');
   const path = join(dir, 'config.toml');
   mkdirSync(dir, { recursive: true });
   const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  if (/^\[mcp_servers\.setu\]/m.test(text)) {
+  if (hasCodexServerTable(text)) {
     ok(`Already configured in ${path}`);
     return;
   }
-  writeFileSync(
+  writeAtomic(
     path,
     `${text.replace(/\n*$/, '\n')}\n[mcp_servers.setu]\nurl = "${MCP_URL}"\n`
   );
@@ -1150,13 +1189,15 @@ function mcpInstallCursor() {
       die(`${path} has invalid JSON -- fix it manually first: ${e.message}`);
     }
   }
+  if (conf === null || typeof conf !== 'object' || Array.isArray(conf)) {
+    die(`${path} must contain a plain object`);
+  }
   conf.mcpServers ??= {};
   if (conf.mcpServers.setu) {
     ok(`Already configured in ${path}`);
     return;
   }
-  conf.mcpServers.setu = { url: MCP_URL };
-  writeFileSync(path, `${JSON.stringify(conf, null, 2)}\n`);
+  writeAtomic(path, cursorConfigText(conf, MCP_URL));
   ok(`Added Setu MCP server to ${path}`);
   console.log('  Restart Cursor (or reload its MCP servers) to pick it up.');
 }
@@ -1445,8 +1486,14 @@ async function cmdDoctor() {
   ]);
   const dnsmasqLine =
     services.split('\n').find((l) => l.startsWith('dnsmasq')) ?? '';
-  const sudoOk = async (argv) =>
-    (await spawnTextCode('sudo', ['-n', '-l', ...argv])).code === 0;
+  // One listing serves both checks. Given a command, `sudo -l` prints only
+  // that command and never the NOPASSWD tag, so list everything instead.
+  let sudoListing;
+  const sudoOk = async (argv) => {
+    sudoListing ??= spawnTextCode('sudo', ['-n', '-l']);
+    const { code, text } = await sudoListing;
+    return code === 0 && sudoRuleCovers(text, argv);
+  };
 
   const checkThunks = [
     ...['caddy', 'cloudflared', 'dnsmasq', 'direnv'].map((pkg) => async () => ({
@@ -1603,8 +1650,24 @@ async function cmdDoctor() {
     const active = listActivePorts();
 
     checkThunks.push(async () => {
-      const known = new Set(entries.map((e) => e.port));
-      const orphanProcs = active.filter((p) => !known.has(p.port));
+      const locks = workspaceState(workspace).inspectLocks();
+      const bad = locks.filter((lock) => lock.retained || lock.alive === false);
+      return {
+        fix: bad.length
+          ? `${bad.map((lock) => lock.path).join(', ')}${bad.some((lock) => lock.alive === false) ? ' — it is safe to delete a lock whose process is dead' : ''}`
+          : undefined,
+        name: 'no stale Setu locks',
+        ok: bad.length === 0,
+      };
+    });
+
+    checkThunks.push(async () => {
+      const orphanProcs = pruneCandidates(
+        entries,
+        active,
+        processCwd,
+        workspace
+      );
       return {
         fix: orphanProcs.length
           ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map((p) => `pid ${p.pid} :${p.port}`).join(', ')})`
@@ -1616,6 +1679,13 @@ async function cmdDoctor() {
 
     checkThunks.push(async () => {
       const mismatches = [];
+      const raw = await spawnText([
+        'docker',
+        'ps',
+        '--format',
+        '{{.Label "com.docker.compose.project"}}\t{{.State}}',
+      ]);
+      const projectState = composeProjectStates(raw);
       for (const e of entries) {
         const p = active.find((a) => a.port === e.port);
         if (!p) {
@@ -1623,6 +1693,14 @@ async function cmdDoctor() {
         }
         const cwd = processCwd(p.pid);
         const expected = resolve(join(workspace, e.repo, e.name));
+        if (
+          projectState.get(composeProjectName(e.repo, e.name)) === 'running'
+        ) {
+          continue;
+        }
+        if (!hasIdentifiableWorktreeCwd(cwd)) {
+          continue;
+        }
         // Nx/monorepo dev servers end up with cwd nested inside apps/<app> —
         // only flag it if cwd isn't the worktree root or underneath it.
         if (
@@ -1683,7 +1761,7 @@ async function cmdDoctor() {
       );
       return {
         fix: stale.length
-          ? `stale: ${stale.map((e) => e.key).join(', ')}  — releasePort() or setu rm each`
+          ? `stale: ${stale.map((e) => e.key).join(', ')}  — setu rm <repo> <branch>`
           : undefined,
         name: 'no registry entries for missing worktrees',
         ok: stale.length === 0,
@@ -1806,7 +1884,7 @@ function cmdHelp() {
     setu new   <repo> <branch> --tunnel   ...and take the public URL
     setu new   <repo> <branch> --start    ...and start its dev server (new worktree → containerized; see below)
     setu new   <repo> <branch> --start --bare   ...force a bare process instead (no memory/CPU cap)
-    setu rm    <repo> <branch>       Remove worktree through the running portal
+    setu rm    <repo> <branch> [--force]  Remove worktree through the running portal
       --operation-id <id>          Resume that pending removal only
       --json                       Print the complete result, including partial failure
 
@@ -1839,7 +1917,7 @@ function cmdHelp() {
                                       Claude Code: claude --plugin-dir <setu>/claude-plugin (already packaged)
 
   ${C}Meta${R}
-    setu update                      Update setu (stash-safe, shows changelog)
+    setu update [--restart] [--include-untracked]  Update setu safely
     setu version                     Show version + commit
     setu help                        Show this
 `);

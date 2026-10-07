@@ -25,10 +25,10 @@ export interface WorkspaceInventory {
   checkedAt: number;
   counts: {
     linked: number | null;
-    missing: number;
+    missing: number | null;
     observedLinked: number;
     registered: number;
-    unregistered: number;
+    unregistered: number | null;
   };
   repositories: {
     checkedAt: number;
@@ -97,7 +97,7 @@ export function parseWorkspaceInventory(value: unknown): WorkspaceInventory {
       isRecord(counts) &&
       orNull(isCount)(counts.linked) &&
       ['missing', 'observedLinked', 'registered', 'unregistered'].every(
-        (field) => isCount(counts[field])
+        (field) => orNull(isCount)(counts[field])
       )
     )
   ) {

@@ -135,9 +135,10 @@ test('missing registrations stay visible; permission errors and discovery failur
   expect(data.state).toBe('partial');
   expect(data.counts).toMatchObject({
     linked: null,
-    missing: 1,
+    missing: null,
     observedLinked: 0,
     registered: 2,
+    unregistered: null,
   });
   expect(data.rows[0]).toMatchObject({
     discovery: 'ready',
