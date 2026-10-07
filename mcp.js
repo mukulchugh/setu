@@ -20,10 +20,18 @@
 // "./*" entry, which does NOT auto-append .js, so an extensionless import
 // of e.g. "@modelcontextprotocol/sdk/client/stdio" fails to resolve.
 import { Client } from '@modelcontextprotocol/sdk/client';
+import {
+  discoverOAuthServerInfo,
+  UnauthorizedError,
+} from '@modelcontextprotocol/sdk/client/auth.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { UnauthorizedError, discoverOAuthServerInfo } from '@modelcontextprotocol/sdk/client/auth.js';
-import { loadMcpTokens, saveMcpTokens, PORTAL_PORT } from './lib.js';
+import {
+  installedStateValue,
+  loadMcpTokens,
+  PORTAL_PORT,
+  saveMcpTokens,
+} from './lib.js';
 
 const STDERR_TAIL_MAX = 20;
 
@@ -33,6 +41,10 @@ const serverStatus = new Map();
 // serverId -> {client, transport} for connected servers, so disconnect can
 // close them cleanly. Tool-calling against these is the next plan's job.
 const activeClients = new Map();
+// Keep stdio ownership until the SDK observes child close. Its close() may
+// return immediately after SIGKILL; an error or fulfilled close is not exit.
+const ownedStdio = new Map(); // transport -> serverId
+let connectingOrAuthorizing = 0;
 // serverId -> {state, transport, provider} -- bridges the redirect-then-
 // callback gap. Keyed by serverId, not state: the callback route already
 // gives us serverId from the URL path (one in-flight attempt per server is
@@ -41,16 +53,38 @@ const activeClients = new Map();
 const pendingAuth = new Map();
 
 function setStatus(serverId, patch) {
-  const prev = serverStatus.get(serverId) ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] };
+  const prev = serverStatus.get(serverId) ?? {
+    error: null,
+    status: 'disconnected',
+    stderrTail: [],
+    tools: [],
+  };
   serverStatus.set(serverId, { ...prev, ...patch });
 }
 
 export function mcpStatus(serverId) {
-  return serverStatus.get(serverId) ?? { error: null, status: 'disconnected', stderrTail: [], tools: [] };
+  return (
+    serverStatus.get(serverId) ?? {
+      error: null,
+      status: 'disconnected',
+      stderrTail: [],
+      tools: [],
+    }
+  );
 }
 
 export function mcpStatuses() {
   return Object.fromEntries(serverStatus.entries());
+}
+
+export function mcpHasOwnedWork() {
+  return (
+    connectingOrAuthorizing > 0 ||
+    ownedStdio.size > 0 ||
+    activeClients.size > 0 ||
+    pendingAuth.size > 0 ||
+    [...serverStatus.values()].some((row) => row.status === 'connecting')
+  );
 }
 
 function pushStderr(serverId, text) {
@@ -65,7 +99,7 @@ function pushStderr(serverId, text) {
 // it before construction, rather than waiting on saveDiscoveryState's
 // callback, avoids a chicken-and-egg gap where an early clientInformation()
 // call wouldn't yet know which issuer's stored info to return.
-class SetuOAuthProvider {
+export class SetuOAuthProvider {
   constructor(workspace, serverId, issuer) {
     this.workspace = workspace;
     this.serverId = serverId;
@@ -94,18 +128,20 @@ class SetuOAuthProvider {
   clientInformation() {
     return loadMcpTokens(this.workspace)[this.issuer]?.clientInformation;
   }
-  saveClientInformation(info) {
-    const tokens = loadMcpTokens(this.workspace);
-    tokens[this.issuer] = { ...(tokens[this.issuer] ?? {}), clientInformation: info };
-    saveMcpTokens(this.workspace, tokens);
+  async saveClientInformation(info) {
+    installedStateValue(
+      await saveMcpTokens(this.workspace, this.issuer, {
+        clientInformation: info,
+      })
+    );
   }
   tokens() {
     return loadMcpTokens(this.workspace)[this.issuer]?.tokens;
   }
-  saveTokens(t) {
-    const tokens = loadMcpTokens(this.workspace);
-    tokens[this.issuer] = { ...(tokens[this.issuer] ?? {}), tokens: t };
-    saveMcpTokens(this.workspace, tokens);
+  async saveTokens(t) {
+    installedStateValue(
+      await saveMcpTokens(this.workspace, this.issuer, { tokens: t })
+    );
   }
   redirectToAuthorization(url) {
     // Hand off to the user's real browser -- same macOS `open` shell-out
@@ -122,13 +158,21 @@ class SetuOAuthProvider {
     this.lastState = crypto.randomUUID();
     return this.lastState;
   }
-  saveCodeVerifier(v) { this._codeVerifier = v; }
+  saveCodeVerifier(v) {
+    this._codeVerifier = v;
+  }
   codeVerifier() {
-    if (!this._codeVerifier) throw new Error('no code verifier saved');
+    if (!this._codeVerifier) {
+      throw new Error('no code verifier saved');
+    }
     return this._codeVerifier;
   }
-  saveDiscoveryState(state) { this._discovery = state; }
-  discoveryState() { return this._discovery; }
+  saveDiscoveryState(state) {
+    this._discovery = state;
+  }
+  discoveryState() {
+    return this._discovery;
+  }
 }
 
 // ---- stdio ----
@@ -142,17 +186,27 @@ async function connectStdioServer(server) {
       env: server.env,
       stderr: 'pipe', // default is 'inherit' (parent process's own stderr) -- 'pipe' is required for the .stderr getter below to return a real stream
     });
-    transport.stderr?.on('data', chunk => pushStderr(server.id, chunk.toString()));
+    ownedStdio.set(transport, server.id);
+    transport.stderr?.on('data', (chunk) =>
+      pushStderr(server.id, chunk.toString())
+    );
     transport.onclose = () => {
+      ownedStdio.delete(transport);
       activeClients.delete(server.id);
       setStatus(server.id, { status: 'disconnected' });
     };
-    transport.onerror = err => {
-      activeClients.delete(server.id);
-      setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
+    transport.onerror = (err) => {
+      setStatus(server.id, {
+        error: String(err?.message ?? err),
+        status: 'error',
+      });
     };
 
-    const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
+    const client = new Client(
+      { name: 'setu', version: '1.0.0' },
+      { capabilities: {} }
+    );
+    activeClients.set(server.id, { client, transport });
     await client.connect(transport);
     const { tools } = await client.listTools();
     activeClients.set(server.id, { client, transport });
@@ -170,8 +224,14 @@ async function connectHttpServer(server, workspace) {
     if (server.httpAuthMode === 'oauth') {
       // Resolve the issuer before constructing the provider -- see
       // SetuOAuthProvider's comment for why this ordering matters.
-      const { authorizationServerUrl } = await discoverOAuthServerInfo(server.url);
-      const provider = new SetuOAuthProvider(workspace, server.id, authorizationServerUrl);
+      const { authorizationServerUrl } = await discoverOAuthServerInfo(
+        server.url
+      );
+      const provider = new SetuOAuthProvider(
+        workspace,
+        server.id,
+        authorizationServerUrl
+      );
       await attemptOAuthConnect(server, provider);
     } else {
       const transport = new StreamableHTTPClientTransport(new URL(server.url), {
@@ -181,11 +241,17 @@ async function connectHttpServer(server, workspace) {
         activeClients.delete(server.id);
         setStatus(server.id, { status: 'disconnected' });
       };
-      transport.onerror = err => {
-        activeClients.delete(server.id);
-        setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
+      transport.onerror = (err) => {
+        setStatus(server.id, {
+          error: String(err?.message ?? err),
+          status: 'error',
+        });
       };
-      const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
+      const client = new Client(
+        { name: 'setu', version: '1.0.0' },
+        { capabilities: {} }
+      );
+      activeClients.set(server.id, { client, transport });
       await client.connect(transport);
       const { tools } = await client.listTools();
       activeClients.set(server.id, { client, transport });
@@ -202,18 +268,26 @@ async function connectHttpServer(server, workspace) {
 // so its saved tokens/client info carry over. server must be the full config
 // object (needs server.url), not just an id.
 async function attemptOAuthConnect(server, provider) {
-  const transport = new StreamableHTTPClientTransport(new URL(server.url), { authProvider: provider });
+  const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+    authProvider: provider,
+  });
   transport.onclose = () => {
     activeClients.delete(server.id);
     pendingAuth.delete(server.id);
     setStatus(server.id, { status: 'disconnected' });
   };
-  transport.onerror = err => {
-    activeClients.delete(server.id);
-    setStatus(server.id, { error: String(err?.message ?? err), status: 'error' });
+  transport.onerror = (err) => {
+    setStatus(server.id, {
+      error: String(err?.message ?? err),
+      status: 'error',
+    });
   };
 
-  const client = new Client({ name: 'setu', version: '1.0.0' }, { capabilities: {} });
+  const client = new Client(
+    { name: 'setu', version: '1.0.0' },
+    { capabilities: {} }
+  );
+  activeClients.set(server.id, { client, transport });
   try {
     await client.connect(transport);
     const { tools } = await client.listTools();
@@ -227,7 +301,11 @@ async function attemptOAuthConnect(server, provider) {
       // this exact transport/provider pair so the callback route can finish
       // the flow on the SAME transport instance the SDK requires, then
       // reconnect on a fresh one.
-      pendingAuth.set(server.id, { provider, state: provider.lastState, transport });
+      pendingAuth.set(server.id, {
+        provider,
+        state: provider.lastState,
+        transport,
+      });
       setStatus(server.id, { error: null, status: 'awaiting-auth' });
       return;
     }
@@ -243,8 +321,15 @@ async function attemptOAuthConnect(server, provider) {
 // ---- exported entry points ----
 
 export async function connectMcpServer(server, workspace) {
-  if (server.transport === 'stdio') return connectStdioServer(server);
-  return connectHttpServer(server, workspace);
+  connectingOrAuthorizing += 1;
+  try {
+    if (server.transport === 'stdio') {
+      return await connectStdioServer(server);
+    }
+    return await connectHttpServer(server, workspace);
+  } finally {
+    connectingOrAuthorizing -= 1;
+  }
 }
 
 // Called by the GET /api/mcp/oauth/callback/:serverId route with the
@@ -252,32 +337,69 @@ export async function connectMcpServer(server, workspace) {
 // server is the full config object looked up fresh from mcp-servers.json by
 // the route (needed for server.url on the reconnect below).
 export async function finishMcpAuth(server, code, state) {
-  const pending = pendingAuth.get(server.id);
-  if (!pending) return { error: 'No pending authorization for this server (expired, or already completed).', ok: false };
-  if (pending.state !== state) {
-    pendingAuth.delete(server.id);
-    return { error: 'State mismatch -- possible CSRF, aborting.', ok: false };
-  }
+  connectingOrAuthorizing += 1;
   try {
-    await pending.transport.finishAuth(code);
-  } catch (e) {
-    pendingAuth.delete(server.id);
-    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
-    return { error: String(e?.message ?? e), ok: false };
+    const pending = pendingAuth.get(server.id);
+    if (!pending) {
+      return {
+        error:
+          'No pending authorization for this server (expired, or already completed).',
+        ok: false,
+      };
+    }
+    if (pending.state !== state) {
+      pendingAuth.delete(server.id);
+      return { error: 'State mismatch -- possible CSRF, aborting.', ok: false };
+    }
+    try {
+      await pending.transport.finishAuth(code);
+    } catch (e) {
+      pendingAuth.delete(server.id);
+      setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
+      return { error: String(e?.message ?? e), ok: false };
+    }
+    // Reconnect on a fresh transport instance, reusing the same provider (its
+    // saved tokens now satisfy the connection) -- attemptOAuthConnect clears
+    // pendingAuth itself once this settles, whichever way it goes.
+    await attemptOAuthConnect(server, pending.provider);
+    return { ok: true };
+  } finally {
+    connectingOrAuthorizing -= 1;
   }
-  // Reconnect on a fresh transport instance, reusing the same provider (its
-  // saved tokens now satisfy the connection) -- attemptOAuthConnect clears
-  // pendingAuth itself once this settles, whichever way it goes.
-  await attemptOAuthConnect(server, pending.provider);
-  return { ok: true };
 }
 
-export function disconnectMcpServer(serverId) {
+export async function disconnectMcpServer(serverId) {
   const active = activeClients.get(serverId);
+  const pending = pendingAuth.get(serverId);
+  const transports = new Set(
+    [...ownedStdio]
+      .filter(([, id]) => id === serverId)
+      .map(([transport]) => transport)
+  );
   if (active) {
-    active.transport.close?.();
+    transports.add(active.transport);
+  }
+  if (pending) {
+    transports.add(pending.transport);
+  }
+  await Promise.all([...transports].map((transport) => transport.close?.()));
+  if ([...ownedStdio.values()].includes(serverId)) {
+    return {
+      code: 'MCP_TEARDOWN_UNKNOWN',
+      error:
+        'MCP process exit is unconfirmed; retry Disconnect before update cutover',
+      ok: false,
+    };
+  }
+  if (activeClients.get(serverId) === active) {
     activeClients.delete(serverId);
   }
   pendingAuth.delete(serverId);
-  setStatus(serverId, { error: null, status: 'disconnected', stderrTail: [], tools: [] });
+  setStatus(serverId, {
+    error: null,
+    status: 'disconnected',
+    stderrTail: [],
+    tools: [],
+  });
+  return { ok: true };
 }

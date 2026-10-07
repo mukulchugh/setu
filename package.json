@@ -1,8 +1,67 @@
 {
+  "name": "@quivly/setu",
+  "version": "0.2.0",
+  "description": "Workspace bridge — git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
+  "type": "module",
   "bin": {
     "setu": "./cli.js"
   },
+  "files": [
+    "agent.js",
+    "checkout-identity.js",
+    "cli.js",
+    "costs.js",
+    "dependency-sharing.js",
+    "deployment-guard.js",
+    "dev-runtime.js",
+    "host-health.js",
+    "lib.js",
+    "listener-observation.js",
+    "log-tail.js",
+    "mcp-server.js",
+    "mcp.js",
+    "owned-process-map.js",
+    "portal-status.js",
+    "portal-update.js",
+    "portal.js",
+    "pr-review.js",
+    "process-observation.js",
+    "removal-routing.js",
+    "remove-command.js",
+    "trigger-command.js",
+    "update-command.js",
+    "update-transaction.js",
+    "workspace-inventory.js",
+    "workspace-setup.js",
+    "workspace-state.js",
+    "worktree-lifecycle.js",
+    "worktree-removal.js",
+    "worktree-stream.js",
+    "portal",
+    "claude-plugin",
+    "raycast/src",
+    "raycast/assets",
+    "raycast/package.json",
+    "raycast/tsconfig.json",
+    "bunfig.toml",
+    "tsconfig.json",
+    "mise.toml",
+    "install.sh",
+    "banner.webp"
+  ],
+  "scripts": {
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "test": "bun test checkout-identity.test.js cli-setup.test.js dependency-sharing.test.js deployment-guard.test.js dev-runtime.test.js git-operations.test.js hardening.regression.test.js host-health.test.js listener-observation.test.js log-tail.test.js owned-process-map.test.js portal-update.test.js portal.api.test.ts portal.costs-read.test.ts portal.deploy-intent.test.ts portal.dialog-focus.test.ts portal.dropdown-ref.test.tsx portal.host-storage.test.ts portal.inventory-read.test.ts portal.log-read.test.ts portal.mcp-config.test.ts portal.read-array.test.ts portal.regression.test.js portal.settings-draft.test.ts portal.socket-client.test.ts portal.visible-poll.test.ts portal.worktree-list.test.ts process-observation.test.js removal-mcp.test.js removal-raycast.test.ts remove-command.test.js trigger-command.test.js update-command.test.js update-transaction.test.js workspace-inventory.test.js workspace-setup.test.js workspace-state.callers.test.js workspace-state.test.js worktree-lifecycle.test.js worktree-removal.test.js worktree-stream.test.js && bun agent.test.js && bun lib.agent-compose.test.js",
+    "typecheck": "bun raycast/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && bun raycast/node_modules/typescript/bin/tsc --noEmit -p raycast/tsconfig.json",
+    "verify": "bun run test && bun run typecheck"
+  },
+  "overrides": {
+    "react": "npm:@preact/compat@^18.3.2",
+    "react-dom": "npm:@preact/compat@^18.3.2"
+  },
   "dependencies": {
+    "@ai-hero/sandcastle": "^0.12.0",
     "@base-ui/react": "^1.7.0",
     "@fontsource/ibm-plex-mono": "^5.3.0",
     "@fontsource/syne": "^5.3.0",
@@ -17,32 +76,11 @@
     "tailwindcss": "^4.3.2",
     "zod": "^4.4.3"
   },
-  "description": "Workspace bridge — git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
     "ultracite": "7.10.5"
   },
   "engines": {
-    "bun": ">=1.0.0"
-  },
-  "files": [
-    "cli.js",
-    "lib.js",
-    "portal.js",
-    "portal",
-    "bunfig.toml",
-    "tsconfig.json",
-    "install.sh"
-  ],
-  "name": "@quivly/setu",
-  "overrides": {
-    "react": "npm:@preact/compat@^18.3.2",
-    "react-dom": "npm:@preact/compat@^18.3.2"
-  },
-  "scripts": {
-    "check": "ultracite check",
-    "fix": "ultracite fix"
-  },
-  "type": "module",
-  "version": "0.2.0"
+    "bun": ">=1.3.4"
+  }
 }

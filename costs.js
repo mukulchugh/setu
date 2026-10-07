@@ -1,9 +1,7 @@
 // Cost management — pulls org-level spend from Anthropic's and OpenAI's
 // Admin APIs. Read-only: never writes ~/.setu-costs.json (see
 // COSTS_CFG_PATH's own comment in lib.js) and never returns a raw key
-// value to a caller, only aggregated numbers -- the portal binds 0.0.0.0
-// (LAN-reachable), so an endpoint that echoed a key back would be a real
-// hole, not a theoretical one.
+// value to a caller, only aggregated numbers.
 //
 // Gemini has no equivalent admin/usage API (verified against
 // ai.google.dev/gemini-api/docs/billing): spend is only visible in the AI
@@ -20,7 +18,7 @@
 // endpoint family -- completions/embeddings/images/...) that can be added
 // later if actually wanted.
 
-import { loadCostsConfig, commandExists } from './lib.js';
+import { commandExists, loadCostsConfig } from './lib.js';
 
 const WINDOW_DAYS = 30;
 
@@ -37,17 +35,29 @@ function rfc3339(d) {
 
 async function fetchAllPages(baseUrl, params, headers) {
   const buckets = [];
+  const seen = new Set();
+  const signal = AbortSignal.timeout(15_000);
   let page;
   do {
     const p = new URLSearchParams(params);
-    if (page) p.set('page', page);
-    const res = await fetch(`${baseUrl}?${p.toString()}`, { headers });
+    if (page) {
+      p.set('page', page);
+    }
+    const res = await fetch(`${baseUrl}?${p.toString()}`, { headers, signal });
     if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText}: ${await res.text().catch(() => '')}`);
+      throw new Error(
+        `${res.status} ${res.statusText}: ${await res.text().catch(() => '')}`
+      );
     }
     const body = await res.json();
     buckets.push(...(body.data ?? []));
     page = body.has_more ? body.next_page : null;
+    if (body.has_more && (!page || seen.has(page) || seen.size >= 100)) {
+      throw new Error('Invalid cost pagination');
+    }
+    if (page) {
+      seen.add(page);
+    }
   } while (page);
   return buckets;
 }
@@ -98,15 +108,22 @@ function summarize(provider, buckets, dateOf, resultsOf, amountOf, labelOf) {
 
 async function anthropicCosts(adminKey) {
   const headers = { 'anthropic-version': '2023-06-01', 'x-api-key': adminKey };
-  const buckets = await fetchAllPages('https://api.anthropic.com/v1/organizations/cost_report', {
-    'group_by[]': 'description',
-    starting_at: rfc3339(new Date(Date.now() - WINDOW_DAYS * 86_400_000)),
-  }, headers);
-  return summarize('anthropic', buckets,
+  const buckets = await fetchAllPages(
+    'https://api.anthropic.com/v1/organizations/cost_report',
+    {
+      'group_by[]': 'description',
+      starting_at: rfc3339(new Date(Date.now() - WINDOW_DAYS * 86_400_000)),
+    },
+    headers
+  );
+  return summarize(
+    'anthropic',
+    buckets,
     (b) => b.starting_at.slice(0, 10),
     (b) => b.results,
     (r) => Number(r.amount) / 100,
-    (r) => r.model ?? r.description);
+    (r) => r.model ?? r.description
+  );
 }
 
 // ── OpenAI ───────────────────────────────────────────────────────────────
@@ -115,39 +132,51 @@ async function anthropicCosts(adminKey) {
 
 async function openaiCosts(adminKey) {
   const headers = { Authorization: `Bearer ${adminKey}` };
-  const buckets = await fetchAllPages('https://api.openai.com/v1/organization/costs', {
-    'group_by[]': 'line_item',
-    limit: String(WINDOW_DAYS),
-    start_time: String(Math.floor((Date.now() - WINDOW_DAYS * 86_400_000) / 1000)),
-  }, headers);
-  return summarize('openai', buckets,
+  const buckets = await fetchAllPages(
+    'https://api.openai.com/v1/organization/costs',
+    {
+      'group_by[]': 'line_item',
+      limit: String(WINDOW_DAYS),
+      start_time: String(
+        Math.floor((Date.now() - WINDOW_DAYS * 86_400_000) / 1000)
+      ),
+    },
+    headers
+  );
+  return summarize(
+    'openai',
+    buckets,
     (b) => new Date(b.start_time * 1000).toISOString().slice(0, 10),
     (b) => b.results,
     (r) => r.amount?.value ?? 0,
-    (r) => r.line_item);
+    (r) => r.line_item
+  );
 }
 
 // ── Gemini (detection only) ─────────────────────────────────────────────
 
 function geminiStatus(cfg) {
-  if (!commandExists('gcloud') || !commandExists('bq')) {
+  if (!(commandExists('gcloud') && commandExists('bq'))) {
     return {
       configured: false,
       provider: 'gemini',
-      reason: 'gcloud/bq CLI not installed. Gemini has no admin API — usage/cost needs Google Cloud Billing export to BigQuery. Install the Google Cloud SDK, then check billing setup with `gcloud billing accounts list`.',
+      reason:
+        'gcloud/bq CLI not installed. Gemini has no admin API — usage/cost needs Google Cloud Billing export to BigQuery. Install the Google Cloud SDK, then check billing setup with `gcloud billing accounts list`.',
     };
   }
-  if (!cfg.gemini?.gcpProjectId || !cfg.gemini?.bigQueryDataset) {
+  if (!(cfg.gemini?.gcpProjectId && cfg.gemini?.bigQueryDataset)) {
     return {
       configured: false,
       provider: 'gemini',
-      reason: 'gcloud/bq found, but gcpProjectId/bigQueryDataset are not set in ~/.setu-costs.json. Also requires Cloud Billing export to BigQuery already enabled for your billing account (docs.cloud.google.com/billing/docs/how-to/export-data-bigquery) — not automatic, and not retroactive once enabled.',
+      reason:
+        'gcloud/bq found, but gcpProjectId/bigQueryDataset are not set in ~/.setu-costs.json. Also requires Cloud Billing export to BigQuery already enabled for your billing account (docs.cloud.google.com/billing/docs/how-to/export-data-bigquery) — not automatic, and not retroactive once enabled.',
     };
   }
   return {
     configured: false,
     provider: 'gemini',
-    reason: 'gcloud/bq + config found, but BigQuery querying isn’t implemented yet — this is a detection-only stub.',
+    reason:
+      'gcloud/bq + config found, but BigQuery querying isn’t implemented yet — this is a detection-only stub.',
   };
 }
 
@@ -160,34 +189,75 @@ function geminiStatus(cfg) {
 // shown as some default. "warning" at 80% of limit, "over" at 100%+ --
 // tokentop's own "visual warnings" framing, not an arbitrary threshold.
 function budgetStatus(spent, limit) {
-  if (spent >= limit) return 'over';
-  if (spent >= limit * 0.8) return 'warning';
+  if (spent >= limit) {
+    return 'over';
+  }
+  if (spent >= limit * 0.8) {
+    return 'warning';
+  }
   return 'ok';
 }
 
 function computeBudgets(cfg, providers) {
   const b = cfg.budgets;
-  if (!b) return null;
+  if (!b) {
+    return null;
+  }
   const spent = { last1d: 0, last7d: 0, last30d: 0 };
+  const incomplete =
+    !providers.some((p) => p.configured && !p.error) ||
+    providers.some((p) => p.configured && p.error) ||
+    !!(cfg.gemini?.gcpProjectId && cfg.gemini?.bigQueryDataset);
   for (const p of providers) {
-    if (!p.configured || p.error) continue;
+    if (!p.configured || p.error) {
+      continue;
+    }
     spent.last1d += p.last1d ?? 0;
     spent.last7d += p.last7d ?? 0;
     spent.last30d += p.last30d ?? 0;
   }
-  const periods = { daily: ['last1d', b.daily], weekly: ['last7d', b.weekly], monthly: ['last30d', b.monthly] };
+  const periods = {
+    daily: ['last1d', b.daily],
+    monthly: ['last30d', b.monthly],
+    weekly: ['last7d', b.weekly],
+  };
   const out = {};
   for (const [period, [key, limit]] of Object.entries(periods)) {
-    if (limit == null) continue;
+    if (!Number.isFinite(limit) || limit <= 0) {
+      continue;
+    }
     const s = round2(spent[key]);
-    out[period] = { limit, spent: s, status: budgetStatus(s, limit) };
+    out[period] = {
+      incomplete,
+      limit,
+      spent: s,
+      status:
+        s >= limit
+          ? 'over'
+          : incomplete
+            ? 'incomplete'
+            : budgetStatus(s, limit),
+    };
   }
   return Object.keys(out).length ? out : null;
 }
 
 // ── orchestration ────────────────────────────────────────────────────────
 
-export async function getCostsSummary() {
+let costsInFlight = null,
+  costsCachedAt = 0;
+export function getCostsSummary() {
+  if (!costsInFlight || Date.now() - costsCachedAt > 60_000) {
+    costsCachedAt = Date.now();
+    costsInFlight = computeCostsSummary().catch((error) => {
+      costsInFlight = null;
+      throw error;
+    });
+  }
+  return costsInFlight;
+}
+
+async function computeCostsSummary() {
   const cfg = loadCostsConfig();
   // ~/.setu-costs.json is still the primary source (see COSTS_CFG_PATH's
   // comment in lib.js on why this is never portal-writable) -- env vars are
@@ -199,12 +269,35 @@ export async function getCostsSummary() {
 
   const [anthropic, openai] = await Promise.all([
     anthropicKey
-      ? anthropicCosts(anthropicKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'anthropic' }))
-      : Promise.resolve({ configured: false, provider: 'anthropic', reason: 'anthropicAdminKey not set in ~/.setu-costs.json (or $ANTHROPIC_ADMIN_KEY)' }),
+      ? anthropicCosts(anthropicKey).catch((e) => ({
+          configured: true,
+          error: String(e.message ?? e),
+          provider: 'anthropic',
+        }))
+      : Promise.resolve({
+          configured: false,
+          provider: 'anthropic',
+          reason:
+            'anthropicAdminKey not set in ~/.setu-costs.json (or $ANTHROPIC_ADMIN_KEY)',
+        }),
     openaiKey
-      ? openaiCosts(openaiKey).catch((e) => ({ configured: true, error: String(e.message ?? e), provider: 'openai' }))
-      : Promise.resolve({ configured: false, provider: 'openai', reason: 'openaiAdminKey not set in ~/.setu-costs.json (or $OPENAI_ADMIN_KEY)' }),
+      ? openaiCosts(openaiKey).catch((e) => ({
+          configured: true,
+          error: String(e.message ?? e),
+          provider: 'openai',
+        }))
+      : Promise.resolve({
+          configured: false,
+          provider: 'openai',
+          reason:
+            'openaiAdminKey not set in ~/.setu-costs.json (or $OPENAI_ADMIN_KEY)',
+        }),
   ]);
 
-  return { anthropic, budgets: computeBudgets(cfg, [anthropic, openai]), gemini: geminiStatus(cfg), openai };
+  return {
+    anthropic,
+    budgets: computeBudgets(cfg, [anthropic, openai]),
+    gemini: geminiStatus(cfg),
+    openai,
+  };
 }

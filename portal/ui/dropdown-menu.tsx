@@ -33,8 +33,9 @@
 // Group/Label/Shortcut are deliberately NOT ported (YAGNI) — pull them from
 // the same registry JSON if a real consumer ever needs them.
 import { Menu as MenuPrimitive } from '@base-ui/react/menu';
-import type { ComponentChildren } from 'preact';
 import { cva } from 'class-variance-authority';
+import type { ComponentChildren } from 'preact';
+import { forwardRef } from 'preact/compat';
 import { cn } from './utils';
 
 // Renders no DOM element of its own (Base UI's own doc: "Doesn't render its
@@ -51,7 +52,10 @@ import { cn } from './utils';
 // non-modal — only scroll-lock/pointer-blocking (never present in the old
 // Menu either) is what a non-default `modal` here gives up. Callers that
 // genuinely want modal behavior can still pass `modal` to override.
-export function DropdownMenu({ modal = false, ...props }: MenuPrimitive.Root.Props) {
+export function DropdownMenu({
+  modal = false,
+  ...props
+}: MenuPrimitive.Root.Props) {
   return <MenuPrimitive.Root modal={modal} {...props} />;
 }
 
@@ -69,9 +73,17 @@ export function DropdownMenu({ modal = false, ...props }: MenuPrimitive.Root.Pro
 // or component) — so treat `render={<IconButton/>}` as wholly unverified
 // until it's checked live, not as a drop-in replacement for the old
 // `trigger={toggle => <IconButton onClick={toggle}>...}` render-prop.
-export function DropdownMenuTrigger({ class: cls, ...props }: MenuPrimitive.Trigger.Props & { class?: string }) {
-  return <MenuPrimitive.Trigger className={cls} {...props} />;
-}
+//
+// forwardRef, not a plain function: Preact attaches a ref on a plain function
+// component to its instance, so callers that focus the trigger (More > View
+// logs) got an object without focus(). Forwarding lets Base UI place the ref
+// on the real <button>.
+export const DropdownMenuTrigger = forwardRef<
+  HTMLButtonElement,
+  MenuPrimitive.Trigger.Props & { class?: string }
+>(function Trigger({ class: cls, ...props }, ref) {
+  return <MenuPrimitive.Trigger className={cls} ref={ref} {...props} />;
+});
 
 // align defaults to 'end' (right edges flush), NOT the registry's 'start' —
 // the old Menu defaulted `align='right'`, and 6 of this repo's 9 real call
@@ -112,7 +124,7 @@ const dropdownMenuContentVariants = cva(
   // transition has something to animate from; data-ending-style is its
   // exit-side match, held on the mounted element for the transition's
   // duration before Base UI unmounts it.
-  'z-40 min-w-[170px] max-h-(--available-height) overflow-y-auto overflow-x-hidden origin-(--transform-origin) rounded-none border border-zinc-200 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md py-1 shadow-[0_8px_24px_-4px_rgba(8,80,65,0.25)] dark:shadow-[0_8px_24px_-4px_rgba(0,0,0,0.55)] outline-none opacity-100 scale-100 transition-[opacity,transform] duration-150 ease-out data-starting-style:opacity-0 data-starting-style:scale-95 data-ending-style:opacity-0 data-ending-style:scale-95',
+  'z-40 max-h-(--available-height) min-w-[170px] origin-(--transform-origin) scale-100 overflow-y-auto overflow-x-hidden rounded-none border border-zinc-200 bg-white/95 py-1 opacity-100 shadow-[0_8px_24px_-4px_rgba(8,80,65,0.25)] outline-none backdrop-blur-md transition-[opacity,transform] duration-150 ease-out data-ending-style:scale-95 data-starting-style:scale-95 data-ending-style:opacity-0 data-starting-style:opacity-0 dark:border-zinc-700 dark:bg-zinc-900/95 dark:shadow-[0_8px_24px_-4px_rgba(0,0,0,0.55)]'
 );
 
 export function DropdownMenuContent({
@@ -123,11 +135,23 @@ export function DropdownMenuContent({
   sideOffset = 6,
   ...props
 }: MenuPrimitive.Popup.Props &
-  Pick<MenuPrimitive.Positioner.Props, 'align' | 'alignOffset' | 'side' | 'sideOffset'> & { class?: string }) {
+  Pick<
+    MenuPrimitive.Positioner.Props,
+    'align' | 'alignOffset' | 'side' | 'sideOffset'
+  > & { class?: string }) {
   return (
     <MenuPrimitive.Portal>
-      <MenuPrimitive.Positioner className="z-40 outline-none" align={align} alignOffset={alignOffset} side={side} sideOffset={sideOffset}>
-        <MenuPrimitive.Popup className={cn(dropdownMenuContentVariants(), cls)} {...props} />
+      <MenuPrimitive.Positioner
+        align={align}
+        alignOffset={alignOffset}
+        className="z-40 outline-none"
+        side={side}
+        sideOffset={sideOffset}
+      >
+        <MenuPrimitive.Popup
+          className={cn(dropdownMenuContentVariants(), cls)}
+          {...props}
+        />
       </MenuPrimitive.Positioner>
     </MenuPrimitive.Portal>
   );
@@ -160,10 +184,10 @@ const dropdownMenuItemVariants = cva(
       // reservation, not honor the "vibrant" rule.
       tone: {
         red: 'text-signal-red data-highlighted:bg-signal-red/10 dark:data-highlighted:bg-signal-red/15',
-        zinc: 'text-zinc-700 dark:text-zinc-300 data-highlighted:bg-zinc-50 dark:data-highlighted:bg-white/10',
+        zinc: 'text-zinc-700 data-highlighted:bg-zinc-50 dark:text-zinc-300 dark:data-highlighted:bg-white/10',
       },
     },
-  },
+  }
 );
 
 export function DropdownMenuItem({
@@ -172,9 +196,16 @@ export function DropdownMenuItem({
   icon,
   children,
   ...props
-}: MenuPrimitive.Item.Props & { class?: string; tone?: DropdownMenuItemTone; icon?: ComponentChildren }) {
+}: MenuPrimitive.Item.Props & {
+  class?: string;
+  tone?: DropdownMenuItemTone;
+  icon?: ComponentChildren;
+}) {
   return (
-    <MenuPrimitive.Item className={cn(dropdownMenuItemVariants({ tone }), cls)} {...props}>
+    <MenuPrimitive.Item
+      className={cn(dropdownMenuItemVariants({ tone }), cls)}
+      {...props}
+    >
       {icon}
       {children}
     </MenuPrimitive.Item>
@@ -186,6 +217,14 @@ export function DropdownMenuItem({
 // Separator primitive and several real call sites (the worktree tool-open
 // menu's sidecar/logs/danger groupings) read as natural candidates for one,
 // even though nothing requires it today.
-export function DropdownMenuSeparator({ class: cls, ...props }: MenuPrimitive.Separator.Props & { class?: string }) {
-  return <MenuPrimitive.Separator className={cn('my-1 h-px w-full bg-zinc-200 dark:bg-zinc-700', cls)} {...props} />;
+export function DropdownMenuSeparator({
+  class: cls,
+  ...props
+}: MenuPrimitive.Separator.Props & { class?: string }) {
+  return (
+    <MenuPrimitive.Separator
+      className={cn('my-1 h-px w-full bg-zinc-200 dark:bg-zinc-700', cls)}
+      {...props}
+    />
+  );
 }

@@ -18,11 +18,11 @@
 // permission check. --output-format stream-json requires --verbose in
 // --print mode (undocumented, confirmed via a hard CLI error).
 
-import { readFileSync } from 'fs';
+import { closeSync, readFileSync } from 'node:fs';
 import { HOME } from './lib.js';
 
 const RUN_TIMEOUT_MS = 20 * 60 * 1000; // wall-clock cap on a single run
-const MAX_BUDGET_USD = 2.00;           // real money on the user's account per click
+const MAX_BUDGET_USD = 2.0; // real money on the user's account per click
 
 // ── plugin detection ────────────────────────────────────────────────────────
 
@@ -35,10 +35,18 @@ const PLUGIN_KEY = 'pr-walkthrough@mukulchugh-skills';
 // then fail to resolve /pr-walkthrough at all.
 export function detectPrWalkthroughPlugin(wtDir) {
   try {
-    const raw = readFileSync(`${HOME}/.claude/plugins/installed_plugins.json`, 'utf8');
+    const raw = readFileSync(
+      `${HOME}/.claude/plugins/installed_plugins.json`,
+      'utf8'
+    );
     const installs = JSON.parse(raw).plugins?.[PLUGIN_KEY] ?? [];
-    return installs.some(i => i.scope === 'user' || (i.scope === 'project' && i.projectPath === wtDir));
-  } catch { return false; }
+    return installs.some(
+      (i) =>
+        i.scope === 'user' || (i.scope === 'project' && i.projectPath === wtDir)
+    );
+  } catch {
+    return false;
+  }
 }
 
 // ── artifact lookup ──────────────────────────────────────────────────────────
@@ -59,12 +67,20 @@ export function findLatestArtifact(slug, prNumber, skill, currentHeadSha) {
   const dir = SKILL_DIR[skill];
   const base = `${DATA_ROOT}/${dir}/${slug}/pr-${prNumber}`;
   let latest;
-  try { latest = JSON.parse(readFileSync(`${base}/latest.json`, 'utf8')); }
-  catch { return null; }
+  try {
+    latest = JSON.parse(readFileSync(`${base}/latest.json`, 'utf8'));
+  } catch {
+    return null;
+  }
 
   let manifest;
-  try { manifest = JSON.parse(readFileSync(`${base}/${latest.snapshot}/manifest.json`, 'utf8')); }
-  catch { return null; }
+  try {
+    manifest = JSON.parse(
+      readFileSync(`${base}/${latest.snapshot}/manifest.json`, 'utf8')
+    );
+  } catch {
+    return null;
+  }
 
   return {
     findings: manifest.stats?.findings ?? null,
@@ -80,7 +96,9 @@ export function findLatestArtifact(slug, prNumber, skill, currentHeadSha) {
 // ever runs (portal.js's artifact route allowlists it) — repeated here as a
 // guard since this resolves a real filesystem path.
 export function artifactHtmlPath(slug, prNumber, skill, snapshot, htmlFile) {
-  if (!SKILL_DIR[skill] || !htmlFile) return null;
+  if (!(SKILL_DIR[skill] && htmlFile)) {
+    return null;
+  }
   return `${DATA_ROOT}/${SKILL_DIR[skill]}/${slug}/pr-${prNumber}/${snapshot}/${htmlFile}`;
 }
 
@@ -126,13 +144,19 @@ const DISALLOWED_BASH = [
 
 function claudeArgs(skill, slug, prNumber) {
   return [
-    '-p', `/${skill} ${slug}#${prNumber}`,
-    '--permission-mode', 'acceptEdits',
-    '--tools', 'Read,Grep,Glob,Bash,Write,Task',
-    '--disallowedTools', ...DISALLOWED_BASH,
-    '--output-format', 'stream-json',
+    '-p',
+    `/${skill} ${slug}#${prNumber}`,
+    '--permission-mode',
+    'acceptEdits',
+    '--tools',
+    'Read,Grep,Glob,Bash,Write,Task',
+    '--disallowedTools',
+    ...DISALLOWED_BASH,
+    '--output-format',
+    'stream-json',
     '--verbose',
-    '--max-budget-usd', String(MAX_BUDGET_USD),
+    '--max-budget-usd',
+    String(MAX_BUDGET_USD),
   ];
 }
 
@@ -145,13 +169,23 @@ function claudeArgs(skill, slug, prNumber) {
 // further back.
 function parseResult(logText) {
   const lines = logText.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i].trim();
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
     try {
       const d = JSON.parse(line);
-      if (d.type === 'result') return { costUsd: d.total_cost_usd ?? null, isError: !!d.is_error, subtype: d.subtype ?? null };
-    } catch {}
+      if (d.type === 'result') {
+        return {
+          costUsd: d.total_cost_usd ?? null,
+          isError: !!d.is_error,
+          subtype: d.subtype ?? null,
+        };
+      }
+    } catch {
+      // An unreadable result line falls through to the explicit error result.
+    }
     break;
   }
   return { costUsd: null, isError: true, subtype: null };
@@ -162,13 +196,32 @@ function parseResult(logText) {
 // spawnText — this file stays unaware of the worktree registry or HTTP
 // routing, mirroring mcp.js's own split (connectMcpServer takes plain
 // values, not portal.js internals).
-export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd, logPath, spawnText }) {
+export function runDeepReview(
+  repo,
+  name,
+  skill,
+  { wtDir, slug, prNumber, logFd, logPath, spawnText, onCompletion }
+) {
   const key = `${repo}/${name}`;
-  if (runs.get(key)?.running) return { error: 'a pr-review run is already in flight for this worktree', ok: false };
+  if (runs.get(key)?.running) {
+    closeSync(logFd);
+    return {
+      error: 'a pr-review run is already in flight for this worktree',
+      ok: false,
+    };
+  }
 
-  runs.set(key, { costUsd: null, dirtyAfter: null, error: null, exitCode: null, running: true, skill, startedAt: Date.now() });
+  runs.set(key, {
+    costUsd: null,
+    dirtyAfter: null,
+    error: null,
+    exitCode: null,
+    running: true,
+    skill,
+    startedAt: Date.now(),
+  });
 
-  (async () => {
+  const completion = (async () => {
     // --untracked-files=no: the worktree's own dev server (Next.js .next/,
     // log files, generated artifacts) can freely add/remove untracked paths
     // while a multi-minute review runs alongside it — that's unrelated
@@ -176,13 +229,27 @@ export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd,
     // files only, and comparing as a sorted set (not a raw string) so a
     // same-lines-different-order porcelain dump doesn't false-positive
     // either, keeps this tripwire meaningful instead of firing on noise.
-    const statusArgs = ['git', '-C', wtDir, '--no-optional-locks', 'status', '--porcelain', '--untracked-files=no'];
-    const snapshot = async () => new Set((await spawnText(statusArgs)).split('\n').filter(Boolean));
-    const setsEqual = (a, b) => a.size === b.size && [...a].every(l => b.has(l));
+    const statusArgs = [
+      'git',
+      '-C',
+      wtDir,
+      '--no-optional-locks',
+      'status',
+      '--porcelain',
+      '--untracked-files=no',
+    ];
+    const snapshot = async () =>
+      new Set((await spawnText(statusArgs)).split('\n').filter(Boolean));
+    const setsEqual = (a, b) =>
+      a.size === b.size && [...a].every((l) => b.has(l));
 
     const before = await snapshot();
     const proc = Bun.spawn(['claude', ...claudeArgs(skill, slug, prNumber)], {
-      cwd: wtDir, stderr: logFd, stdin: 'ignore', stdout: logFd, timeout: RUN_TIMEOUT_MS,
+      cwd: wtDir,
+      stderr: logFd,
+      stdin: 'ignore',
+      stdout: logFd,
+      timeout: RUN_TIMEOUT_MS,
     });
     await proc.exited;
     const timedOut = proc.signalCode === 'SIGTERM';
@@ -190,19 +257,45 @@ export function runDeepReview(repo, name, skill, { wtDir, slug, prNumber, logFd,
     const dirtyAfter = !setsEqual(before, after);
 
     if (timedOut) {
-      runs.set(key, { costUsd: null, dirtyAfter, error: 'timed out after 20 minutes', exitCode: 'timeout', running: false, skill, startedAt: runs.get(key).startedAt });
+      runs.set(key, {
+        costUsd: null,
+        dirtyAfter,
+        error: 'timed out after 20 minutes',
+        exitCode: 'timeout',
+        running: false,
+        skill,
+        startedAt: runs.get(key).startedAt,
+      });
       return;
     }
     let text = '';
-    try { text = readFileSync(logPath, 'utf8'); } catch {}
+    try {
+      text = readFileSync(logPath, 'utf8');
+    } catch {
+      // Empty input produces an error result when the report cannot be read.
+    }
     const { costUsd, isError, subtype } = parseResult(text);
-    runs.set(key, {costUsd,
+    runs.set(key, {
+      costUsd,
       dirtyAfter,
       error: isError ? (subtype ?? 'run failed') : null,
-      exitCode: isError ? 'error' : 'success', 
-      running: false, skill, startedAt: runs.get(key).startedAt,
+      exitCode: isError ? 'error' : 'success',
+      running: false,
+      skill,
+      startedAt: runs.get(key).startedAt,
     });
-  })();
+  })()
+    .catch((error) => {
+      runs.set(key, {
+        ...runs.get(key),
+        error: String(error),
+        exitCode: 'error',
+        running: false,
+      });
+    })
+    .finally(() => closeSync(logFd));
+
+  onCompletion?.(completion);
 
   return { ok: true, running: true, skill };
 }

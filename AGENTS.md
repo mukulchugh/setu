@@ -33,20 +33,25 @@ setu start <repo> <branch> [--container|--bare]
 setu stop <repo> <branch>            # stop dev server via the portal, or cancel it if still queued
 setu prune [--force]                 # list (or, with --force, kill) dev-server processes listening on a port
                                       # not in the .ports registry — the "running but invisible to setu" case
-setu rm <repo> <branch>              # stops servers (via portal) + removes worktree/port/domain — also removes
+setu rm <repo> <branch> [--force]    # stops servers (via portal) + removes worktree/port/domain — also removes
                                       # a container-backed worktree's node_modules volume, not just its container
+                                      # requires the running portal; offline removal never deletes locally
+                                      # after an uncertain response, inspect status before retrying
+setu rm <repo> <branch> --operation-id <id> [--json]
+                                      # retry only the recorded removal; never turn this into a fresh delete
 setu path <repo> <branch>            # prints worktree path
 setu cd <repo> <branch>              # cd into worktree (shell wrapper; from scripts use: cd "$(setu path r b)")
 setu init <gh-org>/<repo> [label]    # bare-clone + register + main worktree
 setu tunnel <repo> <branch> [stop]   # point the shared public URL at this worktree
 setu sync <repo> <branch>            # merge the resolved base branch in — clean merges only,
                                       # aborts + reports conflicts rather than leaving it mid-merge
-setu trigger <repo> <branch> [stop]  # trigger.dev dev server per worktree — delegates to the portal
-                                      # (/api/trigger/start|stop) when one is running, falls back to a
-                                      # standalone detached process (own PID file) only when it isn't
+setu trigger <repo> <branch> [stop]  # requires the portal (/api/trigger/start|stop)
+                                      # offline requests never launch or signal a standalone process
 setu mcp install <codex|cursor>      # register the portal's MCP server (see below) in that
                                       # client's own config — idempotent, preserves existing config
-setu update                          # stash-safe git pull + bun link + portal restart
+setu update [--restart] [--include-untracked]
+                                      # guarded cutover; a running portal requires explicit --restart
+                                      # untracked preservation is opt-in; exact recovery stash is retained
 setu version                         # version + commit sha
 ```
 
@@ -69,7 +74,7 @@ refuses connection.
 | GET `/api/ports` | — | processes listening on 3000–3999 (batched single `lsof` call, ~1-2s cached) |
 | GET `/api/logs?repo=&name=&type=dev\|setup\|inngest\|trigger\|sidecar-<name>\|tunnel\|pr-review` | — | tail of that log |
 | POST `/api/create` | `{repo, name, tunnel?}` | create worktree (bun install runs in background — poll the `setup` log) |
-| POST `/api/remove` | `{repo, name}` | stop + remove worktree |
+| POST `/api/remove` | `{repo, name, force?}` | reject dirty trees unless force is explicit, then stop and remove |
 | POST `/api/start` | `{repo, name, container?}` | start dev server. `container: true`/`false` forces that mode. **Omit the field entirely** (not `null` — actually absent) to get the sticky per-worktree default (see Container mode below) instead of a flat global one — this is what the portal UI's Start button does. Container mode requires a reachable Docker-API-compatible daemon, any engine — fails with an explicit error rather than silently falling back to bare if none is reachable. Returns `{ok:true, container}` if actually started (the resolved mode, useful when the caller didn't force one), or `{ok:true, queued:true, position:N, container}` if the concurrent-server cap (`maxConcurrentDevServers`, default 3) is already reached; auto-starts sidecars from `sidecars.json` alongside it |
 | POST `/api/stop` | `{repo, name}` | stop dev server (or dequeue it if still queued) — also stops its sidecars |
 | POST `/api/open` | `{repo, name, tool}` | open the worktree in an installed agent CLI (Ghostty) — `tool` must be one of `/api/agents`' returned ids |
@@ -82,16 +87,32 @@ refuses connection.
 | GET `/api/pr-review/artifact?repo=&name=&skill=` | — | serves the most recent run's self-contained report HTML directly |
 | POST `/api/pr/create` | `{repo, name}` | push the branch and open a GitHub PR (`gh pr create --fill`) — fails clearly if there's no GitHub remote, no commits ahead of base, or a PR already exists |
 | POST `/api/pr/ready` | `{repo, name, ready}` | flip an existing PR between draft and ready for review (`gh pr ready` / `--undo`) |
-| GET `/api/costs` | — | last-30-days spend per provider (Anthropic + OpenAI's real Admin APIs; Gemini is detection-only, no admin API exists) from `costs.js` — `{configured, totalCostUsd, last1d, last7d, last30d, byModel, daily}` or `{configured:false, reason}`, plus a top-level `budgets` object (`{daily?, weekly?, monthly?}`, each `{limit, spent, status}` — `status` is `ok`/`warning` (≥80% of limit)/`over`) if `~/.setu-costs.json` sets any budget thresholds, else `null`. `last1d`/`last7d`/`last30d` and `budgets.spent` are all derived from the same 30-day `daily` fetch — no extra API calls. Never echoes `~/.setu-costs.json`'s key values back — aggregated numbers only, see that file's own comment in `lib.js` for why |
+| GET `/api/costs` | — | last-30-days spend per provider (Anthropic + OpenAI's real Admin APIs; Gemini is detection-only, no admin API exists) from `costs.js` — `{configured, totalCostUsd, last1d, last7d, last30d, byModel, daily}` or `{configured:false, reason}`, plus a top-level `budgets` object (`{daily?, weekly?, monthly?}`, each `{limit, spent, status}` — `status` is `ok`/`warning` (≥80% of limit)/`over`/`incomplete`) if `~/.setu-costs.json` sets any budget thresholds, else `null`. `last1d`/`last7d`/`last30d` and `budgets.spent` are all derived from the same 30-day `daily` fetch — no extra API calls. Never echoes `~/.setu-costs.json`'s key values back — aggregated numbers only, see that file's own comment in `lib.js` for why |
 
 All POSTs return `{ok: boolean, error?: string, ...}`. A `queued: true` response means the
 action was accepted but not yet performed — poll `/api/worktrees` and check `active`, not
 just `ok`, to know if a dev server is actually running.
 
+Recovery fields are part of the action contract. `/api/remove` accepts an optional
+`operationId` to retry that exact recorded removal. A failed response can still contain
+`removed: true`, `completedStages` and `pendingSteps`; do not repeat it as a new delete.
+`GET /api/status` exposes `pendingRemovals` independently of existing worktree rows.
+An uncertain network response is not evidence that an action failed before mutation.
+
+`GET /api/worktrees?snapshot=1` adds `worktrees`, `status`, `checkedAt` and
+`listenerObservation`; the default route preserves its array response. Unknown listener
+observations retain the last display without certifying freshness. WebSocket clients
+subscribe only while visible and close when their final view unsubscribes.
+
+Status also includes workspace-filesystem `hostHealth`; `GET /api/status?refresh=1`
+requests a fresh storage check. Unknown storage is not zero free space. Deployment
+requires a current preflight context; an unknown completion keeps its owner and blocks
+retry until diagnosed. Never remove a target lock merely because its operation is old.
+
 ## Action log
 
 Every mutating `POST /api/*` request appends one JSON line to `~/workspace/logs/actions.log`
-(same rotation as every other log here — 5MB, `.old` backup): `{ts, route, repo, name, ok,
+(retention checks every five seconds; logs above 5 MB retain their latest 2.5 MB): `{ts, route, repo, name, ok,
 error?}`. GET routes aren't logged (reads, not actions — the list/status polls alone run at
 800ms-3s intervals and would drown out everything else). Built specifically to close a real
 gap: a prior incident (a worktree silently switched from bare to a container mid-use) took
@@ -111,7 +132,7 @@ that order of age) — `mcp-server.js`'s 15 tools (`list_worktrees`, `create_wor
 `list_ports`, `list_projects`, `list_repo_prs`, `get_pr_review_status`, `run_pr_review`,
 `create_pr`, `pr_ready`) call straight into portal.js's own functions in-process, not over
 HTTP — no self-fetch loopback. Streamable HTTP, stateless (fresh `McpServer` per request),
-DNS-rebinding protection on, no CORS. The server also sends a real `instructions` string on
+DNS-rebinding protection on, no CORS. The portal binds `127.0.0.1`; HTTP, WebSocket and MCP requests share a loopback/Host/Origin guard. Local Caddy access works, forwarded remote clients are rejected. The server also sends a real `instructions` string on
 connect (MCP's own `InitializeResult.instructions` field) — architecture overview, tool
 groupings, and a concrete debugging workflow, not just per-tool descriptions in isolation.
 
@@ -129,8 +150,7 @@ start/stop) now go through async siblings (`activePidAsync`/`listActivePortsAsyn
 `execFileSync`/`spawnSync`, so a slow git/lsof/kill call no longer stalls the whole
 single-threaded portal for every other in-flight request — same fix pattern `fetchPR` proved
 out earlier. `cli.js` still uses the synchronous versions (one-shot foreground process, no
-concurrent requests to starve). Still synchronous, left for a follow-up: `docker compose down`
-in `stopContainer`/`removeWorktree`.
+concurrent requests to starve). Compose teardown is asynchronous and propagates failures; failed cleanup keeps the worktree registered.
 
 ## Container mode (the default since 2026-08-10, sticky per worktree since the same day)
 
@@ -177,13 +197,13 @@ macOS-native binaries (`@next/swc-darwin-arm64` etc.) that can't run in the Linu
 The resolved (symlink-followed) `.env.local` is bind-mounted at the same in-container path
 the app expects it at.
 
-**Resource limits**: `containerMemoryLimit`/`containerCpuLimit` in `~/.setu.json` (defaults
-`4g`/`2`) are auto-clamped (`engineCapacity()`, `lib.js`) against `docker info`'s actual
-`NCPU`/`MemTotal` — never trust the configured value blindly, a container asking for more
-than the engine's own VM has gets rejected outright, not silently capped by Docker itself.
-`setu doctor` separately checks that `maxConcurrentDevServers × containerMemoryLimit` fits
-under the engine's total memory — the aggregate case `engineCapacity()`'s per-container clamp
-doesn't cover (each container individually valid, but three of them jointly overcommitting).
+**Resource limits**: requested `containerMemoryLimit`/`containerCpuLimit` in `~/.setu.json`
+(defaults `4g`/`2`) are clamped to engine capacity. Container admission shares the VM CPU
+budget and 90% of VM memory across running and starting containers; the remaining 10% is
+reserved for the engine. The configured concurrency cap still applies. Queue admission uses
+the limits assigned at launch; adopted containers reserve the VM until stopped because their
+original limits are unknown. `/api/status` reports effective and configured limits separately.
+Native sidecars remain outside container cgroups and are included in the footprint watchdog.
 
 **Compose project names are a hash of the exact `repo/name` registry key, not just a
 sanitized slug** (`composeProjectName()`, `lib.js`) — a lossy slug alone let two different,
@@ -192,25 +212,21 @@ project name, causing the second `up` to silently recreate (destroy) the first w
 container while the tracking layer kept reporting the first as running. Don't revert to a
 plain slug without re-solving this.
 
-**Concurrency**: dev servers share one cap (`maxConcurrentDevServers`) regardless of bare vs.
-container. `stopWorktree(repo, name, port, { drain: false })` exists specifically for a
-caller that stops a worktree only to immediately respawn the *same* one (the memory-ceiling
-restart path, tunnel enable/disable) — letting the default `drainQueue()` run in that gap
-used to let a queued worktree fill the freed slot right before the original was added back on
-top, silently exceeding the cap. Tunnel enable/disable also now resume a worktree in whatever
-mode it was actually running in (`respawnAsBefore()`) — it used to always resume bare, which
-silently stripped a containerized worktree's resource cap on every tunnel toggle.
+**Concurrency**: `worktree-lifecycle.js` owns admission, FIFO queueing, Stop and restart.
+Bare and container processes share `maxConcurrentDevServers`. Restart preserves its
+reservation until teardown is confirmed, then checks current capacity and launches with
+the admitted limits. Tunnel changes use the same owner and preserve the running mode;
+they cannot release a slot to another worktree and then silently overbook it.
 
 **Crash-loop / liveness**: `restart: on-failure:3` lets Docker's own OOM-kill+retry handle a
 container hitting its memory ceiling, capped so a limit that's genuinely too low doesn't
 crash-loop forever. `checkMemoryCeilings()`'s 60s interval separately notices a container
 that exhausted its retries and permanently gave up — nothing else does, since
 `docker compose up -d` itself exits successfully long before a crash-loop plays out, so the
-slot would otherwise stay occupied indefinitely. This requires **two consecutive** "not
-alive" readings (`deadContainerStrikes` in `portal.js`) before freeing the slot, not one — a
-single miss can be a transient window during a legitimate respawn (e.g. a tunnel toggle),
-not a genuinely dead container; freeing the slot on one miss risked losing tracking of a
-worktree that was actually fine a moment later.
+slot would otherwise stay occupied indefinitely. `worktree-lifecycle.js` requires **two
+consecutive confirmed-dead observations** (`record.deadObservations`) before freeing a
+container's slot. Failed or unavailable engine observations remain unknown and preserve
+the reservation. An attached Compose wrapper exiting is not proof its container exited.
 
 **`setu rm` on a container-backed worktree** also removes its `node_modules` volume (`down -v`,
 not just `down`) — a normal stop deliberately keeps the volume so the next start skips
@@ -225,7 +241,7 @@ would leak forever with nothing left pointing at it.
 - New branches fork from `origin/staging`.
 - `importRepo` (`lib.js`, `writeSetuAgentMarkers`) writes `.setu.json` + a `## Managed by Setu` AGENTS.md section into a brand-new project's `main` worktree — so an agent working in a *managed* project (quivly-app, etc.) knows Setu owns its dev servers/worktrees, without having to already know Setu exists. Project-level only (repo name, portal URL, CLI reference, install one-liner) — never a specific worktree's port/domain, since these files are meant to be committed once to the project's default branch and inherited by every future worktree via git; baking in one worktree's assigned port would be stale for the next. Non-destructive to an existing AGENTS.md (appends, idempotent — checks for the marker heading before writing again) and never auto-committed, only `git add`-staged: committing into a project this tool doesn't own is the user's call. Only runs on first registration (`setu init`/sweep `--import`), not on every subsequent `setu new` — once committed, later worktrees inherit the files via normal git checkout.
   - Don't confuse this with `~/.setu-costs.json` (`COSTS_CFG_PATH` in `lib.js`) below — same filename stem, opposite everything else: that one lives in `$HOME` (not a managed project's repo), is never written by this tool at all (the user hand-writes it), and is never committed anywhere.
-- `~/.setu-costs.json` (`COSTS_CFG_PATH`/`loadCostsConfig` in `lib.js`, consumed by `costs.js`) holds `anthropicAdminKey`/`openaiAdminKey` for the portal's `/api/costs` page — org-admin-scope credentials, a materially bigger blast radius than the rest of `~/.setu.json`, so they get their own file rather than a section of it. Read-only from this tool's side: nothing in `lib.js`/`portal.js` ever writes to it, and no route ever echoes its values back (the portal binds `0.0.0.0`, LAN-reachable — see the MCP server section above — so a key-echoing endpoint would be a real hole). The user writes it by hand. Either key falls back to `$ANTHROPIC_ADMIN_KEY`/`$OPENAI_ADMIN_KEY` if absent from the file — still same-machine/already-trusted, not a new input surface, since nothing ever reads a credential from the request itself. Optional `"budgets": {"daily": N, "weekly": N, "monthly": N}` (USD, any subset) drives the Costs page's budget bar — combined spend across whichever providers are actually configured, compared against each configured threshold; an unset period is simply omitted from `/api/costs`'s response, not defaulted.
+- `~/.setu-costs.json` (`COSTS_CFG_PATH`/`loadCostsConfig` in `lib.js`, consumed by `costs.js`) holds `anthropicAdminKey`/`openaiAdminKey` for the portal's `/api/costs` page — org-admin-scope credentials, a materially bigger blast radius than the rest of `~/.setu.json`, so they get their own file rather than a section of it. Read-only from this tool's side: nothing in `lib.js`/`portal.js` ever writes to it, and no route ever echoes its values back (the local portal never returns provider keys). The user writes it by hand. Either key falls back to `$ANTHROPIC_ADMIN_KEY`/`$OPENAI_ADMIN_KEY` if absent from the file — still same-machine/already-trusted, not a new input surface, since nothing ever reads a credential from the request itself. Optional `"budgets": {"daily": N, "weekly": N, "monthly": N}` (USD, any subset) drives the Costs page's budget bar — combined spend across whichever providers are actually configured, compared against each configured threshold; an unset period is simply omitted from `/api/costs`'s response, not defaulted.
   ```json
   {
     "anthropicAdminKey": "sk-ant-admin01-...",
@@ -242,3 +258,14 @@ would leak forever with nothing left pointing at it.
 - AI coding CLI registry: `AGENT_CLIS` in `lib.js` (tool-id → binary name), detected live via `which` — not a fixed list. Add a new tool by adding one entry there; no other file needs to change.
 - Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>,pr-review}.log`.
 - PR review (`pr-review.js`): Tier 1 is the existing "Local diff" section (`computeDiff`/`/api/diff`) — a worktree-branch-vs-base diff, not the actual GitHub PR diff, labeled accordingly. Tier 2 shells out to the installed `pr-walkthrough`/`pr-brief` Claude Code plugin headlessly (`claude -p`, `--permission-mode acceptEdits`, `--tools` dropping `Edit`, `--disallowedTools` denying GH/git write-shaped Bash commands as the primary guard — verified empirically, not assumed, see the plugin-marketplace plan). Reads `~/.local/share/pr-walkthrough/{reviews,briefs}/<owner>/<repo>/pr-<N>/latest.json` + that snapshot's `manifest.json` for status/artifacts, never the multi-MB `guide.json`/`brief.json` directly.
+
+## Verification and polling
+
+Run `bun run verify` after changing lifecycle, resource, access, or cost behavior. It runs
+the regression checks and type checks the Preact portal and React Raycast extension separately.
+`bun run check` retains the broader Ultracite style audit.
+
+Dirty counts are asynchronous metadata (`number | null`), refreshed at most once per 15 seconds
+with four Git checks in flight. `null` means unknown. Removal always runs a fresh Git status.
+Warm listener and branch reads return cached data during refresh. Preserve lsof output on exit 1:
+multiple port selectors can print valid listeners and still return a nonzero status.

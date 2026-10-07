@@ -11,7 +11,9 @@ type Input = WorktreeRef;
 export default async function tool(input: Input) {
   const res = await startWorktree(input.repo, input.name);
   if (res.ok === false) throw new Error(res.error ?? "Start failed");
-  return `Started ${input.repo}/${input.name}.`;
+  return res.queued
+    ? `Queued ${input.repo}/${input.name} at position ${res.position}.`
+    : `Starting ${input.repo}/${input.name}.`;
 }
 
 export const confirmation: Tool.Confirmation<Input> = async (input) => ({
