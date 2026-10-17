@@ -21,6 +21,7 @@
 import { commandExists, loadCostsConfig } from './lib.js';
 
 const WINDOW_DAYS = 30;
+const rfc3339MillisecondsPattern = /\.\d{3}Z$/;
 
 function round2(n) {
   return Math.round(n * 100) / 100;
@@ -30,7 +31,7 @@ function round2(n) {
 // ("2025-01-08T00:00:00Z") exactly rather than trusting a picky parser to
 // accept toISOString()'s milliseconds.
 function rfc3339(d) {
-  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return d.toISOString().replace(rfc3339MillisecondsPattern, 'Z');
 }
 
 export async function fetchAllPages(
@@ -48,6 +49,7 @@ export async function fetchAllPages(
     if (page) {
       p.set('page', page);
     }
+    // biome-ignore lint/performance/noAwaitInLoops: Each pagination request requires the prior response's opaque next_page token.
     const res = await request(`${baseUrl}?${p.toString()}`, {
       headers,
       signal,
@@ -221,6 +223,16 @@ function budgetStatus(spent, limit) {
   return 'ok';
 }
 
+function periodStatus(spent, limit, incomplete) {
+  if (!Number.isFinite(spent)) {
+    return 'incomplete';
+  }
+  if (spent >= limit) {
+    return 'over';
+  }
+  return incomplete ? 'incomplete' : budgetStatus(spent, limit);
+}
+
 export function computeBudgets(cfg, providers) {
   const b = cfg.budgets;
   if (!b) {
@@ -259,13 +271,7 @@ export function computeBudgets(cfg, providers) {
       incomplete,
       limit,
       spent: s,
-      status: Number.isFinite(s)
-        ? s >= limit
-          ? 'over'
-          : incomplete
-            ? 'incomplete'
-            : budgetStatus(s, limit)
-        : 'incomplete',
+      status: periodStatus(s, limit, incomplete),
     };
   }
   return Object.keys(out).length ? out : null;

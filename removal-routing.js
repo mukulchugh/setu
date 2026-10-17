@@ -76,6 +76,7 @@ export function claimTunnelOwner(key, { serialize, routes, release }, claim) {
       if (previous === key) {
         continue;
       }
+      // biome-ignore lint/performance/noAwaitInLoops: Shared-tunnel eviction is ordered; a failed earlier release must prevent later route mutations.
       const result = await release(previous, route);
       if (!result.ok) {
         return result;

@@ -218,6 +218,7 @@ test('native hook ids require a trusted mapping and never trust wrong checkout o
     ['ended', '/worktree'],
     ['unknown', '/worktree'],
   ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each attention update must settle before the next request mutates the shared attention journal.
     await expect(
       attention.receive({
         payload: { cwd, hook_event_name: 'Stop', session_id: sessionId },
@@ -332,6 +333,7 @@ test('return to terminal focuses a proven running session once and never launche
   const focused = [];
   const attention = createTerminalAttention({
     launcher: {
+      // biome-ignore lint/suspicious/useAwait: Focus fixtures preserve the asynchronous native terminal contract.
       focus: async ({ checkoutIdentity, sessionId }) => {
         focused.push(sessionId);
         return { checkoutIdentity, ok: true, sessionId };
@@ -339,17 +341,20 @@ test('return to terminal focuses a proven running session once and never launche
     },
     now: () => 1,
     sessions: {
-      get: (id) =>
-        id === 'active'
-          ? {
-              checkoutIdentity: 'checkout-1',
-              id,
-              ownership: 'owned',
-              state: 'running',
-            }
-          : id === 'unknown'
-            ? { id, ownership: 'unknown', state: 'unknown' }
-            : null,
+      get: (id) => {
+        if (id === 'active') {
+          return {
+            checkoutIdentity: 'checkout-1',
+            id,
+            ownership: 'owned',
+            state: 'running',
+          };
+        }
+        if (id === 'unknown') {
+          return { id, ownership: 'unknown', state: 'unknown' };
+        }
+        return null;
+      },
       list: () => [],
     },
     state: fixture.state,

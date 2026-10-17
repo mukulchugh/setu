@@ -9,6 +9,10 @@ const pending = (code, error, port) => ({
   recovery: 'Retry this adoption with the same repo, name, and checkout path.',
 });
 
+function errorMessage(error, fallback) {
+  return error?.message ?? fallback;
+}
+
 function validRecord(record, repo, name) {
   return (
     record &&
@@ -68,7 +72,7 @@ export function createWorktreeAdoption({
     return { identity };
   }
 
-  async function adoptLocked(target) {
+  async function adoptionState(target) {
     let records;
     try {
       records = await readRecords();
@@ -77,97 +81,122 @@ export function createWorktreeAdoption({
       }
     } catch {
       return {
-        code: 'ADOPTION_STATE_UNREADABLE',
-        error: 'Adoption recovery state could not be read',
-        ok: false,
+        result: {
+          code: 'ADOPTION_STATE_UNREADABLE',
+          error: 'Adoption recovery state could not be read',
+          ok: false,
+        },
       };
     }
     const key = `${target.repo}/${target.name}`;
     const existing = records[key];
     if (existing && !validRecord(existing, target.repo, target.name)) {
       return {
-        code: 'ADOPTION_STATE_UNREADABLE',
-        error: 'Adoption recovery state is invalid',
-        ok: false,
+        result: {
+          code: 'ADOPTION_STATE_UNREADABLE',
+          error: 'Adoption recovery state is invalid',
+          ok: false,
+        },
       };
     }
-    let port = registeredPort(target.repo, target.name);
+    const port = registeredPort(target.repo, target.name);
     if (port !== null && !existing) {
       return {
-        code: 'WORKTREE_ALREADY_REGISTERED',
-        error: `Worktree ${target.repo}/${target.name} is already registered with Setu`,
-        ok: false,
+        result: {
+          code: 'WORKTREE_ALREADY_REGISTERED',
+          error: `Worktree ${target.repo}/${target.name} is already registered with Setu`,
+          ok: false,
+        },
       };
     }
+    return { existing, key, port, records };
+  }
 
-    const first = await verify(target, existing?.identity);
-    if (first.result) {
-      return first.result;
+  async function register(target, state) {
+    const first = await verify(target, state.existing?.identity);
+    if (Object.hasOwn(first, 'result')) {
+      return first;
     }
-    if (!existing) {
-      records[key] = {
+    if (!state.existing) {
+      state.records[state.key] = {
         identity: first.identity,
         name: target.name,
         repo: target.repo,
         version: 1,
       };
-      await writeRecords(records);
+      await writeRecords(state.records);
     }
-
-    // Registration publication is the point of no return. Observe again so a
-    // replacement checkout cannot inherit a port intended for its predecessor.
-    const beforeRegistration = await verify(target, records[key].identity);
-    if (beforeRegistration.result) {
-      return beforeRegistration.result;
+    const verified = await verify(target, state.records[state.key].identity);
+    if (Object.hasOwn(verified, 'result')) {
+      return verified;
     }
+    let { port } = state;
     if (port === null) {
       try {
         port = await assignPort(target.repo, target.name);
       } catch (error) {
-        return pending(
-          'ADOPTION_REGISTRATION_PENDING',
-          error?.message ?? 'Worktree registration could not be completed',
-          null
-        );
+        return {
+          result: pending(
+            'ADOPTION_REGISTRATION_PENDING',
+            errorMessage(error, 'Worktree registration could not be completed'),
+            null
+          ),
+        };
       }
     }
-    if (registeredPort(target.repo, target.name) !== port) {
+    return { identity: verified.identity, port };
+  }
+
+  async function adoptLocked(target) {
+    const state = await adoptionState(target);
+    if (Object.hasOwn(state, 'result')) {
+      return state.result;
+    }
+    // Registration publication is the point of no return. Observe again so a
+    // replacement checkout cannot inherit a port intended for its predecessor.
+    const registered = await register(target, state);
+    if (Object.hasOwn(registered, 'result')) {
+      return registered.result;
+    }
+
+    if (registeredPort(target.repo, target.name) !== registered.port) {
       return pending(
         'ADOPTION_REGISTRATION_CHANGED',
         'Worktree registration changed before routing could be applied',
-        port
+        registered.port
       );
     }
 
     let routing;
     try {
-      routing = await writeRouting(target.repo, target.name, port);
+      routing = await writeRouting(target.repo, target.name, registered.port);
     } catch (error) {
       return pending(
         'ADOPTION_ROUTING_PENDING',
-        error?.message ?? 'Worktree was registered but routing is pending',
-        port
+        errorMessage(error, 'Worktree was registered but routing is pending'),
+        registered.port
       );
     }
     if (!routing?.ok) {
       return pending(
         routing?.code ?? 'ADOPTION_ROUTING_PENDING',
         routing?.error ?? 'Worktree was registered but routing is pending',
-        port
+        registered.port
       );
     }
-    delete records[key];
-    await writeRecords(records);
+    delete state.records[state.key];
+    await writeRecords(state.records);
     return {
       name: target.name,
       ok: true,
-      path: beforeRegistration.identity.checkoutPath,
-      port,
+      path: registered.identity.checkoutPath,
+      port: registered.port,
       repo: target.repo,
     };
   }
 
   return {
+    // biome-ignore lint/suspicious/useAwait: Target validation can throw synchronously; adoption callers require a rejected Promise from this public boundary.
     async adopt({ name, path, repo }) {
       let target;
       try {

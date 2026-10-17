@@ -134,15 +134,21 @@ export function createSetupProgress({ state, now, newAttemptId }) {
     return result;
   }
 
-  function inputIsValid({ target, checkoutIdentity, logLocation, stage }) {
+  function inputIsValid({
+    target,
+    checkoutIdentity,
+    logLocation,
+    stage: currentStage,
+  }) {
     return (
       validTarget(target) &&
       validIdentity(checkoutIdentity) &&
       validText(logLocation) &&
-      validText(stage)
+      validText(currentStage)
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: The public progress API must reject synchronous state failures consistently with its Promise-returning callers.
   async function start(input) {
     if (!inputIsValid(input)) {
       return refusal(
@@ -182,6 +188,7 @@ export function createSetupProgress({ state, now, newAttemptId }) {
     });
   }
 
+  // biome-ignore lint/suspicious/useAwait: The public progress API must reject synchronous state failures consistently with its Promise-returning callers.
   async function stage({
     target,
     checkoutIdentity,
@@ -236,6 +243,7 @@ export function createSetupProgress({ state, now, newAttemptId }) {
     });
   }
 
+  // biome-ignore lint/suspicious/useAwait: The public progress API must reject synchronous state failures consistently with its Promise-returning callers.
   async function finish({ target, checkoutIdentity, attemptId, outcome }) {
     if (
       !(
@@ -330,6 +338,7 @@ export function createSetupProgress({ state, now, newAttemptId }) {
     return { ok: true, recovered };
   }
 
+  // biome-ignore lint/suspicious/useAwait: The public progress API must reject synchronous state failures consistently with its Promise-returning callers.
   async function retry(input) {
     if (!inputIsValid(input)) {
       return refusal(

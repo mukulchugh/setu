@@ -3,6 +3,7 @@ import { observeProcessIdentity } from './process-observation.js';
 
 const positiveInteger = (value) => Number.isSafeInteger(value) && value > 0;
 const processParent = (value) => Number.isSafeInteger(value) && value >= 0;
+const processColumnsPattern = /\s+/;
 
 const readPs = () =>
   new Promise((resolve, reject) => {
@@ -30,7 +31,7 @@ export async function readProcessTable({ run = readPs } = {}) {
     }
     const [pid, parentPid, groupId, ...extra] = line
       .trim()
-      .split(/\s+/)
+      .split(processColumnsPattern)
       .map(Number);
     if (
       extra.length ||
@@ -126,6 +127,7 @@ export async function findProcessChildren(
   for (const candidate of candidates) {
     let child;
     try {
+      // biome-ignore lint/performance/noAwaitInLoops: Each current process identity and parent proof must be established before returning any owned child.
       child = await observeProcess(candidate.pid);
     } catch {
       return { state: 'unknown' };

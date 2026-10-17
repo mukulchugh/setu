@@ -26,6 +26,19 @@ test('filesystem causes preserve ENOSPC but exclude arbitrary exception data', (
 
 const roots = [];
 const children = [];
+const targetLockPattern = /^\.setu-target-/;
+
+function asPromise(callback) {
+  try {
+    return Promise.resolve(callback());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function permissionMode(mode) {
+  return mode % 0o1000;
+}
 function fixture(overrides = {}) {
   const root = fs.mkdtempSync(join(tmpdir(), 'setu-state-test-'));
   roots.push(root);
@@ -44,6 +57,7 @@ afterEach(async () => {
     if (child.exitCode === null) {
       child.kill();
     }
+    // biome-ignore lint/performance/noAwaitInLoops: Reap each fixture child before advancing teardown and removing their shared roots.
     await closed;
   }
   for (const root of roots.splice(0)) {
@@ -234,7 +248,7 @@ test('short writes publish a complete validated file with unknown fields and per
   });
   expect(JSON.parse(fs.readFileSync(path, 'utf8'))).toEqual(result.value);
   const after = fs.statSync(path);
-  expect([after.mode & 0o777, after.uid, after.gid]).toEqual([
+  expect([permissionMode(after.mode), after.uid, after.gid]).toEqual([
     0o640,
     before.uid,
     before.gid,
@@ -247,7 +261,7 @@ test('private creation and token replacement apply 0600 before rename', async ()
     fs: {
       ...fs,
       renameSync(from, to) {
-        seen.push(fs.statSync(from).mode & 0o777);
+        seen.push(permissionMode(fs.statSync(from).mode));
         fs.renameSync(from, to);
       },
     },
@@ -335,6 +349,16 @@ test('whole-workspace aliases use one identity; partial sharing of coupled regis
   expect(fs.existsSync(join(other.root, 'sidecars.json'))).toBe(false);
 });
 
+test('generated output preserves existing permissions when mode is null', async () => {
+  const { root, store } = fixture();
+  const generated = join(root, '.envrc');
+  fs.writeFileSync(generated, 'before');
+  fs.chmodSync(generated, 0o640);
+  await store.replaceText(generated, 'after', { mode: null });
+  expect(fs.readFileSync(generated, 'utf8')).toBe('after');
+  expect(permissionMode(fs.statSync(generated).mode)).toBe(0o640);
+});
+
 test('generated output rejects symlinks and never changes shared input', async () => {
   const { root, store } = fixture();
   const secret = join(root, '.env.local'),
@@ -354,8 +378,9 @@ test('five-second lock deadline is monotonic for unreadable locks and dead owner
   let elapsed = 0;
   const { root, store } = fixture({
     now: () => elapsed,
-    sleep: async (ms) => {
+    sleep: (ms) => {
       elapsed += ms;
+      return Promise.resolve();
     },
   });
   const lock = join(root, 'config.json.setu-lock');
@@ -408,19 +433,21 @@ test('a deliberately retained target lease is never reclaimed and inspection rep
   );
   fs.writeFileSync(
     path,
-    JSON.stringify({ nonce: 'retained', pid: 99999999, retained: true })
+    JSON.stringify({ nonce: 'retained', pid: 99_999_999, retained: true })
   );
   const sameTarget = { name: 'topic', repo: 'repo' };
-  await expect(store.withTargets([sameTarget], () => {})).rejects.toMatchObject(
-    {
-      code: 'STATE_BUSY',
-    }
-  );
+  await expect(
+    store.withTargets([sameTarget], () => {
+      /* The retained lock must refuse before invoking this task. */
+    })
+  ).rejects.toMatchObject({
+    code: 'STATE_BUSY',
+  });
   expect(store.inspectLocks()).toContainEqual({
     alive: false,
     kind: 'target',
     path: path.replace(fs.realpathSync(root), root),
-    pid: 99999999,
+    pid: 99_999_999,
     retained: true,
   });
   releaseHeldLocks();
@@ -625,6 +652,7 @@ test('an independent reader sees complete old or new content during repeated pub
   const reader = writer(root, 'reader');
   await reader.wait('ready');
   for (let i = 0; i < 12; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: The reader must observe a sequence of committed replacements, not competing writes.
     await store.replace('config', { version: 'old' });
   }
   await store.replace('config', {
@@ -652,11 +680,12 @@ test('a symlink changed while waiting for its destination lock is rejected after
   fs.writeFileSync(lock, 'another writer');
   const store = createWorkspaceState({
     configPath: alias,
-    sleep: async () => {
-      fs.unlinkSync(alias);
-      fs.symlinkSync(other, alias);
-      fs.unlinkSync(lock);
-    },
+    sleep: () =>
+      asPromise(() => {
+        fs.unlinkSync(alias);
+        fs.symlinkSync(other, alias);
+        fs.unlinkSync(lock);
+      }),
   });
   await expect(store.update('config', () => ({}))).rejects.toMatchObject({
     code: 'STATE_UNREADABLE',
@@ -687,7 +716,9 @@ test('unsupported ownership transfer refuses publication without loosening desti
     store.update('config', () => ({ change: true }))
   ).rejects.toMatchObject({ code: 'STATE_WRITE_FAILED', phase: 'ownership' });
   expect(fs.readFileSync(join(root, 'config.json'), 'utf8')).toBe('{}');
-  expect(fs.statSync(join(root, 'config.json')).mode & 0o777).toBe(0o600);
+  expect(permissionMode(fs.statSync(join(root, 'config.json')).mode)).toBe(
+    0o600
+  );
 });
 
 test('invalid or duplicate registries fail closed and slash branches round-trip', async () => {
@@ -702,6 +733,7 @@ test('invalid or duplicate registries fail closed and slash branches round-trip'
     expect(() => store.read('ports')).toThrow(
       expect.objectContaining({ code: 'STATE_CORRUPT' })
     );
+    // biome-ignore lint/performance/noAwaitInLoops: Each refusal must finish before the next malformed value replaces this same fixture file.
     await expect(store.replace('ports', [])).rejects.toMatchObject({
       code: 'STATE_CORRUPT',
     });
@@ -726,7 +758,7 @@ test('target scopes canonicalize whole-root aliases, reject checkout aliases and
   const linked = createWorkspaceState({ setuDir: root, workspaceRoot: alias });
   let key;
   await store.withTargets([{ name: 'feat/a', repo: 'r' }], async (targets) => {
-    key = targets[0];
+    [key] = targets;
     await store.withTargets([{ name: 'feat/a', repo: 'r' }], (same) => {
       expect(same).toEqual(targets);
     });
@@ -760,8 +792,9 @@ test('unknown child completion retains target leases while short routing and met
   let time = 0;
   const { root, store } = fixture({
     now: () => time,
-    sleep: async (ms) => {
+    sleep: (ms) => {
       time += ms;
+      return Promise.resolve();
     },
   });
   const target = { name: 'branch', repo: 'repo' };
@@ -780,7 +813,7 @@ test('unknown child completion retains target leases while short routing and met
     .readdirSync(root)
     .filter((name) => name.endsWith('.lock') || name.endsWith('.setu-lock'));
   expect(locks.length).toBe(1);
-  expect(locks[0]).toMatch(/^\.setu-target-/);
+  expect(locks[0]).toMatch(targetLockPattern);
   expect(JSON.parse(fs.readFileSync(join(root, locks[0]), 'utf8')).pid).toBe(
     process.pid
   );
@@ -790,4 +823,63 @@ test('unknown child completion retains target leases while short routing and met
   expect(
     (await store.update('sidecars', () => ({ separate: [] }))).reconciled
   ).toBe(true);
+});
+
+test('root and serialization refusals retain their existing sanitized error shape', async () => {
+  const denied = fixture({
+    fs: {
+      ...fs,
+      realpathSync() {
+        throw Object.assign(new Error('private path'), { code: 'EACCES' });
+      },
+    },
+  });
+  const rootFailure = await denied.store
+    .withWorkspace([], () => {
+      throw new Error('unreachable: root validation must refuse first');
+    })
+    .catch((error) => error);
+  expect(rootFailure).toMatchObject({
+    code: 'STATE_UNREADABLE',
+    phase: 'root',
+  });
+  expect(rootFailure).not.toHaveProperty('causeCode');
+  expect(rootFailure).not.toHaveProperty('cause');
+
+  const { store } = fixture();
+  const invalid = {
+    toJSON() {
+      throw Object.assign(new Error('private value'), { code: 'EIO' });
+    },
+  };
+  const serializationFailure = await store
+    .update('config', () => invalid)
+    .catch((error) => error);
+  expect(serializationFailure).toMatchObject({
+    code: 'STATE_CORRUPT',
+    phase: 'validate',
+  });
+  expect(serializationFailure).not.toHaveProperty('causeCode');
+  expect(serializationFailure).not.toHaveProperty('cause');
+});
+
+test('new lock ownership is published before yielding after exclusive open', async () => {
+  const observations = [];
+  const { store } = fixture({
+    fs: {
+      ...fs,
+      openSync(path, flags, mode) {
+        const fd = fs.openSync(path, flags, mode);
+        if (flags === 'wx' && path.endsWith('.setu-lock')) {
+          queueMicrotask(() =>
+            observations.push(fs.readFileSync(path, 'utf8'))
+          );
+        }
+        return fd;
+      },
+    },
+  });
+  await store.update('config', () => ({ published: true }));
+  expect(observations).toHaveLength(1);
+  expect(JSON.parse(observations[0])).toMatchObject({ pid: process.pid });
 });

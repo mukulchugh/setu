@@ -93,13 +93,8 @@ export function createReviewHandoff({
       ? maxChars
       : DEFAULT_MAX_CHARS;
 
-  async function send({
-    target,
-    checkoutIdentity,
-    artifact,
-    findings,
-    sessionId,
-  }) {
+  const refusal = (code, error) => ({ code, error, ok: false });
+  const validInput = ({ artifact, checkoutIdentity, findings, target }) => {
     if (
       !(
         target?.repo &&
@@ -111,52 +106,40 @@ export function createReviewHandoff({
       findings.length === 0 ||
       findings.some((finding) => !finding || typeof finding !== 'object')
     ) {
-      return {
-        code: 'HANDOFF_INVALID',
-        error:
-          'A target, checkout identity, artifact and selected finding are required',
-        ok: false,
-      };
+      return refusal(
+        'HANDOFF_INVALID',
+        'A target, checkout identity, artifact and selected finding are required'
+      );
     }
-    if (!(typeof sessionId === 'string' && sessionId)) {
-      return {
-        code: 'SESSION_SELECTION_REQUIRED',
-        error: 'Select the exact terminal session for this handoff',
-        ok: false,
-      };
-    }
-    if (
-      artifact.checkoutIdentity !== undefined &&
-      !sameIdentity(artifact.checkoutIdentity, checkoutIdentity)
-    ) {
-      return {
-        code: 'CHECKOUT_IDENTITY_MISMATCH',
-        error: 'The review artifact does not match this checkout',
-        ok: false,
-      };
-    }
+    return null;
+  };
+
+  const sessionFor = (sessionId, target, checkoutIdentity) => {
     const session = sessions.get(sessionId);
     if (!session) {
       return {
-        code: 'SESSION_NOT_FOUND',
-        error: 'The selected terminal session does not exist',
-        ok: false,
+        failure: refusal(
+          'SESSION_NOT_FOUND',
+          'The selected terminal session does not exist'
+        ),
       };
     }
-    if (!matchesSession(session, sessionId, target, checkoutIdentity)) {
-      return {
-        code: 'NO_OWNED_SESSION',
-        error:
-          'The selected terminal session is not an owned running session for this worktree',
-        ok: false,
-      };
-    }
+    return matchesSession(session, sessionId, target, checkoutIdentity)
+      ? { session }
+      : {
+          failure: refusal(
+            'NO_OWNED_SESSION',
+            'The selected terminal session is not an owned running session for this worktree'
+          ),
+        };
+  };
+
+  const verifySelectedSession = async (sessionId, target, checkoutIdentity) => {
     if (typeof verifySession !== 'function') {
-      return {
-        code: 'SESSION_VERIFICATION_UNAVAILABLE',
-        error: 'The terminal session cannot be reconciled before delivery',
-        ok: false,
-      };
+      return refusal(
+        'SESSION_VERIFICATION_UNAVAILABLE',
+        'The terminal session cannot be reconciled before delivery'
+      );
     }
     let verified;
     try {
@@ -165,17 +148,59 @@ export function createReviewHandoff({
       verified = null;
     }
     if (
-      !(
-        verified?.ok &&
-        matchesSession(verified.session, sessionId, target, checkoutIdentity)
-      )
+      verified?.ok &&
+      matchesSession(verified.session, sessionId, target, checkoutIdentity)
     ) {
-      return {
-        code: 'SESSION_OWNERSHIP_UNKNOWN',
-        error:
-          'Terminal session ownership could not be verified before delivery',
-        ok: false,
-      };
+      return null;
+    }
+    return refusal(
+      'SESSION_OWNERSHIP_UNKNOWN',
+      'Terminal session ownership could not be verified before delivery'
+    );
+  };
+
+  async function send({
+    target,
+    checkoutIdentity,
+    artifact,
+    findings,
+    sessionId,
+  }) {
+    const inputFailure = validInput({
+      artifact,
+      checkoutIdentity,
+      findings,
+      target,
+    });
+    if (inputFailure) {
+      return inputFailure;
+    }
+    if (!(typeof sessionId === 'string' && sessionId)) {
+      return refusal(
+        'SESSION_SELECTION_REQUIRED',
+        'Select the exact terminal session for this handoff'
+      );
+    }
+    if (
+      artifact.checkoutIdentity !== undefined &&
+      !sameIdentity(artifact.checkoutIdentity, checkoutIdentity)
+    ) {
+      return refusal(
+        'CHECKOUT_IDENTITY_MISMATCH',
+        'The review artifact does not match this checkout'
+      );
+    }
+    const selected = sessionFor(sessionId, target, checkoutIdentity);
+    if ('failure' in selected) {
+      return selected.failure;
+    }
+    const verificationFailure = await verifySelectedSession(
+      sessionId,
+      target,
+      checkoutIdentity
+    );
+    if (verificationFailure) {
+      return verificationFailure;
     }
     if (typeof deliver !== 'function') {
       return {

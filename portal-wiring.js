@@ -17,6 +17,19 @@ function filterTarget(records, repo, name) {
   );
 }
 
+function outcomeState(result) {
+  if (result?.state === 'unknown' || result?.code?.includes('UNKNOWN')) {
+    return 'unknown';
+  }
+  if (result?.queued) {
+    return 'queued';
+  }
+  if (['starting', 'running', 'accepted'].includes(result?.state)) {
+    return 'accepted';
+  }
+  return result?.ok === false ? 'failed' : 'completed';
+}
+
 // Portal composition only. Runtime modules remain independent factories; this
 // adapter gives HTTP and MCP one target-validation and outcome-recording path.
 export function createPortalWiring({
@@ -55,16 +68,7 @@ export function createPortalWiring({
     if (!events?.record) {
       return { operationId: id, outcomeRecorded: false };
     }
-    const state =
-      result?.state === 'unknown' || result?.code?.includes('UNKNOWN')
-        ? 'unknown'
-        : result?.queued
-          ? 'queued'
-          : ['starting', 'running', 'accepted'].includes(result?.state)
-            ? 'accepted'
-            : result?.ok === false
-              ? 'failed'
-              : 'completed';
+    const state = outcomeState(result);
     const persisted = await events.record({
       ...(result?.code ? { code: result.code } : {}),
       at: now(),

@@ -31,8 +31,8 @@ export async function assertStorageHeadroom(
         `Workspace storage is critically low (${(health.availableBytes / 1024 ** 3).toFixed(2)} GiB free; at least 10 GiB required). New disk-heavy work was not started; Stop and removal remain available.`
       ),
       {
-        code: 'STORAGE_LOW',
         availableBytes: health.availableBytes,
+        code: 'STORAGE_LOW',
         minimumAvailableBytes: MINIMUM_BYTES,
       }
     );
@@ -126,6 +126,6 @@ export function createHostHealth(
         cancel(timeout);
         pending = null;
       });
-    return pending;
+    return await pending;
   };
 }

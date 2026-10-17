@@ -13,6 +13,7 @@ const initial: ResourceValues = {
 };
 const tick = async () => {
   for (let i = 0; i < 8; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Successive microtasks drain serialized writes and readbacks before assertions.
     await Promise.resolve();
   }
 };
@@ -59,6 +60,7 @@ test('failure keeps draft; confirmed durability warning reconciles effective val
       /* No side effect is needed in this fixture. */
     },
     read: async () => ({ ...initial, containerCpuLimit: 3 }),
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes the captured ok flag between failed and successful saves.
     write: async () => ({ ok, warning: ok ? {} : undefined }),
   });
   controller.edit('containerCpuLimit', '4');
@@ -103,6 +105,7 @@ test('uncertain writes stop queued intent; the first Retry only reconciles', asy
     publish() {
       /* No side effect is needed in this fixture. */
     },
+    // biome-ignore lint/suspicious/useAwait: The config reader fixture preserves the asynchronous collaborator contract.
     read: async () => {
       reads += 1;
       return initial;

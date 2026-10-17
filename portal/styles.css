@@ -34,6 +34,22 @@
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
+input,
+textarea {
+  caret-color: var(--color-accent);
+}
+.dark input,
+.dark textarea {
+  caret-color: #77e3b0;
+}
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
 /* Labels, status text, badges — uppercase/tracked system sans. The original
    pass paired uppercase+tracking with a mono font, which read as industrial
    signage rather than modern SaaS (confirmed head-to-head, see memory:
@@ -136,11 +152,11 @@
   position: relative;
 }
 .tip::after {
-  display: none;
   position: absolute;
   bottom: calc(100% + 6px);
   left: 50%;
   z-index: 100;
+  display: none;
   padding: 3px 8px;
   font-family: -apple-system, sans-serif;
   font-size: 11px;
@@ -278,17 +294,14 @@
 }
 
 .dark {
-  color-scheme: dark;
   --focus-color: #77e3b0;
   --color-signal-green: #70dda8;
   --color-signal-amber: #fac46a;
   --color-signal-red: #ff9a8c;
+  color-scheme: dark;
 }
 .section-anchor {
   scroll-margin-top: calc(var(--portal-status-height, 0px) + 1rem);
-}
-.worktree-actions button {
-  font-size: 0.75rem;
 }
 .wt-card .board-mono {
   font-size: 0.6875rem;
@@ -435,6 +448,10 @@
   }
 }
 
+.worktree-actions button {
+  font-size: 0.75rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -461,21 +478,6 @@ body {
 ::selection {
   color: #fff;
   background: #085041;
-}
-input,
-textarea {
-  caret-color: var(--color-accent);
-}
-.dark input,
-.dark textarea {
-  caret-color: #77e3b0;
-}
-button,
-a,
-input,
-select,
-textarea {
-  -webkit-tap-highlight-color: transparent;
 }
 .portal-status {
   font-variant-numeric: tabular-nums;
@@ -538,12 +540,12 @@ textarea {
 }
 .skip-link {
   position: fixed;
-  left: 1rem;
   top: 0.5rem;
+  left: 1rem;
   z-index: 100;
   padding: 0.75rem 1rem;
-  background: #085041;
   color: white;
+  background: #085041;
   transform: translateY(-200%);
 }
 .skip-link:focus {
@@ -560,8 +562,8 @@ textarea {
 .page-toolbar {
   display: flex;
   flex-wrap: wrap;
-  align-items: end;
   gap: 0.75rem;
+  align-items: end;
   margin-bottom: 1rem;
 }
 .page-toolbar > label {
@@ -578,21 +580,21 @@ textarea {
 .read-notice {
   padding: 0.75rem 1rem;
   margin-bottom: 1rem;
-  border: 1px solid #c9822540;
-  background: #fff5dcaa;
-  color: #744508;
   font-size: 0.875rem;
   line-height: 1.5;
+  color: #744508;
+  background: #fff5dcaa;
+  border: 1px solid #c9822540;
 }
 .dark .read-notice {
+  color: #fde4b2;
   background: #783e0c30;
   border-color: #fbbf2460;
-  color: #fde4b2;
 }
 .log-viewer {
   min-height: 0;
-  tab-size: 2;
   font-variant-numeric: tabular-nums;
+  tab-size: 2;
 }
 @media (max-width: 767px) {
   .section-navigation a {

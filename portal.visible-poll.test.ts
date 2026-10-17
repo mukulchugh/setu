@@ -24,7 +24,6 @@ function fixture(
     cancel: (key) => timers.delete(key),
     immediate,
     intervalMs,
-    refreshOnVisible,
     onVisibility(cb) {
       listener = cb;
       return () => {
@@ -41,6 +40,7 @@ function fixture(
           signal,
         })
       ),
+    refreshOnVisible,
     reject: () => {
       const previous = failures;
       failures += 1;
@@ -156,7 +156,7 @@ describe('visible read lifecycle', () => {
     expect(f.values).toEqual(['kept']);
     expect(f.timers.size).toBe(0);
   });
-  test('rotations wait a full interval at mount and resume and stay idle while hidden', async () => {
+  test('rotations wait a full interval at mount and resume and stay idle while hidden', () => {
     const f = fixture(false);
     expect(f.reads).toHaveLength(0);
     f.visibility(false);

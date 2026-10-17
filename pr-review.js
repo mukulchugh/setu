@@ -54,13 +54,16 @@ export function detectPrWalkthroughPlugin(wtDir) {
 
 const SKILL_DIR = { 'pr-brief': 'briefs', 'pr-walkthrough': 'reviews' };
 const DATA_ROOT = `${HOME}/.local/share/pr-walkthrough`;
+const plainPathSegmentPattern = /^[^/\\]+$/;
+const unsafeShellPattern = /[;&|`$<>\\'"\n\r]/;
+const whitespacePattern = /\s+/;
 
 function plainPathSegment(value) {
   return (
     typeof value === 'string' &&
     value !== '.' &&
     value !== '..' &&
-    /^[^/\\]+$/.test(value)
+    plainPathSegmentPattern.test(value)
   );
 }
 
@@ -152,70 +155,94 @@ export function reviewRunStatus(repo, name) {
 // it is the primary Bash guard, not permission mode or the plugin hook.
 const REVIEW_GUARD = new URL('./pr-review-guard.js', import.meta.url).pathname;
 
+const reviewGitFlags = {
+  diff: new Set([
+    '--cached',
+    '--stat',
+    '--name-only',
+    '--name-status',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--',
+  ]),
+  log: new Set(['--oneline', '--decorate', '--']),
+  'ls-files': new Set(['--cached', '--others', '--exclude-standard', '--']),
+  'rev-parse': new Set(['--verify', '--quiet']),
+  show: new Set([
+    '--stat',
+    '--name-only',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--',
+  ]),
+  status: new Set([
+    '--porcelain',
+    '--short',
+    '--untracked-files=no',
+    '--untracked-files=normal',
+    '--untracked-files=all',
+  ]),
+};
+
+const flagsOnly = (values, allowed) =>
+  values.every((word) => !word.startsWith('-') || allowed.has(word));
+
+function gitReviewAllowed(words) {
+  const [, command] = words;
+  const allowed = reviewGitFlags[command];
+  if (!allowed) {
+    return (
+      words.length === 3 &&
+      command === 'branch' &&
+      words[2] === '--show-current'
+    );
+  }
+  const values = words.slice(2);
+  if (!flagsOnly(values, allowed)) {
+    return false;
+  }
+  const separator = values.indexOf('--');
+  const options = separator < 0 ? values : values.slice(0, separator);
+  return (
+    !['diff', 'show'].includes(command) ||
+    (options.includes('--no-ext-diff') && options.includes('--no-textconv'))
+  );
+}
+
+function ghReviewAllowed(words) {
+  return (
+    words[1] === 'pr' &&
+    ['view', 'diff', 'checks'].includes(words[2]) &&
+    flagsOnly(words.slice(3), new Set(['--json', '--jq', '--repo']))
+  );
+}
+
+async function confirmedReviewExit(proc, unknownExit) {
+  try {
+    const exitCode = await proc?.exited;
+    if (Number.isInteger(exitCode) && exitCode >= 0) {
+      return exitCode;
+    }
+  } catch {
+    // Process failure is intentionally reduced to the existing unknown-exit result.
+  }
+  throw unknownExit();
+}
+
 export function reviewBashAllowed(command) {
   if (
     typeof command !== 'string' ||
     !command.trim() ||
-    /[;&|`$<>\\'"\n\r]/.test(command)
+    unsafeShellPattern.test(command)
   ) {
     return false;
   }
-  const words = command.trim().split(/\s+/);
-  const flagsOnly = (values, allowed) =>
-    values.every((word) => !word.startsWith('-') || allowed.has(word));
+  const words = command.trim().split(whitespacePattern);
   if (words[0] === 'git') {
-    const flags = {
-      diff: new Set([
-        '--cached',
-        '--stat',
-        '--name-only',
-        '--name-status',
-        '--no-ext-diff',
-        '--no-textconv',
-        '--',
-      ]),
-      log: new Set(['--oneline', '--decorate', '--']),
-      'ls-files': new Set(['--cached', '--others', '--exclude-standard', '--']),
-      'rev-parse': new Set(['--verify', '--quiet']),
-      show: new Set([
-        '--stat',
-        '--name-only',
-        '--no-ext-diff',
-        '--no-textconv',
-        '--',
-      ]),
-      status: new Set([
-        '--porcelain',
-        '--short',
-        '--untracked-files=no',
-        '--untracked-files=normal',
-        '--untracked-files=all',
-      ]),
-    };
-    if (flags[words[1]]) {
-      const values = words.slice(2);
-      if (!flagsOnly(values, flags[words[1]])) {
-        return false;
-      }
-      const separator = values.indexOf('--');
-      const options = separator < 0 ? values : values.slice(0, separator);
-      return (
-        !['diff', 'show'].includes(words[1]) ||
-        (options.includes('--no-ext-diff') && options.includes('--no-textconv'))
-      );
-    }
-    return (
-      words.length === 3 &&
-      words[1] === 'branch' &&
-      words[2] === '--show-current'
-    );
+    return gitReviewAllowed(words);
   }
   if (words[0] === 'gh') {
-    return (
-      words[1] === 'pr' &&
-      ['view', 'diff', 'checks'].includes(words[2]) &&
-      flagsOnly(words.slice(3), new Set(['--json', '--jq', '--repo']))
-    );
+    return ghReviewAllowed(words);
   }
   if (words[0] === 'pwd') {
     return words.length === 1;
@@ -307,7 +334,8 @@ function parseResult(logText) {
           subtype: d.subtype ?? null,
           valid:
             typeof d.is_error === 'boolean' &&
-            (d.total_cost_usd == null ||
+            (d.total_cost_usd === undefined ||
+              d.total_cost_usd === null ||
               (typeof d.total_cost_usd === 'number' &&
                 Number.isFinite(d.total_cost_usd))) &&
             (d.subtype === undefined ||
@@ -387,13 +415,18 @@ export function runDeepReview(
       a.size === b.size && [...a].every((l) => b.has(l));
 
     const failed = (code, error) => ({ code, error, ok: false });
-    const updateRun = ({ costUsd = null, dirtyAfter, error, exitCode }) => {
+    const updateRun = ({
+      costUsd: nextCostUsd = null,
+      dirtyAfter: nextDirtyAfter,
+      error: nextError,
+      exitCode: nextExitCode,
+    }) => {
       const current = runs.get(key);
       runs.set(key, {
-        costUsd,
-        dirtyAfter,
-        error,
-        exitCode,
+        costUsd: nextCostUsd,
+        dirtyAfter: nextDirtyAfter,
+        error: nextError,
+        exitCode: nextExitCode,
         running: false,
         skill,
         startedAt: current?.startedAt ?? Date.now(),
@@ -417,15 +450,7 @@ export function runDeepReview(
         timeout: RUN_TIMEOUT_MS,
       }
     );
-    let exitCode;
-    try {
-      exitCode = await proc?.exited;
-    } catch {
-      throw unknownExit();
-    }
-    if (!Number.isInteger(exitCode) || exitCode < 0) {
-      throw unknownExit();
-    }
+    const exitCode = await confirmedReviewExit(proc, unknownExit);
     const timedOut = proc.signalCode === 'SIGTERM';
     let after;
     try {

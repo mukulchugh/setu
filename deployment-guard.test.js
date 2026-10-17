@@ -56,9 +56,12 @@ function fixture(options = {}) {
     branch: async () => branch,
     deploymentState: () => deploymentState,
     identity: async () => identity,
-    launch: async (request, binding) => {
-      launches.push({ binding, request });
-      return { completion, result: { deploying: true, ok: true } };
+    launch: (launchRequest, binding) => {
+      launches.push({ binding, request: launchRequest });
+      return Promise.resolve({
+        completion,
+        result: { deploying: true, ok: true },
+      });
     },
     operation: () => lifecycle.operationStatus(target.key),
     resolveProvider: async () => {
@@ -66,8 +69,8 @@ function fixture(options = {}) {
       return { destination, launch: { args: ['bound', destination.id] } };
     },
     revision: async () => ({ dirty: false, head: 'a'.repeat(40), known: true }),
-    startOperation: (target, launch) =>
-      lifecycle.startOperation(target, 'deploy', launch),
+    startOperation: (operationTarget, operationLaunch) =>
+      lifecycle.startOperation(operationTarget, 'deploy', operationLaunch),
     target: () => target,
   });
   const request = {
@@ -107,9 +110,9 @@ test('production confirmation binds the real HEAD commit and dirty state', async
     branch: async () => 'main',
     deploymentState: () => null,
     identity: async () => ({ known: true }),
-    launch: async () => {
+    launch: () => {
       launches += 1;
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     },
     operation: () => null,
     resolveProvider: async () => ({
@@ -183,19 +186,20 @@ test('production needs the exact preflight context and holds admission through c
   await f.lifecycle.waitForOperation({ key: 'repo/topic' });
 });
 
-test('branch, linkage, incarnation, target and deployment-state changes invalidate confirmed intent', async () => {
-  for (const change of [
-    { branch: 'different-branch' },
-    { identity: { checkout: { ino: '11' }, known: true } },
-    {
-      destination: {
-        environment: 'production',
-        id: 'prj_other',
-        label: 'replacement',
-      },
+test.each([
+  { branch: 'different-branch' },
+  { identity: { checkout: { ino: '11' }, known: true } },
+  {
+    destination: {
+      environment: 'production',
+      id: 'prj_other',
+      label: 'replacement',
     },
-    { deploymentState: { startedAt: 200 } },
-  ]) {
+  },
+  { deploymentState: { startedAt: 200 } },
+])(
+  'changed checkout or deployment state invalidates confirmed intent: %#',
+  async (change) => {
     const f = fixture();
     const before = await f.guard.preflight(f.request);
     f.change(change);
@@ -207,6 +211,9 @@ test('branch, linkage, incarnation, target and deployment-state changes invalida
     ).toMatchObject({ code: 'DEPLOY_CONTEXT_CHANGED', ok: false });
     expect(f.launches).toHaveLength(0);
   }
+);
+
+test('a changed target invalidates confirmed intent', async () => {
   const f = fixture(),
     before = await f.guard.preflight(f.request);
   expect(
@@ -254,12 +261,12 @@ test('unknown checkout identity and unverifiable provider binding perform no dep
   const base = {
     readJson: () =>
       Promise.resolve({ orgId: 'team_one', projectId: 'prj_one' }),
-    run: async () => {
+    run: () => {
       remoteCalls += 1;
-      return {
+      return Promise.resolve({
         code: 0,
         stdout: '{"id":"prj_other","accountId":"team_one","name":"wrong"}',
-      };
+      });
     },
   };
   await expect(
@@ -464,9 +471,9 @@ test('provider result handling retains Netlify site checks and Convex success wi
   const recorded = [];
   const outcomes = createPortalOperationOutcomes({
     events: {
-      record: async (event) => {
+      record: (event) => {
         recorded.push(event);
-        return { ok: true };
+        return Promise.resolve({ ok: true });
       },
     },
   });
@@ -664,16 +671,16 @@ test('Vercel resolves authority read-only and binds explicit project, owner and 
   const resolver = createProviderResolver({
     readJson: () =>
       Promise.resolve({ orgId: 'team_one', projectId: 'prj_one' }),
-    run: async (args, options) => {
+    run: (args, options) => {
       calls.push({ args, options });
-      return {
+      return Promise.resolve({
         code: 0,
         stdout: JSON.stringify({
           accountId: 'team_one',
           id: 'prj_one',
           name: 'actual-project',
         }),
-      };
+      });
     },
     tool: () =>
       Promise.resolve({ executable: '/installed/vercel', version: '58.9.1' }),
@@ -715,11 +722,12 @@ test('unknown provider inspection command completion remains unknown to the life
   const resolver = createProviderResolver({
     readJson: () =>
       Promise.resolve({ orgId: 'team_one', projectId: 'prj_one' }),
-    run: async () => {
-      throw Object.assign(new Error('inspection exit unknown'), {
-        code: 'OPERATION_UNKNOWN',
-      });
-    },
+    run: () =>
+      Promise.reject(
+        Object.assign(new Error('inspection exit unknown'), {
+          code: 'OPERATION_UNKNOWN',
+        })
+      ),
     tool: () =>
       Promise.resolve({ executable: '/installed/vercel', version: '58.9.1' }),
   });
@@ -736,8 +744,9 @@ test('Netlify binds production and explicit aliases to its linked site, and Conv
   const resolver = createProviderResolver({
     readJson: () =>
       Promise.resolve({ siteId: '11111111-2222-3333-4444-555555555555' }),
-    run: async () => {
+    run: () => {
       probes += 1;
+      return Promise.resolve();
     },
     tool: () =>
       Promise.resolve({
@@ -787,14 +796,12 @@ test('Netlify binds production and explicit aliases to its linked site, and Conv
 
 test('Convex binds production keys and explicit preview names without provider discovery', async () => {
   const resolver = createProviderResolver({
-    convexDeployKey: async () => ({
-      value: 'preview:team-one:project-one|secret',
-    }),
-    readJson: async () => ({}),
-    run: async () => {
-      throw new Error('no discovery');
-    },
-    tool: async () => ({ executable: '/installed/convex', version: '1.0.0' }),
+    convexDeployKey: () =>
+      Promise.resolve({ value: 'preview:team-one:project-one|secret' }),
+    readJson: () => Promise.resolve({}),
+    run: () => Promise.reject(new Error('no discovery')),
+    tool: () =>
+      Promise.resolve({ executable: '/installed/convex', version: '1.0.0' }),
   });
   const preview = await resolver(
     { provider: 'convex', target: 'review-42' },

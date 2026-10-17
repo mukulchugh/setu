@@ -129,6 +129,84 @@ test('new, start, rm, and mcp install flags parse as documented', () => {
   });
 });
 
+test('lifecycle command overrides isolate start, stop, and removal then restore defaults', async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = (url) => {
+    calls.push(['fetch', String(url)]);
+    return Promise.resolve(Response.json({ ok: true }));
+  };
+  console.log = () => undefined;
+  const lifecycleCommand = {
+    cfg: () => {
+      calls.push(['cfg']);
+      return { workspace: '/isolated' };
+    },
+    ensurePortal: (config) => {
+      calls.push(['ensurePortal', config]);
+      return Promise.resolve();
+    },
+    getPort: (...input) => {
+      calls.push(['getPort', ...input]);
+      return 43_210;
+    },
+    portalPid: () => {
+      calls.push(['portalPid']);
+      return 123;
+    },
+    requestRemoval: (body, options) => {
+      calls.push(['requestRemoval', body, options]);
+      return Promise.resolve({ ok: true });
+    },
+  };
+  const request = ({ body, path }) => {
+    calls.push(['request', path, body]);
+    return Promise.resolve({ container: false, ok: true });
+  };
+
+  try {
+    expect(
+      await runCli(['start', 'repo', 'topic', '--bare'], {
+        lifecycleCommand,
+        request,
+      })
+    ).toBe(0);
+    expect(
+      await runCli(['stop', 'repo', 'topic'], { lifecycleCommand, request })
+    ).toBe(0);
+    expect(
+      await runCli(['rm', 'repo', 'topic', '--force', '--json'], {
+        lifecycleCommand,
+      })
+    ).toBe(0);
+    expect(await runCli(['rm', 'repo', 'topic', '--json'])).toBe(0);
+    await runCli(['help']);
+  } finally {
+    console.log = originalLog;
+    globalThis.fetch = originalFetch;
+  }
+
+  expect(calls).toEqual([
+    ['cfg'],
+    ['getPort', '/isolated', 'repo', 'topic'],
+    ['ensurePortal', { workspace: '/isolated' }],
+    [
+      'request',
+      '/api/start',
+      { container: false, name: 'topic', repo: 'repo' },
+    ],
+    ['portalPid'],
+    ['request', '/api/stop', { name: 'topic', repo: 'repo' }],
+    [
+      'requestRemoval',
+      { force: true, name: 'topic', repo: 'repo' },
+      { url: 'http://127.0.0.1:2999/api/remove' },
+    ],
+    ['fetch', 'http://127.0.0.1:2999/api/remove'],
+  ]);
+});
+
 test('cmdNew refuses admission and preserves unknown setup outcomes without portal effects', async () => {
   const root = fs.mkdtempSync(join(tmpdir(), 'setu-cli-new-'));
   roots.push(root);
@@ -158,18 +236,20 @@ test('cmdNew refuses admission and preserves unknown setup outcomes without port
         newCommand: {
           config: () => ({ workspace: root }),
           createResourceAdmission: () => ({ admit: async () => refusal }),
-          createWorktree: async () => {
-            throw new Error('must not create after admission refusal');
-          },
-          ensurePortal: async () => {
+          createWorktree: () =>
+            Promise.reject(
+              new Error('must not create after admission refusal')
+            ),
+          ensurePortal: () => {
             portalChecks += 1;
+            return Promise.resolve();
           },
           operationId: () => 'setup-refusal',
           workspaceState: () => state,
         },
-        request: async () => {
+        request: () => {
           starts += 1;
-          return { ok: true };
+          return Promise.resolve({ ok: true });
         },
       })
     ).toBe(1);
@@ -194,30 +274,34 @@ test('cmdNew refuses admission and preserves unknown setup outcomes without port
       await runCli(['new', 'repo', 'unknown', '--start', '--json'], {
         newCommand: {
           config: () => ({ workspace: root }),
-          createAndInstallWorktree: async () => {
-            throw Object.assign(
-              new Error('Setup completion could not be confirmed.'),
-              {
-                code: 'OPERATION_UNKNOWN',
-                recovery: { progress: { code: 'SETUP_PROGRESS_UNAVAILABLE' } },
-              }
-            );
-          },
+          createAndInstallWorktree: () =>
+            Promise.reject(
+              Object.assign(
+                new Error('Setup completion could not be confirmed.'),
+                {
+                  code: 'OPERATION_UNKNOWN',
+                  recovery: {
+                    progress: { code: 'SETUP_PROGRESS_UNAVAILABLE' },
+                  },
+                }
+              )
+            ),
           createOperationEvents: () => ({
             record: async () => ({
               code: 'OPERATION_EVENT_UNAVAILABLE',
               ok: false,
             }),
           }),
-          ensurePortal: async () => {
+          ensurePortal: () => {
             portalChecks += 1;
+            return Promise.resolve();
           },
           operationId: () => 'setup-unknown',
           workspaceState: () => state,
         },
-        request: async () => {
+        request: () => {
           starts += 1;
-          return { ok: true };
+          return Promise.resolve({ ok: true });
         },
       })
     ).toBe(1);
@@ -275,12 +359,20 @@ test('local workspace mutations record outcomes without making read-only sweep w
   });
   const originalLog = console.log,
     originalError = console.error;
-  console.log = () => {};
-  console.error = () => {};
+  console.log = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
+  console.error = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
   let nextId = 0;
   const local = (overrides = {}) => ({
     config: () => ({ workspace: root }),
-    operationId: (kind) => `${kind}-${nextId++}`,
+    operationId: (kind) => {
+      const id = `${kind}-${nextId}`;
+      nextId += 1;
+      return id;
+    },
     workspaceState: () => state,
     ...overrides,
   });
@@ -298,11 +390,12 @@ test('local workspace mutations record outcomes without making read-only sweep w
     expect(
       await runCli(['init', 'org/refused'], {
         localCommand: local({
-          importRepo: async () => {
-            throw Object.assign(new Error('Storage is too low.'), {
-              code: 'STORAGE_LOW',
-            });
-          },
+          importRepo: () =>
+            Promise.reject(
+              Object.assign(new Error('Storage is too low.'), {
+                code: 'STORAGE_LOW',
+              })
+            ),
         }),
         request: async () => ({ ok: true }),
       })
@@ -355,9 +448,8 @@ test('local workspace mutations record outcomes without making read-only sweep w
               status: 'importable',
             },
           ],
-          importRepo: async () => {
-            throw new Error('Clone state could not be confirmed.');
-          },
+          importRepo: () =>
+            Promise.reject(new Error('Clone state could not be confirmed.')),
         }),
         request: async () => ({ ok: true }),
       })
@@ -410,7 +502,9 @@ test('local workspace mutations record outcomes without making read-only sweep w
               ok: false,
             }),
           }),
-          execFileSync: () => {},
+          execFileSync: () => {
+            /* The operation outcome recorder is the subject of this fixture. */
+          },
         }),
         request: async () => ({ ok: true }),
       })
@@ -468,9 +562,9 @@ test('local workspace mutations record outcomes without making read-only sweep w
 test('CLI API requests retain the route, target, method, and CLI attribution', async () => {
   const calls = [];
   const api = createCliApi({
-    request: async (request) => {
+    request: (request) => {
       calls.push(request);
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     },
   });
   await api.get('/api/operations', { limit: 10, name: 'topic', repo: 'repo' });
@@ -537,11 +631,13 @@ test('new capability commands dispatch to their reviewed portal route and preser
   );
   const calls = [],
     original = console.log;
-  console.log = () => {};
+  console.log = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
   try {
-    const request = async (call) => {
+    const request = (call) => {
       calls.push(call);
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     };
     for (const argv of [
       ['storage'],
@@ -676,6 +772,7 @@ test('new capability commands dispatch to their reviewed portal route and preser
         findings,
       ],
     ]) {
+      // biome-ignore lint/performance/noAwaitInLoops: Commands share module-level CLI state and the test asserts their recorded request order.
       expect(await runCli(argv, { request })).toBe(0);
     }
   } finally {
@@ -751,7 +848,9 @@ test('cache partial retry, headless stdin limits, and a later success reset the 
     JSON.stringify({ manifestId: 'manifest-1', retryId: 'retry-1' })
   );
   const original = console.error;
-  console.error = () => {};
+  console.error = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
   try {
     expect(
       await runCli(
@@ -777,13 +876,13 @@ test('cache partial retry, headless stdin limits, and a later success reset the 
     const calls = [];
     expect(
       await runCli(['caches', 'execute', 'repo', 'topic', '--retry', retry], {
-        request: async (call) => {
+        request: (call) => {
           calls.push(call);
-          return {
+          return Promise.resolve({
             ok: true,
             removedPaths: ['.next/cache/a'],
             retryId: 'retry-1',
-          };
+          });
         },
       })
     ).toBe(0);
@@ -813,9 +912,9 @@ test('cache partial retry, headless stdin limits, and a later success reset the 
         {
           readFile: (path) =>
             path === 0 ? 'stdin prompt' : fs.readFileSync(path, 'utf8'),
-          request: async (call) => {
+          request: (call) => {
             stdin = call.body;
-            return { ok: true };
+            return Promise.resolve({ ok: true });
           },
         }
       )
@@ -833,7 +932,9 @@ test('cache partial retry, headless stdin limits, and a later success reset the 
 
 test('invalid new-command flags refuse before a portal request', async () => {
   const original = console.error;
-  console.error = () => {};
+  console.error = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
   try {
     let calls = 0;
     expect(
@@ -849,9 +950,9 @@ test('invalid new-command flags refuse before a portal request', async () => {
           '1.5',
         ],
         {
-          request: async () => {
+          request: () => {
             calls += 1;
-            return { ok: true };
+            return Promise.resolve({ ok: true });
           },
         }
       )
@@ -864,12 +965,14 @@ test('invalid new-command flags refuse before a portal request', async () => {
 
 test('unsupported subcommands and extra positionals refuse before a portal request', async () => {
   const original = console.error;
-  console.error = () => {};
+  console.error = () => {
+    /* Output is deliberately suppressed for this fixture. */
+  };
   try {
     let calls = 0;
-    const request = async () => {
+    const request = () => {
       calls += 1;
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     };
     expect(await runCli(['actions', 'unknown'], { request })).toBe(1);
     expect(

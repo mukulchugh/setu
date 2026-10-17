@@ -34,7 +34,7 @@ const identity = {
   repositoryPath: target.repoDir,
 };
 
-function fixture(overrides = {}, documents) {
+function fixture(overrides, documents) {
   const data = documents ?? {
     archive: [],
     ports: [
@@ -51,6 +51,7 @@ function fixture(overrides = {}, documents) {
   const clone = (value) => structuredClone(value);
   const state = {
     read: (name) => clone(data[name]),
+    // biome-ignore lint/suspicious/useAwait: Injected storage callbacks may throw; the workspace adapter must reject.
     async withWorkspace(_names, task) {
       return task({
         read: (name) => clone(data[name]),
@@ -65,40 +66,46 @@ function fixture(overrides = {}, documents) {
   const deps = {
     admit: async (_target, task) =>
       task({
-        stop: async () => {
+        stop: () => {
           effects.push('stop');
-          return { ok: true };
+          return Promise.resolve({ ok: true });
         },
       }),
-    assertClean: async () => {
+    assertClean: () => {
       effects.push('dirty-check');
+      return Promise.resolve();
     },
-    capture: async () => ({
-      archive: {
-        branch: 'topic',
-        label: 'Repo',
-        name: 'topic',
-        reason: 'manual',
-        removedAt: 1000,
-        repo: 'repo',
-      },
-      identity,
-    }),
-    cleanupRouting: async () => {
+    capture: () =>
+      Promise.resolve({
+        archive: {
+          branch: 'topic',
+          label: 'Repo',
+          name: 'topic',
+          reason: 'manual',
+          removedAt: 1000,
+          repo: 'repo',
+        },
+        identity,
+      }),
+    cleanupRouting: () => {
       effects.push('routing');
+      return Promise.resolve();
     },
-    detachTunnel: async () => {
+    detachTunnel: () => {
       effects.push('tunnel');
+      return Promise.resolve();
     },
     now: () => 1_000_000,
-    observe: async () => ({ state: observation }),
+    observe: () => Promise.resolve({ state: observation }),
     randomId: () => '00000000-0000-4000-8000-000000000001',
-    removeGit: async () => {
+    removeGit: () => {
       effects.push('git');
       observation = 'absent';
+      return Promise.resolve();
     },
-    removeVolumes: async () => {
+    removeVolumes: () => {
       effects.push('volumes');
+      return Promise.resolve();
     },
     serialize: (task) => task(),
     state,
@@ -142,9 +149,11 @@ test('persisted tunnel stage retries owned teardown after the in-memory route di
   let attempts = 0,
     allowExit = false;
   const routing = createRemovalRouting({
+    // biome-ignore lint/suspicious/useAwait: Failed tunnel teardown must reject until the later retry permits exit.
     removeTunnelRoute: async () => {
       attempts += 1;
       routes.delete(target.key);
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes allowExit between teardown retries.
       if (!allowExit) {
         throw new Error('Tunnel group absence unconfirmed');
       }
@@ -178,23 +187,26 @@ test('failed hosts apply retains recovery and its port until exact retry confirm
     cleared = 0;
   const routing = createRemovalRouting({
     fs: {
+      // biome-ignore lint/suspicious/useAwait: The filesystem adapter must reject with ENOENT after unlink.
       lstat: async () => {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: unlink changes snippets before a later lstat call.
         if (!snippets) {
           throw Object.assign(new Error('absent'), { code: 'ENOENT' });
         }
         return { isFile: () => true, isSymbolicLink: () => false };
       },
       readFile: async () => `reverse_proxy localhost:${target.port}\n`,
-      unlink: async () => {
+      unlink: () => {
         snippets -= 1;
+        return Promise.resolve();
       },
     },
     onRemoved: () => {
       cleared += 1;
     },
-    reloadCaddy: async () => {
+    reloadCaddy: () => {
       refreshed += 1;
-      return true;
+      return Promise.resolve(true);
     },
     removeTunnelRoute: () => {
       /* No side effect is needed in this fixture. */
@@ -229,11 +241,13 @@ test('tunnel Caddy failure stops configuration before route launch', async () =>
   const effects = [];
   await expect(
     applyTunnelConfiguration(true, {
-      addRoute: async () => {
+      addRoute: () => {
         effects.push('add-route');
+        return Promise.resolve();
       },
-      configure: async () => {
+      configure: () => {
         effects.push('configure');
+        return Promise.resolve();
       },
       reload: () => Promise.resolve(false),
       removeRoute: () => {
@@ -259,6 +273,7 @@ test('concurrent tunnel creates evict the previous owner before target setup adm
     firstEntered = resolve;
   });
   const deps = {
+    // biome-ignore lint/suspicious/useAwait: Assertion failures in the release adapter must reject the serialized operation.
     release: async (key) => {
       expect(admitted).toBe(false);
       effects.push(`release ${key}`);
@@ -307,9 +322,7 @@ test('concurrent tunnel creates evict the previous owner before target setup adm
 
 test('dirty rejection precedes persistence, runtime signals, volume removal and Git deletion', async () => {
   const f = fixture({
-    assertClean: () => {
-      return Promise.reject(new Error('dirty worktree'));
-    },
+    assertClean: () => Promise.reject(new Error('dirty worktree')),
   });
   expect(await f.controller.remove(target)).toMatchObject({
     ok: false,
@@ -322,12 +335,10 @@ test('dirty rejection precedes persistence, runtime signals, volume removal and 
 
 test('an absent unregistered checkout skips clean and identity capture but clears registry and routing', async () => {
   const f = fixture({
-    assertClean: async () => {
-      throw new Error('must not inspect a missing checkout');
-    },
-    capture: async () => {
-      throw new Error('must not capture a missing checkout');
-    },
+    assertClean: () =>
+      Promise.reject(new Error('must not inspect a missing checkout')),
+    capture: () =>
+      Promise.reject(new Error('must not capture a missing checkout')),
     observe: async (record) => ({
       state: record.identity?.absent ? 'absent' : 'unknown',
     }),
@@ -342,9 +353,7 @@ test('an absent unregistered checkout skips clean and identity capture but clear
 
 test('a pending intact checkout can be cancelled, but an in-flight removal cannot', async () => {
   const f = fixture({
-    removeVolumes: async () => {
-      throw new Error('engine unavailable');
-    },
+    removeVolumes: () => Promise.reject(new Error('engine unavailable')),
   });
   const pending = await f.controller.remove(target);
   expect(pending).toMatchObject({ ok: false, removed: false });
@@ -362,9 +371,10 @@ test('a pending intact checkout can be cancelled, but an in-flight removal canno
   });
   const running = active.controller.remove(target);
   while (!Object.keys(active.data.removals).length) {
+    // biome-ignore lint/performance/noAwaitInLoops: Yield microtasks until the in-flight operation publishes its identity.
     await Promise.resolve();
   }
-  const operationId = Object.keys(active.data.removals)[0];
+  const [operationId] = Object.keys(active.data.removals);
   await expect(active.controller.cancel(operationId)).resolves.toMatchObject({
     code: 'REMOVAL_IN_FLIGHT',
     ok: false,
@@ -375,17 +385,16 @@ test('a pending intact checkout can be cancelled, but an in-flight removal canno
 
 test('a retry whose checkout vanished completes pending idempotent teardown', async () => {
   const f = fixture({
-    removeVolumes: async () => {
-      throw new Error('engine unavailable');
-    },
+    removeVolumes: () => Promise.reject(new Error('engine unavailable')),
   });
   const pending = await f.controller.remove(target);
   expect(pending).toMatchObject({ ok: false, removed: false });
   f.setObservation('absent');
   const retry = createRemovalController({
     ...f.deps,
-    removeVolumes: async () => {
+    removeVolumes: () => {
       f.effects.push('volumes');
+      return Promise.resolve();
     },
   });
   await expect(
@@ -449,8 +458,9 @@ test('routing failure reports removed and keeps its port reservation; reconstruc
 
 test('unknown post-Git observation reports uncertain deletion and keeps metadata for exact retry', async () => {
   const f = fixture();
-  f.deps.removeGit = async () => {
+  f.deps.removeGit = () => {
     f.setObservation('unknown');
+    return Promise.resolve();
   };
   // Construct with the controlled failure dependency; importing does not perform recovery.
   const controller = createRemovalController(f.deps);
@@ -497,8 +507,10 @@ test('unconfirmed Git process completion retains target admission even if checko
     },
   });
   const f = fixture({
-    admit: (target, task) => lifecycle.runOperation(target, 'remove', task),
+    admit: (removalTarget, task) =>
+      lifecycle.runOperation(removalTarget, 'remove', task),
   });
+  // biome-ignore lint/suspicious/useAwait: Unconfirmed process completion must reject after changing the observed checkout state.
   f.deps.removeGit = async () => {
     f.setObservation('absent');
     throw Object.assign(new Error('exit observation failed'), {
@@ -534,9 +546,7 @@ test('prepare-only intent may be cleared for Start, but a begun volume step cann
   await before.controller.assertCanMutate(target, { kind: 'start' });
   expect(before.data.removals).toEqual({});
   const after = fixture({
-    removeVolumes: () => {
-      return Promise.reject(new Error('volume result unknown'));
-    },
+    removeVolumes: () => Promise.reject(new Error('volume result unknown')),
   });
   await after.controller.remove(target);
   await expect(
@@ -571,13 +581,12 @@ test('an explicit different operation ID cannot join an in-flight removal', asyn
 
 test('a retry requires current force permission and a same-path replacement blocks all effects', async () => {
   const f = fixture({
-    removeVolumes: () => {
-      return Promise.reject(new Error('volume unavailable'));
-    },
+    removeVolumes: () => Promise.reject(new Error('volume unavailable')),
   });
   const first = await f.controller.remove(target, { force: true });
   const retry = fixture(
     {
+      // biome-ignore lint/suspicious/useAwait: A missing force approval must reject at the clean-check boundary.
       assertClean: async (_target, force) => {
         if (!force) {
           throw new Error('dirty without current force');
@@ -627,8 +636,9 @@ test('prepare write failure performs no destructive work; committed unreadable p
   expect(after.effects).toEqual(['dirty-check']);
 });
 
-test('final archive marker failure and pending clear failure remain retryable without a second Git removal', async () => {
-  for (const failure of ['marker', 'clear']) {
+test.each(['marker', 'clear'])(
+  'final %s failure remains retryable without a second Git removal',
+  async (failure) => {
     const f = fixture();
     failWrite(f, (name, value) =>
       failure === 'marker'
@@ -667,7 +677,7 @@ test('final archive marker failure and pending clear failure remain retryable wi
     expect(retry.effects).toEqual([]);
     expect(f.data.archive).toHaveLength(1);
   }
-});
+);
 
 test('real state allocation cannot reuse the removed port while routing cleanup is pending', async () => {
   const root = await fs.mkdtemp(join(tmpdir(), 'setu-removal-state-'));
@@ -733,6 +743,7 @@ test('production observation distinguishes original, replacement, absent checkou
     let registered = true;
     const run = async () => ({
       code: 0,
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: The test clears registration before the final observation.
       stdout: registered
         ? `worktree ${wtDir}\0branch refs/heads/topic\0\0`
         : '',
@@ -771,9 +782,12 @@ test('absent-identity observation accepts a registry row when both checkout and 
     await expect(
       observeRemovalCheckout({ identity: { absent: true } }, t, {
         fs,
-        run: async () => {
-          throw new Error('git must not be invoked when the bare repository is gone');
-        },
+        run: () =>
+          Promise.reject(
+            new Error(
+              'git must not be invoked when the bare repository is gone'
+            )
+          ),
       })
     ).resolves.toEqual({ state: 'absent' });
   } finally {
@@ -783,26 +797,60 @@ test('absent-identity observation accepts a registry row when both checkout and 
 
 test('persisted identity key order does not turn an unchanged incarnation into a conflict', async () => {
   // Keep the old on-disk ordering literal: formatters must not rewrite this fixture.
-  const oldIdentity = JSON.parse('{"known":true,"checkoutPath":"/isolated/repo/topic","repositoryPath":"/isolated/repo.git","adminPath":"/isolated/repo.git/worktrees/topic","checkout":{"dev":"1","ino":"2","birthtimeNs":"3"},"repository":{"dev":"1","ino":"4","birthtimeNs":"5"},"admin":{"dev":"1","ino":"6","birthtimeNs":"7"}}');
+  const oldIdentity = JSON.parse(
+    '{"known":true,"checkoutPath":"/isolated/repo/topic","repositoryPath":"/isolated/repo.git","adminPath":"/isolated/repo.git/worktrees/topic","checkout":{"dev":"1","ino":"2","birthtimeNs":"3"},"repository":{"dev":"1","ino":"4","birthtimeNs":"5"},"admin":{"dev":"1","ino":"6","birthtimeNs":"7"}}'
+  );
   const directory = (path) => {
-    const value = path === target.repoDir ? oldIdentity.repository : path === target.wtDir ? oldIdentity.checkout : oldIdentity.admin;
-    return { dev: BigInt(value.dev), ino: BigInt(value.ino), birthtimeNs: BigInt(value.birthtimeNs), isDirectory: () => true, isSymbolicLink: () => false };
+    let value = oldIdentity.admin;
+    if (path === target.repoDir) {
+      value = oldIdentity.repository;
+    } else if (path === target.wtDir) {
+      value = oldIdentity.checkout;
+    }
+    return {
+      birthtimeNs: BigInt(value.birthtimeNs),
+      dev: BigInt(value.dev),
+      ino: BigInt(value.ino),
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    };
   };
   const files = {
+    lstat: (path) => Promise.resolve(directory(path)),
+    readFile: (path) => {
+      if (path === `${target.wtDir}/.git`) {
+        return Promise.resolve(`gitdir: ${oldIdentity.adminPath}\n`);
+      }
+      if (path === `${oldIdentity.adminPath}/gitdir`) {
+        return Promise.resolve(`${target.wtDir}/.git\n`);
+      }
+      return Promise.resolve('../..\n');
+    },
     realpath: (path) => Promise.resolve(path),
     stat: (path) => Promise.resolve(directory(path)),
-    lstat: (path) => Promise.resolve(directory(path)),
-    readFile: (path) => Promise.resolve(path === `${target.wtDir}/.git` ? `gitdir: ${oldIdentity.adminPath}\n` : path === `${oldIdentity.adminPath}/gitdir` ? `${target.wtDir}/.git\n` : '../..\n'),
   };
-  const run = () => Promise.resolve({ code: 0, stdout: `worktree ${target.wtDir}\0\0` });
-  expect(await observeRemovalCheckout({ identity: oldIdentity }, target, { fs: files, run })).toEqual({ state: 'original' });
-  for (const part of ['checkout', 'repository', 'admin']) {
-    for (const field of ['dev', 'ino', 'birthtimeNs']) {
-      const changed = structuredClone(oldIdentity);
-      changed[part][field] = '999';
-      expect(await observeRemovalCheckout({ identity: changed }, target, { fs: files, run })).toEqual({ state: 'conflict' });
-    }
-  }
+  const run = () =>
+    Promise.resolve({ code: 0, stdout: `worktree ${target.wtDir}\0\0` });
+  expect(
+    await observeRemovalCheckout({ identity: oldIdentity }, target, {
+      fs: files,
+      run,
+    })
+  ).toEqual({ state: 'original' });
+  await Promise.all(
+    ['checkout', 'repository', 'admin'].flatMap((part) =>
+      ['dev', 'ino', 'birthtimeNs'].map(async (field) => {
+        const changed = structuredClone(oldIdentity);
+        changed[part][field] = '999';
+        expect(
+          await observeRemovalCheckout({ identity: changed }, target, {
+            fs: files,
+            run,
+          })
+        ).toEqual({ state: 'conflict' });
+      })
+    )
+  );
 });
 
 test('archive updates preserve the legacy chronological order and cap', async () => {
@@ -822,18 +870,58 @@ test('archive updates preserve the legacy chronological order and cap', async ()
   });
 });
 
-test('Git receives only the force choice on this destructive request', async () => {
-  for (const force of [false, true]) {
+test.each([false, true])(
+  'Git receives only the force choice %s on this destructive request',
+  async (force) => {
     const values = [],
       f = fixture();
     const controller = createRemovalController({
       ...f.deps,
-      removeGit: async (_record, currentForce) => {
+      removeGit: (_record, currentForce) => {
         values.push(currentForce);
         f.setObservation('absent');
+        return Promise.resolve();
       },
     });
     expect((await controller.remove(target, { force })).ok).toBe(true);
     expect(values).toEqual([force]);
   }
+);
+
+test('a mismatched retry retains the selected recovery operation details', async () => {
+  const f = fixture({
+    detachTunnel: () => Promise.reject(new Error('tunnel pending')),
+  });
+  const first = await f.controller.remove(target);
+  const result = await f.controller.remove(
+    { ...target, key: 'repo/other', name: 'other' },
+    { operationId: first.operationId }
+  );
+  expect(result).toMatchObject({
+    code: 'REMOVAL_IDENTITY_CHANGED',
+    ok: false,
+    operationId: first.operationId,
+    removed: false,
+  });
+  expect(result.completedStages).toEqual(first.completedStages);
+});
+
+test('observation failure retains deletion state refreshed after admission', async () => {
+  const f = fixture({
+    detachTunnel: () => Promise.reject(new Error('tunnel pending')),
+  });
+  const first = await f.controller.remove(target);
+  const retry = fixture(
+    {
+      admit: (_selected, work) => {
+        f.data.removals[first.operationId].removed = true;
+        return work({ stop: () => Promise.resolve({ ok: true }) });
+      },
+      observe: () => Promise.reject(new Error('observation unavailable')),
+    },
+    f.data
+  );
+  expect(
+    await retry.controller.remove(target, { operationId: first.operationId })
+  ).toMatchObject({ ok: false, operationId: first.operationId, removed: true });
 });

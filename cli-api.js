@@ -22,9 +22,10 @@ async function portalFetch({ method, path, body, headers }) {
   try {
     result = await response.json();
   } catch {
+    // biome-ignore lint/style/useErrorCause: The CLI deliberately replaces an untrusted portal body with this fixed public parse error.
     throw new Error('Portal response could not be read');
   }
-  if (!response.ok && (!result || result.ok !== false)) {
+  if (!response.ok && result?.ok !== false) {
     throw new Error(`Portal request failed (${response.status})`);
   }
   return result;

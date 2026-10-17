@@ -15,6 +15,7 @@ test('selected findings are delivered to the verified owned session in a bounded
     state: 'running',
   };
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: The delivery fixture preserves the asynchronous terminal handoff contract.
     deliver: async (message) => {
       delivered.push(message);
       return {
@@ -58,6 +59,7 @@ test('selected findings are delivered to the verified owned session in a bounded
 test('handoff requires an exact selected session rather than choosing among matching sessions', async () => {
   let delivered = false;
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: The delivery fixture preserves the asynchronous terminal handoff contract.
     deliver: async () => {
       delivered = true;
     },
@@ -78,6 +80,7 @@ test('handoff requires an exact selected session rather than choosing among matc
 
 test('handoff refuses an artifact that identifies a different checkout', async () => {
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: Unexpected delivery must reject through the handoff collaborator contract.
     deliver: async () => {
       throw new Error('must not deliver');
     },
@@ -114,6 +117,7 @@ test('handoff is bounded even when selected context is oversized', async () => {
     state: 'running',
   };
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: The delivery fixture preserves the asynchronous terminal handoff contract.
     deliver: async (message) => {
       delivered = message;
       return {
@@ -150,6 +154,7 @@ test('handoff refuses a session whose ownership changed during immediate verific
     state: 'running',
   };
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: The delivery fixture preserves the asynchronous terminal handoff contract.
     deliver: async () => {
       delivered = true;
     },
@@ -220,4 +225,18 @@ test('handoff refuses an adapter that cannot confirm the exact terminal delivery
       target,
     })
   ).resolves.toMatchObject({ code: 'HANDOFF_DELIVERY_UNCONFIRMED', ok: false });
+});
+
+test('missing session selection takes precedence over an artifact mismatch', async () => {
+  const handoff = createReviewHandoff({
+    sessions: { get: () => null },
+  });
+  await expect(
+    handoff.deliver({
+      artifact: { ...artifact, checkoutIdentity: 'different-checkout' },
+      checkoutIdentity: 'checkout-a',
+      findings: [{ id: 'F-1' }],
+      target,
+    })
+  ).resolves.toMatchObject({ code: 'SESSION_SELECTION_REQUIRED', ok: false });
 });

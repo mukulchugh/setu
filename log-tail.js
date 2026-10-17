@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 
 const MAX_BYTES = 256 * 1024;
+const UTF8_CONTINUATION_BYTE_MIN = 0x80;
+const UTF8_CONTINUATION_BYTE_MAX = 0xc0;
 const SAFE_CODES = new Set([
   'EACCES',
   'EPERM',
@@ -46,7 +48,7 @@ export function readLogTail(
   let fd;
   try {
     fd = files.openSync(path, 'r');
-    const size = files.fstatSync(fd).size;
+    const { size } = files.fstatSync(fd);
     const offset = Math.max(0, size - MAX_BYTES);
     const buffer = Buffer.alloc(Math.min(size, MAX_BYTES));
     const count = buffer.length
@@ -59,7 +61,11 @@ export function readLogTail(
     }
     let start = 0;
     if (offset) {
-      while (start < count && (buffer[start] & 0xc0) === 0x80) {
+      while (
+        start < count &&
+        buffer[start] >= UTF8_CONTINUATION_BYTE_MIN &&
+        buffer[start] < UTF8_CONTINUATION_BYTE_MAX
+      ) {
         start += 1;
       }
     }
@@ -98,17 +104,18 @@ export function readLogTail(
 
 export function logSignature(path, files = fs) {
   try {
-    const stat = files.statSync(path);
-    return `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    const { ino, mtimeMs, size } = files.statSync(path);
+    return `${ino}:${size}:${mtimeMs}`;
   } catch (error) {
     return error.code === 'ENOENT' ? 'missing' : null;
   }
 }
 
 export function readLogSnapshot(entry, path, options = {}) {
+  let resolvedPath = path;
   try {
-    if (typeof path === 'function') {
-      path = path();
+    if (typeof resolvedPath === 'function') {
+      resolvedPath = resolvedPath();
     }
   } catch (error) {
     entry.signature = null;
@@ -119,7 +126,7 @@ export function readLogSnapshot(entry, path, options = {}) {
     );
     return entry.snapshot;
   }
-  const signature = logSignature(path, options.files);
+  const signature = logSignature(resolvedPath, options.files);
   if (
     signature !== null &&
     signature === entry.signature &&
@@ -127,7 +134,7 @@ export function readLogSnapshot(entry, path, options = {}) {
   ) {
     return null;
   }
-  entry.snapshot = readLogTail(path, 150, {
+  entry.snapshot = readLogTail(resolvedPath, 150, {
     ...options,
     previous: entry.snapshot,
   });

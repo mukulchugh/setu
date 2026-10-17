@@ -38,6 +38,7 @@ test('marker staging retains unknown completion while known staging failures rem
   try {
     await expect(
       writeSetuAgentMarkers('fixture', directory, {
+        // biome-ignore lint/suspicious/useAwait: The stage fixture models a rejected subprocess outcome.
         stage: async () => {
           throw Object.assign(new Error('unknown stage'), {
             code: 'OPERATION_UNKNOWN',
@@ -55,6 +56,7 @@ test('marker staging retains unknown completion while known staging failures rem
 
 test('unknown Sync merge completion propagates without launching status or abort', async () => {
   const calls = [];
+  // biome-ignore lint/suspicious/useAwait: Git command failures must reject through the injected runner contract.
   const runGit = async (_dir, args) => {
     calls.push(args);
     if (args[0] === 'merge') {
@@ -82,6 +84,7 @@ test('unknown Sync merge completion propagates without launching status or abort
 
 test('sync accepts an async base resolver for portal request paths', async () => {
   const calls = [];
+  // biome-ignore lint/suspicious/useAwait: The runner fixture preserves asynchronous command results.
   const runGit = async (_dir, args) => {
     calls.push(args);
     if (args[0] === 'status') {
@@ -109,6 +112,7 @@ test('a known conflicting merge reports unchanged only after its abort has compl
   const abort = new Promise((resolve) => {
     finish = resolve;
   });
+  // biome-ignore lint/suspicious/useAwait: Merge and abort fixtures preserve the command runner promise boundary.
   const runGit = async (_dir, args) => {
     calls.push(args);
     if (args[0] === 'status') {
@@ -136,6 +140,7 @@ test('a known conflicting merge reports unchanged only after its abort has compl
     return value;
   });
   for (let i = 0; i < 12; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Successive microtasks must advance the pending abort before checking that the operation has not settled.
     await Promise.resolve();
   }
   expect(calls.at(-1)).toEqual(['merge', '--abort']);
@@ -150,6 +155,7 @@ test('a known conflicting merge reports unchanged only after its abort has compl
 
 test('unknown abort completion cannot become a cleanly aborted result', async () => {
   let statusReads = 0;
+  // biome-ignore lint/suspicious/useAwait: The abort fixture must reject unknown subprocess outcomes.
   const runGit = async (_dir, args) => {
     if (args[0] === 'status') {
       const priorReads = statusReads;

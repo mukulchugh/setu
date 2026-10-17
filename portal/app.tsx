@@ -236,7 +236,7 @@ export interface Worktree {
   label: string;
   lastCommitAt: number | null;
   lifecycleError?: WorktreeListRow['lifecycleError'];
-  memMb: number | null;
+  memMb: number | null | undefined;
   name: string;
   needsMigrationPrompt: boolean;
   netlifyDeploy: DeployStatus;
@@ -303,8 +303,8 @@ interface CustomAgent {
 interface SettingsData {
   containerCpuLimit: number;
   containerMemoryLimit: string;
-  docker: { cpus: number | null; memMb: number | null };
-  mac: { cpus: number | null; memMb: number | null };
+  docker: { cpus: number | null; memMb: number | null | undefined };
+  mac: { cpus: number | null; memMb: number | null | undefined };
   maxConcurrentDevServers: number;
 }
 interface Status {
@@ -342,6 +342,10 @@ type Route =
   | { page: 'inventory' }
   | { page: 'costs' };
 
+const WORKTREE_ROUTE_PATTERN = /^\/worktree\/([^/]+)\/(.+)$/;
+const REPOSITORY_ROUTE_PATTERN = /^\/repo\/([^/]+)$/;
+const BRANCH_TREE_PATH_PATTERN = /\/tree\/.*$/;
+
 function parseRoute(pathname: string): Route {
   if (pathname === '/settings') {
     return { page: 'settings' };
@@ -361,7 +365,7 @@ function parseRoute(pathname: string): Route {
   if (pathname === '/inventory') {
     return { page: 'inventory' };
   }
-  const wt = pathname.match(/^\/worktree\/([^/]+)\/(.+)$/);
+  const wt = pathname.match(WORKTREE_ROUTE_PATTERN);
   if (wt) {
     return {
       name: decodeURIComponent(wt[2]),
@@ -369,7 +373,7 @@ function parseRoute(pathname: string): Route {
       repo: decodeURIComponent(wt[1]),
     };
   }
-  const repo = pathname.match(/^\/repo\/([^/]+)$/);
+  const repo = pathname.match(REPOSITORY_ROUTE_PATTERN);
   if (repo) {
     return { page: 'repo', repo: decodeURIComponent(repo[1]) };
   }
@@ -454,30 +458,39 @@ function useRoute(): Route {
 // active/queued/stopped tone and label logic, previously copy-pasted in both.
 function worktreeStatus(w: Worktree): { tone: Tone; text: string } {
   const state = worktreeState(w);
+  let text: string = state;
+  if (state === 'attention') {
+    text = 'needs attention';
+  } else if (
+    state === 'queued' &&
+    w.queuePosition !== null &&
+    w.queuePosition !== undefined
+  ) {
+    text = `queued #${w.queuePosition}`;
+  }
+
+  let tone: Tone = 'amber';
+  if (state === 'attention') {
+    tone = 'red';
+  } else if (state === 'running') {
+    tone = 'emerald';
+  } else if (state === 'stopped') {
+    tone = 'zinc';
+  }
   return {
-    text:
-      state === 'attention'
-        ? 'needs attention'
-        : state === 'queued' && w.queuePosition != null
-          ? `queued #${w.queuePosition}`
-          : state,
-    tone:
-      state === 'attention'
-        ? 'red'
-        : state === 'running'
-          ? 'emerald'
-          : state === 'stopped'
-            ? 'zinc'
-            : 'amber',
+    text,
+    tone,
   };
 }
 
 function queueWaitReason(w: Worktree): string | null {
-  return w.queued
-    ? w.queueReason === 'container-capacity'
-      ? 'waiting for container capacity'
-      : 'waiting for a free server slot'
-    : null;
+  if (!w.queued) {
+    return null;
+  }
+  if (w.queueReason === 'container-capacity') {
+    return 'waiting for container capacity';
+  }
+  return 'waiting for a free server slot';
 }
 
 // Shared by WorktreeCard and WorktreePage, same deploying/error/url/idle
@@ -570,6 +583,101 @@ function formatMem(mb: number, short = false): string {
     : `${Math.round(mb)}${short ? 'm' : 'MB'}`;
 }
 
+function dirtyStatus(dirty: number | null | undefined) {
+  if (dirty === null || dirty === undefined) {
+    return 'unknown';
+  }
+  if (dirty > 0) {
+    return <span class="text-signal-amber">{dirty} files</span>;
+  }
+  return 'clean';
+}
+
+function repoActiveEmptyMessage(loaded: boolean) {
+  return loaded ? 'No active worktrees in this project.' : 'Loading worktrees…';
+}
+
+function repoStoppedEmptyMessage(loaded: boolean, search: string) {
+  if (!loaded) {
+    return 'Loading worktrees…';
+  }
+  if (search) {
+    return 'No stopped worktrees match this search.';
+  }
+  return 'No stopped worktrees in this project.';
+}
+
+function filteredStoppedEmptyMessage(loaded: boolean, hasFilters: boolean) {
+  if (!loaded) {
+    return 'Loading worktrees…';
+  }
+  if (hasFilters) {
+    return 'No stopped worktrees match these filters.';
+  }
+  return 'No stopped worktrees. Create a worktree to begin.';
+}
+
+function deploymentDialogTitle(phase: string, production: boolean) {
+  if (phase === 'reading') {
+    return 'Checking deployment target…';
+  }
+  if (production) {
+    return 'Deploy to production?';
+  }
+  return 'Review deployment target';
+}
+
+function deploymentRefreshLabel(phase: string) {
+  return phase === 'uncertain'
+    ? 'Refresh deployment status'
+    : 'Refresh target context';
+}
+
+function prReadyActionLabel(busy: 'create' | 'ready' | null, state: string) {
+  if (busy === 'ready') {
+    return 'Updating…';
+  }
+  return state === 'draft' ? 'Mark ready for review' : 'Convert to draft';
+}
+
+function projectSubmitValues(
+  tab: 'existing' | 'new',
+  github: string,
+  name: string
+) {
+  if (tab === 'new') {
+    const trimmedName = name.trim();
+    return { github: '', invalid: !trimmedName, name: trimmedName };
+  }
+  const trimmedGithub = github.trim();
+  return { github: trimmedGithub, invalid: !trimmedGithub, name: '' };
+}
+
+function projectInputError(tab: 'existing' | 'new') {
+  return tab === 'existing'
+    ? 'Enter a GitHub URL or organization/repository.'
+    : 'Enter a repo name.';
+}
+
+function projectSubmittingStatus(tab: 'existing' | 'new') {
+  return tab === 'existing' ? 'Cloning repo…' : 'Initializing repo…';
+}
+
+function deploymentActionLabel(
+  phase: string,
+  production: boolean | undefined,
+  context: DeploymentIntentState['context'],
+  intent: DeploymentIntent
+) {
+  if (phase === 'submitting') {
+    return 'Submitting…';
+  }
+  if (production) {
+    return 'Deploy to production';
+  }
+  return `Deploy ${context?.destination.environment ?? intent.target}`;
+}
+
 // Same "cd into this worktree" string used by both the card's copy button and
 // the detail page's "Copy cd command" action.
 function cdCommand(w: Worktree): string {
@@ -597,6 +705,7 @@ function CreateModal({
   onClose: () => void;
   onCreated: () => void;
 }) {
+  // biome-ignore lint/suspicious/noUnnecessaryConditions: Project transport data can be empty or omit the first name; retain the empty-string fallback.
   const [repo, setRepo] = useState(initialRepo ?? projects[0]?.name ?? '');
   const [name, setName] = useState(initialName ?? '');
   const [tunnel, setTunnel] = useState(false);
@@ -638,6 +747,7 @@ function CreateModal({
     const owner = tunnel ? worktrees.find((w) => w.tunnelOn) : undefined;
     if (
       owner &&
+      // biome-ignore lint/suspicious/noAlert: This confirmation gates the tunnel-moving create request below.
       !confirm(
         `Move the public tunnel from ${owner.repo}/${owner.name} to this new worktree? Both dev servers will restart.`
       )
@@ -843,19 +953,18 @@ function AddProjectModal({
     if (busy || uncertain) {
       return;
     }
-    const name = tab === 'new' ? newName.trim() : '';
-    const gh = tab === 'existing' ? github.trim() : '';
-    if (tab === 'existing' ? !gh : !name) {
-      setStatus(
-        tab === 'existing'
-          ? 'Enter a GitHub URL or organization/repository.'
-          : 'Enter a repo name.'
-      );
+    const {
+      github: gh,
+      invalid,
+      name,
+    } = projectSubmitValues(tab, github, newName);
+    if (invalid) {
+      setStatus(projectInputError(tab));
       tabInputRef.current?.focus();
       return;
     }
     setBusy(true);
-    setStatus(tab === 'existing' ? 'Cloning repo…' : 'Initializing repo…');
+    setStatus(projectSubmittingStatus(tab));
     const res = await post('/api/project/add', {
       github: gh,
       label: label.trim(),
@@ -1455,9 +1564,7 @@ function DeployMenu({
       >
         <Icon class="h-4 w-4" />
       </DropdownMenuTrigger>
-      <DropdownMenuContent
-        finalFocus={() => (openingDialog.current ? false : true)}
-      >
+      <DropdownMenuContent finalFocus={() => !openingDialog.current}>
         <DropdownMenuItem onClick={() => choose('preview')}>
           Deploy preview
         </DropdownMenuItem>
@@ -1466,8 +1573,9 @@ function DeployMenu({
         </DropdownMenuItem>
         <DropdownMenuItem
           onClick={() => {
+            // biome-ignore lint/suspicious/noAlert: Existing prompt is the custom deployment target entry gate; cancellation and blank input leave the request untouched.
             const custom = window.prompt(customPrompt);
-            if (custom && custom.trim()) {
+            if (custom?.trim()) {
               choose(custom.trim());
             }
           }}
@@ -1556,7 +1664,7 @@ type PrReviewRun = {
   skill: string;
   startedAt: number;
   exitCode: 'success' | 'error' | 'timeout' | null;
-  costUsd: number | null;
+  costUsd: number | null | undefined;
   error: string | null;
   dirtyAfter: boolean | null;
 } | null;
@@ -1567,7 +1675,7 @@ type PrReviewArtifact = {
   generatedAt: string;
   headSha: string;
   htmlFile: string | null;
-  findings: number | null;
+  findings: number | null | undefined;
   stale: boolean;
 } | null;
 interface PrReviewStatus {
@@ -1627,7 +1735,11 @@ function PrReviewSection({
     return null;
   }
 
-  const running = status?.run?.running ?? false;
+  const reviewRun = status?.run;
+  const running = reviewRun?.running ?? false;
+  const runningSkill = reviewRun
+    ? PR_REVIEW_LABEL[reviewRun.skill as (typeof PR_REVIEW_SKILLS)[number]]
+    : undefined;
 
   return (
     <Section title="PR Review">
@@ -1640,25 +1752,34 @@ function PrReviewSection({
           </button>
         </p>
       )}
-      {status ? (
-        status.pluginInstalled ? (
+      {(function renderPrReviewContent() {
+        if (!status) {
+          return !failed && <p class="text-sm text-zinc-400">Loading…</p>;
+        }
+        if (!status.pluginInstalled) {
+          return (
+            <p class="text-xs text-zinc-400">
+              The pr-walkthrough plugin isn't installed for this worktree.
+              Install it with{' '}
+              <code class="font-mono text-zinc-500">
+                claude plugin install pr-walkthrough@mukulchugh-skills
+              </code>
+              .
+            </p>
+          );
+        }
+        return (
           <div class="flex flex-col gap-3">
             <div class="flex flex-wrap items-center gap-3">
               {running ? (
                 <button
                   class="flex items-center gap-1.5 text-signal-amber text-xs transition-opacity duration-150 hover:opacity-80"
                   onClick={() => onOpenLogs(w.repo, w.name, 'pr-review')}
-                  title={`Running ${PR_REVIEW_LABEL[status!.run!.skill as (typeof PR_REVIEW_SKILLS)[number]]}, click to view progress`}
+                  title={`Running ${runningSkill}, click to view progress`}
                   type="button"
                 >
                   <StatusDot pulse tone="amber" />
-                  running{' '}
-                  {
-                    PR_REVIEW_LABEL[
-                      status!.run!.skill as (typeof PR_REVIEW_SKILLS)[number]
-                    ]
-                  }
-                  …
+                  running {runningSkill}…
                 </button>
               ) : (
                 PR_REVIEW_SKILLS.map((skill) => (
@@ -1685,7 +1806,8 @@ function PrReviewSection({
               {status?.run &&
                 !running &&
                 status.run.exitCode === 'success' &&
-                status.run.costUsd != null && (
+                status.run.costUsd !== null &&
+                status.run.costUsd !== undefined && (
                   <span class="text-xs text-zinc-400">
                     last run cost ${status.run.costUsd.toFixed(2)}
                   </span>
@@ -1701,7 +1823,7 @@ function PrReviewSection({
             {status &&
               PR_REVIEW_SKILLS.map((skill) => {
                 const a = status.artifacts[skill];
-                if (!(a && a.htmlFile)) {
+                if (!a?.htmlFile) {
                   return null;
                 }
                 return (
@@ -1714,7 +1836,7 @@ function PrReviewSection({
                     >
                       Open {PR_REVIEW_LABEL[skill].toLowerCase()}
                     </a>
-                    {a.findings != null && (
+                    {a.findings !== null && a.findings !== undefined && (
                       <Badge tone="zinc">
                         {a.findings} finding{a.findings === 1 ? '' : 's'}
                       </Badge>
@@ -1750,19 +1872,8 @@ function PrReviewSection({
               toast={toast}
             />
           </div>
-        ) : (
-          <p class="text-xs text-zinc-400">
-            The pr-walkthrough plugin isn't installed for this worktree. Install
-            it with{' '}
-            <code class="font-mono text-zinc-500">
-              claude plugin install pr-walkthrough@mukulchugh-skills
-            </code>
-            .
-          </p>
-        )
-      ) : (
-        !failed && <p class="text-sm text-zinc-400">Loading…</p>
-      )}
+        );
+      })()}
     </Section>
   );
 }
@@ -1783,6 +1894,7 @@ function GithubActionsSection({
   onRefresh: () => void;
 }) {
   const [busy, setBusy] = useState<'create' | 'ready' | null>(null);
+  const { pr } = w;
 
   async function createPr() {
     setBusy('create');
@@ -1821,11 +1933,12 @@ function GithubActionsSection({
   // fall back to the repo's Actions list filtered to this branch --
   // branchUrl is `${github}/tree/${name}`, strip the /tree/... suffix to
   // get back to the bare repo URL.
-  const ciUrl = w.pr
-    ? `${w.pr.url}/checks`
-    : w.branchUrl
-      ? `${w.branchUrl.replace(/\/tree\/.*$/, '')}/actions?query=${encodeURIComponent(`branch:${w.name}`)}`
-      : null;
+  let ciUrl: string | null = null;
+  if (w.pr) {
+    ciUrl = `${w.pr.url}/checks`;
+  } else if (w.branchUrl) {
+    ciUrl = `${w.branchUrl.replace(BRANCH_TREE_PATH_PATTERN, '')}/actions?query=${encodeURIComponent(`branch:${w.name}`)}`;
+  }
 
   return (
     <Section title="GitHub">
@@ -1845,18 +1958,14 @@ function GithubActionsSection({
             {busy === 'create' ? 'Creating…' : 'Create PR'}
           </Button>
         )}
-        {w.pr && (w.pr.state === 'open' || w.pr.state === 'draft') && (
+        {pr && (pr.state === 'open' || pr.state === 'draft') && (
           <Button
             compact
             disabled={busy === 'ready'}
-            onClick={() => toggleReady(w.pr!.state === 'draft')}
+            onClick={() => toggleReady(pr.state === 'draft')}
             variant="secondary"
           >
-            {busy === 'ready'
-              ? 'Updating…'
-              : w.pr.state === 'draft'
-                ? 'Mark ready for review'
-                : 'Convert to draft'}
+            {prReadyActionLabel(busy, pr.state)}
           </Button>
         )}
         {ciUrl && (
@@ -2048,11 +2157,10 @@ function ConvexDeployMenu({
       >
         <ConvexIcon class="h-4 w-4" />
       </DropdownMenuTrigger>
-      <DropdownMenuContent
-        finalFocus={() => (openingDialog.current ? false : true)}
-      >
+      <DropdownMenuContent finalFocus={() => !openingDialog.current}>
         <DropdownMenuItem
           onClick={() => {
+            // biome-ignore lint/suspicious/noAlert: Existing prompt is the named preview target entry gate; cancellation and blank input leave the request untouched.
             const target = window.prompt('Named Convex preview target:');
             if (target?.trim()) {
               choose(target.trim());
@@ -2177,14 +2285,6 @@ function WorktreeCard({
   toast: (msg: string, tone?: Tone) => void;
   gridMode: boolean;
 }) {
-  const { tone: statusTone, text: statusText } = worktreeStatus(w);
-  const showInngestInline = w.inngestActive;
-  const showTriggerInline = w.triggerActive;
-  // Two-part gate, unlike the two above: Convex isn't assumed available on
-  // every worktree, so the inline chip needs both "configured" and "active",
-  // not just "active" alone.
-  const showConvexInline = w.convexConfigured && w.convexActive;
-
   return (
     <div
       class={`wt-card group rounded-none border bg-white/85 backdrop-blur-md transition-colors duration-150 hover:border-zinc-300 hover:bg-white/95 dark:bg-zinc-900/55 dark:hover:border-zinc-700 dark:hover:bg-zinc-900/75 ${
@@ -2198,222 +2298,253 @@ function WorktreeCard({
       }`}
     >
       <div class="min-w-0 flex-1">
-        {worktreeIssue(w) && (
-          <p class="mb-2 break-words text-signal-red text-xs" role="status">
-            {worktreeIssue(w)}
-          </p>
-        )}
-        <div class={'mb-1 flex flex-wrap items-baseline gap-2.5'}>
-          <a
-            class="worktree-name min-w-0 max-w-full text-left font-medium text-[15px] text-zinc-900 transition-colors duration-150 hover:text-accent dark:text-zinc-100"
-            href={`/worktree/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.name)}`}
-            onClick={(e) =>
-              followRoute(
-                e,
-                `/worktree/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.name)}`
-              )
-            }
-          >
-            {w.name}
-          </a>
-          <a
-            aria-label={`Open ${w.label} repository`}
-            class="tip board-mono min-w-0 max-w-full break-words font-bold text-[10px] text-zinc-600 transition-colors duration-150 hover:text-accent dark:text-zinc-300"
-            href={`/repo/${encodeURIComponent(w.repo)}`}
-            onClick={(e) =>
-              followRoute(e, `/repo/${encodeURIComponent(w.repo)}`)
-            }
-          >
-            {w.label}
-          </a>
-          <span class="flex shrink-0 items-center gap-1.5">
-            <StatusDot pulse={w.active} tone={statusTone} />
-            <StatusFlap text={statusText} tone={statusTone} />
-          </span>
-          {queueWaitReason(w) && (
-            <span class="text-xs text-zinc-500">{queueWaitReason(w)}</span>
-          )}
-          {w.container && (w.active || w.starting) && (
-            <Badge
-              tip="Running in a container — real memory/CPU cap"
-              tone="zinc"
-            >
-              container
-            </Badge>
-          )}
-          {w.agent && (
-            <Badge tip={agentTip(w.agent)} tone={agentTone(w.agent)}>
-              {agentChipText(w.agent)}
-            </Badge>
-          )}
-          {!(w.active || w.queued) && (
-            <Badge
-              tip={
-                w.nextStartMode === 'container'
-                  ? 'Next Start will use a container (real memory/CPU cap)'
-                  : 'Next Start will run bare — this worktree has bare-only history'
-              }
-              tone="zinc"
-            >
-              → {w.nextStartMode}
-            </Badge>
-          )}
-          {w.active && w.memMb != null && (
-            <Badge
-              tip="Resident memory of this dev server and its child processes"
-              tone={memTone(w.memMb)}
-            >
-              {formatMem(w.memMb, true)}
-            </Badge>
-          )}
-          {w.dirty === null ? (
-            <Badge
-              tip="The working tree status could not be checked"
-              tone="amber"
-            >
-              changes unknown
-            </Badge>
-          ) : (
-            w.dirty > 0 && (
-              <Badge
-                tip={`${w.dirty} uncommitted change${(w.dirty ?? 0) > 1 ? 's' : ''}`}
-                tone="amber"
-              >
-                {w.dirty} dirty
-              </Badge>
-            )
-          )}
-        </div>
-        <div
-          class={`flex min-w-0 items-center gap-3 text-xs text-zinc-600 dark:text-zinc-400 ${gridMode ? 'flex-wrap' : 'flex-wrap'}`}
-        >
-          <span class="max-w-full truncate font-mono">{w.domain}</span>
-          {w.tunnelOn && (
-            <span class="truncate font-mono text-zinc-500">{w.pubDomain}</span>
-          )}
-          {w.lastCommitAt && (
-            <span class="shrink-0" title="Last commit on this branch">
-              <RelativeTime value={w.lastCommitAt} />
-            </span>
-          )}
-          {(w.ahead > 0 || w.behind > 0) && (
-            <span
-              class="shrink-0 font-mono"
-              title={`${w.ahead} ahead, ${w.behind} behind its base branch`}
-            >
-              {w.ahead > 0 && `↑${w.ahead}`}
-              {w.ahead > 0 && w.behind > 0 && ' '}
-              {w.behind > 0 && `↓${w.behind}`}
-            </span>
-          )}
-          {showInngestInline && (
-            <a
-              class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
-              href={`http://localhost:${w.inngestPort}`}
-              rel="noopener"
-              target="_blank"
-              title="Inngest dashboard"
-            >
-              <SidecarIcon tool="inngest" />
-              inngest
-            </a>
-          )}
-          {showTriggerInline && (
-            <button
-              class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
-              onClick={() => onOpenLogs(w.repo, w.name, 'trigger')}
-              title="trigger.dev logs"
-              type="button"
-            >
-              <SidecarIcon tool="trigger" />
-              trigger
-            </button>
-          )}
-          {showConvexInline && (
-            <button
-              class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
-              onClick={() => onOpenLogs(w.repo, w.name, 'convex')}
-              title="Convex dev logs"
-              type="button"
-            >
-              <ConvexIcon class="h-3 w-3" />
-              convex
-            </button>
-          )}
-          {w.sidecars.some((s) => s.active) && (
-            <span
-              class="flex shrink-0 items-center gap-1.5"
-              title={w.sidecars
-                .filter((s) => s.active)
-                .map((s) => s.name)
-                .join(', ')}
-            >
-              <StatusDot tone="emerald" />
-              {w.sidecars.filter((s) => s.active).length === 1
-                ? w.sidecars.find((s) => s.active)!.name
-                : `${w.sidecars.filter((s) => s.active).length} sidecars`}
-            </span>
-          )}
-          {w.branchUrl && (
-            <a
-              class="flex shrink-0 items-center gap-1 transition-colors duration-150 hover:text-zinc-600"
-              href={w.branchUrl}
-              rel="noopener"
-              target="_blank"
-            >
-              <svg
-                aria-hidden="true"
-                class="h-3 w-3"
-                fill="currentColor"
-                viewBox="0 0 16 16"
-              >
-                <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm3-8.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z" />
-              </svg>
-              branch
-            </a>
-          )}
-          {w.pr && (
-            <a
-              class={`flex shrink-0 items-center gap-1 transition-colors duration-150 ${prLinkClass(w.pr.state)}`}
-              href={w.pr.url}
-              rel="noopener"
-              target="_blank"
-              title={`${w.pr.state}: ${w.pr.title}`}
-            >
-              <svg
-                aria-hidden="true"
-                class="h-3 w-3"
-                fill="currentColor"
-                viewBox="0 0 16 16"
-              >
-                <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm8.25.75a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z" />
-              </svg>
-              PR #{w.pr.number}
-              {w.pr.state === 'merged' && (
-                <span class="board-mono font-bold text-[8px]">MERGED</span>
+        {(function renderCardHeader() {
+          const { tone: statusTone, text: statusText } = worktreeStatus(w);
+          return (
+            <>
+              {worktreeIssue(w) && (
+                <p
+                  class="mb-2 break-words text-signal-red text-xs"
+                  role="status"
+                >
+                  {worktreeIssue(w)}
+                </p>
               )}
-              {(w.pr.state === 'open' || w.pr.state === 'draft') &&
-                w.pr.checks !== 'none' && (
-                  <StatusDot
-                    pulse={w.pr.checks === 'pending'}
-                    tone={checksTone(w.pr.checks)}
-                  />
+              <div class={'mb-1 flex flex-wrap items-baseline gap-2.5'}>
+                <a
+                  class="worktree-name min-w-0 max-w-full text-left font-medium text-[15px] text-zinc-900 transition-colors duration-150 hover:text-accent dark:text-zinc-100"
+                  href={`/worktree/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.name)}`}
+                  onClick={(e) =>
+                    followRoute(
+                      e,
+                      `/worktree/${encodeURIComponent(w.repo)}/${encodeURIComponent(w.name)}`
+                    )
+                  }
+                >
+                  {w.name}
+                </a>
+                <a
+                  aria-label={`Open ${w.label} repository`}
+                  class="tip board-mono min-w-0 max-w-full break-words font-bold text-[10px] text-zinc-600 transition-colors duration-150 hover:text-accent dark:text-zinc-300"
+                  href={`/repo/${encodeURIComponent(w.repo)}`}
+                  onClick={(e) =>
+                    followRoute(e, `/repo/${encodeURIComponent(w.repo)}`)
+                  }
+                >
+                  {w.label}
+                </a>
+                <span class="flex shrink-0 items-center gap-1.5">
+                  <StatusDot pulse={w.active} tone={statusTone} />
+                  <StatusFlap text={statusText} tone={statusTone} />
+                </span>
+                {queueWaitReason(w) && (
+                  <span class="text-xs text-zinc-500">
+                    {queueWaitReason(w)}
+                  </span>
                 )}
-            </a>
-          )}
-          <DeployStatusChips
-            deploy={w.vercelDeploy}
-            onOpenLogs={onOpenLogs}
-            provider="vercel"
-            w={w}
-          />
-          <DeployStatusChips
-            deploy={w.netlifyDeploy}
-            onOpenLogs={onOpenLogs}
-            provider="netlify"
-            w={w}
-          />
-        </div>
+                {w.container && (w.active || w.starting) && (
+                  <Badge
+                    tip="Running in a container — real memory/CPU cap"
+                    tone="zinc"
+                  >
+                    container
+                  </Badge>
+                )}
+                {w.agent && (
+                  <Badge tip={agentTip(w.agent)} tone={agentTone(w.agent)}>
+                    {agentChipText(w.agent)}
+                  </Badge>
+                )}
+                {!(w.active || w.queued) && (
+                  <Badge
+                    tip={
+                      w.nextStartMode === 'container'
+                        ? 'Next Start will use a container (real memory/CPU cap)'
+                        : 'Next Start will run bare — this worktree has bare-only history'
+                    }
+                    tone="zinc"
+                  >
+                    → {w.nextStartMode}
+                  </Badge>
+                )}
+                {w.active && w.memMb !== null && w.memMb !== undefined && (
+                  <Badge
+                    tip="Resident memory of this dev server and its child processes"
+                    tone={memTone(w.memMb)}
+                  >
+                    {formatMem(w.memMb, true)}
+                  </Badge>
+                )}
+                {w.dirty === null ? (
+                  <Badge
+                    tip="The working tree status could not be checked"
+                    tone="amber"
+                  >
+                    changes unknown
+                  </Badge>
+                ) : (
+                  w.dirty > 0 && (
+                    <Badge
+                      tip={`${w.dirty} uncommitted change${(w.dirty ?? 0) > 1 ? 's' : ''}`}
+                      tone="amber"
+                    >
+                      {w.dirty} dirty
+                    </Badge>
+                  )
+                )}
+              </div>
+            </>
+          );
+        })()}
+        {(function renderCardMetadata() {
+          const activeSidecars = w.sidecars.filter((sidecar) => sidecar.active);
+          const activeSidecarLabel =
+            activeSidecars.length === 1
+              ? activeSidecars[0]?.name
+              : `${activeSidecars.length} sidecars`;
+          const showInngestInline = w.inngestActive;
+          const showTriggerInline = w.triggerActive;
+          // Two-part gate, unlike the two above: Convex isn't assumed available on
+          // every worktree, so the inline chip needs both "configured" and "active",
+          // not just "active" alone.
+          const showConvexInline = w.convexConfigured && w.convexActive;
+          function renderActiveSidecars() {
+            return (
+              activeSidecars.length > 0 && (
+                <span
+                  class="flex shrink-0 items-center gap-1.5"
+                  title={activeSidecars
+                    .map((sidecar) => sidecar.name)
+                    .join(', ')}
+                >
+                  <StatusDot tone="emerald" />
+                  {activeSidecarLabel}
+                </span>
+              )
+            );
+          }
+          return (
+            <div
+              class={`flex min-w-0 items-center gap-3 text-xs text-zinc-600 dark:text-zinc-400 ${gridMode ? 'flex-wrap' : 'flex-wrap'}`}
+            >
+              <span class="max-w-full truncate font-mono">{w.domain}</span>
+              {w.tunnelOn && (
+                <span class="truncate font-mono text-zinc-500">
+                  {w.pubDomain}
+                </span>
+              )}
+              {w.lastCommitAt && (
+                <span class="shrink-0" title="Last commit on this branch">
+                  <RelativeTime value={w.lastCommitAt} />
+                </span>
+              )}
+              {(w.ahead > 0 || w.behind > 0) && (
+                <span
+                  class="shrink-0 font-mono"
+                  title={`${w.ahead} ahead, ${w.behind} behind its base branch`}
+                >
+                  {w.ahead > 0 && `↑${w.ahead}`}
+                  {w.ahead > 0 && w.behind > 0 && ' '}
+                  {w.behind > 0 && `↓${w.behind}`}
+                </span>
+              )}
+              {showInngestInline && (
+                <a
+                  class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
+                  href={`http://localhost:${w.inngestPort}`}
+                  rel="noopener"
+                  target="_blank"
+                  title="Inngest dashboard"
+                >
+                  <SidecarIcon tool="inngest" />
+                  inngest
+                </a>
+              )}
+              {showTriggerInline && (
+                <button
+                  class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
+                  onClick={() => onOpenLogs(w.repo, w.name, 'trigger')}
+                  title="trigger.dev logs"
+                  type="button"
+                >
+                  <SidecarIcon tool="trigger" />
+                  trigger
+                </button>
+              )}
+              {showConvexInline && (
+                <button
+                  class="flex shrink-0 items-center gap-1.5 transition-colors duration-150 hover:text-zinc-600"
+                  onClick={() => onOpenLogs(w.repo, w.name, 'convex')}
+                  title="Convex dev logs"
+                  type="button"
+                >
+                  <ConvexIcon class="h-3 w-3" />
+                  convex
+                </button>
+              )}
+              {renderActiveSidecars()}
+              {w.branchUrl && (
+                <a
+                  class="flex shrink-0 items-center gap-1 transition-colors duration-150 hover:text-zinc-600"
+                  href={w.branchUrl}
+                  rel="noopener"
+                  target="_blank"
+                >
+                  <svg
+                    aria-hidden="true"
+                    class="h-3 w-3"
+                    fill="currentColor"
+                    viewBox="0 0 16 16"
+                  >
+                    <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm3-8.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0z" />
+                  </svg>
+                  branch
+                </a>
+              )}
+              {w.pr && (
+                <a
+                  class={`flex shrink-0 items-center gap-1 transition-colors duration-150 ${prLinkClass(w.pr.state)}`}
+                  href={w.pr.url}
+                  rel="noopener"
+                  target="_blank"
+                  title={`${w.pr.state}: ${w.pr.title}`}
+                >
+                  <svg
+                    aria-hidden="true"
+                    class="h-3 w-3"
+                    fill="currentColor"
+                    viewBox="0 0 16 16"
+                  >
+                    <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm8.25.75a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0z" />
+                  </svg>
+                  PR #{w.pr.number}
+                  {w.pr.state === 'merged' && (
+                    <span class="board-mono font-bold text-[8px]">MERGED</span>
+                  )}
+                  {(w.pr.state === 'open' || w.pr.state === 'draft') &&
+                    w.pr.checks !== 'none' && (
+                      <StatusDot
+                        pulse={w.pr.checks === 'pending'}
+                        tone={checksTone(w.pr.checks)}
+                      />
+                    )}
+                </a>
+              )}
+              <DeployStatusChips
+                deploy={w.vercelDeploy}
+                onOpenLogs={onOpenLogs}
+                provider="vercel"
+                w={w}
+              />
+              <DeployStatusChips
+                deploy={w.netlifyDeploy}
+                onOpenLogs={onOpenLogs}
+                provider="netlify"
+                w={w}
+              />
+            </div>
+          );
+        })()}
       </div>
 
       <div
@@ -2605,7 +2736,7 @@ function HostHealth({ initial }: { initial: Status['hostHealth'] }) {
     }
   }
   const view = hostStorageView(read);
-  const observation = read.observation;
+  const { observation } = read;
   const filesystem =
     observation?.workspacePath ?? read.lastReady?.workspacePath;
   const volume = observation?.volumeId ?? read.lastReady?.volumeId;
@@ -2619,6 +2750,7 @@ function HostHealth({ initial }: { initial: Status['hostHealth'] }) {
           <div class="min-w-0 grow basis-64">
             <strong>{view.title}</strong>
             <p>{view.detail}</p>
+            {/* biome-ignore lint/suspicious/noUnnecessaryConditions: hostStorageView retains lastChecked as optional for unknown host observations even when the rendered tone is non-null. */}
             {view.lastChecked !== undefined && (
               <p class="text-xs">
                 {view.summary}. Last successful check:{' '}
@@ -2682,6 +2814,7 @@ function HostHealth({ initial }: { initial: Status['hostHealth'] }) {
                 {reading ? 'Checking…' : 'Check storage'}
               </button>
             )}
+            {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /help#storage is a real section and followRoute preserves modified-click navigation. */}
             <a
               class="inline-flex min-h-11 items-center px-2 underline"
               href="/help#storage"
@@ -2857,6 +2990,7 @@ function PortalStatus({
 }) {
   return (
     <div class="portal-status flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+      {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /#active-work is a real section and followRoute preserves modified-click navigation. */}
       <a
         class="font-semibold text-accent dark:text-emerald-300"
         href="/#active-work"
@@ -2866,6 +3000,7 @@ function PortalStatus({
       </a>
       <StatusStrip loaded={loaded} status={status} />
       {!!status?.pendingRemovals?.length && (
+        // biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /#pending-cleanup is a real section and followRoute preserves modified-click navigation.
         <a
           class="text-amber-900 underline dark:text-amber-200"
           href="/#pending-cleanup"
@@ -2947,189 +3082,210 @@ function WorktreePage({
 
   return (
     <div class="portal-page mx-auto max-w-4xl px-4 py-6 sm:px-6">
-      <PageHeader
-        actions={
-          <WorktreeActions
-            agents={agents}
-            onAct={onAct}
-            onOpenLogs={onOpenLogs}
-            onOpenTool={onOpenTool}
-            onRemove={onRemove}
-            onStart={onStart}
-            pending={pending}
-            toast={toast}
-            w={w}
-          />
-        }
-        back={{ label: 'All worktrees', onClick: () => navigate('/') }}
-        subtitle={
-          <div class="flex flex-wrap items-center gap-2">
-            <span class="flex items-center gap-1.5">
-              <StatusDot pulse={w.active} tone={statusTone} />
-              <StatusFlap text={statusText} tone={statusTone} />
-            </span>
-            {queueWaitReason(w) && (
-              <span class="text-xs text-zinc-500">{queueWaitReason(w)}</span>
+      {(function renderWorktreeHeader() {
+        return (
+          <>
+            <PageHeader
+              actions={
+                <WorktreeActions
+                  agents={agents}
+                  onAct={onAct}
+                  onOpenLogs={onOpenLogs}
+                  onOpenTool={onOpenTool}
+                  onRemove={onRemove}
+                  onStart={onStart}
+                  pending={pending}
+                  toast={toast}
+                  w={w}
+                />
+              }
+              back={{ label: 'All worktrees', onClick: () => navigate('/') }}
+              subtitle={
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="flex items-center gap-1.5">
+                    <StatusDot pulse={w.active} tone={statusTone} />
+                    <StatusFlap text={statusText} tone={statusTone} />
+                  </span>
+                  {queueWaitReason(w) && (
+                    <span class="text-xs text-zinc-500">
+                      {queueWaitReason(w)}
+                    </span>
+                  )}
+                  <Badge tone="zinc">{w.label}</Badge>
+                  {w.container && (w.active || w.starting) && (
+                    <Badge tip="Real memory/CPU cap enforced" tone="zinc">
+                      container
+                    </Badge>
+                  )}
+                  {!(w.active || w.queued) && (
+                    <Badge tone="zinc">→ {w.nextStartMode}</Badge>
+                  )}
+                </div>
+              }
+              title={w.name}
+            />
+            {worktreeIssue(w) && (
+              <p class="mb-6 break-words text-signal-red text-sm" role="status">
+                {worktreeIssue(w)}{' '}
+                <button class="underline" onClick={onRefresh} type="button">
+                  Refresh status
+                </button>
+              </p>
             )}
-            <Badge tone="zinc">{w.label}</Badge>
-            {w.container && (w.active || w.starting) && (
-              <Badge tip="Real memory/CPU cap enforced" tone="zinc">
-                container
-              </Badge>
-            )}
-            {!(w.active || w.queued) && (
-              <Badge tone="zinc">→ {w.nextStartMode}</Badge>
-            )}
-          </div>
-        }
-        title={w.name}
-      />
-      {worktreeIssue(w) && (
-        <p class="mb-6 break-words text-signal-red text-sm" role="status">
-          {worktreeIssue(w)}{' '}
-          <button class="underline" onClick={onRefresh} type="button">
-            Refresh status
-          </button>
-        </p>
-      )}
 
-      {/* Distinct banner, not folded into the Overview grid below: this is
+            {/* Distinct banner, not folded into the Overview grid below: this is
           the one PR state that asks for a decision (clean up or not), the
           others (open/closed/draft) are just informational. "Clean up
           worktree" calls the same onRemove as the Remove button at the
           bottom of this page, so it's still confirm()-gated and still
           leaves the branch alone, a shortcut to the existing flow, not a
           second one. */}
-      {w.pr?.state === 'merged' && (
-        <div class="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-none border border-signal-green/30 bg-signal-green/5 px-4 py-3 text-sm">
-          <span class="flex items-center gap-2 text-zinc-700 dark:text-zinc-300">
-            <StatusDot tone="emerald" />
-            PR #{w.pr.number} merged. Remove this checkout when its work is
-            finished.
-          </span>
-          <Button
-            compact
-            disabled={w.name === 'main'}
-            onClick={() => onRemove(w, 'merged')}
-            variant="secondary"
-          >
-            Clean up worktree
-          </Button>
-        </div>
-      )}
-
-      <Section
-        actions={
-          <Button onClick={() => onAct('/api/sync', w)} variant="secondary">
-            Sync with base
-          </Button>
-        }
-        title="Overview"
-      >
-        <div class="grid grid-cols-1 gap-4 text-sm sm:grid-cols-2 [&>*]:min-w-0 [&_a]:break-all [&_span]:break-words">
-          <div>
-            <div class="mb-0.5 text-xs text-zinc-400">Local domain</div>
-            <a
-              class="font-mono text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
-              href={`http://${w.domain}`}
-              rel="noopener"
-              target="_blank"
-            >
-              {w.domain}
-            </a>
-          </div>
-          {w.tunnelOn && (
-            <div>
-              <div class="mb-0.5 text-xs text-zinc-400">Public tunnel</div>
-              <span class="font-mono text-zinc-700 dark:text-zinc-300">
-                {w.pubDomain}
-              </span>
-            </div>
-          )}
-          {w.branchUrl && (
-            <div>
-              <div class="mb-0.5 text-xs text-zinc-400">Branch</div>
-              <a
-                class="text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
-                href={w.branchUrl}
-                rel="noopener"
-                target="_blank"
-              >
-                {w.repo}/{w.name}
-              </a>
-            </div>
-          )}
-          {w.pr && (
-            <div class="min-w-0">
-              <div class="mb-0.5 text-xs text-zinc-400">Pull request</div>
-              <div class="flex min-w-0 items-center gap-2">
-                <a
-                  class="truncate text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
-                  href={w.pr.url}
-                  rel="noopener"
-                  target="_blank"
+            {w.pr?.state === 'merged' && (
+              <div class="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-none border border-signal-green/30 bg-signal-green/5 px-4 py-3 text-sm">
+                <span class="flex items-center gap-2 text-zinc-700 dark:text-zinc-300">
+                  <StatusDot tone="emerald" />
+                  PR #{w.pr.number} merged. Remove this checkout when its work
+                  is finished.
+                </span>
+                <Button
+                  compact
+                  disabled={w.name === 'main'}
+                  onClick={() => onRemove(w, 'merged')}
+                  variant="secondary"
                 >
-                  PR #{w.pr.number} — {w.pr.title}
-                </a>
-                <Badge tone={prTone(w.pr.state)}>{w.pr.state}</Badge>
-                {(w.pr.state === 'open' || w.pr.state === 'draft') &&
-                  w.pr.checks !== 'none' && (
-                    <span
-                      class="tip shrink-0"
-                      data-tip={`checks: ${w.pr.checks}`}
-                    >
-                      <StatusDot
-                        pulse={w.pr.checks === 'pending'}
-                        tone={checksTone(w.pr.checks)}
-                      />
-                    </span>
-                  )}
+                  Clean up worktree
+                </Button>
               </div>
-            </div>
-          )}
-        </div>
-      </Section>
+            )}
+          </>
+        );
+      })()}
 
-      <Section title="Metrics">
-        <div class="grid grid-cols-2 gap-4 text-sm">
-          <div>
-            <div class="mb-0.5 text-xs text-zinc-400">Last commit</div>
-            <div>{w.lastCommitAt ? relativeTime(w.lastCommitAt) : '—'}</div>
-          </div>
-          <div>
-            <div class="mb-0.5 text-xs text-zinc-400">Created</div>
-            <div>{w.createdAt ? relativeTime(w.createdAt) : '—'}</div>
-          </div>
-          <div>
-            <div class="mb-0.5 text-xs text-zinc-400">Ahead / behind base</div>
-            <div class="font-mono">
-              ↑{w.ahead} ↓{w.behind}
-            </div>
-          </div>
-          <div>
-            <div class="mb-0.5 text-xs text-zinc-400">Uncommitted changes</div>
-            <div>
-              {w.dirty == null ? (
-                'unknown'
-              ) : (w.dirty ?? 0) > 0 ? (
-                <span class="text-signal-amber">{w.dirty} files</span>
-              ) : (
-                'clean'
-              )}
-            </div>
-          </div>
-          {w.active && w.memMb != null && (
-            <div>
-              <div class="mb-0.5 text-xs text-zinc-400">Resident memory</div>
-              <div
-                class={memTone(w.memMb) === 'amber' ? 'text-signal-amber' : ''}
-              >
-                {formatMem(w.memMb)}
+      {(function renderWorktreeOverview() {
+        return (
+          <>
+            <Section
+              actions={
+                <Button
+                  onClick={() => onAct('/api/sync', w)}
+                  variant="secondary"
+                >
+                  Sync with base
+                </Button>
+              }
+              title="Overview"
+            >
+              <div class="grid grid-cols-1 gap-4 text-sm sm:grid-cols-2 [&>*]:min-w-0 [&_a]:break-all [&_span]:break-words">
+                <div>
+                  <div class="mb-0.5 text-xs text-zinc-400">Local domain</div>
+                  <a
+                    class="font-mono text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
+                    href={`http://${w.domain}`}
+                    rel="noopener"
+                    target="_blank"
+                  >
+                    {w.domain}
+                  </a>
+                </div>
+                {w.tunnelOn && (
+                  <div>
+                    <div class="mb-0.5 text-xs text-zinc-400">
+                      Public tunnel
+                    </div>
+                    <span class="font-mono text-zinc-700 dark:text-zinc-300">
+                      {w.pubDomain}
+                    </span>
+                  </div>
+                )}
+                {w.branchUrl && (
+                  <div>
+                    <div class="mb-0.5 text-xs text-zinc-400">Branch</div>
+                    <a
+                      class="text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
+                      href={w.branchUrl}
+                      rel="noopener"
+                      target="_blank"
+                    >
+                      {w.repo}/{w.name}
+                    </a>
+                  </div>
+                )}
+                {w.pr && (
+                  <div class="min-w-0">
+                    <div class="mb-0.5 text-xs text-zinc-400">Pull request</div>
+                    <div class="flex min-w-0 items-center gap-2">
+                      <a
+                        class="truncate text-zinc-700 transition-colors hover:text-accent dark:text-zinc-300"
+                        href={w.pr.url}
+                        rel="noopener"
+                        target="_blank"
+                      >
+                        PR #{w.pr.number} — {w.pr.title}
+                      </a>
+                      <Badge tone={prTone(w.pr.state)}>{w.pr.state}</Badge>
+                      {(w.pr.state === 'open' || w.pr.state === 'draft') &&
+                        w.pr.checks !== 'none' && (
+                          <span
+                            class="tip shrink-0"
+                            data-tip={`checks: ${w.pr.checks}`}
+                          >
+                            <StatusDot
+                              pulse={w.pr.checks === 'pending'}
+                              tone={checksTone(w.pr.checks)}
+                            />
+                          </span>
+                        )}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-        </div>
-      </Section>
+            </Section>
+
+            <Section title="Metrics">
+              <div class="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <div class="mb-0.5 text-xs text-zinc-400">Last commit</div>
+                  <div>
+                    {w.lastCommitAt ? relativeTime(w.lastCommitAt) : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div class="mb-0.5 text-xs text-zinc-400">Created</div>
+                  <div>{w.createdAt ? relativeTime(w.createdAt) : '—'}</div>
+                </div>
+                <div>
+                  <div class="mb-0.5 text-xs text-zinc-400">
+                    Ahead / behind base
+                  </div>
+                  <div class="font-mono">
+                    ↑{w.ahead} ↓{w.behind}
+                  </div>
+                </div>
+                <div>
+                  <div class="mb-0.5 text-xs text-zinc-400">
+                    Uncommitted changes
+                  </div>
+                  <div>{dirtyStatus(w.dirty)}</div>
+                </div>
+                {w.active && w.memMb !== null && w.memMb !== undefined && (
+                  <div>
+                    <div class="mb-0.5 text-xs text-zinc-400">
+                      Resident memory
+                    </div>
+                    <div
+                      class={
+                        memTone(w.memMb) === 'amber' ? 'text-signal-amber' : ''
+                      }
+                    >
+                      {formatMem(w.memMb)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </Section>
+          </>
+        );
+      })()}
 
       {/* Natural expansion of Metrics' ahead/behind/dirty counts above: this
           is the actual content behind those numbers, not a separate concern.
@@ -3152,124 +3308,130 @@ function WorktreePage({
 
       <WorktreeResourceControls name={w.name} repo={w.repo} toast={toast} />
 
-      <Section id="sidecars" title="Sidecars">
-        <p class="mb-3 text-xs text-zinc-600 dark:text-zinc-300">
-          <a
-            class="underline"
-            href="/help#sidecar-approval"
-            onClick={(e) => followRoute(e, '/help#sidecar-approval')}
-          >
-            Why a sidecar needs command approval
-          </a>{' '}
-          ·{' '}
-          <a
-            class="underline"
-            href="/help#tunnel"
-            onClick={(e) => followRoute(e, '/help#tunnel')}
-          >
-            Public tunnel help
-          </a>
-        </p>
-        <div class="sidecar-controls flex flex-wrap items-center gap-4 text-sm">
-          <div class="flex items-center gap-2">
-            <SidecarIcon tool="inngest" />
-            <StatusDot tone={w.inngestActive ? 'emerald' : 'zinc'} />
-            <span>Inngest</span>
-            {w.inngestActive ? (
-              <>
-                <a
-                  class="text-emerald-600 text-xs hover:underline"
-                  href={`http://localhost:${w.inngestPort}`}
-                  rel="noopener"
-                  target="_blank"
-                >
-                  dashboard
-                </a>
+      {(function renderWorktreeSidecars() {
+        return (
+          <Section id="sidecars" title="Sidecars">
+            <p class="mb-3 text-xs text-zinc-600 dark:text-zinc-300">
+              {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /help#sidecar-approval is a real section and followRoute preserves modified-click navigation. */}
+              <a
+                class="underline"
+                href="/help#sidecar-approval"
+                onClick={(e) => followRoute(e, '/help#sidecar-approval')}
+              >
+                Why a sidecar needs command approval
+              </a>{' '}
+              ·{' '}
+              {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /help#tunnel is a real section and followRoute preserves modified-click navigation. */}
+              <a
+                class="underline"
+                href="/help#tunnel"
+                onClick={(e) => followRoute(e, '/help#tunnel')}
+              >
+                Public tunnel help
+              </a>
+            </p>
+            <div class="sidecar-controls flex flex-wrap items-center gap-4 text-sm">
+              <div class="flex items-center gap-2">
+                <SidecarIcon tool="inngest" />
+                <StatusDot tone={w.inngestActive ? 'emerald' : 'zinc'} />
+                <span>Inngest</span>
+                {w.inngestActive ? (
+                  <>
+                    <a
+                      class="text-emerald-600 text-xs hover:underline"
+                      href={`http://localhost:${w.inngestPort}`}
+                      rel="noopener"
+                      target="_blank"
+                    >
+                      dashboard
+                    </a>
+                    <button
+                      aria-label={`Stop Inngest for ${w.repo}/${w.name}`}
+                      class="text-red-500 text-xs hover:underline"
+                      onClick={() => onAct('/api/inngest/stop', w)}
+                      type="button"
+                    >
+                      stop
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    aria-label={`Start Inngest for ${w.repo}/${w.name}`}
+                    class="text-xs text-zinc-500 hover:underline"
+                    onClick={() => onAct('/api/inngest/start', w)}
+                    type="button"
+                  >
+                    start
+                  </button>
+                )}
+              </div>
+              <div class="flex items-center gap-2">
+                <SidecarIcon tool="trigger" />
+                <StatusDot tone={w.triggerActive ? 'emerald' : 'zinc'} />
+                <span>trigger.dev</span>
+                {w.triggerActive ? (
+                  <button
+                    aria-label={`Stop trigger.dev for ${w.repo}/${w.name}`}
+                    class="text-red-500 text-xs hover:underline"
+                    onClick={() => onAct('/api/trigger/stop', w)}
+                    type="button"
+                  >
+                    stop
+                  </button>
+                ) : (
+                  <button
+                    aria-label={`Start trigger.dev for ${w.repo}/${w.name}`}
+                    class="text-xs text-zinc-500 hover:underline"
+                    onClick={() => onAct('/api/trigger/start', w)}
+                    type="button"
+                  >
+                    start
+                  </button>
+                )}
+              </div>
+              <div class="flex items-center gap-2">
+                <StatusDot tone={w.tunnelRunning ? 'emerald' : 'zinc'} />
+                <span>Tunnel</span>
                 <button
-                  aria-label={`Stop Inngest for ${w.repo}/${w.name}`}
-                  class="text-red-500 text-xs hover:underline"
-                  onClick={() => onAct('/api/inngest/stop', w)}
-                  type="button"
-                >
-                  stop
-                </button>
-              </>
-            ) : (
-              <button
-                aria-label={`Start Inngest for ${w.repo}/${w.name}`}
-                class="text-xs text-zinc-500 hover:underline"
-                onClick={() => onAct('/api/inngest/start', w)}
-                type="button"
-              >
-                start
-              </button>
-            )}
-          </div>
-          <div class="flex items-center gap-2">
-            <SidecarIcon tool="trigger" />
-            <StatusDot tone={w.triggerActive ? 'emerald' : 'zinc'} />
-            <span>trigger.dev</span>
-            {w.triggerActive ? (
-              <button
-                aria-label={`Stop trigger.dev for ${w.repo}/${w.name}`}
-                class="text-red-500 text-xs hover:underline"
-                onClick={() => onAct('/api/trigger/stop', w)}
-                type="button"
-              >
-                stop
-              </button>
-            ) : (
-              <button
-                aria-label={`Start trigger.dev for ${w.repo}/${w.name}`}
-                class="text-xs text-zinc-500 hover:underline"
-                onClick={() => onAct('/api/trigger/start', w)}
-                type="button"
-              >
-                start
-              </button>
-            )}
-          </div>
-          <div class="flex items-center gap-2">
-            <StatusDot tone={w.tunnelRunning ? 'emerald' : 'zinc'} />
-            <span>Tunnel</span>
-            <button
-              aria-label={`${w.tunnelOn ? 'Disable' : 'Enable'} tunnel for ${w.repo}/${w.name}`}
-              class="text-xs text-zinc-500 hover:underline"
-              disabled={tunnelBusy}
-              onClick={() =>
-                onAct(
-                  w.tunnelOn ? '/api/tunnel/disable' : '/api/tunnel/enable',
-                  w
-                )
-              }
-              type="button"
-            >
-              {w.tunnelOn ? 'disable' : 'enable'}
-            </button>
-          </div>
-          {/* Custom sidecars (sidecars.json) don't have their own start/stop
-              route -- they're bundled into the worktree's own start/stop, so
-              this is status-only, same as it actually is on the backend. */}
-          {w.sidecars.map((s) => (
-            <div class="flex items-center gap-2" key={s.name}>
-              <StatusDot tone={s.active ? 'emerald' : 'zinc'} />
-              <span>{s.name}</span>
-              {s.active && (
-                <button
-                  aria-label={`View ${s.name} log for ${w.repo}/${w.name}`}
+                  aria-label={`${w.tunnelOn ? 'Disable' : 'Enable'} tunnel for ${w.repo}/${w.name}`}
                   class="text-xs text-zinc-500 hover:underline"
+                  disabled={tunnelBusy}
                   onClick={() =>
-                    onOpenLogs(w.repo, w.name, `sidecar-${s.name}`)
+                    onAct(
+                      w.tunnelOn ? '/api/tunnel/disable' : '/api/tunnel/enable',
+                      w
+                    )
                   }
                   type="button"
                 >
-                  log
+                  {w.tunnelOn ? 'disable' : 'enable'}
                 </button>
-              )}
+              </div>
+              {/* Custom sidecars (sidecars.json) don't have their own start/stop
+              route -- they're bundled into the worktree's own start/stop, so
+              this is status-only, same as it actually is on the backend. */}
+              {w.sidecars.map((s) => (
+                <div class="flex items-center gap-2" key={s.name}>
+                  <StatusDot tone={s.active ? 'emerald' : 'zinc'} />
+                  <span>{s.name}</span>
+                  {s.active && (
+                    <button
+                      aria-label={`View ${s.name} log for ${w.repo}/${w.name}`}
+                      class="text-xs text-zinc-500 hover:underline"
+                      onClick={() =>
+                        onOpenLogs(w.repo, w.name, `sidecar-${s.name}`)
+                      }
+                      type="button"
+                    >
+                      log
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-      </Section>
+          </Section>
+        );
+      })()}
 
       {/* Only rendered when this worktree actually has Convex configured --
           unlike the Sidecars Section above (Inngest/Trigger/Tunnel, assumed
@@ -3328,8 +3490,10 @@ function WorktreePage({
   );
 }
 
-function fmtGb(mb: number | null) {
-  return mb == null ? '?' : `${(mb / 1024).toFixed(mb % 1024 ? 1 : 0)}GB`;
+function fmtGb(mb: number | null | undefined) {
+  return mb === null || mb === undefined
+    ? '?'
+    : `${(mb / 1024).toFixed(mb % 1024 ? 1 : 0)}GB`;
 }
 
 // One sidecar row — name/command/args/enabled, edited in place. The parent
@@ -3620,6 +3784,7 @@ function RepoPage({
         </h2>
         <p class="mb-4 text-sm text-zinc-600 dark:text-zinc-300">
           Running, starting, stopping and queued work in this project.{' '}
+          {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /#active-work is a real section and followRoute preserves modified-click navigation. */}
           <a
             class="underline"
             href="/#active-work"
@@ -3630,11 +3795,7 @@ function RepoPage({
         </p>
         <WorktreeList
           agents={agents}
-          emptyMessage={
-            loaded
-              ? 'No active worktrees in this project.'
-              : 'Loading worktrees…'
-          }
+          emptyMessage={repoActiveEmptyMessage(loaded)}
           gridMode={false}
           items={list.active}
           onAct={onAct}
@@ -3666,13 +3827,7 @@ function RepoPage({
         </label>
         <WorktreeList
           agents={agents}
-          emptyMessage={
-            loaded
-              ? stoppedSearch
-                ? 'No stopped worktrees match this search.'
-                : 'No stopped worktrees in this project.'
-              : 'Loading worktrees…'
-          }
+          emptyMessage={repoStoppedEmptyMessage(loaded, stoppedSearch)}
           gridMode={false}
           items={list.pageRows}
           onAct={onAct}
@@ -3709,11 +3864,21 @@ function RepoPage({
               : 'Use Refresh PRs to try again.'}
           </p>
         )}
-        {prs ? (
-          prs.error ? (
-            <p class="py-6 text-center text-signal-red text-sm">{prs.error}</p>
-          ) : prs.prs.length ? (
-            prs.prs.map((pr) => {
+        {(function renderPullRequestContent() {
+          if (!prs) {
+            return (
+              !prsFailed && <p class="empty-state">Loading pull requests…</p>
+            );
+          }
+          if (prs.error) {
+            return (
+              <p class="py-6 text-center text-signal-red text-sm">
+                {prs.error}
+              </p>
+            );
+          }
+          if (prs.prs.length) {
+            return prs.prs.map((pr) => {
               const match = repoWorktrees.find((w) => w.branch === pr.branch);
               return (
                 <div
@@ -3776,15 +3941,14 @@ function RepoPage({
                   )}
                 </div>
               );
-            })
-          ) : (
+            });
+          }
+          return (
             <p class="py-6 text-center text-sm text-zinc-400">
               No open PRs on this repo
             </p>
-          )
-        ) : (
-          !prsFailed && <p class="empty-state">Loading pull requests…</p>
-        )}
+          );
+        })()}
       </Section>
 
       <div class="rail-divider my-8" />
@@ -3820,7 +3984,7 @@ function RepoPage({
                 </button>
               </p>
             )}
-            {(() => {
+            {(function renderSidecarList() {
               if (!sidecars) {
                 return (
                   !sidecarsFailed && (
@@ -3862,23 +4026,27 @@ function RepoPage({
                 </button>
               </p>
             )}
-            {fileSyncGlobs ? (
-              fileSyncGlobs.length ? (
+            {(function renderFileSyncGlobs() {
+              if (!fileSyncGlobs) {
+                return (
+                  !fileSyncFailed && (
+                    <p class="text-xs text-zinc-400">
+                      Loading file sync configuration…
+                    </p>
+                  )
+                );
+              }
+              if (!fileSyncGlobs.length) {
+                return <p class="text-xs text-zinc-400">None configured</p>;
+              }
+              return (
                 <ul class="flex flex-col gap-0.5 font-mono text-xs text-zinc-600 dark:text-zinc-400">
                   {fileSyncGlobs.map((g) => (
                     <li key={g}>{g}</li>
                   ))}
                 </ul>
-              ) : (
-                <p class="text-xs text-zinc-400">None configured</p>
-              )
-            ) : (
-              !fileSyncFailed && (
-                <p class="text-xs text-zinc-400">
-                  Loading file sync configuration…
-                </p>
-              )
-            )}
+              );
+            })()}
           </div>
         </div>
       </Section>
@@ -4061,8 +4229,8 @@ function SettingsPage({
 
   useEffect(() => {
     mounted.current = true;
-    void loadSettings();
-    void loadProjects();
+    loadSettings();
+    loadProjects();
     return () => {
       mounted.current = false;
       settingsRead.current?.abort();
@@ -4136,6 +4304,7 @@ function SettingsPage({
   }
   async function removeProject(name: string) {
     if (
+      // biome-ignore lint/suspicious/noAlert: This confirmation gates removal from the project registry below.
       !confirm(
         `Remove project "${name}"? Existing worktrees keep working. This only drops it from the registry.`
       )
@@ -4143,7 +4312,7 @@ function SettingsPage({
       return;
     }
     await postOrToast('/api/project/remove', { name }, toast, 'remove failed');
-    void loadProjects();
+    loadProjects();
   }
   const saveSidecarsList = () => sidecarDraft.save();
   const saveFileSyncGlobsList = () => fileDraft.save();
@@ -4170,11 +4339,11 @@ function SettingsPage({
       'approve failed'
     );
     if (result.ok) {
-      void sidecarDraft.reload();
+      sidecarDraft.reload();
     }
   }
   function resourceInput(field: ResourceField) {
-    const row = resourceDraft![field];
+    const row = (resourceDraft as ResourceDraft)[field];
     return {
       'aria-describedby': `${field}-status resource-autosave-help`,
       'aria-invalid': row.state === 'error',
@@ -4191,21 +4360,24 @@ function SettingsPage({
     };
   }
   function resourceStatus(field: ResourceField) {
-    const row = resourceDraft![field];
+    const row = (resourceDraft as ResourceDraft)[field];
+    let status = 'Could not save';
+    if (row.state === 'saved') {
+      status = 'Saved';
+    }
+    if (row.state === 'dirty') {
+      status = 'Unsaved changes';
+    }
+    if (row.state === 'saving') {
+      status = 'Saving…';
+    }
     return (
       <p
         class={`mt-1 text-xs ${row.state === 'error' ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-300'}`}
         id={`${field}-status`}
         role="status"
       >
-        {row.message ??
-          (row.state === 'saving'
-            ? 'Saving…'
-            : row.state === 'dirty'
-              ? 'Unsaved changes'
-              : row.state === 'saved'
-                ? 'Saved'
-                : 'Could not save')}
+        {row.message ?? status}
         {row.state === 'error' && (
           <button
             class="ml-2 underline"
@@ -4228,16 +4400,19 @@ function SettingsPage({
     message: string | null;
     reload: () => Promise<boolean>;
   }) {
+    let status = draft.message ?? (draft.loaded ? '' : 'Loading…');
+    if (draft.dirty) {
+      status = 'Unsaved changes';
+    }
+    if (draft.error) {
+      status = `${draft.message ? `${draft.message} ` : ''}${draft.error}`;
+    }
     return (
       <p
         class={`text-xs ${draft.error ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-300'}`}
         role="status"
       >
-        {draft.error
-          ? `${draft.message ? `${draft.message} ` : ''}${draft.error}`
-          : draft.dirty
-            ? 'Unsaved changes'
-            : (draft.message ?? (draft.loaded ? '' : 'Loading…'))}
+        {status}
         {draft.error && (
           <button
             class="ml-2 underline"
@@ -4352,6 +4527,7 @@ function SettingsPage({
             >
               Changes save when you leave a field or press Enter. Limits apply
               to new starts.{' '}
+              {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /help#capacity is a real section and followRoute preserves modified-click navigation. */}
               <a
                 class="underline"
                 href="/help#capacity"
@@ -4383,8 +4559,18 @@ function SettingsPage({
             </button>
           </p>
         )}
-        {projectsLoaded ? (
-          projects.length ? (
+        {(function renderProjects() {
+          if (!projectsLoaded) {
+            return !projectsError && <p>Loading projects…</p>;
+          }
+          if (!projects.length) {
+            return (
+              <p class="text-sm text-zinc-400">
+                No projects registered yet. Click + Project to add one.
+              </p>
+            );
+          }
+          return (
             <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
               {projects.map((p) => (
                 <div
@@ -4414,14 +4600,8 @@ function SettingsPage({
                 </div>
               ))}
             </div>
-          ) : (
-            <p class="text-sm text-zinc-400">
-              No projects registered yet. Click + Project to add one.
-            </p>
-          )
-        ) : (
-          !projectsError && <p>Loading projects…</p>
-        )}
+          );
+        })()}
       </Section>
 
       <DiscoverProjectsSection onImported={loadProjects} toast={toast} />
@@ -4448,8 +4628,20 @@ function SettingsPage({
         id="sidecar-settings"
         title="Sidecars"
       >
-        {projectsLoaded ? (
-          projects.length ? (
+        {(function renderSidecarSettings() {
+          if (!projectsLoaded) {
+            return (
+              <p class="text-sm text-zinc-600 dark:text-zinc-300">
+                {projectsError
+                  ? 'Project list unavailable. Retry the Projects section above.'
+                  : 'Loading projects…'}
+              </p>
+            );
+          }
+          if (!projects.length) {
+            return <p class="text-sm text-zinc-400">Add a project first.</p>;
+          }
+          return (
             <div class="flex flex-col gap-2">
               {draftStatus(sidecarDraft)}
               {sidecars.map((s, i) => (
@@ -4502,16 +4694,8 @@ function SettingsPage({
                 controls on each worktree's page.
               </p>
             </div>
-          ) : (
-            <p class="text-sm text-zinc-400">Add a project first.</p>
-          )
-        ) : (
-          <p class="text-sm text-zinc-600 dark:text-zinc-300">
-            {projectsError
-              ? 'Project list unavailable. Retry the Projects section above.'
-              : 'Loading projects…'}
-          </p>
-        )}
+          );
+        })()}
       </Section>
 
       <Section
@@ -4536,8 +4720,20 @@ function SettingsPage({
         id="file-sync-settings"
         title="File Sync"
       >
-        {projectsLoaded ? (
-          projects.length ? (
+        {(function renderFileSyncSettings() {
+          if (!projectsLoaded) {
+            return (
+              <p class="text-sm text-zinc-600 dark:text-zinc-300">
+                {projectsError
+                  ? 'Project list unavailable. Retry the Projects section above.'
+                  : 'Loading projects…'}
+              </p>
+            );
+          }
+          if (!projects.length) {
+            return <p class="text-sm text-zinc-400">Add a project first.</p>;
+          }
+          return (
             <div class="flex flex-col gap-2">
               {draftStatus(fileDraft)}
               <label
@@ -4575,16 +4771,8 @@ function SettingsPage({
                 e.g. apps/quivly-app/.env.development.local.
               </p>
             </div>
-          ) : (
-            <p class="text-sm text-zinc-400">Add a project first.</p>
-          )
-        ) : (
-          <p class="text-sm text-zinc-600 dark:text-zinc-300">
-            {projectsError
-              ? 'Project list unavailable. Retry the Projects section above.'
-              : 'Loading projects…'}
-          </p>
-        )}
+          );
+        })()}
       </Section>
 
       <Section id="agent-settings" title="Custom Agents">
@@ -4737,7 +4925,7 @@ function DeploymentDialog({
   }
   const production =
     state.requiresConfirmation ||
-    context?.destination.environment === 'production' ||
+    (context ? context.destination.environment === 'production' : false) ||
     intent.target === 'production';
   const labels = { convex: 'Convex', netlify: 'Netlify', vercel: 'Vercel' };
   return (
@@ -4761,11 +4949,7 @@ function DeploymentDialog({
         initialFocus={cancel}
       >
         <DialogTitle class="font-semibold text-base">
-          {phase === 'reading'
-            ? 'Checking deployment target…'
-            : production
-              ? 'Deploy to production?'
-              : 'Review deployment target'}
+          {deploymentDialogTitle(phase, production)}
         </DialogTitle>
         <DialogDescription class="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
           {phase === 'submitting'
@@ -4834,17 +5018,11 @@ function DeploymentDialog({
           </button>
           {(phase === 'error' || phase === 'uncertain') && (
             <Button onClick={onRefresh} variant="secondary">
-              {phase === 'uncertain'
-                ? 'Refresh deployment status'
-                : 'Refresh target context'}
+              {deploymentRefreshLabel(phase)}
             </Button>
           )}
           <Button disabled={phase !== 'ready'} onClick={onConfirm}>
-            {phase === 'submitting'
-              ? 'Submitting…'
-              : production
-                ? 'Deploy to production'
-                : `Deploy ${context?.destination.environment ?? intent.target}`}
+            {deploymentActionLabel(phase, production, context, intent)}
           </Button>
         </div>
         <a
@@ -5001,6 +5179,7 @@ function App() {
       },
     });
   }
+  const controller = deploymentController.current;
   useEffect(() => () => deploymentController.current?.stop(), []);
   const toastId = useRef(0);
   const [createOpen, setCreateOpen] = useState(false);
@@ -5253,6 +5432,7 @@ function App() {
         );
         if (
           owner &&
+          // biome-ignore lint/suspicious/noAlert: This confirmation gates moving the shared tunnel in the request below.
           !confirm(
             `Move the public tunnel from ${owner.repo}/${owner.name} to ${w.repo}/${w.name}? Both dev servers will restart.`
           )
@@ -5348,6 +5528,7 @@ function App() {
         return;
       }
       if (
+        // biome-ignore lint/suspicious/noAlert: This confirmation gates the destructive worktree removal request below.
         !confirm(
           `Remove worktree "${w.name}"? The branch is kept. Tracked, untracked, and ignored local files such as a real .env.local block removal. node_modules and build output are deleted.`
         )
@@ -5393,6 +5574,7 @@ function App() {
     if (
       !(
         entry.removed ||
+        // biome-ignore lint/suspicious/noAlert: This confirmation gates retrying the checkout removal stage below.
         confirm(
           `Retry removal of "${entry.name}"? Its checkout still exists, so this reruns the git removal stage.`
         )
@@ -5471,13 +5653,13 @@ function App() {
         (element) => element.dataset.deployTrigger === `${w.key}:${provider}`
       ) ?? null;
     if (
-      !deploymentController.current!.begin({
+      !controller.begin({
         name: w.name,
         provider,
         repo: w.repo,
         target,
       }) &&
-      deploymentController.current!.getState().phase === 'submitting'
+      controller.getState().phase === 'submitting'
     ) {
       toast(
         'A deployment request is already being submitted. Refresh status before trying again.',
@@ -5522,7 +5704,7 @@ function App() {
       const w = worktrees.find(
         (x) => x.repo === route.repo && x.name === route.name
       );
-      return (
+      const renderDetailRoute = () => (
         <>
           <WorktreePage
             agents={agents}
@@ -5566,10 +5748,11 @@ function App() {
           )}
         </>
       );
+      return renderDetailRoute();
     }
 
     if (route.page === 'settings') {
-      return (
+      const renderSettingsRoute = () => (
         <>
           <SettingsPage toast={toast} />
           {commandOpen && (
@@ -5584,10 +5767,11 @@ function App() {
           )}
         </>
       );
+      return renderSettingsRoute();
     }
 
     if (route.page === 'help') {
-      return (
+      const renderHelpRoute = () => (
         <>
           <HelpPage onBack={() => navigate('/')} />
           {commandOpen && (
@@ -5602,10 +5786,11 @@ function App() {
           )}
         </>
       );
+      return renderHelpRoute();
     }
 
     if (route.page === 'ports') {
-      return (
+      const renderPortsRoute = () => (
         <>
           <PortsPage onBack={() => navigate('/')} />
           {commandOpen && (
@@ -5620,10 +5805,11 @@ function App() {
           )}
         </>
       );
+      return renderPortsRoute();
     }
 
     if (route.page === 'inventory') {
-      return (
+      const renderInventoryRoute = () => (
         <>
           <InventoryPage
             onBack={() => navigate('/')}
@@ -5646,10 +5832,11 @@ function App() {
           )}
         </>
       );
+      return renderInventoryRoute();
     }
 
     if (route.page === 'costs') {
-      return (
+      const renderCostsRoute = () => (
         <>
           <CostsPage onBack={() => navigate('/')} />
           {commandOpen && (
@@ -5664,11 +5851,12 @@ function App() {
           )}
         </>
       );
+      return renderCostsRoute();
     }
 
     if (route.page === 'repo') {
       const proj = projects.find((p) => p.name === route.repo);
-      return (
+      const renderRepoRoute = () => (
         <>
           <RepoPage
             agents={agents}
@@ -5717,6 +5905,7 @@ function App() {
           )}
         </>
       );
+      return renderRepoRoute();
     }
 
     if (route.page === 'archived') {
@@ -5727,7 +5916,7 @@ function App() {
         setRecreatePrefill({ name: a.branch || a.name, repo: a.repo });
         navigate('/');
       };
-      return (
+      const renderArchivedRoute = () => (
         <>
           <ArchivedPage onBack={() => navigate('/')} onRecreate={onRecreate} />
           {commandOpen && (
@@ -5742,361 +5931,383 @@ function App() {
           )}
         </>
       );
+      return renderArchivedRoute();
     }
 
-    return (
-      <div class="portal-workspace mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:py-12">
-        <PageHeader
-          actions={
-            <>
-              <Button
-                compact
-                onClick={() => setAddProjectOpen(true)}
-                variant="secondary"
-              >
-                + Project
-              </Button>
-              <Button
-                compact
-                onClick={() => setCreateOpen(true)}
-                variant="primary"
-              >
-                + Worktree
-              </Button>
-            </>
-          }
-          subtitle={
-            loaded && (
-              <div class="flex flex-col gap-3">
-                <PortalStatus
-                  activeCount={running.length}
-                  loaded={loaded}
-                  status={status}
-                />
-                <p class="max-w-xl text-xs text-zinc-400 dark:text-zinc-500">
-                  Parallel branches, dedicated dev servers, sidecars, and synced
-                  environments. One bridge for every feature an agent is
-                  building at once.
-                </p>
-              </div>
-            )
-          }
-          title={<span class="wordmark">setu</span>}
-        />
-
-        {!loaded && <InitialLoad />}
-        {loaded && (
-          <>
-            <div class="rail-divider mb-8" />
-            <div class="flex flex-col items-start gap-6 lg:flex-row">
-              <WorkspaceSidebar
-                dark={dark}
-                filter={filter}
-                onAhead={setOnlyAhead}
-                onDirty={setOnlyDirty}
-                onFilter={setFilter}
-                onFollow={followRoute}
-                onJump={openCommand}
-                onlyAhead={onlyAhead}
-                onlyDirty={onlyDirty}
-                onSort={setSortKey}
-                onTheme={() => setDark(!dark)}
-                onToggle={() => setFiltersOpen(!filtersOpen)}
-                onView={setView}
-                open={filtersOpen}
-                projects={projects}
-                sortKey={sortKey}
-                view={view}
-              >
-                <div class="hidden lg:block">
-                  <TriviaCard />
+    const renderWorkspaceRoute = () => {
+      function renderCreateModal() {
+        return (
+          (createOpen || recreatePrefill) && (
+            <CreateModal
+              initialName={recreatePrefill?.name}
+              initialRepo={recreatePrefill?.repo}
+              onClose={() => {
+                setCreateOpen(false);
+                setRecreatePrefill(null);
+              }}
+              onCreated={refresh}
+              projects={projects}
+              worktrees={worktrees}
+            />
+          )
+        );
+      }
+      function renderAddProjectModal() {
+        return (
+          addProjectOpen && (
+            <AddProjectModal
+              onAdded={loadProjects}
+              onClose={() => setAddProjectOpen(false)}
+            />
+          )
+        );
+      }
+      function renderLogModal() {
+        return (
+          logView && (
+            <LogModal
+              extraTabs={worktrees
+                .find((x) => x.repo === logView.repo && x.name === logView.name)
+                ?.sidecars.map((s) => s.name)}
+              initialType={logView.type}
+              name={logView.name}
+              onClose={() => setLogView(null)}
+              repo={logView.repo}
+              returnFocus={logView.returnFocus}
+            />
+          )
+        );
+      }
+      function renderCommandBar() {
+        return (
+          commandOpen && (
+            <CommandBar
+              onClose={() => setCommandOpen(false)}
+              onSelect={(w) =>
+                navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)
+              }
+              returnFocus={commandOpener}
+              worktrees={worktrees}
+            />
+          )
+        );
+      }
+      return (
+        <div class="portal-workspace mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:py-12">
+          <PageHeader
+            actions={
+              <>
+                <Button
+                  compact
+                  onClick={() => setAddProjectOpen(true)}
+                  variant="secondary"
+                >
+                  + Project
+                </Button>
+                <Button
+                  compact
+                  onClick={() => setCreateOpen(true)}
+                  variant="primary"
+                >
+                  + Worktree
+                </Button>
+              </>
+            }
+            subtitle={
+              loaded && (
+                <div class="flex flex-col gap-3">
+                  <PortalStatus
+                    activeCount={running.length}
+                    loaded={loaded}
+                    status={status}
+                  />
+                  <p class="max-w-xl text-xs text-zinc-400 dark:text-zinc-500">
+                    Parallel branches, dedicated dev servers, sidecars, and
+                    synced environments. One bridge for every feature an agent
+                    is building at once.
+                  </p>
                 </div>
-              </WorkspaceSidebar>
-              <div class="w-full min-w-0 flex-1">
-                <section aria-labelledby="active-work" class="mb-8">
-                  <div class="mb-4">
-                    <h2
-                      class="section-anchor board-mono font-bold text-[11px] text-zinc-400"
-                      id="active-work"
-                      tabIndex={-1}
-                    >
-                      Active work{loaded ? ` (${running.length})` : ''}
-                    </h2>
-                    <p class="mt-1 text-xs text-zinc-600 dark:text-zinc-300">
-                      All projects · always shown
-                      {loaded && running.length > 0 && (
-                        <span>
-                          {' · '}
-                          {(
-                            [
-                              'running',
-                              'starting',
-                              'stopping',
-                              'queued',
-                              'attention',
-                            ] as const
-                          )
-                            .map((state) => {
-                              const count = running.filter(
-                                (w) => worktreeState(w) === state
-                              ).length;
-                              return count
-                                ? `${count} ${state === 'attention' ? 'need attention' : state}`
-                                : '';
-                            })
-                            .filter(Boolean)
-                            .join(' · ')}
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                  <WorktreeList
-                    agents={agents}
-                    emptyMessage={
-                      loaded
-                        ? 'No active or queued worktrees'
-                        : 'Loading worktrees…'
-                    }
-                    gridMode={view === 'grid'}
-                    items={running}
-                    onAct={act}
-                    onDeploy={deploy}
-                    onOpenLogs={openLogs}
-                    onOpenTool={openTool}
-                    onRemove={remove}
-                    onStart={start}
-                    pendingStart={pendingStart.current}
-                    toast={toast}
-                  />
-                </section>
+              )
+            }
+            title={<span class="wordmark">setu</span>}
+          />
 
-                <PendingCleanup
-                  busy={cleanupRunning}
-                  entries={status?.pendingRemovals ?? []}
-                  onCancel={cancelRemoval}
-                  onRetry={retryCleanup}
-                />
-                <div class="rail-divider mb-8" />
-                <section aria-labelledby="stopped-worktrees">
-                  <div class="mb-4">
-                    <h2
-                      class="board-mono font-bold text-[11px] text-zinc-400"
-                      id="stopped-worktrees"
-                    >
-                      Stopped worktrees
-                    </h2>
-                    <p
-                      class="mt-1 text-xs text-zinc-600 dark:text-zinc-300"
-                      id="filter-scope"
-                    >
-                      {loaded && `${rest.length} of ${stoppedTotal} shown. `}
-                      Filters apply to stopped worktrees. Active work above
-                      always includes all projects.
-                    </p>
+          {!loaded && <InitialLoad />}
+          {loaded && (
+            <>
+              <div class="rail-divider mb-8" />
+              <div class="flex flex-col items-start gap-6 lg:flex-row">
+                <WorkspaceSidebar
+                  dark={dark}
+                  filter={filter}
+                  onAhead={setOnlyAhead}
+                  onDirty={setOnlyDirty}
+                  onFilter={setFilter}
+                  onFollow={followRoute}
+                  onJump={openCommand}
+                  onlyAhead={onlyAhead}
+                  onlyDirty={onlyDirty}
+                  onSort={setSortKey}
+                  onTheme={() => setDark(!dark)}
+                  onToggle={() => setFiltersOpen(!filtersOpen)}
+                  onView={setView}
+                  open={filtersOpen}
+                  projects={projects}
+                  sortKey={sortKey}
+                  view={view}
+                >
+                  <div class="hidden lg:block">
+                    <TriviaCard />
                   </div>
-                  <div class="relative mb-3">
-                    <label class="sr-only" htmlFor="stopped-search">
-                      Search stopped worktrees
-                    </label>
-                    <svg
-                      aria-hidden="true"
-                      class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-zinc-500 dark:text-zinc-400"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="2.25"
-                      viewBox="0 0 24 24"
-                    >
-                      <path d={tablerSearch.path} />
-                    </svg>
-                    <input
-                      aria-describedby="filter-scope"
-                      autoComplete="off"
-                      class="w-full rounded-none border border-white/75 bg-white/60 py-2.5 pr-3 pl-9 text-sm text-zinc-800 placeholder-zinc-600 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/5 dark:text-zinc-100 dark:placeholder-zinc-400"
-                      id="stopped-search"
-                      onInput={(e) => setSearch(e.currentTarget.value)}
-                      placeholder="Search stopped worktrees by name, repo, or label…"
-                      value={search}
-                    />
-                  </div>
-                  {hasFilters && (
-                    <fieldset
-                      aria-label="Active stopped-worktree filters"
-                      class="mb-3 flex min-w-0 flex-wrap items-center gap-2"
-                    >
-                      {filter !== 'all' && (
-                        <button
-                          aria-label={`Clear project filter ${filter}`}
-                          class="filter-chip"
-                          onClick={() => setFilter('all')}
-                          type="button"
-                        >
-                          Project:{' '}
-                          {projects.find((p) => p.name === filter)?.label ??
-                            filter}{' '}
-                          <span aria-hidden="true">×</span>
-                        </button>
-                      )}
-                      {onlyDirty && (
-                        <button
-                          aria-label="Clear uncommitted changes filter"
-                          class="filter-chip"
-                          onClick={() => setOnlyDirty(false)}
-                          type="button"
-                        >
-                          Uncommitted changes <span aria-hidden="true">×</span>
-                        </button>
-                      )}
-                      {onlyAhead && (
-                        <button
-                          aria-label="Clear ahead of base filter"
-                          class="filter-chip"
-                          onClick={() => setOnlyAhead(false)}
-                          type="button"
-                        >
-                          Ahead of base <span aria-hidden="true">×</span>
-                        </button>
-                      )}
-                      {search.trim() && (
-                        <button
-                          aria-label="Clear search filter"
-                          class="filter-chip max-w-full break-words"
-                          onClick={() => setSearch('')}
-                          type="button"
-                        >
-                          Search: {search} <span aria-hidden="true">×</span>
-                        </button>
-                      )}
-                      <Button
-                        compact
-                        onClick={clearFilters}
-                        variant="secondary"
+                </WorkspaceSidebar>
+                <div class="w-full min-w-0 flex-1">
+                  <section aria-labelledby="active-work" class="mb-8">
+                    <div class="mb-4">
+                      <h2
+                        class="section-anchor board-mono font-bold text-[11px] text-zinc-400"
+                        id="active-work"
+                        tabIndex={-1}
                       >
-                        Clear filters
-                      </Button>
-                    </fieldset>
-                  )}
-                  <WorktreeList
-                    agents={agents}
-                    emptyMessage={
-                      loaded
-                        ? hasFilters
-                          ? 'No stopped worktrees match these filters.'
-                          : 'No stopped worktrees. Create a worktree to begin.'
-                        : 'Loading worktrees…'
-                    }
-                    gridMode={view === 'grid'}
-                    items={filtered}
-                    onAct={act}
-                    onDeploy={deploy}
-                    onOpenLogs={openLogs}
-                    onOpenTool={openTool}
-                    onRemove={remove}
-                    onStart={start}
-                    pendingStart={pendingStart.current}
-                    toast={toast}
-                  />
-                  {loaded && rest.length > 0 && (
-                    <p class="mt-4 text-xs text-zinc-600 dark:text-zinc-300">
-                      Showing {currentPage * PAGE_SIZE + 1} to{' '}
-                      {Math.min((currentPage + 1) * PAGE_SIZE, rest.length)} of{' '}
-                      {rest.length} matching stopped worktrees
-                    </p>
-                  )}
-                  <Pagination
-                    onPage={setPage}
-                    page={currentPage}
-                    pageCount={pageCount}
-                  />
-                </section>
-
-                <div class="rail-divider mt-10 mb-4" />
-                <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
-                  <a
-                    class="flex w-fit items-center gap-2 transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-                    href="https://mukulchugh.com"
-                    rel="noopener"
-                    target="_blank"
-                  >
-                    <img
-                      alt=""
-                      class="h-4 w-4 rounded-none"
-                      height={16}
-                      src={MUKUL_LOGO_URI}
-                      width={16}
+                        Active work{loaded ? ` (${running.length})` : ''}
+                      </h2>
+                      <p class="mt-1 text-xs text-zinc-600 dark:text-zinc-300">
+                        All projects · always shown
+                        {loaded && running.length > 0 && (
+                          <span>
+                            {' · '}
+                            {(
+                              [
+                                'running',
+                                'starting',
+                                'stopping',
+                                'queued',
+                                'attention',
+                              ] as const
+                            )
+                              .map((state) => {
+                                const count = running.filter(
+                                  (w) => worktreeState(w) === state
+                                ).length;
+                                return count
+                                  ? `${count} ${state === 'attention' ? 'need attention' : state}`
+                                  : '';
+                              })
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                    <WorktreeList
+                      agents={agents}
+                      emptyMessage={
+                        loaded
+                          ? 'No active or queued worktrees'
+                          : 'Loading worktrees…'
+                      }
+                      gridMode={view === 'grid'}
+                      items={running}
+                      onAct={act}
+                      onDeploy={deploy}
+                      onOpenLogs={openLogs}
+                      onOpenTool={openTool}
+                      onRemove={remove}
+                      onStart={start}
+                      pendingStart={pendingStart.current}
+                      toast={toast}
                     />
-                    Created by Mukul Chugh
-                  </a>
-                  <div class="flex items-center gap-4">
+                  </section>
+
+                  <PendingCleanup
+                    busy={cleanupRunning}
+                    entries={status?.pendingRemovals ?? []}
+                    onCancel={cancelRemoval}
+                    onRetry={retryCleanup}
+                  />
+                  <div class="rail-divider mb-8" />
+                  <section aria-labelledby="stopped-worktrees">
+                    <div class="mb-4">
+                      <h2
+                        class="board-mono font-bold text-[11px] text-zinc-400"
+                        id="stopped-worktrees"
+                      >
+                        Stopped worktrees
+                      </h2>
+                      <p
+                        class="mt-1 text-xs text-zinc-600 dark:text-zinc-300"
+                        id="filter-scope"
+                      >
+                        {loaded && `${rest.length} of ${stoppedTotal} shown. `}
+                        Filters apply to stopped worktrees. Active work above
+                        always includes all projects.
+                      </p>
+                    </div>
+                    <div class="relative mb-3">
+                      <label class="sr-only" htmlFor="stopped-search">
+                        Search stopped worktrees
+                      </label>
+                      <svg
+                        aria-hidden="true"
+                        class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-zinc-500 dark:text-zinc-400"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="2.25"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d={tablerSearch.path} />
+                      </svg>
+                      <input
+                        aria-describedby="filter-scope"
+                        autoComplete="off"
+                        class="w-full rounded-none border border-white/75 bg-white/60 py-2.5 pr-3 pl-9 text-sm text-zinc-800 placeholder-zinc-600 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/5 dark:text-zinc-100 dark:placeholder-zinc-400"
+                        id="stopped-search"
+                        onInput={(e) => setSearch(e.currentTarget.value)}
+                        placeholder="Search stopped worktrees by name, repo, or label…"
+                        value={search}
+                      />
+                    </div>
+                    {hasFilters && (
+                      <fieldset
+                        aria-label="Active stopped-worktree filters"
+                        class="mb-3 flex min-w-0 flex-wrap items-center gap-2"
+                      >
+                        {filter !== 'all' && (
+                          <button
+                            aria-label={`Clear project filter ${filter}`}
+                            class="filter-chip"
+                            onClick={() => setFilter('all')}
+                            type="button"
+                          >
+                            Project:{' '}
+                            {projects.find((p) => p.name === filter)?.label ??
+                              filter}{' '}
+                            <span aria-hidden="true">×</span>
+                          </button>
+                        )}
+                        {onlyDirty && (
+                          <button
+                            aria-label="Clear uncommitted changes filter"
+                            class="filter-chip"
+                            onClick={() => setOnlyDirty(false)}
+                            type="button"
+                          >
+                            Uncommitted changes{' '}
+                            <span aria-hidden="true">×</span>
+                          </button>
+                        )}
+                        {onlyAhead && (
+                          <button
+                            aria-label="Clear ahead of base filter"
+                            class="filter-chip"
+                            onClick={() => setOnlyAhead(false)}
+                            type="button"
+                          >
+                            Ahead of base <span aria-hidden="true">×</span>
+                          </button>
+                        )}
+                        {search.trim() && (
+                          <button
+                            aria-label="Clear search filter"
+                            class="filter-chip max-w-full break-words"
+                            onClick={() => setSearch('')}
+                            type="button"
+                          >
+                            Search: {search} <span aria-hidden="true">×</span>
+                          </button>
+                        )}
+                        <Button
+                          compact
+                          onClick={clearFilters}
+                          variant="secondary"
+                        >
+                          Clear filters
+                        </Button>
+                      </fieldset>
+                    )}
+                    <WorktreeList
+                      agents={agents}
+                      emptyMessage={filteredStoppedEmptyMessage(
+                        loaded,
+                        hasFilters
+                      )}
+                      gridMode={view === 'grid'}
+                      items={filtered}
+                      onAct={act}
+                      onDeploy={deploy}
+                      onOpenLogs={openLogs}
+                      onOpenTool={openTool}
+                      onRemove={remove}
+                      onStart={start}
+                      pendingStart={pendingStart.current}
+                      toast={toast}
+                    />
+                    {loaded && rest.length > 0 && (
+                      <p class="mt-4 text-xs text-zinc-600 dark:text-zinc-300">
+                        Showing {currentPage * PAGE_SIZE + 1} to{' '}
+                        {Math.min((currentPage + 1) * PAGE_SIZE, rest.length)}{' '}
+                        of {rest.length} matching stopped worktrees
+                      </p>
+                    )}
+                    <Pagination
+                      onPage={setPage}
+                      page={currentPage}
+                      pageCount={pageCount}
+                    />
+                  </section>
+
+                  <div class="rail-divider mt-10 mb-4" />
+                  <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
                     <a
-                      class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-                      href="/help"
-                      onClick={(e: MouseEvent) => {
-                        e.preventDefault();
-                        navigate('/help');
-                      }}
-                    >
-                      Help &amp; guide
-                    </a>
-                    <a
-                      class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
-                      href="https://github.com/mukulchugh/setu"
+                      class="flex w-fit items-center gap-2 transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                      href="https://mukulchugh.com"
                       rel="noopener"
                       target="_blank"
                     >
-                      Contribute on GitHub
+                      <img
+                        alt=""
+                        class="h-4 w-4 rounded-none"
+                        height={16}
+                        src={MUKUL_LOGO_URI}
+                        width={16}
+                      />
+                      Created by Mukul Chugh
                     </a>
+                    <div class="flex items-center gap-4">
+                      <a
+                        class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                        href="/help"
+                        onClick={(e: MouseEvent) => {
+                          e.preventDefault();
+                          navigate('/help');
+                        }}
+                      >
+                        Help &amp; guide
+                      </a>
+                      <a
+                        class="transition-colors duration-150 hover:text-zinc-600 dark:hover:text-zinc-300"
+                        href="https://github.com/mukulchugh/setu"
+                        rel="noopener"
+                        target="_blank"
+                      >
+                        Contribute on GitHub
+                      </a>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-          </>
-        )}
+            </>
+          )}
 
-        {(createOpen || recreatePrefill) && (
-          <CreateModal
-            initialName={recreatePrefill?.name}
-            initialRepo={recreatePrefill?.repo}
-            onClose={() => {
-              setCreateOpen(false);
-              setRecreatePrefill(null);
-            }}
-            onCreated={refresh}
-            projects={projects}
-            worktrees={worktrees}
-          />
-        )}
-        {addProjectOpen && (
-          <AddProjectModal
-            onAdded={loadProjects}
-            onClose={() => setAddProjectOpen(false)}
-          />
-        )}
-        {logView && (
-          <LogModal
-            extraTabs={worktrees
-              .find((x) => x.repo === logView.repo && x.name === logView.name)
-              ?.sidecars.map((s) => s.name)}
-            initialType={logView.type}
-            name={logView.name}
-            onClose={() => setLogView(null)}
-            repo={logView.repo}
-            returnFocus={logView.returnFocus}
-          />
-        )}
-        {commandOpen && (
-          <CommandBar
-            onClose={() => setCommandOpen(false)}
-            onSelect={(w) =>
-              navigate(`/worktree/${w.repo}/${encodeURIComponent(w.name)}`)
-            }
-            returnFocus={commandOpener}
-            worktrees={worktrees}
-          />
-        )}
-      </div>
-    );
+          {renderCreateModal()}
+          {renderAddProjectModal()}
+          {renderLogModal()}
+          {renderCommandBar()}
+        </div>
+      );
+    };
+    return renderWorkspaceRoute();
   })();
   return (
     <>
@@ -6180,9 +6391,9 @@ function App() {
         {pageContent}
       </main>
       <DeploymentDialog
-        onClose={() => deploymentController.current!.close()}
-        onConfirm={() => deploymentController.current!.confirm()}
-        onRefresh={() => deploymentController.current!.refresh()}
+        onClose={() => controller.close()}
+        onConfirm={() => controller.confirm()}
+        onRefresh={() => controller.refresh()}
         returnFocus={deploymentOpener}
         state={deploymentIntent}
       />
@@ -6191,4 +6402,4 @@ function App() {
   );
 }
 
-render(<App />, document.getElementById('root')!);
+render(<App />, document.getElementById('root') as HTMLElement);

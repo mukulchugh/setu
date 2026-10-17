@@ -46,9 +46,9 @@ test('expired listener reads await one shared fresh observation; failures preser
 });
 
 test('initial observation failure cannot manufacture a valid empty listener set', async () => {
-  const cache = createListenerObservation(() => {
-    return Promise.reject(new Error('denied'));
-  });
+  const cache = createListenerObservation(() =>
+    Promise.reject(new Error('denied'))
+  );
   await expect(cache.read()).rejects.toMatchObject({
     code: 'LISTENER_PROBE_FAILED',
   });

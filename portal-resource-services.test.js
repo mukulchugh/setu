@@ -10,7 +10,12 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import * as fs from 'node:fs/promises';
+import {
+  readdir as readdirAsync,
+  readFile as readFileAsync,
+  realpath as realpathAsync,
+  stat as statAsync,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
@@ -28,6 +33,11 @@ const commandResult = (stdout = '') => ({
   timedOut: false,
   truncated: false,
 });
+const checkoutFs = {
+  readFile: readFileAsync,
+  realpath: realpathAsync,
+  stat: statAsync,
+};
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, stdio: 'ignore' });
@@ -89,7 +99,7 @@ async function fixture() {
   git(['worktree', 'add', '-b', 'topic', topic, 'main'], bare);
   git(['worktree', 'add', '-b', 'other', other, 'main'], bare);
   mkdirSync(store);
-  const canonicalStore = await fs.realpath(store);
+  const canonicalStore = await realpathAsync(store);
   const storeStat = statSync(canonicalStore);
   let currentConfig = {
     dependencySharing: {
@@ -144,9 +154,10 @@ async function fixture() {
     if (!(target && registrations.includes(target.key))) {
       return null;
     }
-    const checkoutIdentity = await inspectCheckoutIdentity(target, fs);
+    const checkoutIdentity = await inspectCheckoutIdentity(target, checkoutFs);
     return checkoutIdentity.known ? { ...target, checkoutIdentity } : null;
   };
+  // biome-ignore lint/suspicious/useAwait: The injected command runner rejects unexpected commands through its promise contract.
   const command = async (args) => {
     calls.push(args);
     if (args.slice(0, 3).join(' ') === 'gh workflow list') {
@@ -189,11 +200,17 @@ async function fixture() {
     nativeRuntime: async () => 'dead',
     operationId: (() => {
       let id = 0;
-      return () => `op-${++id}`;
+      return () => {
+        id += 1;
+        return `op-${id}`;
+      };
     })(),
     randomId: (() => {
       let id = 0;
-      return () => `retry-${++id}`;
+      return () => {
+        id += 1;
+        return `retry-${id}`;
+      };
     })(),
     resolveTarget,
     state,
@@ -222,7 +239,7 @@ test('production resource dispatcher dynamically catalogs registered source and 
   const fx = await fixture();
   try {
     const topic = await fx.targets.get('r/topic');
-    const identity = await inspectCheckoutIdentity(topic, fs);
+    const identity = await inspectCheckoutIdentity(topic, checkoutFs);
     await fx.state.replace('dependencyViews', {
       consumers: {
         [identity.checkoutPath]: { checkout: identity.checkoutPath },
@@ -254,7 +271,7 @@ test('production resource dispatcher dynamically catalogs registered source and 
     );
     expect(first.observations).toEqual([]);
     const catalog = await json(fx.services, '/api/shared-caches');
-    const canonicalStore = await fs.realpath(fx.store);
+    const canonicalStore = await realpathAsync(fx.store);
     const shared = catalog.stores.find(
       (store) => store.path === canonicalStore
     );
@@ -330,7 +347,7 @@ test('production composition distinguishes clean empty journals from malformed r
     const endedRun = {
       checkoutIdentity: await inspectCheckoutIdentity(
         fx.targets.get('r/topic'),
-        fs
+        checkoutFs
       ),
       checkoutPath: fx.topic,
       createdAt: 1,
@@ -399,7 +416,7 @@ test('production composition distinguishes clean empty journals from malformed r
     });
     expect(fx.state.read('cacheManifests')).toEqual({ manifests: [] });
     const other = fx.targets.get('r/other');
-    const otherIdentity = await inspectCheckoutIdentity(other, fs);
+    const otherIdentity = await inspectCheckoutIdentity(other, checkoutFs);
     await fx.state.replace('cacheManifests', {
       manifests: {
         foreign: {
@@ -432,7 +449,7 @@ test('dependency views use the durable canonical consumer map and reject malform
   const fx = await fixture();
   try {
     const target = fx.targets.get('r/topic');
-    const checkout = await fs.realpath(target.wtDir);
+    const checkout = await realpathAsync(target.wtDir);
     const namespace = 'darwin-arm64-bun-1.3.14';
     const links = join(fx.store, namespace, 'links');
     mkdirSync(join(links, 'package'), { recursive: true });
@@ -469,7 +486,7 @@ test('dependency views use the durable canonical consumer map and reject malform
       repo: 'r',
       state: 'shared and healthy',
     });
-    const beforeRepair = await fs.readdir(
+    const beforeRepair = await readdirAsync(
       join(target.wtDir, 'node_modules', '.bun')
     );
     const planned = await json(fx.services, '/api/dependency-sharing/repair', {
@@ -483,7 +500,7 @@ test('dependency views use the durable canonical consumer map and reject malform
       ok: false,
     });
     expect(
-      await fs.readdir(join(target.wtDir, 'node_modules', '.bun'))
+      await readdirAsync(join(target.wtDir, 'node_modules', '.bun'))
     ).toEqual(beforeRepair);
     await fx.state.replace('dependencyViews', {
       consumers: { [checkout]: { checkout } },
@@ -526,7 +543,10 @@ test('the imported dispatcher and MCP expose the same managed-service malformed-
         if (!target) {
           return null;
         }
-        const checkoutIdentity = await inspectCheckoutIdentity(target, fs);
+        const checkoutIdentity = await inspectCheckoutIdentity(
+          target,
+          checkoutFs
+        );
         return checkoutIdentity.known ? { ...target, checkoutIdentity } : null;
       },
       state: fx.state,

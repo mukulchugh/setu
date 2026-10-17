@@ -185,11 +185,11 @@ describe('worktree list scope', () => {
 test('snapshot reconciliation preserves unchanged rows while delivering nested state and order changes', async () => {
   const { reuseWorktreeRows } = await import('./portal/worktree-list');
   const stoppedRow = {
-    key: 'repo/stopped',
     active: false,
-    sidecars: [{ name: 'worker', active: false }],
+    key: 'repo/stopped',
+    sidecars: [{ active: false, name: 'worker' }],
   };
-  const active = { key: 'repo/active', active: true, memMb: 100, sidecars: [] };
+  const active = { active: true, key: 'repo/active', memMb: 100, sidecars: [] };
   const previous = [stoppedRow, active];
   expect(
     reuseWorktreeRows(previous, JSON.parse(JSON.stringify(previous)))
@@ -202,7 +202,7 @@ test('snapshot reconciliation preserves unchanged rows while delivering nested s
   expect(next[1]).not.toBe(active);
   expect(next[1].memMb).toBe(200);
   const nested = reuseWorktreeRows(previous, [
-    { ...stoppedRow, sidecars: [{ name: 'worker', active: true }] },
+    { ...stoppedRow, sidecars: [{ active: true, name: 'worker' }] },
     active,
   ]);
   expect(nested[0]).not.toBe(stoppedRow);

@@ -30,7 +30,8 @@ function reviewRunFixture({
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'setu-pr-review-'));
   reviewRoots.push(root);
-  const name = `topic-${++reviewNumber}`;
+  reviewNumber += 1;
+  const name = `topic-${reviewNumber}`;
   let completion;
   const started = runDeepReview('repo', name, 'pr-walkthrough', {
     closeLog: (fd) => {
@@ -65,6 +66,7 @@ afterEach(() => {
   }
 });
 
+// biome-ignore lint/suspicious/useAwait: Subprocess launch failures must reject through the guard runner contract.
 async function guardExit(kind, args, event) {
   const proc = Bun.spawn(['bun', './pr-review-guard.js', kind, ...args], {
     cwd: import.meta.dir,
@@ -155,7 +157,7 @@ test('deep-review completion retains ownership for an unknown exit and reports p
   });
 });
 
-test('deep review arguments fail closed for write-shaped Bash commands', async () => {
+test('deep review arguments fail closed for write-shaped Bash commands', () => {
   const args = buildDeepReviewArgs('pr-walkthrough', 'owner/repo', 42);
   expect(args).toContain('--settings');
   expect(args[args.indexOf('--settings') + 1]).toContain('pr-review-guard.js');
@@ -174,30 +176,23 @@ test('deep review arguments fail closed for write-shaped Bash commands', async (
     expect(args).not.toContain(`Bash(${command})`);
   }
   expect(reviewBashAllowed('git status')).toBe(true);
-  for (const command of [
-    'git diff --stat',
-    'git show --name-only',
-    'git diff -- --no-ext-diff --no-textconv',
-  ]) {
-    expect(reviewBashAllowed(command)).toBe(false);
-    expect(await guardExit('bash', [], { tool_input: { command } })).toBe(2);
-  }
-  for (const command of [
-    'git diff --no-ext-diff --no-textconv --stat',
-    'git show --no-ext-diff --no-textconv --name-only',
-  ]) {
-    expect(reviewBashAllowed(command)).toBe(true);
-    expect(await guardExit('bash', [], { tool_input: { command } })).toBe(0);
-  }
-  for (const command of [
-    "sed -n 'w /tmp/output' file",
-    'sort --output=/tmp/output file',
-    'rg --pre command pattern file',
-    'git diff --output=/tmp/output',
-  ]) {
-    expect(reviewBashAllowed(command)).toBe(false);
-    expect(await guardExit('bash', [], { tool_input: { command } })).toBe(2);
-  }
+});
+
+test.each([
+  ['git diff --stat', false],
+  ['git show --name-only', false],
+  ['git diff -- --no-ext-diff --no-textconv', false],
+  ['git diff --no-ext-diff --no-textconv --stat', true],
+  ['git show --no-ext-diff --no-textconv --name-only', true],
+  ["sed -n 'w /tmp/output' file", false],
+  ['sort --output=/tmp/output file', false],
+  ['rg --pre command pattern file', false],
+  ['git diff --output=/tmp/output', false],
+])('review Bash guard applies its policy to %s', async (command, allowed) => {
+  expect(reviewBashAllowed(command)).toBe(allowed);
+  expect(await guardExit('bash', [], { tool_input: { command } })).toBe(
+    allowed ? 0 : 2
+  );
 });
 
 test('review write guard rejects existing, dangling, and intermediate symlink ancestors', async () => {

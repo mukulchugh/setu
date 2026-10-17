@@ -137,7 +137,7 @@ function setupFixture(manifest) {
     },
   });
   const deps = {
-    assertStorage: async () => {},
+    assertStorage: () => Promise.resolve(),
     closeLog: (fd) => {
       effects.push(['close', fd]);
     },
@@ -176,9 +176,7 @@ test('low storage refuses both dependency installers before logs or processes an
   const refusal = Object.assign(new Error('Only 116 MiB is available'), {
     code: 'STORAGE_LOW',
   });
-  const assertStorage = async () => {
-    throw refusal;
-  };
+  const assertStorage = () => Promise.reject(refusal);
   f.deps.assertStorage = assertStorage;
   try {
     expect(await f.create()).toMatchObject({ code: 'STORAGE_LOW', ok: false });
@@ -233,13 +231,14 @@ test('portal setup without a dependency manifest becomes ready without any insta
   }
 });
 
-test('manifest selection stays shared by CLI and portal dependency installation', async () => {
-  for (const [manifest, command, args] of [
-    ['package.json', 'bun', ['install']],
-    ['pyproject.toml', 'uv', ['sync']],
-    ['requirements.txt', 'uv', ['sync']],
-    [null, null, null],
-  ]) {
+test.each([
+  ['package.json', 'bun', ['install']],
+  ['pyproject.toml', 'uv', ['sync']],
+  ['requirements.txt', 'uv', ['sync']],
+  [null, null, null],
+])(
+  'manifest %s selects the same installer through CLI and portal',
+  async (manifest, command, args) => {
     const f = setupFixture(manifest),
       calls = [];
     try {
@@ -266,12 +265,12 @@ test('manifest selection stays shared by CLI and portal dependency installation'
       f.lifecycle.dispose();
     }
   }
-});
+);
 
 test('inline dependency installation forwards its stdio choice', async () => {
   let options;
   await installWorktreeDependencies('/fixture', {
-    assertStorage: async () => {},
+    assertStorage: () => Promise.resolve(),
     exists: (path) => path.endsWith('package.json'),
     run: (_command, _args, runOptions) => {
       options = runOptions;
@@ -448,6 +447,7 @@ test('setup admission releases an exact lease once without masking completion fa
   let releases = 0;
   const admission = {
     admit: (...args) => raw.admit(...args),
+    // biome-ignore lint/suspicious/useAwait: The release adapter must turn synchronous state failures into rejected promises.
     release: async (...args) => {
       releases += 1;
       return raw.release(...args);
@@ -493,8 +493,9 @@ test('setup admission releases an exact lease once without masking completion fa
   }
 });
 
-test('unknown portal child outcomes retain admission when durable progress persistence fails', async () => {
-  for (const mode of ['exited', 'group-stop']) {
+test.each(['exited', 'group-stop'])(
+  'unknown child outcome %s retains admission when progress persistence fails',
+  async (mode) => {
     const f = durableFixture();
     const rawProgress = createSetupProgress({
       newAttemptId: () => `attempt-${mode}`,
@@ -503,9 +504,7 @@ test('unknown portal child outcomes retain admission when durable progress persi
     });
     const progress = {
       ...rawProgress,
-      finish: async () => {
-        throw new Error('progress write unavailable');
-      },
+      finish: () => Promise.reject(new Error('progress write unavailable')),
     };
     const admission = testAdmission(f.state);
     const target = { name: `topic-${mode}`, repo: 'repo' };
@@ -529,19 +528,20 @@ test('unknown portal child outcomes retain admission when durable progress persi
               res: { localDom: 'topic.local', port: 3301, wtDir },
             },
             {
-              assertStorage: async () => {},
+              assertStorage: () => Promise.resolve(),
               checkoutIdentity: realpathSync(wtDir),
-              closeLog: () => {},
+              closeLog: () => {
+                /* The fixture has no log handle to close. */
+              },
               exists: (path) => path === join(wtDir, 'package.json'),
               logLocation: join(f.root, 'setup.log'),
               openLog: () => 1,
               progress,
               spawn: () => ({ exited, pid: 712 }),
-              stopProcess: async () => {
-                if (mode === 'group-stop') {
-                  throw new Error('cannot observe group');
-                }
-              },
+              stopProcess: () =>
+                mode === 'group-stop'
+                  ? Promise.reject(new Error('cannot observe group'))
+                  : Promise.resolve(),
               target,
             }
           ),
@@ -563,10 +563,11 @@ test('unknown portal child outcomes retain admission when durable progress persi
       f.dispose();
     }
   }
-});
+);
 
-test('known log launch failures finish durable setup and close failure waits for child proof', async () => {
-  for (const mode of ['open', 'spawn', 'close']) {
+test.each(['open', 'spawn', 'close'])(
+  'log failure %s finishes durable setup only after required child proof',
+  async (mode) => {
     const f = durableFixture();
     const target = { name: `topic-${mode}`, repo: 'repo' };
     const wtDir = join(f.workspace, 'repo', target.name);
@@ -583,7 +584,7 @@ test('known log launch failures finish durable setup and close failure waits for
     });
     try {
       const options = {
-        assertStorage: async () => {},
+        assertStorage: () => Promise.resolve(),
         checkoutIdentity: realpathSync(wtDir),
         closeLog: () => {
           if (mode === 'close') {
@@ -605,7 +606,7 @@ test('known log launch failures finish durable setup and close failure waits for
           }
           return { exited, pid: 811 };
         },
-        stopProcess: async () => {},
+        stopProcess: () => Promise.resolve(),
         target,
       };
       if (mode === 'close') {
@@ -635,15 +636,11 @@ test('known log launch failures finish durable setup and close failure waits for
       f.dispose();
     }
   }
-});
+);
 
-test('shared setup refuses corrupt consumers and unsafe views without invoking an install', async () => {
-  for (const scenario of [
-    'malformed',
-    'invalid-consumer',
-    'replaced',
-    'unknown',
-  ]) {
+test.each(['malformed', 'invalid-consumer', 'replaced', 'unknown'])(
+  'shared setup refuses consumer %s without invoking an install',
+  async (scenario) => {
     const f = sharedFixture();
     const calls = [];
     const consumerPath = join(f.workspace, '.setu-dependency-views.json');
@@ -670,7 +667,7 @@ test('shared setup refuses corrupt consumers and unsafe views without invoking a
       const malformed = ['malformed', 'invalid-consumer'].includes(scenario);
       const before = malformed ? readFileSync(consumerPath, 'utf8') : null;
       const error = await installWorktreeDependencies(f.wtDir, {
-        assertStorage: async () => {},
+        assertStorage: () => Promise.resolve(),
         exists: (path) => path === join(f.wtDir, 'package.json'),
         run: (...args) => {
           calls.push(args);
@@ -693,14 +690,14 @@ test('shared setup refuses corrupt consumers and unsafe views without invoking a
       f.dispose();
     }
   }
-});
+);
 
 test('an absent dependency consumer document is a legitimate fresh shared install', async () => {
   const f = sharedFixture();
   const calls = [];
   try {
     await installWorktreeDependencies(f.wtDir, {
-      assertStorage: async () => {},
+      assertStorage: () => Promise.resolve(),
       exists: (path) => path === join(f.wtDir, 'package.json'),
       run: (...args) => {
         calls.push(args);
@@ -727,7 +724,10 @@ test('reviewed retry runs its exact durable attempt once and rejects forged cont
   const identity = realpathSync(wtDir);
   let attempt = 0;
   const progress = createSetupProgress({
-    newAttemptId: () => `attempt-${++attempt}`,
+    newAttemptId: () => {
+      attempt += 1;
+      return `attempt-${attempt}`;
+    },
     now: () => attempt,
     state: f.state,
   });
@@ -740,18 +740,21 @@ test('reviewed retry runs its exact durable attempt once and rejects forged cont
   });
   let launches = 0;
   const common = {
-    assertStorage: async () => {},
+    assertStorage: () => Promise.resolve(),
     checkoutIdentity: identity,
-    closeLog: () => {},
+    closeLog: () => {
+      /* no log descriptor is opened in this fixture */
+    },
     exists: (path) => path === join(wtDir, 'package.json'),
     logLocation: join(f.root, 'setup.log'),
     openLog: () => 1,
     progress,
-    spawn: () => ({
-      exited: launches++ === 0 ? firstExit : secondExit,
-      pid: 900 + launches,
-    }),
-    stopProcess: async () => {},
+    spawn: () => {
+      const exited = launches === 0 ? firstExit : secondExit;
+      launches += 1;
+      return { exited, pid: 900 + launches };
+    },
+    stopProcess: () => Promise.resolve(),
     target,
   };
   const context = {
@@ -809,7 +812,10 @@ test('durable retry rejects an old completion and completes only its new attempt
   const identity = realpathSync(wtDir);
   let nextAttempt = 0;
   const progress = createSetupProgress({
-    newAttemptId: () => `attempt-${++nextAttempt}`,
+    newAttemptId: () => {
+      nextAttempt += 1;
+      return `attempt-${nextAttempt}`;
+    },
     now: () => nextAttempt,
     state: f.state,
   });
@@ -822,9 +828,11 @@ test('durable retry rejects an old completion and completes only its new attempt
     return { done, exited, pid: 400 + starts.length };
   };
   const options = () => ({
-    assertStorage: async () => {},
+    assertStorage: () => Promise.resolve(),
     checkoutIdentity: identity,
-    closeLog: () => {},
+    closeLog: () => {
+      /* no log descriptor is opened in this fixture */
+    },
     exists: (path) => path === join(wtDir, 'package.json'),
     logLocation: join(f.root, 'setup.log'),
     openLog: () => 1,
@@ -834,7 +842,7 @@ test('durable retry rejects an old completion and completes only its new attempt
       starts.push(process);
       return process;
     },
-    stopProcess: async () => {},
+    stopProcess: () => Promise.resolve(),
     target,
   });
   const context = {
@@ -883,9 +891,7 @@ test('CLI create retains admission when both install outcome and progress persis
       newAttemptId: () => 'cli-attempt',
       state: f.state,
     }),
-    finish: async () => {
-      throw new Error('progress write unavailable');
-    },
+    finish: () => Promise.reject(new Error('progress write unavailable')),
   };
   try {
     await expect(
@@ -893,6 +899,7 @@ test('CLI create retains admission when both install outcome and progress persis
         admission,
         checkoutIdentity: async () => realpathSync(wtDir),
         create: async () => ({ wtDir }),
+        // biome-ignore lint/suspicious/useAwait: Unknown installer completion must reject with its operation code.
         install: async () => {
           throw Object.assign(new Error('child outcome unknown'), {
             code: 'OPERATION_UNKNOWN',
@@ -946,12 +953,13 @@ test('completed create retry does not reinstall or move tunnel ownership', async
     const result = await createAndInstallWorktree({
       checkoutIdentity: async () => identity,
       create: async () => ({ wtDir }),
-      enableTunnel: async () => {
+      enableTunnel: () => {
         tunnels += 1;
-        return 'public.example';
+        return Promise.resolve('public.example');
       },
-      install: async () => {
+      install: () => {
         installs += 1;
+        return Promise.resolve();
       },
       logLocation: 'setup.log',
       name: target.name,
@@ -976,7 +984,7 @@ test('ordinary opt-out remains an ordinary install and failed shared setup recor
   const calls = [];
   try {
     await installWorktreeDependencies(wtDir, {
-      assertStorage: async () => {},
+      assertStorage: () => Promise.resolve(),
       exists: (path) => path === join(wtDir, 'package.json'),
       run: (...args) => {
         calls.push(args);
@@ -988,7 +996,7 @@ test('ordinary opt-out remains an ordinary install and failed shared setup recor
     expect(calls[0].slice(0, 2)).toEqual(['bun', ['install']]);
     await expect(
       installWorktreeDependencies(wtDir, {
-        assertStorage: async () => {},
+        assertStorage: () => Promise.resolve(),
         exists: (path) => path === join(wtDir, 'package.json'),
         run: () => ({ status: 0 }),
         sharing: { enabled: true },
@@ -1007,6 +1015,7 @@ test('clone awaits the checked async command before registration preparation and
   const held = new Promise((resolve) => {
     finish = resolve;
   });
+  // biome-ignore lint/suspicious/useAwait: The command adapter must retain async errors and adoption of the held clone promise.
   const run = async (args) => {
     calls.push(args);
     if (args[0] === 'gh') {
@@ -1036,6 +1045,7 @@ test('checkout creation awaits the async Git add', async () => {
     finish = resolve;
   });
   const calls = [];
+  // biome-ignore lint/suspicious/useAwait: The command adapter must retain async errors and adoption of the held Git promise.
   const run = async (args) => {
     calls.push(args);
     return args.includes('add') ? held : { code: 0, stdout: '' };
@@ -1050,6 +1060,7 @@ test('checkout creation awaits the async Git add', async () => {
     { run }
   );
   for (let i = 0; i < 10; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Advance the command promise chain without releasing the held Git add.
     await Promise.resolve();
   }
   expect(calls.some((args) => args.includes('add'))).toBe(true);
@@ -1077,6 +1088,7 @@ test('existing checkout path must be a linked worktree, not a plain parent direc
     execFileSync('git', ['clone', '--bare', source, repoDir]);
     const wtDir = join(root, 'repo', 'feat');
     mkdirSync(join(wtDir, 'x'), { recursive: true });
+    // biome-ignore lint/suspicious/useAwait: This synchronous Git fixture implements the production async command interface.
     const run = async (args) => {
       try {
         return {
@@ -1141,6 +1153,7 @@ for (const kind of ['clone', 'checkout']) {
         return Promise.resolve();
       },
     });
+    // biome-ignore lint/suspicious/useAwait: Setup must adopt the held command promise and reject callback failures.
     const run = async (args) => {
       if (args[1] === 'clone' || args.includes('add')) {
         entered();

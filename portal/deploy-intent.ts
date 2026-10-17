@@ -54,6 +54,7 @@ function validContext(
     context.identity &&
     typeof context.identity === 'object' &&
     !Array.isArray(context.identity) &&
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: expectedContext is untrusted preflight transport input; malformed destination must reject rather than throw in createDeploymentIntent.
     typeof context.destination?.id === 'string' &&
     context.destination.id &&
     typeof context.destination.label === 'string' &&
@@ -138,7 +139,7 @@ export function createDeploymentIntent(io: {
       context.destination.environment !== 'production' &&
       intent.target !== 'production'
     ) {
-      void submit();
+      submit();
     }
   }
   async function submit() {
@@ -213,7 +214,7 @@ export function createDeploymentIntent(io: {
       ) {
         return false;
       }
-      void preflight(intent, reviewAgain.has(key(intent)));
+      preflight(intent, reviewAgain.has(key(intent)));
       return true;
     },
     close() {
@@ -225,12 +226,12 @@ export function createDeploymentIntent(io: {
       publish({ phase: 'idle' });
     },
     confirm: () => {
-      void submit();
+      submit();
     },
     getState: () => state,
     refresh() {
       if (state.intent && !submitting && state.phase !== 'reading') {
-        void preflight(
+        preflight(
           state.intent,
           true,
           'Review the current destination before submitting.'

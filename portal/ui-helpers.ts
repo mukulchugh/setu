@@ -1,8 +1,9 @@
-const ANSI_SGR = /\u001B\[[0-?]*[ -/]*m/g;
+const ANSI_SGR = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*m`, 'g');
 const SIDECAR_NAME = /^[a-zA-Z0-9_-]+$/;
+const WHITESPACE = /\s+/;
 
 export function sidecarArguments(text: string): string[] {
-  return text.trim() ? text.trim().split(/\s+/) : [];
+  return text.trim() ? text.trim().split(WHITESPACE) : [];
 }
 
 export function fileSyncPatterns(text: string): string[] {

@@ -1,56 +1,65 @@
 import { expect, test } from 'bun:test';
 import { createGithubActions } from './github-actions.js';
 
+function asPromise(callback) {
+  try {
+    return Promise.resolve(callback());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 function fixture() {
   const calls = [];
   const actions = createGithubActions({
     branch: async () => 'feature/review',
-    run: async (argv, options) => {
-      calls.push({ argv, options });
-      if (argv.slice(1, 3).join(' ') === 'workflow list') {
-        return {
-          code: 0,
-          stdout: JSON.stringify([
-            {
-              id: 12,
-              name: 'Tests',
-              path: '.github/workflows/tests.yml',
-              state: 'active',
-            },
-            {
-              id: 13,
-              name: 'Dormant',
-              path: '.github/workflows/old.yml',
-              state: 'disabled_manually',
-            },
-          ]),
-        };
-      }
-      if (argv.slice(1, 3).join(' ') === 'run list') {
-        return {
-          code: 0,
-          stdout: JSON.stringify([
-            {
-              databaseId: 100,
-              headBranch: 'feature/review',
-              status: 'completed',
-            },
-          ]),
-        };
-      }
-      if (argv.slice(1, 3).join(' ') === 'workflow view') {
-        return {
-          code: 0,
-          stdout: argv.some((part) => part.includes('tests.yml'))
-            ? 'on: [push, workflow_dispatch]\n'
-            : 'on: push\n',
-        };
-      }
-      if (argv.slice(1, 3).join(' ') === 'workflow run') {
-        return { code: 0, stdout: '' };
-      }
-      throw new Error(`unexpected command ${argv.join(' ')}`);
-    },
+    run: (argv, options) =>
+      asPromise(() => {
+        calls.push({ argv, options });
+        if (argv.slice(1, 3).join(' ') === 'workflow list') {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                id: 12,
+                name: 'Tests',
+                path: '.github/workflows/tests.yml',
+                state: 'active',
+              },
+              {
+                id: 13,
+                name: 'Dormant',
+                path: '.github/workflows/old.yml',
+                state: 'disabled_manually',
+              },
+            ]),
+          };
+        }
+        if (argv.slice(1, 3).join(' ') === 'run list') {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                databaseId: 100,
+                headBranch: 'feature/review',
+                status: 'completed',
+              },
+            ]),
+          };
+        }
+        if (argv.slice(1, 3).join(' ') === 'workflow view') {
+          return {
+            code: 0,
+            stdout: argv.some((part) => part.includes('tests.yml'))
+              ? 'on: [push, workflow_dispatch]\n'
+              : 'on: push\n',
+          };
+        }
+        if (argv.slice(1, 3).join(' ') === 'workflow run') {
+          return { code: 0, stdout: '' };
+        }
+        throw new Error(`unexpected command ${argv.join(' ')}`);
+      }),
     target: () => ({ wtDir: '/worktrees/repo/feature-review' }),
   });
   return { actions, calls };
@@ -126,35 +135,36 @@ test('GitHub Actions parses inline workflow dispatch syntax and rejects malforme
   const calls = [];
   const actions = createGithubActions({
     branch: async () => 'topic',
-    run: async (argv) => {
-      calls.push(argv);
-      if (argv.slice(1, 3).join(' ') === 'workflow list') {
-        return {
-          code: 0,
-          stdout: JSON.stringify([
-            {
-              id: 1,
-              name: 'Inline map',
-              path: '.github/workflows/inline.yml',
-              state: 'active',
-            },
-            {
-              id: 2,
-              name: 'Scalar',
-              path: '.github/workflows/scalar.yml',
-              state: 'active',
-            },
-          ]),
-        };
-      }
-      if (argv.some((part) => part.includes('inline.yml'))) {
-        return { code: 0, stdout: 'on: { workflow_dispatch: {} }\n' };
-      }
-      if (argv.some((part) => part.includes('scalar.yml'))) {
-        return { code: 0, stdout: 'on: workflow_dispatch\n' };
-      }
-      throw new Error(`unexpected command ${argv.join(' ')}`);
-    },
+    run: (argv) =>
+      asPromise(() => {
+        calls.push(argv);
+        if (argv.slice(1, 3).join(' ') === 'workflow list') {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                id: 1,
+                name: 'Inline map',
+                path: '.github/workflows/inline.yml',
+                state: 'active',
+              },
+              {
+                id: 2,
+                name: 'Scalar',
+                path: '.github/workflows/scalar.yml',
+                state: 'active',
+              },
+            ]),
+          };
+        }
+        if (argv.some((part) => part.includes('inline.yml'))) {
+          return { code: 0, stdout: 'on: { workflow_dispatch: {} }\n' };
+        }
+        if (argv.some((part) => part.includes('scalar.yml'))) {
+          return { code: 0, stdout: 'on: workflow_dispatch\n' };
+        }
+        throw new Error(`unexpected command ${argv.join(' ')}`);
+      }),
     target: () => ({ wtDir: '/fixture' }),
   });
   expect(
@@ -173,4 +183,41 @@ test('GitHub Actions parses inline workflow dispatch syntax and rejects malforme
   expect(
     await invalid.listWorkflows({ name: 'topic', repo: 'repo' })
   ).toMatchObject({ code: 'GITHUB_WORKFLOWS_UNAVAILABLE', ok: false });
+});
+
+test.each([
+  { id: null },
+  { id: undefined },
+  { id: true },
+  { id: {} },
+  { id: [] },
+])('workflow rows without a usable id stay skipped: %#', async ({ id }) => {
+  const calls = [];
+  const workflow = {
+    id: 12,
+    name: 'Tests',
+    path: '.github/workflows/tests.yml',
+    state: 'active',
+  };
+  const actions = createGithubActions({
+    branch: () => Promise.resolve('topic'),
+    run: (argv) => {
+      calls.push(argv);
+      return Promise.resolve({
+        code: 0,
+        stdout:
+          argv[2] === 'list'
+            ? JSON.stringify([{ id, state: 'active' }, workflow])
+            : 'on: workflow_dispatch\n',
+      });
+    },
+    target: () => ({ wtDir: '/fixture' }),
+  });
+  expect(await actions.listWorkflows({ name: 'topic', repo: 'repo' })).toEqual({
+    ok: true,
+    workflows: [{ id: 12, name: 'Tests', path: '.github/workflows/tests.yml' }],
+  });
+  expect(calls.filter((argv) => argv[2] === 'view')).toEqual([
+    ['gh', 'workflow', 'view', workflow.path, '--yaml', '--ref', 'topic'],
+  ]);
 });

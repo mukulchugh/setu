@@ -50,12 +50,12 @@ export function useVisiblePoll<T>(
       cancel: (timer) => clearTimeout(timer),
       immediate,
       intervalMs,
-      refreshOnVisible,
       onVisibility(callback) {
         document.addEventListener('visibilitychange', callback);
         return () => document.removeEventListener('visibilitychange', callback);
       },
       read: (signal) => reader.current(signal),
+      refreshOnVisible,
       reject: () => setSnapshot((previous) => ({ ...previous, failed: true })),
       schedule: (callback, delay) => setTimeout(callback, delay),
       visible: () => document.visibilityState !== 'hidden',

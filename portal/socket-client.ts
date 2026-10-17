@@ -14,6 +14,44 @@ interface Observation {
   observedAt: number;
   state: 'ready' | 'unknown';
 }
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  if (value !== null && typeof value === 'object') {
+    return value as Record<string, unknown>;
+  }
+}
+
+function snapshotObservation(data: unknown) {
+  const snapshot = record(data);
+  if (
+    !(
+      snapshot &&
+      typeof snapshot.checkedAt === 'number' &&
+      Number.isFinite(snapshot.checkedAt) &&
+      snapshot.listenerObservation
+    )
+  ) {
+    return;
+  }
+  const observation = {
+    ...(snapshot.listenerObservation as object),
+  } as unknown as Observation;
+  if (
+    !Number.isFinite(observation.observedAt) ||
+    snapshot.checkedAt < observation.observedAt ||
+    snapshot.checkedAt - observation.observedAt > 1500
+  ) {
+    observation.state = 'unknown';
+    observation.code = 'OBSERVATION_EXPIRED';
+  }
+  return { checkedAt: snapshot.checkedAt, observation };
+}
+
+function isWorktreeSnapshot(payload: unknown) {
+  const snapshot = record(payload);
+  return Array.isArray(payload) || Array.isArray(snapshot?.worktrees);
+}
+type Timer = Parameters<typeof clearTimeout>[0];
 export interface ConnectionState {
   checkedAt?: number;
   error?: string;
@@ -29,12 +67,12 @@ export interface ConnectionState {
   receivedAt?: number;
 }
 interface Options {
-  cancel: (timer: any) => void;
+  cancel: (timer: Timer) => void;
   now: () => number;
   onVisibility: (cb: () => void) => () => void;
   openSocket: () => Socket;
   readSnapshot: () => Promise<unknown>;
-  schedule: (cb: () => void, ms: number) => any;
+  schedule: (cb: () => void, ms: number) => Timer;
   visible: () => boolean;
 }
 
@@ -47,9 +85,9 @@ export function createPortalSocket(io: Options) {
   let socket: Socket | null = null,
     generation = 0,
     backoff = 500;
-  let reconnect: any = null,
-    fallback: any = null,
-    deadline: any = null;
+  let reconnect: Timer | null = null,
+    fallback: Timer | null = null,
+    deadline: Timer | null = null;
   let removeVisibility: (() => void) | null = null;
   let hasConnected = false,
     awaiting = true,
@@ -67,7 +105,7 @@ export function createPortalSocket(io: Options) {
       cb(state);
     }
   };
-  const clear = (timer: any) => {
+  const clear = (timer: Timer | null) => {
     if (timer !== null) {
       io.cancel(timer);
     }
@@ -89,21 +127,12 @@ export function createPortalSocket(io: Options) {
     socket = null;
     previous?.close();
   }
-  function freshness(data: any, heartbeat = false, viaHttp = false) {
-    const capable =
-      Number.isFinite(data?.checkedAt) && data?.listenerObservation;
-    if (capable) {
-      const observation = { ...data.listenerObservation } as Observation;
-      if (
-        !Number.isFinite(observation.observedAt) ||
-        data.checkedAt < observation.observedAt ||
-        data.checkedAt - observation.observedAt > 1500
-      ) {
-        observation.state = 'unknown';
-        observation.code = 'OBSERVATION_EXPIRED';
-      }
+  function freshness(data: unknown, heartbeat = false, viaHttp = false) {
+    const snapshot = snapshotObservation(data);
+    if (snapshot) {
+      const { checkedAt, observation } = snapshot;
       publish({
-        checkedAt: data.checkedAt,
+        checkedAt,
         error:
           observation.state === 'unknown'
             ? 'Current process status could not be checked.'
@@ -148,10 +177,11 @@ export function createPortalSocket(io: Options) {
       });
     }
   }
-  function receive(topic: string, data: any, viaHttp = false) {
+  function receive(topic: string, data: unknown, viaHttp = false) {
+    let payload: unknown = data;
     if (topic === 'worktrees:checked') {
       if (listeners.has('worktrees')) {
-        freshness(data, true);
+        freshness(payload, true);
       }
       return;
     }
@@ -160,23 +190,51 @@ export function createPortalSocket(io: Options) {
       return;
     }
     if (topic === 'worktrees') {
-      if (!(Array.isArray(data) || Array.isArray(data?.worktrees))) {
+      if (!isWorktreeSnapshot(payload)) {
         return;
       }
       delivery += 1;
-      freshness(data, false, viaHttp);
+      freshness(payload, false, viaHttp);
     }
-    if (topic.startsWith('logs:') && Array.isArray(data)) {
+    if (topic.startsWith('logs:') && Array.isArray(payload)) {
       const previous = snapshots.get(topic) as { lines?: string[] } | undefined;
-      const text = [...(previous?.lines ?? []), ...data]
+      const text = [...(previous?.lines ?? []), ...payload]
         .slice(-150)
         .join('\n')
         .slice(-256 * 1024);
-      data = { lines: text.split('\n') };
+      payload = { lines: text.split('\n') };
     }
-    snapshots.set(topic, data);
+    snapshots.set(topic, payload);
     for (const cb of subscribers) {
-      cb(data);
+      cb(payload);
+    }
+  }
+  const fallbackIsCurrent = (ownGeneration: number) =>
+    wanted() && generation === ownGeneration && awaiting;
+  async function readFallback(ownGeneration: number) {
+    fallback = null;
+    if (!fallbackIsCurrent(ownGeneration)) {
+      return;
+    }
+    const ownDelivery = delivery;
+    fallbackPending = true;
+    try {
+      const result = await io.readSnapshot();
+      if (fallbackIsCurrent(ownGeneration) && delivery === ownDelivery) {
+        receive('worktrees', result, true);
+      }
+    } catch {
+      if (wanted() && generation === ownGeneration) {
+        publish({
+          error:
+            'Could not refresh worktrees. Retry when the portal is available.',
+        });
+      }
+    } finally {
+      fallbackPending = false;
+      if (generation !== ownGeneration && wanted() && awaiting) {
+        armFallback(generation);
+      }
     }
   }
   function armFallback(ownGeneration: number) {
@@ -186,37 +244,40 @@ export function createPortalSocket(io: Options) {
     if (!listeners.has('worktrees')) {
       return;
     }
-    fallback = io.schedule(async () => {
-      fallback = null;
-      if (!wanted() || generation !== ownGeneration || !awaiting) {
-        return;
+    fallback = io.schedule(() => readFallback(ownGeneration), 5000);
+  }
+  const socketIsCurrent = (current: Socket, ownGeneration: number) =>
+    generation === ownGeneration && socket === current && wanted();
+  function resetLogSnapshots() {
+    for (const topic of listeners.keys()) {
+      if (topic.startsWith('logs:')) {
+        snapshots.delete(topic);
       }
-      const ownDelivery = delivery;
-      fallbackPending = true;
-      try {
-        const result = await io.readSnapshot();
-        if (
-          wanted() &&
-          generation === ownGeneration &&
-          awaiting &&
-          delivery === ownDelivery
-        ) {
-          receive('worktrees', result, true);
-        }
-      } catch {
-        if (wanted() && generation === ownGeneration) {
-          publish({
-            error:
-              'Could not refresh worktrees. Retry when the portal is available.',
-          });
-        }
-      } finally {
-        fallbackPending = false;
-        if (generation !== ownGeneration && wanted() && awaiting) {
-          armFallback(generation);
-        }
+    }
+  }
+  function notifyResync() {
+    for (const callbacks of resync.values()) {
+      for (const cb of callbacks) {
+        cb();
       }
-    }, 5000);
+    }
+  }
+  function subscribeAll() {
+    for (const topic of listeners.keys()) {
+      send({ sub: topic });
+    }
+  }
+  function socketOpened(current: Socket, ownGeneration: number) {
+    if (!socketIsCurrent(current, ownGeneration)) {
+      return;
+    }
+    backoff = 500;
+    if (hasConnected) {
+      resetLogSnapshots();
+      notifyResync();
+    }
+    hasConnected = true;
+    subscribeAll();
   }
   function connect(
     phase: ConnectionState['phase'] = hasConnected
@@ -239,30 +300,8 @@ export function createPortalSocket(io: Options) {
       return;
     }
     socket = current;
-    const valid = () =>
-      generation === ownGeneration && socket === current && wanted();
-    current.onopen = () => {
-      if (!valid()) {
-        return;
-      }
-      backoff = 500;
-      if (hasConnected) {
-        for (const topic of listeners.keys()) {
-          if (topic.startsWith('logs:')) {
-            snapshots.delete(topic);
-          }
-        }
-        for (const callbacks of resync.values()) {
-          for (const cb of callbacks) {
-            cb();
-          }
-        }
-      }
-      hasConnected = true;
-      for (const topic of listeners.keys()) {
-        send({ sub: topic });
-      }
-    };
+    const valid = () => socketIsCurrent(current, ownGeneration);
+    current.onopen = () => socketOpened(current, ownGeneration);
     current.onmessage = (event) => {
       if (!valid()) {
         return;

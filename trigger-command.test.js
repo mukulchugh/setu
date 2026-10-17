@@ -2,8 +2,9 @@ import { expect, test } from 'bun:test';
 import { requestPortalMutation } from './remove-command.js';
 import { runTriggerCommand } from './trigger-command.js';
 
-test('offline Trigger start and stop never spawn, signal, read PID files or start the portal', async () => {
-  for (const action of ['start', 'stop']) {
+test.each(['start', 'stop'])(
+  'offline Trigger start and stop never spawn, signal, read PID files or start the portal: %s',
+  async (action) => {
     const effects = [],
       output = [],
       errors = [];
@@ -12,6 +13,7 @@ test('offline Trigger start and stop never spawn, signal, read PID files or star
       {
         ensurePortal: () => effects.push('portal'),
         readPid: () => effects.push('pid'),
+        // biome-ignore lint/suspicious/useAwait: The request fixture must reject the offline transport error.
         request: async () => {
           throw Object.assign(new Error('offline'), { code: 'ECONNREFUSED' });
         },
@@ -27,7 +29,7 @@ test('offline Trigger start and stop never spawn, signal, read PID files or star
     expect(output).toEqual([]);
     expect(errors[0]).toContain('No local process');
   }
-});
+);
 test('online Trigger delegates exact start/stop once and JSON preserves refusal metadata', async () => {
   const sent = [],
     output = [];
@@ -39,6 +41,7 @@ test('online Trigger delegates exact start/stop once and JSON preserves refusal 
   const result = await runTriggerCommand(
     { action: 'start', json: true, name: 'feature/one', repo: 'r' },
     {
+      // biome-ignore lint/suspicious/useAwait: The request fixture preserves the asynchronous transport contract.
       request: async (path, body) => {
         sent.push({ body, path });
         return response;
@@ -62,6 +65,7 @@ test('malformed successful HTTP response is uncertain and never replayed', async
     {
       request: (path, body) =>
         requestPortalMutation(body, {
+          // biome-ignore lint/suspicious/useAwait: The fetch fixture preserves rejected response-construction errors.
           fetch: async () => {
             requests += 1;
             return new Response('not JSON', { status: 200 });

@@ -157,14 +157,14 @@ export function createPortalResourceServices({
       })),
     update: async (id, mutate) =>
       state.update('cacheManifests', (document) => {
-        const entries = manifestMap(document);
-        const current = entries[id];
+        const manifestEntries = manifestMap(document);
+        const current = manifestEntries[id];
         if (!current) {
           throw new Error('cleanup manifest disappeared');
         }
         return {
           ...document,
-          manifests: { ...entries, [id]: mutate(current) },
+          manifests: { ...manifestEntries, [id]: mutate(current) },
         };
       }),
   };
@@ -300,7 +300,7 @@ export function createPortalResourceServices({
     return { state: 'clear' };
   }
 
-  async function runtime(target) {
+  function lifecycleRuntime(target) {
     const life = lifecycle?.snapshot?.(target.key);
     if (life?.phase === 'unknown') {
       return { state: 'unknown' };
@@ -321,18 +321,15 @@ export function createPortalResourceServices({
     ) {
       return { state: 'active' };
     }
-    if (life?.reserved) {
-      return life.phase === 'queued'
-        ? { queued: true, state: 'stopped' }
-        : { state: 'active' };
+    if (!life?.reserved) {
+      return null;
     }
-    const native = await nativeRuntime(target);
-    if (native === 'unknown') {
-      return { state: 'unknown' };
-    }
-    if (native === 'alive') {
-      return { state: 'active' };
-    }
+    return life.phase === 'queued'
+      ? { queued: true, state: 'stopped' }
+      : { state: 'active' };
+  }
+
+  function persistedRuntime(target) {
     let sessions;
     let runs;
     try {
@@ -359,6 +356,21 @@ export function createPortalResourceServices({
     return sessions.state === 'active' || runs.state === 'active'
       ? { state: 'active' }
       : { queued: false, state: 'stopped' };
+  }
+
+  async function runtime(target) {
+    const lifecycleState = lifecycleRuntime(target);
+    if (lifecycleState) {
+      return lifecycleState;
+    }
+    const native = await nativeRuntime(target);
+    if (native === 'unknown') {
+      return { state: 'unknown' };
+    }
+    if (native === 'alive') {
+      return { state: 'active' };
+    }
+    return persistedRuntime(target);
   }
 
   const cache = createWorktreeCache({
@@ -493,6 +505,7 @@ export function createPortalResourceServices({
         if ((repo && row.repo !== repo) || (name && row.name !== name)) {
           continue;
         }
+        // biome-ignore lint/performance/noAwaitInLoops: Views retain registry order and stop at the first unresolved target or failed inspection.
         const target = await resolveTarget(row.repo, row.name);
         if (!target?.checkoutIdentity) {
           return failure(
@@ -548,47 +561,33 @@ export async function dispatchPortalResourceRoute(services, request) {
     new Response(JSON.stringify(value), {
       headers: { 'content-type': 'application/json; charset=utf-8' },
     });
-  const read = async (action, input = query) =>
-    response(await services[action](input));
-  if (request.method === 'GET') {
-    if (url.pathname === '/api/workspace-storage') {
-      return read('workspaceStorage', {});
-    }
-    if (url.pathname === '/api/operations') {
-      return read('operations', {
+  const read = async (serviceAction, input = query) =>
+    response(await services[serviceAction](input));
+  const getRoutes = {
+    '/api/agent-sessions': { action: 'agentSessions', optional: true },
+    '/api/attention': { action: 'attention', optional: true },
+    '/api/dependency-sharing': { action: 'dependencyViews' },
+    '/api/github/runs': { action: 'githubRuns' },
+    '/api/github/workflows': { action: 'githubWorkflows' },
+    '/api/headless-runs': { action: 'headlessRuns', optional: true },
+    '/api/mcp-actions': { action: 'mcpActions', input: {} },
+    '/api/operations': {
+      action: 'operations',
+      input: {
         ...query,
         limit: query.limit ? Number(query.limit) : undefined,
         since: query.since || undefined,
-      });
-    }
-    if (url.pathname === '/api/resource-admission') {
-      return read('admissionStatus', {});
-    }
-    if (url.pathname === '/api/dependency-sharing') {
-      return read('dependencyViews');
-    }
-    if (url.pathname === '/api/shared-caches') {
-      return read('sharedCaches', {});
-    }
-    if (url.pathname === '/api/mcp-actions') {
-      return read('mcpActions', {});
-    }
-    if (url.pathname === '/api/github/workflows') {
-      return read('githubWorkflows');
-    }
-    if (url.pathname === '/api/github/runs') {
-      return read('githubRuns');
-    }
-    if (url.pathname === '/api/agent-sessions' && services.agentSessions) {
-      return read('agentSessions');
-    }
-    if (url.pathname === '/api/attention' && services.attention) {
-      return read('attention');
-    }
-    if (url.pathname === '/api/headless-runs' && services.headlessRuns) {
-      return read('headlessRuns');
-    }
-    return null;
+      },
+    },
+    '/api/resource-admission': { action: 'admissionStatus', input: {} },
+    '/api/shared-caches': { action: 'sharedCaches', input: {} },
+    '/api/workspace-storage': { action: 'workspaceStorage', input: {} },
+  };
+  if (request.method === 'GET') {
+    const route = getRoutes[url.pathname];
+    return route && (!route.optional || services[route.action])
+      ? read(route.action, route.input)
+      : null;
   }
   if (request.method !== 'POST') {
     return null;

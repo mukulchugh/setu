@@ -76,6 +76,15 @@ export function projectWorktrees<T extends WorktreeListRow>(
   };
   const byIdentity = (a: T, b: T) =>
     a.repo.localeCompare(b.repo) || a.name.localeCompare(b.name);
+  const selectedStoppedOrder = (a: T, b: T) => {
+    if (options.sort === 'recent') {
+      return (b.lastCommitAt ?? 0) - (a.lastCommitAt ?? 0);
+    }
+    if (options.sort === 'created') {
+      return (b.createdAt ?? 0) - (a.createdAt ?? 0);
+    }
+    return a.name.localeCompare(b.name);
+  };
   const active = all
     .filter((w) => worktreeState(w) !== 'stopped')
     .sort((a, b) => {
@@ -100,12 +109,7 @@ export function projectWorktrees<T extends WorktreeListRow>(
           .includes(needle)
     )
     .sort((a, b) => {
-      const selected =
-        options.sort === 'recent'
-          ? (b.lastCommitAt ?? 0) - (a.lastCommitAt ?? 0)
-          : options.sort === 'created'
-            ? (b.createdAt ?? 0) - (a.createdAt ?? 0)
-            : a.name.localeCompare(b.name);
+      const selected = selectedStoppedOrder(a, b);
       return selected || byIdentity(a, b);
     });
   const pageCount = Math.max(1, Math.ceil(stopped.length / STOPPED_PAGE_SIZE));

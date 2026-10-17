@@ -15,6 +15,7 @@ export async function requestPortalMutation(
   try {
     result = await response.json();
   } catch {
+    // biome-ignore lint/style/useErrorCause: The CLI deliberately replaces an untrusted portal body with this fixed public parse error.
     throw new Error('Portal response could not be read');
   }
   if (
@@ -28,6 +29,28 @@ export async function requestPortalMutation(
 }
 export const requestRemoval = requestPortalMutation;
 
+function invalidRemoveArguments({ repo, name, force, operationId }) {
+  return (
+    !(repo && name) ||
+    typeof force !== 'boolean' ||
+    (operationId !== undefined &&
+      (typeof operationId !== 'string' || !operationId.trim()))
+  );
+}
+
+function removalFailure(result, { name, repo }, io, finish) {
+  io.stderr(
+    result.error ?? 'Removal failed. Inspect worktree status before retrying.'
+  );
+  if (result.operationId) {
+    const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+    io.stderr(
+      `Operation ${result.operationId}; pending: ${(Array.isArray(result.pendingSteps) ? result.pendingSteps : []).join(', ') || 'inspect status'}. Refresh the portal's Cleanup pending list. Retry only this operation: setu rm ${quote(repo)} ${quote(name)} --operation-id ${quote(result.operationId)}`
+    );
+  }
+  return finish(result, 1);
+}
+
 export async function runRemoveCommand(
   { repo, name, force = false, operationId, json = false },
   io
@@ -38,12 +61,7 @@ export async function runRemoveCommand(
     }
     return { exitCode, result };
   };
-  if (
-    !(repo && name) ||
-    typeof force !== 'boolean' ||
-    (operationId !== undefined &&
-      (typeof operationId !== 'string' || !operationId.trim()))
-  ) {
+  if (invalidRemoveArguments({ force, name, operationId, repo })) {
     const result = {
       code: 'INVALID_ARGUMENT',
       error:
@@ -63,18 +81,8 @@ export async function runRemoveCommand(
     if (!result || typeof result.ok !== 'boolean') {
       throw new Error('Unconfirmed removal response');
     }
-    if (result?.ok === false) {
-      io.stderr(
-        result.error ??
-          'Removal failed. Inspect worktree status before retrying.'
-      );
-      if (result.operationId) {
-        const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
-        io.stderr(
-          `Operation ${result.operationId}; pending: ${(Array.isArray(result.pendingSteps) ? result.pendingSteps : []).join(', ') || 'inspect status'}. Refresh the portal's Cleanup pending list. Retry only this operation: setu rm ${quote(repo)} ${quote(name)} --operation-id ${quote(result.operationId)}`
-        );
-      }
-      return finish(result, 1);
+    if (result.ok === false) {
+      return removalFailure(result, { name, repo }, io, finish);
     }
     if (!json) {
       io.stdout(

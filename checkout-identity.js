@@ -1,5 +1,7 @@
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
+const GIT_DIRECTORY_POINTER = /^gitdir: (.+)$/;
+
 // No Git invocation, host discovery, registry reads or writes. HEAD is deliberately
 // excluded: commits change within an incarnation, replacement directories do not.
 export async function inspectCheckoutIdentity(target, fs) {
@@ -29,7 +31,7 @@ export async function inspectCheckoutIdentity(target, fs) {
     );
     const pointer = (await fs.readFile(gitFile, 'utf8'))
       .trim()
-      .match(/^gitdir: (.+)$/);
+      .match(GIT_DIRECTORY_POINTER);
     if (!pointer) {
       return unknown('Checkout has no linked-worktree Git pointer');
     }
@@ -73,17 +75,17 @@ export async function inspectCheckoutIdentity(target, fs) {
       repositoryPath,
     };
     // Reject replacement during the read itself, as well as between operations.
-    for (const [path, evidence] of [
-      [checkoutPath, checkout],
-      [repositoryPath, repository],
-      [adminPath, admin],
-    ]) {
-      if (
-        JSON.stringify(fingerprint(await fs.stat(path, { bigint: true }))) !==
-        JSON.stringify(evidence)
-      ) {
-        return unknown('Filesystem identity changed during observation');
-      }
+    const unchanged = async (path, evidence) =>
+      JSON.stringify(fingerprint(await fs.stat(path, { bigint: true }))) ===
+      JSON.stringify(evidence);
+    if (
+      !(
+        (await unchanged(checkoutPath, checkout)) &&
+        (await unchanged(repositoryPath, repository)) &&
+        (await unchanged(adminPath, admin))
+      )
+    ) {
+      return unknown('Filesystem identity changed during observation');
     }
     return Object.freeze(result);
   } catch {

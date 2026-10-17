@@ -99,6 +99,7 @@ afterEach(async () => {
     if (child.exitCode === null) {
       child.kill();
     }
+    // biome-ignore lint/performance/noAwaitInLoops: Reap each owned child before teardown removes their shared fixture roots.
     await child.exited;
   }
   for (const root of roots.splice(0)) {
@@ -164,9 +165,7 @@ test('refuses a second run for the same worktree while the first is unresolved',
 test('returns the claimed run id and durable state for refused or uncertain admission', async () => {
   const uncertain = fixture();
   const uncertainRunner = createHeadlessRun({
-    admit: async () => {
-      throw new Error('fixture admission unavailable');
-    },
+    admit: () => Promise.reject(new Error('fixture admission unavailable')),
     state: uncertain.state,
   });
   await expect(
@@ -208,7 +207,7 @@ test('returns the claimed run id and durable state for refused or uncertain admi
 });
 
 test('a deadline signals only a process with the recorded start identity and never reports success', async () => {
-  const { runner, state } = fixture();
+  const { state } = fixture();
   const signals = [];
   const stuck = Bun.spawn([
     process.execPath,
@@ -364,37 +363,37 @@ test('reconciliation leaves an unconfirmed pre-restart run unknown and blocks re
   ).resolves.toMatchObject({ code: 'HEADLESS_RUN_ACTIVE', ok: false });
 });
 
-test('refuses malformed run journals without effects, including corruption under the claim lock', async () => {
-  const corruptions = [
-    ['null runs', { runs: null }],
-    ['array runs', { runs: [] }],
-    ['unknown state', { runs: { bad: storedRun('bad', { state: 'paused' }) } }],
-    [
-      'missing identity',
-      { runs: { bad: storedRun('bad', { checkoutIdentity: undefined }) } },
-    ],
-    [
-      'missing checkout path',
-      { runs: { bad: storedRun('bad', { checkoutPath: undefined }) } },
-    ],
-    [
-      'missing provider',
-      { runs: { bad: storedRun('bad', { provider: undefined }) } },
-    ],
-    [
-      'missing created time',
-      { runs: { bad: storedRun('bad', { createdAt: undefined }) } },
-    ],
-    [
-      'missing limits',
-      { runs: { bad: storedRun('bad', { limits: undefined }) } },
-    ],
-    [
-      'partial process identity',
-      { runs: { bad: storedRun('bad', { pid: 42 }) } },
-    ],
-  ];
-  for (const [, document] of corruptions) {
+test.each([
+  ['null runs', { runs: null }],
+  ['array runs', { runs: [] }],
+  ['unknown state', { runs: { bad: storedRun('bad', { state: 'paused' }) } }],
+  [
+    'missing identity',
+    { runs: { bad: storedRun('bad', { checkoutIdentity: undefined }) } },
+  ],
+  [
+    'missing checkout path',
+    { runs: { bad: storedRun('bad', { checkoutPath: undefined }) } },
+  ],
+  [
+    'missing provider',
+    { runs: { bad: storedRun('bad', { provider: undefined }) } },
+  ],
+  [
+    'missing created time',
+    { runs: { bad: storedRun('bad', { createdAt: undefined }) } },
+  ],
+  [
+    'missing limits',
+    { runs: { bad: storedRun('bad', { limits: undefined }) } },
+  ],
+  [
+    'partial process identity',
+    { runs: { bad: storedRun('bad', { pid: 42 }) } },
+  ],
+])(
+  'refuses malformed run journals without effects: %s',
+  async (_label, document) => {
     const { root, state } = fixture();
     const path = join(root, '.setu-headless-runs.json');
     const bytes = `${JSON.stringify(document, null, 2)}\n`;
@@ -403,9 +402,9 @@ test('refuses malformed run journals without effects, including corruption under
       launches = 0,
       signals = 0;
     const runner = createHeadlessRun({
-      admit: async () => {
+      admit: () => {
         admits += 1;
-        return { ok: true };
+        return Promise.resolve({ ok: true });
       },
       launch: () => {
         launches += 1;
@@ -424,7 +423,9 @@ test('refuses malformed run journals without effects, including corruption under
     expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
     expect([admits, launches, signals]).toEqual([0, 0, 0]);
   }
+);
 
+test('refuses run-journal corruption under the claim lock without effects', async () => {
   const { root, state } = fixture();
   const path = join(root, '.setu-headless-runs.json');
   const bytes = '{\n  "runs": null\n}\n';
@@ -433,9 +434,9 @@ test('refuses malformed run journals without effects, including corruption under
     launches = 0,
     signals = 0;
   const runner = createHeadlessRun({
-    admit: async () => {
+    admit: () => {
       admits += 1;
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     },
     launch: () => {
       launches += 1;
@@ -446,7 +447,8 @@ test('refuses malformed run journals without effects, including corruption under
     state: {
       ...state,
       update(name, mutate) {
-        if (name === 'headlessRuns' && writes++ === 0) {
+        if (name === 'headlessRuns' && writes === 0) {
+          writes += 1;
           fs.writeFileSync(path, bytes);
         }
         return state.update(name, mutate);
@@ -570,11 +572,10 @@ test('an unobservable launched child is drained and remains unresolved without r
   const runner = createHeadlessRun({
     admit: async () => ({ lease: { id: 'lease' }, ok: true }),
     launch: () => child,
-    observeProcess: async () => {
-      throw new Error('fixture cannot observe');
-    },
-    release: async () => {
+    observeProcess: () => Promise.reject(new Error('fixture cannot observe')),
+    release: () => {
       released += 1;
+      return Promise.resolve();
     },
     state,
   });
@@ -612,15 +613,17 @@ test('cancellation rechecks ownership after the state write before signalling', 
   const runner = createHeadlessRun({
     admit: async () => ({ ok: true }),
     launch: () => child,
-    observeProcess: async (pid) => {
+    observeProcess: (pid) => {
       checks += 1;
-      return checks < 3
-        ? {
-            processId: pid,
-            processStartIdentity: `start-${pid}`,
-            state: 'alive',
-          }
-        : { state: 'unknown' };
+      return Promise.resolve(
+        checks < 3
+          ? {
+              processId: pid,
+              processStartIdentity: `start-${pid}`,
+              state: 'alive',
+            }
+          : { state: 'unknown' }
+      );
     },
     signal: (...args) => signals.push(args),
     state,
@@ -697,7 +700,7 @@ test('passes a validated model and rejects unsafe permission modes, excessive li
   const runner = createHeadlessRun({
     admit: async () => ({ ok: true }),
     launch: (input) => {
-      args = input.args;
+      ({ args } = input);
       const child = Bun.spawn([process.execPath, '-e', 'process.exit(0)']);
       children.push(child);
       return child;
@@ -760,8 +763,9 @@ test('a fast exit waits for gated startup publication and is not resurrected as 
         state: 'alive',
       };
     },
-    release: async () => {
+    release: () => {
       released += 1;
+      return Promise.resolve();
     },
     state,
   });
@@ -844,8 +848,9 @@ test('an input write failure retains the launched child for monitored unknown cl
       processStartIdentity: `start-${pid}`,
       state: 'alive',
     }),
-    release: async () => {
+    release: () => {
       released += 1;
+      return Promise.resolve();
     },
     state,
   });
@@ -920,8 +925,9 @@ test('does not launch when the checkout changes while acquiring the target lock'
     launch: () => {
       launches += 1;
     },
-    release: async () => {
+    release: () => {
       releases += 1;
+      return Promise.resolve();
     },
     state,
     withTargetLock: async (_input, work) =>
@@ -952,8 +958,9 @@ test('keeps a returned child tracked when target-lock release fails after launch
       processStartIdentity: `start-${pid}`,
       state: 'alive',
     }),
-    release: async () => {
+    release: () => {
       releases += 1;
+      return Promise.resolve();
     },
     state,
     withTargetLock: async (_input, work) => {
@@ -994,8 +1001,9 @@ test('monitors a child with malformed ownership metadata without certifying the 
       processStartIdentity: `start-${pid}`,
       state: 'alive',
     }),
-    release: async () => {
+    release: () => {
       releases += 1;
+      return Promise.resolve();
     },
     state,
   });
@@ -1038,8 +1046,9 @@ test('retains an uncertain thrown launch with its returned child handle', async 
       processStartIdentity: `start-${pid}`,
       state: 'alive',
     }),
-    release: async () => {
+    release: () => {
       releases += 1;
+      return Promise.resolve();
     },
     state,
   });
@@ -1076,8 +1085,9 @@ test('keeps monitoring a launched child after its identity journal write fails',
       processStartIdentity: `start-${pid}`,
       state: 'alive',
     }),
-    release: async () => {
+    release: () => {
       releases += 1;
+      return Promise.resolve();
     },
     state: {
       ...state,
@@ -1122,9 +1132,9 @@ test('reports an explicit prelaunch refusal despite failed outcome persistence a
         launchAttempt: 'prelaunch',
       });
     },
-    release: async () => {
+    release: () => {
       releases += 1;
-      throw new Error('fixture release failed');
+      return Promise.reject(new Error('fixture release failed'));
     },
     state: {
       ...state,

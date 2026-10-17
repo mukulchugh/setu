@@ -6,8 +6,9 @@ import {
 } from './owned-process-map.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 
-test('sidecar parent exit retains alive or unknown group ownership and blocks cutover', async () => {
-  for (const state of ['alive', 'unknown']) {
+test.each(['alive', 'unknown'])(
+  'sidecar parent exit retains alive or unknown group ownership and blocks cutover: %s',
+  async (state) => {
     const entry = { ownedGroup: true, pid: 42 };
     const map = new Map([['r/topic', entry]]),
       probes = [];
@@ -37,7 +38,7 @@ test('sidecar parent exit retains alive or unknown group ownership and blocks cu
       ok: false,
     });
   }
-});
+);
 
 test('sidecar ownership clears only after shared runtime confirms group absence', async () => {
   const entry = { ownedGroup: true, pid: 42 },

@@ -1,6 +1,6 @@
 {
   "name": "@quivly/setu",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Workspace bridge — git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
   "type": "module",
   "bin": {
@@ -63,6 +63,7 @@
     "shared-cache-catalog.js",
     "terminal-attention.js",
     "trigger-command.js",
+    "tsconfig.backend.json",
     "tsconfig.json",
     "update-command.js",
     "update-transaction.js",
@@ -82,7 +83,7 @@
     "check": "ultracite check",
     "fix": "ultracite fix",
     "test": "bun test ./agent-session-launcher.test.js ./agent-sessions.test.js ./checkout-identity.test.js ./cli-helpers.test.js ./cli-setup.test.js ./cli.test.js ./dependency-sharing.test.js ./deployment-guard.test.js ./dev-runtime.test.js ./git-operations.test.js ./github-actions.test.js ./hardening.regression.test.js ./headless-run.test.js ./host-health.test.js ./lib-safety.test.js ./listener-observation.test.js ./log-tail.test.js ./managed-agent-services.test.js ./mcp-actions.test.js ./mcp.connection.test.js ./native-terminal.test.js ./operation-events.test.js ./owned-process-map.test.js ./portal-operation-outcomes.test.js ./portal-resource-services.test.js ./portal-routes.test.js ./portal-routing.test.js ./portal-update.test.js ./portal-wiring.test.js ./portal.api.test.ts ./portal.costs-read.test.ts ./portal.deploy-intent.test.ts ./portal.dialog-focus.test.ts ./portal.docs.test.js ./portal.dropdown-ref.test.tsx ./portal.host-storage.test.ts ./portal.importability.test.js ./portal.inventory-read.test.ts ./portal.log-read.test.ts ./portal.mcp-config.test.ts ./portal.read-array.test.ts ./portal.regression.test.js ./portal.resource-controls.test.ts ./portal.settings-draft.test.ts ./portal.socket-client.test.ts ./portal.ui-helpers.test.ts ./portal.visible-poll.test.ts ./portal.worktree-list.test.ts ./pr-review.test.js ./process-observation.test.js ./process-tree.test.js ./removal-mcp.test.js ./removal-raycast.test.ts ./remove-command.test.js ./resource-admission.test.js ./review-handoff.test.js ./setup-progress.test.js ./shared-cache-catalog.test.js ./terminal-attention.test.js ./trigger-command.test.js ./update-command.test.js ./update-transaction.real.test.js ./update-transaction.test.js ./workspace-inventory.test.js ./workspace-setup.test.js ./workspace-state.callers.test.js ./workspace-state.test.js ./workspace-storage.test.js ./worktree-cache.test.js ./worktree-lifecycle.test.js ./worktree-removal.test.js ./worktree-stream.test.js ./writer-claims.test.js && bun ./agent.test.js && bun ./lib.agent-compose.test.js",
-    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && bun node_modules/typescript/bin/tsc --noEmit -p raycast/tsconfig.json",
+    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && bun node_modules/typescript/bin/tsc --noEmit -p raycast/tsconfig.json && bun node_modules/typescript/bin/tsc --noEmit -p tsconfig.backend.json",
     "verify": "bun run test && bun run typecheck"
   },
   "overrides": {
@@ -105,11 +106,11 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.6",
     "@raycast/api": "^1.104.24",
     "@raycast/utils": "^2.3.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
-    "@biomejs/biome": "2.5.6",
     "typescript": "^5.6.0",
     "ultracite": "7.10.5"
   },

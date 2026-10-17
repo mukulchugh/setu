@@ -105,6 +105,7 @@ test('an uncertain snapshot child remains an ownership refusal', async () => {
 test('a live pid whose current parent relation changed is not certified as a child', async () => {
   let reads = 0;
   const result = await findProcessChildren(10, {
+    // biome-ignore lint/suspicious/useAwait: Process-list fixtures preserve the asynchronous observer contract.
     listProcesses: async () => {
       reads += 1;
       return reads === 1
@@ -131,6 +132,7 @@ test('the root identity is re-observed before ownership is certified', async () 
   let rootObservations = 0;
   const result = await findProcessChildren(10, {
     listProcesses: async () => [{ parentPid: 1, pid: 10 }],
+    // biome-ignore lint/suspicious/useAwait: Identity observation fixtures preserve their asynchronous result contract.
     observeProcess: async (pid) => {
       if (pid === 10) {
         rootObservations += 1;

@@ -1,5 +1,10 @@
 import { resolve } from 'node:path';
 
+const codexServerTablePattern = /^\[mcp_servers\.(?:setu|"setu")\]$/m;
+const sudoRuleContinuationPattern = /\n {5,}(?=\S)/g;
+const sudoRulePattern = /NOPASSWD:\s*(.+)$/;
+const sudoRuleSeparatorPattern = /\s*,\s*/;
+
 export function caddyfileText(workspace) {
   return `{\n  auto_https off\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
 }
@@ -52,20 +57,20 @@ export function sudoRuleCovers(listingText, argv) {
   const command = argv.join(' ');
   // A captured listing is wrapped at 80 columns; a rule's continuation lines
   // are indented deeper than the rule itself.
-  const unwrapped = listingText.replace(/\n {5,}(?=\S)/g, ' ');
+  const unwrapped = listingText.replace(sudoRuleContinuationPattern, ' ');
   return unwrapped.split('\n').some((line) => {
-    const match = line.match(/NOPASSWD:\s*(.+)$/);
+    const match = line.match(sudoRulePattern);
     if (!match) {
       return false;
     }
     return match[1]
-      .split(/\s*,\s*/)
+      .split(sudoRuleSeparatorPattern)
       .some((rule) => rule.trim() === command || rule.trim() === 'ALL');
   });
 }
 
 export function hasCodexServerTable(text) {
-  return /^\[mcp_servers\.(?:setu|"setu")\]$/m.test(text);
+  return codexServerTablePattern.test(text);
 }
 
 export function cursorConfigText(config, url) {

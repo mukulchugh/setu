@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { createPortalRuntime } from './portal.js';
 import { createWorkspaceState } from './workspace-state.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
@@ -16,7 +18,10 @@ async function fixture(options = {}) {
   const config = { tunnel: 'fixture', workspace: root };
   await state.replace('config', config);
   const portal = await createPortalRuntime({ config, state, ...options });
-  const server = { requestIP: () => ({ address: '127.0.0.1' }), timeout() {} };
+  const server = {
+    requestIP: () => ({ address: '127.0.0.1' }),
+    timeout: () => undefined,
+  };
   return {
     dispose: async () => {
       await portal.dispose();
@@ -40,6 +45,27 @@ async function fixture(options = {}) {
     root,
     state,
   };
+}
+
+function mcpInitializeRequest(port, host = `localhost:${port}`) {
+  return new Request(`http://localhost:${port}/mcp`, {
+    body: JSON.stringify({
+      id: 1,
+      jsonrpc: '2.0',
+      method: 'initialize',
+      params: {
+        capabilities: {},
+        clientInfo: { name: 'host-guard', version: '1' },
+        protocolVersion: '2025-06-18',
+      },
+    }),
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      host,
+    },
+    method: 'POST',
+  });
 }
 
 test('a child import under an empty HOME is inert and exits without a configuration file', async () => {
@@ -73,6 +99,32 @@ test('a child import under an empty HOME is inert and exits without a configurat
     expect(await new Response(proc.stderr).text()).toBe('');
   } finally {
     rmSync(home, { force: true, recursive: true });
+  }
+});
+
+test('MCP accepts only the trusted host for its runtime port', async () => {
+  initMcpServer({});
+  expect((await handleMcpRequest(mcpInitializeRequest(2999))).status).toBe(200);
+
+  const fx = await fixture({ port: 43_210 });
+  const server = {
+    requestIP: () => ({ address: '127.0.0.1' }),
+    timeout: () => undefined,
+  };
+  try {
+    expect(
+      (await fx.portal.handle(mcpInitializeRequest(43_210), server)).status
+    ).toBe(200);
+    expect(
+      (
+        await handleMcpRequest(
+          mcpInitializeRequest(43_210, 'localhost:2999'),
+          43_210
+        )
+      ).status
+    ).toBe(403);
+  } finally {
+    await fx.dispose();
   }
 });
 
@@ -141,20 +193,47 @@ test('settings writes use the supplied isolated state and retain actual source a
   }
 });
 
+test('create reaches its normal validation after resolving dependency sharing', async () => {
+  const fx = await fixture({
+    hostHealth: () =>
+      Promise.resolve({ availableBytes: 32 * 1024 ** 3, state: 'ready' }),
+  });
+  try {
+    await fx.state.replace('projects', {
+      missing: { base: 3900, label: 'Fixture', slug: null },
+    });
+    const response = await fx.request('/api/create', {
+      name: 'topic',
+      repo: 'missing',
+    });
+    expect(await response.json()).toMatchObject({
+      error: `Bare repo not found: ${join(fx.root, 'missing.git')}\nRun: setu init <gh-slug>`,
+      ok: false,
+    });
+  } finally {
+    await fx.dispose();
+  }
+});
+
 test('a queued HTTP start records completion only after the real lifecycle observes it running', async () => {
   const lifecycle = createWorktreeLifecycle({
     capacity: {},
     clock: { clearTimeout, now: Date.now, setTimeout },
     runtime: {
+      // biome-ignore lint/suspicious/useAwait: The launch fixture preserves rejected registration failures at its promise boundary.
       launch: async (_target, _spec, register) => {
         register({ ownedGroup: true, pid: 123 });
         return {};
       },
       observe: async () => 'alive',
-      stop: async () => {},
+      stop: async () => {
+        // The lifecycle fixture has nothing to stop.
+      },
     },
     settings: { maxConcurrentDevServers: 1 },
-    validateTarget: async () => {},
+    validateTarget: async () => {
+      // Every fixture target is valid.
+    },
   });
   const fx = await fixture({ lifecycle });
   try {
@@ -204,18 +283,31 @@ test('explicit startup binds one injected server and dispose removes its hooks a
   const fx = await fixture({
     computeWorktrees: async () => [],
     indexPage: new Response('fixture'),
-    initializeMcp: () => {},
-    managedAgents: { dispose: async () => {}, recover: async () => {} },
+    initializeMcp: () => undefined,
+    managedAgents: {
+      dispose: async () => {
+        // The fixture starts no managed agents.
+      },
+      recover: async () => {
+        // The fixture has no managed-agent state.
+      },
+    },
     observeProcess: async () => ({ state: 'unknown' }),
     port: 43_210,
     projects: {},
-    reconcileDevServers: async () => {},
-    reconcileTriggerSidecars: async () => {},
+    reconcileDevServers: async () => {
+      // The fixture has no existing runtimes to reconcile.
+    },
+    reconcileTriggerSidecars: async () => {
+      // The fixture has no existing Trigger sidecars to reconcile.
+    },
     routing: {
+      // biome-ignore lint/suspicious/useAwait: The routing fixture preserves the asynchronous bootstrap collaborator contract.
       syncHosts: async () => {
         routed += 1;
       },
     },
+    // biome-ignore lint/suspicious/useAwait: The approval migration fixture preserves the asynchronous bootstrap collaborator contract.
     seedSidecarApprovals: async () => {
       migrations += 1;
     },
@@ -231,7 +323,8 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     timers: {
       clearInterval: (id) => timers.delete(id),
       setInterval: () => {
-        const id = ++timerId;
+        timerId += 1;
+        const id = timerId;
         timers.add(id);
         return id;
       },
@@ -264,6 +357,87 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     expect(stopped).toBe(1);
     expect(timers.size).toBe(0);
     expect(process.listenerCount('SIGTERM')).toBe(before);
+  } finally {
+    await fx.dispose();
+  }
+});
+
+test('real fixture removal uses injected routing without invoking host commands', async () => {
+  const effects = [];
+  const fx = await fixture({
+    command: (args) => {
+      expect(args[0]).toBe('git');
+      return Promise.resolve({
+        code: 0,
+        stderr: '',
+        stdout: execFileSync(args[0], args.slice(1), { encoding: 'utf8' }),
+        timedOut: false,
+        truncated: false,
+      });
+    },
+    devRuntime: {
+      observe: () => Promise.resolve('dead'),
+      stop: () => Promise.resolve(),
+    },
+    reconcileTriggerSidecars: () => {
+      effects.push('reconcile');
+      return Promise.resolve();
+    },
+    removalRouting: {
+      reloadCaddy: () => {
+        effects.push('caddy');
+        return Promise.resolve(true);
+      },
+      removeTunnelRoute: () => {
+        effects.push('tunnel');
+        return Promise.resolve({ ok: true });
+      },
+    },
+    routing: {
+      syncHosts: () => {
+        effects.push('hosts');
+        return Promise.resolve(true);
+      },
+    },
+  });
+  try {
+    const bare = join(fx.root, 'fixture.git');
+    const checkout = join(fx.root, 'fixture', 'topic');
+    const git = (...args) =>
+      execFileSync('git', args, {
+        encoding: 'utf8',
+        input: '',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+    git('init', '--bare', bare);
+    const tree = git('-C', bare, 'mktree');
+    const revision = git(
+      '-C',
+      bare,
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      'commit-tree',
+      tree,
+      '-m',
+      'fixture'
+    );
+    git('-C', bare, 'update-ref', 'refs/heads/main', revision);
+    git('-C', bare, 'worktree', 'add', '--detach', checkout, revision);
+    await fx.state.replace('projects', {
+      fixture: { base: 3910, label: 'Fixture', slug: null },
+    });
+    await fx.state.replace('ports', [
+      { key: 'fixture/topic', name: 'topic', port: 3910, repo: 'fixture' },
+    ]);
+    const result = await (
+      await fx.request('/api/remove', { name: 'topic', repo: 'fixture' })
+    ).json();
+    expect(result).toMatchObject({ ok: true });
+    expect(existsSync(checkout)).toBe(false);
+    expect(fx.state.read('ports')).toEqual([]);
+    expect(effects).toEqual(['reconcile', 'tunnel', 'hosts', 'caddy']);
   } finally {
     await fx.dispose();
   }

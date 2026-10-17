@@ -1,20 +1,22 @@
+type Timer = Parameters<typeof clearTimeout>[0];
+
 interface PollIO<T> {
   accept: (data: T) => void;
-  cancel: (timer: any) => void;
+  cancel: (timer: Timer) => void;
   immediate?: boolean;
-  refreshOnVisible?: boolean;
   intervalMs: number | null;
   onVisibility: (callback: () => void) => () => void;
   read: (signal: AbortSignal) => Promise<T>;
+  refreshOnVisible?: boolean;
   reject: () => void;
-  schedule: (callback: () => void, delay: number) => any;
+  schedule: (callback: () => void, delay: number) => Timer;
   visible: () => boolean;
 }
 
 // Completion schedules the next read. Aborted reads must settle before a
 // replacement starts, even when a transport ignores its AbortSignal.
 export function createVisiblePoll<T>(io: PollIO<T>) {
-  let timer: any = null,
+  let timer: Timer | null = null,
     controller: AbortController | null = null;
   let generation = 0,
     stopped = false,
@@ -29,7 +31,7 @@ export function createVisiblePoll<T>(io: PollIO<T>) {
     if (!stopped && io.visible() && io.intervalMs !== null) {
       timer = io.schedule(() => {
         timer = null;
-        void run();
+        run();
       }, io.intervalMs);
     }
   };
@@ -54,7 +56,7 @@ export function createVisiblePoll<T>(io: PollIO<T>) {
       if (!stopped && io.visible()) {
         if (resumePending) {
           resumePending = false;
-          void run();
+          run();
         } else {
           later();
         }
@@ -74,17 +76,17 @@ export function createVisiblePoll<T>(io: PollIO<T>) {
     } else if (io.immediate === false || io.refreshOnVisible === false) {
       later();
     } else {
-      void run();
+      run();
     }
   });
   if (io.immediate === false) {
     later();
   } else {
-    void run();
+    run();
   }
   return {
     refresh: () => {
-      void run();
+      run();
     },
     stop() {
       stopped = true;

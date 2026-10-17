@@ -47,6 +47,14 @@ import { WRITER_AGENT_NAME } from './writer-claims.js';
 // since they're all hoisted function declarations, but this runs last).
 let deps = null;
 
+function errorMessage(error) {
+  return error?.message ?? String(error);
+}
+
+function errorProperty(error, key) {
+  return error?.[key];
+}
+
 export function initMcpServer(d) {
   deps = d;
 }
@@ -58,7 +66,7 @@ async function mutationResult(call) {
   try {
     result = await call();
   } catch (error) {
-    result = { error: error?.message ?? String(error), ok: false };
+    result = { error: errorMessage(error), ok: false };
     for (const key of [
       'code',
       'causeCode',
@@ -67,7 +75,8 @@ async function mutationResult(call) {
       'phase',
       'operationId',
     ]) {
-      if (error?.[key] !== undefined) {
+      const value = errorProperty(error, key);
+      if (value !== undefined) {
         result[key] = error[key];
       }
     }
@@ -130,6 +139,7 @@ function compactWorktree(w) {
 const DIFF_VERBOSE_FILE_CAP = 20;
 const DIFF_TEXT_BUDGET = 200 * 1024;
 const DIFF_TRUNCATION_MARKER = 'Output truncated at 200 KB.';
+const SIDECAR_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
 function shapeDiffGroup(group, verbose) {
   if (!group) {
@@ -171,17 +181,19 @@ function boundedDiffText(value) {
     return text(output);
   }
   output.truncation = DIFF_TRUNCATION_MARKER;
-  while (Buffer.byteLength((rendered = render())) > DIFF_TEXT_BUDGET) {
+  while (Buffer.byteLength(rendered) > DIFF_TEXT_BUDGET) {
     const group = ['committed', 'uncommitted'].find(
       (key) => output[key]?.files?.length
     );
     if (group) {
       output[group].files.pop();
+      rendered = render();
       continue;
     }
     const untracked = output.uncommitted?.untracked;
     if (untracked?.length) {
       untracked.pop();
+      rendered = render();
       continue;
     }
     return text({ truncation: DIFF_TRUNCATION_MARKER });
@@ -401,7 +413,7 @@ function registerTools(server) {
         lines: z.number().int().positive().optional(),
         name: z.string(),
         repo: z.string(),
-        sidecar: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+        sidecar: z.string().regex(SIDECAR_NAME_RE),
       },
       title: 'Get sidecar log tail',
     },
@@ -842,10 +854,10 @@ function registerTools(server) {
         }
       } catch (error) {
         result = {
-          code: error?.code ?? 'REMOVAL_OUTCOME_UNKNOWN',
-          error: error?.message ?? String(error),
+          code: errorProperty(error, 'code') ?? 'REMOVAL_OUTCOME_UNKNOWN',
+          error: errorMessage(error),
           ok: false,
-          removed: error?.removed ?? null,
+          removed: errorProperty(error, 'removed') ?? null,
         };
         for (const key of [
           'operationId',
@@ -857,7 +869,8 @@ function registerTools(server) {
           'reconciled',
           'phase',
         ]) {
-          if (error?.[key] !== undefined) {
+          const value = errorProperty(error, key);
+          if (value !== undefined) {
             result[key] = error[key];
           }
         }
@@ -1070,11 +1083,9 @@ function buildServer() {
 
 // The outer portal guard requires a local peer and trusted Origin. Keep the
 // SDK's Host validation enabled as an additional boundary for MCP clients.
-const ALLOWED_HOSTS = [`localhost:${PORTAL_PORT}`, `127.0.0.1:${PORTAL_PORT}`];
-
-export async function handleMcpRequest(req) {
+export async function handleMcpRequest(req, port = PORTAL_PORT) {
   const transport = new WebStandardStreamableHTTPServerTransport({
-    allowedHosts: ALLOWED_HOSTS,
+    allowedHosts: [`localhost:${port}`, `127.0.0.1:${port}`],
     enableDnsRebindingProtection: true,
   });
   const server = buildServer();

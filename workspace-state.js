@@ -8,6 +8,29 @@ import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 // One async chain must never invert the documented routing -> workspace -> document order.
 const lockContext = new AsyncLocalStorage();
 const heldLocks = new Set();
+const decimalPattern = /^\d+$/;
+const projectTextUnsafePattern = /[\r\n:]/;
+const lockTokenPattern = /^[a-zA-Z0-9_-]{1,128}$/;
+const targetLockPattern = /^\.setu-target-[a-f0-9]{64}\.lock$/;
+const safeRepositoryPartPattern = /^[^/\\\s:]+$/;
+
+function hasAsciiControlCharacter(value) {
+  return [...value].some((character) => character.codePointAt(0) <= 0x20);
+}
+
+function errorCode(error) {
+  return error?.code;
+}
+
+function compareCanonicalPaths(left, right) {
+  if (left < right) {
+    return -1;
+  }
+  if (left > right) {
+    return 1;
+  }
+  return 0;
+}
 
 // Signal handlers cannot await the async lock scope, so every acquired lease is
 // also tracked here. Retained target leases intentionally survive process exit.
@@ -64,7 +87,8 @@ const stringMap = (value) =>
   object(value) && Object.values(value).every((v) => typeof v === 'string');
 const repoName = (value) =>
   typeof value === 'string' &&
-  /^[^/\\\s:\x00-\x20]+$/.test(value) &&
+  safeRepositoryPartPattern.test(value) &&
+  !hasAsciiControlCharacter(value) &&
   !['.', '..'].includes(value) &&
   !value.startsWith('-');
 const branchName = (value) =>
@@ -102,7 +126,7 @@ export function parsePorts(text) {
         slash < 0 ||
         !repoName(repo) ||
         !branchName(name) ||
-        !/^\d+$/.test(raw) ||
+        !decimalPattern.test(raw) ||
         !portNumber(port) ||
         seenKeys.has(key) ||
         seenPorts.has(port)
@@ -125,7 +149,7 @@ export function parseProjects(text) {
     const [name, raw, slug = '', label = '', ...extra] = line.split(':');
     const base = Number(raw);
     if (
-      !(repoName(name) && /^\d+$/.test(raw ?? '') && portNumber(base)) ||
+      !(repoName(name) && decimalPattern.test(raw ?? '') && portNumber(base)) ||
       extra.length ||
       seenNames.has(name) ||
       seenBases.has(base)
@@ -277,10 +301,13 @@ const definitions = {
         (row) =>
           object(row) &&
           portNumber(row.base) &&
-          (row.slug == null ||
-            (typeof row.slug === 'string' && !/[\r\n:]/.test(row.slug))) &&
+          (row.slug === undefined ||
+            row.slug === null ||
+            (typeof row.slug === 'string' &&
+              !projectTextUnsafePattern.test(row.slug))) &&
           (row.label === undefined ||
-            (typeof row.label === 'string' && !/[\r\n:]/.test(row.label)))
+            (typeof row.label === 'string' &&
+              !projectTextUnsafePattern.test(row.label)))
       ),
   },
   // Ticket 06 validates the versioned recovery records; this layer preserves the envelope.
@@ -343,6 +370,7 @@ export function createWorkspaceState({
     try {
       value = def.parse ? def.parse(text) : JSON.parse(text);
     } catch {
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never parser data or raw paths.
       throw new StateError('STATE_CORRUPT', def.name, 'parse');
     }
     if (!def.validate(value)) {
@@ -374,6 +402,7 @@ export function createWorkspaceState({
       if (error instanceof StateError) {
         throw error;
       }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
       throw new StateError('STATE_UNREADABLE', def.name, 'resolve', error.code);
     }
   }
@@ -385,6 +414,7 @@ export function createWorkspaceState({
       if (error.code === 'ENOENT' && allowMissing) {
         return def.initial();
       }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
       throw new StateError('STATE_UNREADABLE', def.name, 'read', error.code);
     }
     return decode(def, text);
@@ -424,21 +454,46 @@ export function createWorkspaceState({
   }
   function token() {
     const value = nonce();
-    if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value)) {
+    if (typeof value !== 'string' || !lockTokenPattern.test(value)) {
       throw new StateError('STATE_WRITE_FAILED', 'lock', 'nonce');
     }
     return value;
   }
-  async function acquire(path, name) {
-    const deadline = now() + lockTimeoutMs;
-    const owner = token();
-    let fd, identity;
+
+  function staleLockIdentity(path) {
+    try {
+      const inspected = fs.lstatSync(path);
+      const metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
+      const ownerPid = metadata?.pid;
+      if (
+        !(
+          Number.isSafeInteger(ownerPid) &&
+          ownerPid > 0 &&
+          metadata?.retained !== true
+        )
+      ) {
+        return;
+      }
+      try {
+        process.kill(ownerPid, 0);
+      } catch (probe) {
+        if (errorCode(probe) === 'ESRCH') {
+          return inspected;
+        }
+      }
+    } catch {
+      // A malformed, replaced or unreadable lease is never safe to steal.
+    }
+  }
+
+  async function openLockIdentity(path, name, deadline, owner) {
     for (;;) {
+      let fd;
       try {
         fd = fs.openSync(path, 'wx', 0o600);
-        break;
       } catch (error) {
         if (error.code !== 'EEXIST') {
+          // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
           throw new StateError(
             'STATE_WRITE_FAILED',
             name,
@@ -446,47 +501,36 @@ export function createWorkspaceState({
             error.code
           );
         }
-        let stale;
-        try {
-          const inspected = fs.lstatSync(path);
-          const metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
-          const ownerPid = metadata?.pid;
-          if (
-            Number.isSafeInteger(ownerPid) &&
-            ownerPid > 0 &&
-            metadata?.retained !== true
-          ) {
-            let alive = true;
-            try {
-              process.kill(ownerPid, 0);
-            } catch (probe) {
-              alive = probe?.code !== 'ESRCH';
-            }
-            stale = alive ? undefined : inspected;
-          }
-        } catch {
-          // A malformed, replaced or unreadable lease is never safe to steal.
-        }
+        const stale = staleLockIdentity(path);
         if (stale) {
           unlinkOwned(path, stale);
           continue;
         }
         const remaining = deadline - now();
         if (remaining <= 0) {
+          // biome-ignore lint/style/useErrorCause: StateError intentionally does not expose the previous lock holder's raw error.
           throw new StateError('STATE_BUSY', name, 'lock-timeout');
         }
+        // biome-ignore lint/performance/noAwaitInLoops: The next lock attempt depends on this lease's current owner and deadline.
         await sleep(Math.min(25, remaining));
+        continue;
       }
+      return writeLockOwner(fd, path, name, owner);
     }
+  }
+
+  function writeLockOwner(fd, path, name, owner) {
+    let openFd = fd;
+    let identity;
     try {
-      identity = fs.fstatSync(fd);
-      writeAll(fd, `${JSON.stringify({ nonce: owner, pid })}\n`);
-      fs.closeSync(fd);
-      fd = undefined;
+      identity = fs.fstatSync(openFd);
+      writeAll(openFd, `${JSON.stringify({ nonce: owner, pid })}\n`);
+      fs.closeSync(openFd);
+      openFd = undefined;
     } catch (error) {
-      if (fd !== undefined) {
+      if (openFd !== undefined) {
         try {
-          fs.closeSync(fd);
+          fs.closeSync(openFd);
         } catch {
           /* Keep the first failure. */
         }
@@ -494,6 +538,7 @@ export function createWorkspaceState({
       if (identity) {
         unlinkOwned(path, identity);
       }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
       throw new StateError(
         'STATE_WRITE_FAILED',
         name,
@@ -501,6 +546,13 @@ export function createWorkspaceState({
         error.code
       );
     }
+    return identity;
+  }
+
+  async function acquire(path, name) {
+    const deadline = now() + lockTimeoutMs;
+    const owner = token();
+    const identity = await openLockIdentity(path, name, deadline, owner);
     const owned = () => {
       try {
         return (
@@ -523,27 +575,30 @@ export function createWorkspaceState({
         if (!owned()) {
           return false;
         }
-        let fd;
+        let retainedFd;
         try {
-          fd = fs.openSync(path, 'r+');
-          if (!sameFile(fs.fstatSync(fd), identity)) {
+          retainedFd = fs.openSync(path, 'r+');
+          if (!sameFile(fs.fstatSync(retainedFd), identity)) {
             return false;
           }
           const metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
           if (metadata?.nonce !== owner) {
             return false;
           }
-          fs.ftruncateSync(fd, 0);
-          writeAll(fd, `${JSON.stringify({ ...metadata, retained: true })}\n`);
-          fs.fsyncSync(fd);
+          fs.ftruncateSync(retainedFd, 0);
+          writeAll(
+            retainedFd,
+            `${JSON.stringify({ ...metadata, retained: true })}\n`
+          );
+          fs.fsyncSync(retainedFd);
           lock.retained = true;
           return true;
         } catch {
           return false;
         } finally {
-          if (fd !== undefined) {
+          if (retainedFd !== undefined) {
             try {
-              fs.closeSync(fd);
+              fs.closeSync(retainedFd);
             } catch {
               /* A retained lease remains owned even if close confirmation fails. */
             }
@@ -576,7 +631,7 @@ export function createWorkspaceState({
       // A CLI may return an unknown child outcome and exit before the child does.
       // Keep only its target lease for diagnosed recovery; short metadata locks
       // still release. A dead owner PID is deliberately not permission to steal.
-      retain = rank === 10 && error?.code === 'OPERATION_UNKNOWN';
+      retain = rank === 10 && errorCode(error) === 'OPERATION_UNKNOWN';
       if (retain && !lock.retain()) {
         retain = false;
       }
@@ -603,137 +658,112 @@ export function createWorkspaceState({
       }
       return root;
     } catch {
+      // biome-ignore lint/style/useErrorCause: StateError intentionally hides root paths and raw filesystem failures.
       throw new StateError('STATE_UNREADABLE', name, 'root');
     }
   }
-  function validateWorkspace(root) {
-    const paths = new Set();
-    for (const [name, def] of Object.entries(definitions)) {
-      if (!def.coupled) {
-        continue;
-      }
-      const canonical = destination(descriptor(name));
-      const rel = relative(root, canonical);
-      if (
-        rel === '..' ||
-        rel.startsWith('../') ||
-        isAbsolute(rel) ||
-        paths.has(canonical)
-      ) {
+  function validateWorkspaceDocument(root, paths, name) {
+    const canonical = destination(descriptor(name));
+    const rel = relative(root, canonical);
+    if (
+      rel === '..' ||
+      rel.startsWith('../') ||
+      isAbsolute(rel) ||
+      paths.has(canonical)
+    ) {
+      throw new StateError('STATE_UNREADABLE', name, 'partial-workspace-alias');
+    }
+    paths.add(canonical);
+    try {
+      if (fs.statSync(canonical).nlink > 1) {
         throw new StateError(
           'STATE_UNREADABLE',
           name,
           'partial-workspace-alias'
         );
       }
-      paths.add(canonical);
-      try {
-        if (fs.statSync(canonical).nlink > 1) {
-          throw new StateError(
-            'STATE_UNREADABLE',
-            name,
-            'partial-workspace-alias'
-          );
-        }
-      } catch (error) {
-        if (error instanceof StateError) {
-          throw error;
-        }
-        if (error.code !== 'ENOENT') {
-          throw new StateError(
-            'STATE_UNREADABLE',
-            name,
-            'alias-check',
-            error.code
-          );
-        }
+    } catch (error) {
+      if (error instanceof StateError) {
+        throw error;
+      }
+      if (error.code !== 'ENOENT') {
+        // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
+        throw new StateError(
+          'STATE_UNREADABLE',
+          name,
+          'alias-check',
+          error.code
+        );
       }
     }
   }
-  function replaceAt(def, canonical, value) {
-    let encoded;
+  function validateWorkspace(root) {
+    const paths = new Set();
+    for (const [name, def] of Object.entries(definitions)) {
+      if (def.coupled) {
+        validateWorkspaceDocument(root, paths, name);
+      }
+    }
+  }
+
+  function validatedEncoding(def, value) {
     try {
       if (!def.validate(value)) {
         throw new Error('invalid');
       }
-      encoded = def.encode
+      const encoded = def.encode
         ? def.encode(value)
         : `${JSON.stringify(value, null, 2)}\n`;
       decode(def, encoded); // Validate the actual persisted representation, including text registries.
+      return encoded;
     } catch {
+      // biome-ignore lint/style/useErrorCause: StateError intentionally hides invalid values and parser details.
       throw new StateError('STATE_CORRUPT', def.name, 'validate');
     }
-    const temp = join(
-      dirname(canonical),
-      `.${basename(canonical)}.setu-tmp-${token()}`
-    );
-    let fd,
-      identity,
-      phase = 'read-metadata';
+  }
+
+  function existingMetadata(canonical) {
     try {
-      let previous;
-      try {
-        previous = fs.statSync(canonical);
-      } catch (error) {
-        if (error.code !== 'ENOENT') {
-          throw error;
-        }
-      }
-      if (destination(def) !== canonical) {
-        throw new StateError('STATE_UNREADABLE', def.name, 'target-changed');
-      }
-      assertOwned();
-      phase = 'open';
-      fd = fs.openSync(temp, 'wx', 0o600);
-      identity = fs.fstatSync(fd);
-      phase = 'write';
-      writeAll(fd, encoded);
-      phase = 'ownership';
-      if (
-        previous &&
-        (identity.uid !== previous.uid || identity.gid !== previous.gid)
-      ) {
-        fs.fchownSync(fd, previous.uid, previous.gid);
-        const owned = fs.fstatSync(fd);
-        if (owned.uid !== previous.uid || owned.gid !== previous.gid) {
-          throw new Error('ownership mismatch');
-        }
-      }
-      phase = 'chmod';
-      fs.fchmodSync(
-        fd,
-        def.forceMode ??
-          (previous ? previous.mode & 0o7777 : def.private ? 0o600 : 0o644)
-      );
-      phase = 'sync';
-      fs.fsyncSync(fd);
-      phase = 'close';
-      fs.closeSync(fd);
-      fd = undefined;
-      if (destination(def) !== canonical) {
-        throw new StateError('STATE_UNREADABLE', def.name, 'target-changed');
-      }
-      assertOwned();
-      phase = 'rename';
-      fs.renameSync(temp, canonical);
+      return fs.statSync(canonical);
     } catch (error) {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* Preserve the first failure. */
-        }
-      }
-      if (identity) {
-        unlinkOwned(temp, identity);
-      }
-      if (error instanceof StateError) {
+      if (error.code !== 'ENOENT') {
         throw error;
       }
-      throw new StateError('STATE_WRITE_FAILED', def.name, phase, error.code);
     }
-    // Rename is the commit point. Nothing below may report a retryable failed write.
-    const result = { committed: true, reconciled: true, status: 'committed' };
+  }
+
+  function assertDestination(def, canonical) {
+    if (destination(def) !== canonical) {
+      throw new StateError('STATE_UNREADABLE', def.name, 'target-changed');
+    }
+  }
+
+  function preserveOwnership(fd, identity, previous) {
+    if (
+      previous &&
+      (identity.uid !== previous.uid || identity.gid !== previous.gid)
+    ) {
+      fs.fchownSync(fd, previous.uid, previous.gid);
+      const owned = fs.fstatSync(fd);
+      if (owned.uid !== previous.uid || owned.gid !== previous.gid) {
+        throw new Error('ownership mismatch');
+      }
+    }
+  }
+
+  function persistedMode(def, previous) {
+    let mode = def.forceMode;
+    if (mode === undefined || mode === null) {
+      if (previous) {
+        mode = previous.mode % 0o1_0000;
+      } else {
+        mode = def.private ? 0o600 : 0o644;
+      }
+    }
+    return mode;
+  }
+
+  function syncDirectory(canonical, result) {
     let directoryFd;
     try {
       directoryFd = fs.openSync(dirname(canonical), 'r');
@@ -755,6 +785,9 @@ export function createWorkspaceState({
         }
       }
     }
+  }
+
+  function reconcileReplacement(def, canonical, result) {
     try {
       if (destination(def) !== canonical) {
         throw new Error('target changed');
@@ -767,17 +800,70 @@ export function createWorkspaceState({
         phase: 'readback',
       };
     }
+  }
+
+  function replaceAt(def, canonical, value) {
+    const encoded = validatedEncoding(def, value);
+    const temp = join(
+      dirname(canonical),
+      `.${basename(canonical)}.setu-tmp-${token()}`
+    );
+    let fd,
+      identity,
+      phase = 'read-metadata';
+    try {
+      const previous = existingMetadata(canonical);
+      assertDestination(def, canonical);
+      assertOwned();
+      phase = 'open';
+      fd = fs.openSync(temp, 'wx', 0o600);
+      identity = fs.fstatSync(fd);
+      phase = 'write';
+      writeAll(fd, encoded);
+      phase = 'ownership';
+      preserveOwnership(fd, identity, previous);
+      phase = 'chmod';
+      fs.fchmodSync(fd, persistedMode(def, previous));
+      phase = 'sync';
+      fs.fsyncSync(fd);
+      phase = 'close';
+      fs.closeSync(fd);
+      fd = undefined;
+      assertDestination(def, canonical);
+      assertOwned();
+      phase = 'rename';
+      fs.renameSync(temp, canonical);
+    } catch (error) {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* Preserve the first failure. */
+        }
+      }
+      if (identity) {
+        unlinkOwned(temp, identity);
+      }
+      if (error instanceof StateError) {
+        throw error;
+      }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
+      throw new StateError('STATE_WRITE_FAILED', def.name, phase, error.code);
+    }
+    // Rename is the commit point. Nothing below may report a retryable failed write.
+    const result = { committed: true, reconciled: true, status: 'committed' };
+    syncDirectory(canonical, result);
+    reconcileReplacement(def, canonical, result);
     if (result.warning) {
       result.status = 'committed-with-durability-warning';
     }
     return result;
   }
+  // biome-ignore lint/suspicious/useAwait: Descriptor resolution can throw synchronously; callers require a rejected Promise from this public state boundary.
   async function withDocuments(defs, work) {
     const entries = defs
       .map((def) => ({ canonical: destination(def), def }))
-      .sort((a, b) =>
-        a.canonical < b.canonical ? -1 : a.canonical > b.canonical ? 1 : 0
-      );
+      .sort((a, b) => compareCanonicalPaths(a.canonical, b.canonical));
     if (new Set(entries.map((row) => row.canonical)).size !== entries.length) {
       throw new StateError('STATE_UNREADABLE', 'store', 'conflicting-alias');
     }
@@ -819,6 +905,7 @@ export function createWorkspaceState({
             if (error.code === 'ENOENT') {
               return false;
             }
+            // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
             throw new StateError('STATE_UNREADABLE', name, 'read', error.code);
           }
         },
@@ -844,6 +931,7 @@ export function createWorkspaceState({
     }
     return enter(0);
   }
+  // biome-ignore lint/suspicious/useAwait: Workspace validation can throw synchronously; callers compose this as a Promise-returning state boundary.
   async function withWorkspace(names, work) {
     const root = canonicalRoot(workspaceRoot, 'workspace');
     validateWorkspace(root);
@@ -880,43 +968,48 @@ export function createWorkspaceState({
     // Outside the checkout: git stash --include-untracked must not stash its owner lock.
     return withLock(`${root}.setu-update.lock`, 0, 'update', work);
   }
+  function targetPathPart(current, part) {
+    const next = join(current, part);
+    try {
+      const stat = fs.lstatSync(next);
+      if (stat.isSymbolicLink()) {
+        throw new StateError(
+          'STATE_UNREADABLE',
+          'target',
+          'conflicting-target-alias'
+        );
+      }
+      if (!stat.isDirectory()) {
+        throw new StateError('STATE_UNREADABLE', 'target', 'not-a-directory');
+      }
+    } catch (error) {
+      if (error instanceof StateError) {
+        throw error;
+      }
+      if (error.code !== 'ENOENT') {
+        // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized cause codes, never raw filesystem errors.
+        throw new StateError(
+          'STATE_UNREADABLE',
+          'target',
+          'resolve',
+          error.code
+        );
+      }
+      // Absent descendants have the same expected canonical path before/after creation.
+    }
+    return next;
+  }
   function targetKey(root, target) {
     if (!(repoName(target.repo) && branchName(target.name))) {
       throw new StateError('STATE_CORRUPT', 'target', 'validate');
     }
-    const parts = [target.repo, ...target.name.split('/')];
     let current = root;
-    for (const part of parts) {
-      current = join(current, part);
-      try {
-        const stat = fs.lstatSync(current);
-        if (stat.isSymbolicLink()) {
-          throw new StateError(
-            'STATE_UNREADABLE',
-            'target',
-            'conflicting-target-alias'
-          );
-        }
-        if (!stat.isDirectory()) {
-          throw new StateError('STATE_UNREADABLE', 'target', 'not-a-directory');
-        }
-      } catch (error) {
-        if (error instanceof StateError) {
-          throw error;
-        }
-        if (error.code !== 'ENOENT') {
-          throw new StateError(
-            'STATE_UNREADABLE',
-            'target',
-            'resolve',
-            error.code
-          );
-        }
-        // Absent descendants have the same expected canonical path before/after creation.
-      }
+    for (const part of [target.repo, ...target.name.split('/')]) {
+      current = targetPathPart(current, part);
     }
     return current;
   }
+  // biome-ignore lint/suspicious/useAwait: Target validation can throw synchronously; callers require a rejected Promise from this public lock boundary.
   async function withTargets(targets, work) {
     const root = canonicalRoot(workspaceRoot, 'workspace');
     validateWorkspace(root);
@@ -936,6 +1029,7 @@ export function createWorkspaceState({
       }
       return work(keys);
     }
+    // biome-ignore lint/suspicious/useAwait: Nested target-lock callbacks must preserve rejected validation errors as promises.
     async function enter(index) {
       if (index < keys.length) {
         const key = keys[index],
@@ -974,6 +1068,38 @@ export function createWorkspaceState({
     };
     return withDocuments([def], (scope) => scope.replace('generated', text));
   }
+  function inspectLock(kind, path) {
+    let metadata;
+    try {
+      if (!fs.lstatSync(path).isFile()) {
+        return [];
+      }
+      metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
+    } catch (error) {
+      return errorCode(error) === 'ENOENT'
+        ? []
+        : [{ alive: null, kind, path, pid: null, retained: false }];
+    }
+    const lockPid = Number.isSafeInteger(metadata?.pid) ? metadata.pid : null;
+    let alive = null;
+    if (lockPid !== null && lockPid > 0) {
+      try {
+        process.kill(lockPid, 0);
+        alive = true;
+      } catch (error) {
+        alive = errorCode(error) === 'ESRCH' ? false : null;
+      }
+    }
+    return [
+      {
+        alive,
+        kind,
+        path,
+        pid: lockPid,
+        retained: metadata?.retained === true,
+      },
+    ];
+  }
   function inspectLocks() {
     const paths = [];
     if (workspaceRoot && isAbsolute(workspaceRoot)) {
@@ -983,7 +1109,7 @@ export function createWorkspaceState({
       });
       try {
         for (const name of fs.readdirSync(workspaceRoot)) {
-          if (/^\.setu-target-[a-f0-9]{64}\.lock$/.test(name)) {
+          if (targetLockPattern.test(name)) {
             paths.push({ kind: 'target', path: join(workspaceRoot, name) });
           }
         }
@@ -998,32 +1124,7 @@ export function createWorkspaceState({
       });
       paths.push({ kind: 'update', path: `${setuDir}.setu-update.lock` });
     }
-    return paths.flatMap(({ kind, path }) => {
-      let metadata;
-      try {
-        if (!fs.lstatSync(path).isFile()) {
-          return [];
-        }
-        metadata = JSON.parse(fs.readFileSync(path, 'utf8'));
-      } catch (error) {
-        return error?.code === 'ENOENT'
-          ? []
-          : [{ alive: null, kind, path, pid: null, retained: false }];
-      }
-      const pid = Number.isSafeInteger(metadata?.pid) ? metadata.pid : null;
-      let alive = null;
-      if (pid !== null && pid > 0) {
-        try {
-          process.kill(pid, 0);
-          alive = true;
-        } catch (error) {
-          alive = error?.code === 'ESRCH' ? false : null;
-        }
-      }
-      return [
-        { alive, kind, path, pid, retained: metadata?.retained === true },
-      ];
-    });
+    return paths.flatMap(({ kind, path }) => inspectLock(kind, path));
   }
   return {
     inspectLocks,

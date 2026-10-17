@@ -17,12 +17,42 @@ interface FieldState {
   text: string;
   version: number;
 }
+interface QueuedResource {
+  text: string;
+  value: number | string;
+  version: number;
+}
 export type ResourceDraft = Record<ResourceField, FieldState>;
 const fields: ResourceField[] = [
   'maxConcurrentDevServers',
   'containerMemoryLimit',
   'containerCpuLimit',
 ];
+const MEMORY_LIMIT_PATTERN = /^(\d+(?:\.\d+)?)\s*(m|g)$/i;
+
+function invalidValueMessage(field: ResourceField) {
+  if (field === 'containerMemoryLimit') {
+    return 'Enter a memory limit from 64m to 1024g.';
+  }
+  if (field === 'maxConcurrentDevServers') {
+    return 'Enter a whole number of server slots from 1 to 64.';
+  }
+  return 'Enter a CPU limit from 0.01 to 1024.';
+}
+
+function unsuccessfulSaveMessage(
+  uncertain: boolean | undefined,
+  installed: boolean,
+  error: string | undefined
+) {
+  if (uncertain) {
+    return 'Outcome not confirmed. Settings were refreshed if available; check the saved value before retrying.';
+  }
+  if (installed) {
+    return 'Saved, but readback failed. Retry to reconcile before another save.';
+  }
+  return error || 'Could not save. Your draft is kept.';
+}
 
 export function reconcileExplicitDraft<T>(
   current: T,
@@ -44,7 +74,7 @@ export function validateResource(
   text: string
 ): number | string | null {
   if (field === 'containerMemoryLimit') {
-    const match = text.trim().match(/^(\d+(?:\.\d+)?)\s*(m|g)$/i);
+    const match = text.trim().match(MEMORY_LIMIT_PATTERN);
     const mb = match
       ? Number(match[1]) * (match[2].toLowerCase() === 'g' ? 1024 : 1)
       : 0;
@@ -82,10 +112,7 @@ export function createResourceDraft(
       { state: 'saved', text: String(initial[key]), version: 0 },
     ])
   ) as ResourceDraft;
-  const queued = new Map<
-    ResourceField,
-    { text: string; version: number; value: number | string }
-  >();
+  const queued = new Map<ResourceField, QueuedResource>();
   const emit = () => {
     if (!stopped) {
       io.publish({ ...draft }, { ...saved });
@@ -93,7 +120,7 @@ export function createResourceDraft(
   };
   function queue(field: ResourceField) {
     if (needsReconcile) {
-      void reconcile();
+      reconcile();
       return;
     }
     const row = draft[field],
@@ -102,12 +129,7 @@ export function createResourceDraft(
       queued.delete(field);
       draft[field] = {
         ...row,
-        message:
-          field === 'containerMemoryLimit'
-            ? 'Enter a memory limit from 64m to 1024g.'
-            : field === 'maxConcurrentDevServers'
-              ? 'Enter a whole number of server slots from 1 to 64.'
-              : 'Enter a CPU limit from 0.01 to 1024.',
+        message: invalidValueMessage(field),
         state: 'error',
       };
       emit();
@@ -122,7 +144,7 @@ export function createResourceDraft(
       return;
     }
     queued.set(field, { text: row.text, value, version: row.version });
-    void flush();
+    flush();
   }
   async function reconcile() {
     if (busy || stopped) {
@@ -151,11 +173,12 @@ export function createResourceDraft(
       }
     }
   }
-  async function flush() {
-    if (busy || stopped || !queued.size) {
-      return;
+  const resolveIdle = () => {
+    for (const done of idle.splice(0)) {
+      done();
     }
-    busy = true;
+  };
+  function beginBatch() {
     const batch = new Map(queued);
     queued.clear();
     for (const [key] of batch) {
@@ -163,19 +186,108 @@ export function createResourceDraft(
       draft[key] = { ...draft[key], message: undefined, state: 'saving' };
     }
     emit();
-    let outcome: Outcome;
+    return batch;
+  }
+  async function writeBatch(batch: Map<ResourceField, QueuedResource>) {
     try {
-      outcome = await io.write(
+      return await io.write(
         Object.fromEntries([...batch].map(([key, row]) => [key, row.value]))
       );
     } catch {
-      outcome = { networkUncertain: true, ok: false };
+      return { networkUncertain: true, ok: false };
     }
+  }
+  async function readSavedValues() {
+    try {
+      return await io.read();
+    } catch {
+      // Keep the draft unresolved until a later read confirms saved values.
+    }
+  }
+  function reconcileNewerDraft(
+    key: ResourceField,
+    row: FieldState,
+    installed: boolean,
+    uncertain: boolean | undefined,
+    current: ResourceValues | undefined
+  ) {
+    if (uncertain || (installed && !current)) {
+      draft[key] = {
+        ...row,
+        message:
+          'The earlier save needs reconciliation. Your newer draft is kept; refresh saved values before retrying.',
+        state: 'error',
+      };
+    }
+  }
+  function applySubmittedDraft(
+    key: ResourceField,
+    row: FieldState,
+    outcome: Outcome,
+    installed: boolean,
+    uncertain: boolean | undefined,
+    current: ResourceValues | undefined
+  ) {
+    if (installed && current && !uncertain) {
+      draft[key] = {
+        ...row,
+        message: outcome.warning
+          ? 'Saved; durability could not be confirmed.'
+          : undefined,
+        state: 'saved',
+        text: String(current[key]),
+      };
+    } else {
+      draft[key] = {
+        ...row,
+        message: unsuccessfulSaveMessage(uncertain, installed, outcome.error),
+        state: 'error',
+      };
+    }
+  }
+  function applyBatchOutcome(
+    batch: Map<ResourceField, QueuedResource>,
+    outcome: Outcome,
+    installed: boolean,
+    uncertain: boolean | undefined,
+    current: ResourceValues | undefined
+  ) {
+    if (current) {
+      saved = { ...current };
+    }
+    for (const [key, submitted] of batch) {
+      const row = draft[key];
+      if (row.version !== submitted.version) {
+        reconcileNewerDraft(key, row, installed, uncertain, current);
+        continue;
+      }
+      applySubmittedDraft(key, row, outcome, installed, uncertain, current);
+    }
+  }
+  function finishFlush(needsRefresh: boolean | undefined) {
+    if (needsRefresh) {
+      queued.clear();
+      needsReconcile = true;
+    }
+    active.clear();
+    busy = false;
+    emit();
+    if (queued.size) {
+      flush();
+    } else {
+      resolveIdle();
+    }
+  }
+  async function flush() {
+    if (busy || stopped || !queued.size) {
+      return;
+    }
+    busy = true;
+    const batch = beginBatch();
+    const outcome = await writeBatch(batch);
     if (stopped) {
       busy = false;
-      for (const done of idle.splice(0)) {
-        done();
-      }
+      resolveIdle();
       return;
     }
     const installed = outcome.ok || outcome.committed === true;
@@ -185,63 +297,10 @@ export function createResourceDraft(
         (!outcome.ok || outcome.reconciled === false));
     let current: ResourceValues | undefined;
     if (installed || uncertain) {
-      try {
-        current = await io.read();
-      } catch {
-        // Keep the draft unresolved until a later read confirms saved values.
-      }
+      current = await readSavedValues();
     }
-    if (current) {
-      saved = { ...current };
-    }
-    for (const [key, submitted] of batch) {
-      const row = draft[key];
-      if (row.version !== submitted.version) {
-        if (uncertain || (installed && !current)) {
-          draft[key] = {
-            ...row,
-            message:
-              'The earlier save needs reconciliation. Your newer draft is kept; refresh saved values before retrying.',
-            state: 'error',
-          };
-        }
-        continue;
-      }
-      if (installed && current && !uncertain) {
-        draft[key] = {
-          ...row,
-          message: outcome.warning
-            ? 'Saved; durability could not be confirmed.'
-            : undefined,
-          state: 'saved',
-          text: String(current[key]),
-        };
-      } else {
-        draft[key] = {
-          ...row,
-          message: uncertain
-            ? 'Outcome not confirmed. Settings were refreshed if available; check the saved value before retrying.'
-            : installed
-              ? 'Saved, but readback failed. Retry to reconcile before another save.'
-              : outcome.error || 'Could not save. Your draft is kept.',
-          state: 'error',
-        };
-      }
-    }
-    if (uncertain || (installed && !current)) {
-      queued.clear();
-      needsReconcile = true;
-    }
-    active.clear();
-    busy = false;
-    emit();
-    if (queued.size) {
-      void flush();
-    } else {
-      for (const done of idle.splice(0)) {
-        done();
-      }
-    }
+    applyBatchOutcome(batch, outcome, installed, uncertain, current);
+    finishFlush(uncertain || (installed && !current));
   }
   return {
     discard() {

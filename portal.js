@@ -21,6 +21,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { agentStatus } from './agent.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { getCostsSummary } from './costs.js';
+import { dependencySharingForTarget } from './dependency-sharing.js';
 import {
   createDeploymentGuard,
   createDeploymentLauncher,
@@ -172,12 +173,31 @@ import {
   writerWorktree,
 } from './writer-claims.js';
 
+const LOG_TYPE_RE =
+  /^(dev|setup|inngest|trigger|convex|vercel|netlify|tunnel|pr-review|sidecar-[a-zA-Z0-9_-]+)$/;
+const ORIGIN_PREFIX_RE = /^origin\//;
+const DIFF_HEADER_RE = /^a\/(.*) b\/(.*)$/;
+const BINARY_DIFF_RE = /^Binary files (.+) and (.+) differ$/;
+const OLD_DIFF_PATH_PREFIX_RE = /^a\//;
+const NEW_DIFF_PATH_PREFIX_RE = /^b\//;
+const DIFF_HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const WHITESPACE_RE = /\s+/;
+const MEMORY_USAGE_RE = /^([\d.]+)\s*(MiB|GiB)/;
+const PID_RE = /^\d+$/;
+const TRIGGER_PROCESS_RE = /^\s*(\d+)\s+.*\.bin\/trigger dev\b/;
+const CONVEX_PROCESS_RE = /^\s*(\d+)\s+.*\bconvex dev\b/;
+const GITHUB_HTTPS_PREFIX_RE = /^https?:\/\/github\.com\//;
+const GITHUB_SSH_PREFIX_RE = /^git@github\.com:/;
+const GIT_SUFFIX_RE = /\.git$/;
+const FOOTPRINT_RE = /phys_footprint:\s*([\d.]+)\s*(KB|MB|GB)/i;
+
 /**
  * Builds an unstarted portal runtime.  Importing this module deliberately does
  * not read user configuration, touch a workspace, or install process hooks.
  * The small collaborators here keep acceptance tests isolated without making
  * the route implementation depend on a test framework.
  */
+// biome-ignore lint/suspicious/useAwait: callers await this factory, so synchronous configuration or collaborator failures must reject its Promise.
 export async function createPortalRuntime(options = {}) {
   let _cfg = options.config ?? requireConfig();
   if (options.workspace) {
@@ -198,7 +218,7 @@ export async function createPortalRuntime(options = {}) {
       localDomain,
       readFile: identityFs.readFile,
       reloadCaddy: () => reloadCaddyAsync(WORKSPACE),
-      run: (args, options) => Bun.spawn(args, options),
+      run: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
       stagingPath: HOSTS_TMP,
       state: portalState,
       writeCaddy: (repo, name, port) =>
@@ -275,11 +295,7 @@ export async function createPortalRuntime(options = {}) {
       return options.logPath(repo, name, type);
     }
     wtPath(repo, name);
-    if (
-      !/^(dev|setup|inngest|trigger|convex|vercel|netlify|tunnel|pr-review|sidecar-[a-zA-Z0-9_-]+)$/.test(
-        type
-      )
-    ) {
+    if (!LOG_TYPE_RE.test(type)) {
       throw new Error('Unknown log type');
     }
     if (type === 'tunnel') {
@@ -293,7 +309,7 @@ export async function createPortalRuntime(options = {}) {
   function trimLog(path, keep = LOG_MAX_BYTES / 2) {
     let fd;
     try {
-      const size = statSync(path).size;
+      const { size } = statSync(path);
       if (size <= LOG_MAX_BYTES) {
         return;
       }
@@ -324,9 +340,13 @@ export async function createPortalRuntime(options = {}) {
     trimLog(`${path}.old`, LOG_MAX_BYTES);
   }
 
-  function spawnWithLog(command, options, fd) {
+  function spawnWithLog(command, spawnOptions, fd) {
     try {
-      return Bun.spawn(command, { ...options, stderr: fd, stdout: fd });
+      return Bun.spawn(command, {
+        ...spawnOptions,
+        stderr: fd,
+        stdout: fd,
+      });
     } finally {
       closeSync(fd);
     }
@@ -342,6 +362,7 @@ export async function createPortalRuntime(options = {}) {
     return openSync(path, 'a');
   }
 
+  // biome-ignore lint/style/useDefaultParameterLast: existing route and MCP callers pass the positional `previous` cursor after optional type and line arguments.
   function tailLog(repo, name, type = 'dev', lines = 150, previous) {
     return readLogTail(logPath(repo, name, type), lines, { previous });
   }
@@ -432,6 +453,7 @@ export async function createPortalRuntime(options = {}) {
   const GIT_META_TTL = 10_000;
 
   const gitMetaInFlight = new Map();
+  // biome-ignore lint/suspicious/useAwait: getWorktrees callers await this cache boundary, which must turn synchronous path/configuration failures into Promise rejections.
   async function repoGitMeta(repo, background = false) {
     const cached = gitMetaCache.get(repo);
     if (cached && Date.now() - cached.fetchedAt < GIT_META_TTL) {
@@ -492,7 +514,7 @@ export async function createPortalRuntime(options = {}) {
     while (dirtyChecks < 4 && dirtyQueue.length) {
       dirtyChecks += 1;
       const task = dirtyQueue.shift();
-      void Promise.resolve()
+      Promise.resolve()
         .then(task)
         .catch((error) => {
           console.error('Dirty metadata refresh failed:', error);
@@ -504,6 +526,7 @@ export async function createPortalRuntime(options = {}) {
     }
   }
 
+  // biome-ignore lint/suspicious/useAwait: getWorktrees callers await this background-cache API, including synchronous validation failures.
   async function fetchDirty(repo, name) {
     const key = `${repo}/${name}`;
     const cached = dirtyCache.get(key);
@@ -579,43 +602,59 @@ export async function createPortalRuntime(options = {}) {
   // and StatusContext (legacy commit statuses, state only). Collapse both into
   // one summary rather than surfacing per-check detail, the badge only needs
   // passing/failing/pending/none, not a checks list.
+  function statusContextSummary(check) {
+    if (check.state === 'FAILURE' || check.state === 'ERROR') {
+      return 'failing';
+    }
+    return check.state === 'PENDING' || check.state === 'EXPECTED'
+      ? 'pending'
+      : 'passing';
+  }
+  function checkRunSummary(check) {
+    if (check.status !== 'COMPLETED') {
+      return 'pending';
+    }
+    // SKIPPED/NEUTRAL aren't failures, a real run (path-filtered CI) can
+    // skip most jobs and still be a passing PR.
+    return ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(
+      check.conclusion
+    )
+      ? 'failing'
+      : 'passing';
+  }
   function summarizeChecks(rollup) {
     if (!Array.isArray(rollup) || rollup.length === 0) {
       return 'none';
     }
     let sawPending = false;
-    for (const c of rollup) {
-      if (c.__typename === 'StatusContext') {
-        if (c.state === 'FAILURE' || c.state === 'ERROR') {
-          return 'failing';
-        }
-        if (c.state === 'PENDING' || c.state === 'EXPECTED') {
-          sawPending = true;
-        }
-        continue;
+    for (const check of rollup) {
+      const summary =
+        check.__typename === 'StatusContext'
+          ? statusContextSummary(check)
+          : checkRunSummary(check);
+      if (summary === 'failing') {
+        return summary;
       }
-      if (c.status !== 'COMPLETED') {
-        sawPending = true;
-        continue;
-      }
-      // SKIPPED/NEUTRAL aren't failures, a real run (path-filtered CI) can
-      // skip most jobs and still be a passing PR.
-      if (
-        c.conclusion === 'FAILURE' ||
-        c.conclusion === 'CANCELLED' ||
-        c.conclusion === 'TIMED_OUT' ||
-        c.conclusion === 'ACTION_REQUIRED'
-      ) {
-        return 'failing';
-      }
+      sawPending ||= summary === 'pending';
     }
     return sawPending ? 'pending' : 'passing';
+  }
+
+  function prState(pr) {
+    if (pr.state === 'MERGED') {
+      return 'merged';
+    }
+    if (pr.state === 'CLOSED') {
+      return 'closed';
+    }
+    return pr.isDraft ? 'draft' : 'open';
   }
 
   const prInFlight = new Map();
   const prWaiters = [];
   let activePrRequests = 0;
 
+  // biome-ignore lint/suspicious/useAwait: getWorktrees and prReviewStatus await this cache API and rely on synchronous setup failures rejecting.
   async function fetchPR(repo, name) {
     const key = `${repo}/${name}`;
     const cached = prCache.get(key);
@@ -646,14 +685,7 @@ export async function createPortalRuntime(options = {}) {
           { timeoutMs: 15_000 }
         );
         const pr = JSON.parse(raw);
-        const state =
-          pr.state === 'MERGED'
-            ? 'merged'
-            : pr.state === 'CLOSED'
-              ? 'closed'
-              : pr.isDraft
-                ? 'draft'
-                : 'open';
+        const state = prState(pr);
         const entry = {
           checks: summarizeChecks(pr.statusCheckRollup),
           fetchedAt: Date.now(),
@@ -772,6 +804,7 @@ export async function createPortalRuntime(options = {}) {
     return result.stdout;
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP mutation callers require synchronous target validation to reject through their Promise boundary.
   async function createPr(repo, name, source = 'portal') {
     return recordPortalMutation('pr-create', repo, name, source, () =>
       lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
@@ -828,7 +861,7 @@ export async function createPortalRuntime(options = {}) {
           '--head',
           branch,
           '--base',
-          base.replace(/^origin\//, ''),
+          base.replace(ORIGIN_PREFIX_RE, ''),
         ]);
         prCache.delete(`${repo}/${branch}`);
         return { ok: true, url };
@@ -836,6 +869,7 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP mutation callers require synchronous target validation to reject through their Promise boundary.
   async function setPrReady(repo, name, ready, source = 'portal') {
     return recordPortalMutation('pr-ready', repo, name, source, () =>
       lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
@@ -896,6 +930,56 @@ export async function createPortalRuntime(options = {}) {
   //   many more there are, rather than an unbounded array.
   const DIFF_MAX_FILES = 300;
 
+  function readBinaryDiffHeader(cur, line) {
+    cur.binary = true;
+    const m = line.match(BINARY_DIFF_RE);
+    if (m) {
+      const a = m[1].replace(OLD_DIFF_PATH_PREFIX_RE, ''),
+        b = m[2].replace(NEW_DIFF_PATH_PREFIX_RE, '');
+      cur.file = b === '/dev/null' ? a : b; // deleted binary file, show the old path
+    }
+  }
+
+  function readDiffFileHeader(cur, line) {
+    if (line.startsWith('Binary files ')) {
+      readBinaryDiffHeader(cur, line);
+      return true;
+    }
+    if (!cur.sawHunk && line.startsWith('--- ')) {
+      const p = line.slice(4).replace(OLD_DIFF_PATH_PREFIX_RE, '');
+      if (p !== '/dev/null') {
+        cur._oldPath = p;
+      }
+      return true;
+    }
+    if (!cur.sawHunk && line.startsWith('+++ ')) {
+      const p = line.slice(4).replace(NEW_DIFF_PATH_PREFIX_RE, '');
+      cur.file = p === '/dev/null' ? (cur._oldPath ?? cur.file) : p; // deleted file, show the old path
+      return true;
+    }
+    return false;
+  }
+
+  function newDiffFile(line, seenFiles) {
+    // "a/<path> b/<path>": greedy match backtracks to the rightmost
+    // " b/", which is correct for the common case (identical paths, or a
+    // path that doesn't itself contain the literal substring " b/").
+    const m = line.slice('diff --git '.length).match(DIFF_HEADER_RE);
+    return {
+      additions: 0,
+      deletions: 0,
+      file: m ? m[2] : line.slice('diff --git '.length),
+      hunks: [],
+      sawHunk: false,
+      // A file past DIFF_MAX_FILES gets sliced out of the response by
+      // summarizeDiff regardless, so reuse the same skip-building path an
+      // individually oversized file already takes below: count its real
+      // additions/deletions for the summary total, don't materialize its
+      // hunk content just to discard it a moment later.
+      tooLarge: seenFiles > DIFF_MAX_FILES,
+    };
+  }
+
   // Hand-rolled unified-diff parser: no diff-parsing dependency in this
   // project, and the format is regular enough not to need one. Single
   // line-by-line state machine: `cur` is the file entry being built, `hunk`
@@ -932,68 +1016,7 @@ export async function createPortalRuntime(options = {}) {
       cur = null;
     }
 
-    for (const line of raw.split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        flushFile();
-        seenFiles += 1;
-        // "a/<path> b/<path>": greedy match backtracks to the rightmost
-        // " b/", which is correct for the common case (identical paths, or a
-        // path that doesn't itself contain the literal substring " b/").
-        const m = line.slice('diff --git '.length).match(/^a\/(.*) b\/(.*)$/);
-        cur = {
-          additions: 0,
-          deletions: 0,
-          file: m ? m[2] : line.slice('diff --git '.length),
-          hunks: [],
-          sawHunk: false,
-          // A file past DIFF_MAX_FILES gets sliced out of the response by
-          // summarizeDiff regardless, so reuse the same skip-building path an
-          // individually oversized file already takes below: count its real
-          // additions/deletions for the summary total, don't materialize its
-          // hunk content just to discard it a moment later.
-          tooLarge: seenFiles > DIFF_MAX_FILES,
-        };
-        continue;
-      }
-      if (!cur) {
-        continue; // stray output before the first file header, shouldn't happen
-      }
-
-      if (line.startsWith('Binary files ')) {
-        cur.binary = true;
-        const m = line.match(/^Binary files (.+) and (.+) differ$/);
-        if (m) {
-          const a = m[1].replace(/^a\//, ''),
-            b = m[2].replace(/^b\//, '');
-          cur.file = b === '/dev/null' ? a : b; // deleted binary file, show the old path
-        }
-        continue;
-      }
-      if (!cur.sawHunk && line.startsWith('--- ')) {
-        const p = line.slice(4).replace(/^a\//, '');
-        if (p !== '/dev/null') {
-          cur._oldPath = p;
-        }
-        continue;
-      }
-      if (!cur.sawHunk && line.startsWith('+++ ')) {
-        const p = line.slice(4).replace(/^b\//, '');
-        cur.file = p === '/dev/null' ? (cur._oldPath ?? cur.file) : p; // deleted file, show the old path
-        continue;
-      }
-      const hm = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      if (hm) {
-        flushHunk();
-        cur.sawHunk = true;
-        oldLine = Number.parseInt(hm[1], 10);
-        newLine = Number.parseInt(hm[2], 10);
-        hunk = { header: line, lines: [] };
-        continue;
-      }
-      if (!hunk) {
-        continue; // metadata between file header and first hunk (index/mode/rename lines)
-      }
-
+    function readDiffHunkLine(line) {
       // Counts and line numbers keep advancing even past the size cap (an
       // oversized file should still report an accurate total), only the
       // per-line array stops growing.
@@ -1041,6 +1064,36 @@ export async function createPortalRuntime(options = {}) {
       if (!cur.tooLarge && cur.additions + cur.deletions > DIFF_FILE_LINE_CAP) {
         cur.tooLarge = true;
       }
+    }
+
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('diff --git ')) {
+        flushFile();
+        seenFiles += 1;
+        cur = newDiffFile(line, seenFiles);
+        continue;
+      }
+      if (!cur) {
+        continue; // stray output before the first file header, shouldn't happen
+      }
+
+      if (readDiffFileHeader(cur, line)) {
+        continue;
+      }
+      const hm = line.match(DIFF_HUNK_RE);
+      if (hm) {
+        flushHunk();
+        cur.sawHunk = true;
+        oldLine = Number.parseInt(hm[1], 10);
+        newLine = Number.parseInt(hm[2], 10);
+        hunk = { header: line, lines: [] };
+        continue;
+      }
+      if (!hunk) {
+        continue; // metadata between file header and first hunk (index/mode/rename lines)
+      }
+
+      readDiffHunkLine(line);
     }
     flushFile();
 
@@ -1135,6 +1188,7 @@ export async function createPortalRuntime(options = {}) {
     options.listenerObservation ??
     createListenerObservation(probeListeningPorts);
 
+  // biome-ignore lint/suspicious/useAwait: listPortsWithWorktree awaits injected listener observations, including synchronous probe failures.
   async function activePortsCached() {
     return listenerObservation.read();
   }
@@ -1156,21 +1210,27 @@ export async function createPortalRuntime(options = {}) {
     return ports.map((p) => ({ ...p, worktree: registry[p.port] ?? null }));
   }
 
+  function isPrunablePort(port) {
+    return (
+      Number.isInteger(port) &&
+      ((port >= 3000 && port <= 3999) || (port >= 8288 && port <= 9287))
+    );
+  }
+
+  function portOwnerChanged(pids, expected) {
+    return expected !== null && pids.length > 0 && !pids.includes(expected);
+  }
+
   async function killPort(port, expectedPid) {
-    if (
-      !(
-        Number.isInteger(port) &&
-        ((port >= 3000 && port <= 3999) || (port >= 8288 && port <= 9287))
-      )
-    ) {
+    if (!isPrunablePort(port)) {
       return { error: 'port must be in 3000-3999 or 8288-9287', ok: false };
     }
     // lsof prints one pid per line when several processes hold the socket.
     const pids = (await (options.activePid ?? activePidAsync)(port))
-      .split(/\s+/)
+      .split(WHITESPACE_RE)
       .filter(Boolean);
     const expected = expectedPid === undefined ? null : String(expectedPid);
-    if (expected !== null && pids.length && !pids.includes(expected)) {
+    if (portOwnerChanged(pids, expected)) {
       return {
         code: 'PORT_OWNER_CHANGED',
         error: `port ${port} is now held by process ${pids.join(', ')}`,
@@ -1220,6 +1280,7 @@ export async function createPortalRuntime(options = {}) {
   // measuring what isn't running), so this never scales with the full 45+
   // worktree registry, only with maxConcurrentDevServers (default 3).
   const memorySamples = new Map();
+  // biome-ignore lint/suspicious/useAwait: computeWorktrees awaits this sample boundary so synchronous injected memory probes reject consistently.
   async function activeMemMb(entry, key) {
     if (!entry) {
       return null;
@@ -1250,7 +1311,7 @@ export async function createPortalRuntime(options = {}) {
       return null;
     }
     if (entry.container) {
-      const id = (
+      const [id] = (
         await runText(
           ['docker', 'compose', '-p', entry.container, 'ps', '-q'],
           { timeoutMs: 3000 }
@@ -1264,7 +1325,7 @@ export async function createPortalRuntime(options = {}) {
         { timeoutMs: 3000 }
       );
       // "123.4MiB / 4GiB" — only the used side matters here
-      const m = raw.match(/^([\d.]+)\s*(MiB|GiB)/);
+      const m = raw.match(MEMORY_USAGE_RE);
       if (!m) {
         return null;
       }
@@ -1293,6 +1354,37 @@ export async function createPortalRuntime(options = {}) {
     return worktreesInFlight;
   }
 
+  function worktreeBranchStatus(
+    repo,
+    name,
+    wtDir,
+    meta,
+    branchMeta,
+    pathToBranch
+  ) {
+    // Worktree directory name isn't reliably the branch name — join through
+    // the real path->branch map, not an assumption (see
+    // worktreeBranchMap's comment in lib.js for the confirmed live case
+    // where this bit us).
+    const branch = pathToBranch.get(resolve(wtDir)) ?? name;
+    const branchUrl = meta.github ? `${meta.github}/tree/${branch}` : null;
+    // Badges refresh in the background; an offline GitHub must not hold up
+    // local start/stop state. fetchPR bounds and deduplicates the work.
+    if (branch !== 'main') {
+      fetchPR(repo, branch);
+    }
+    return {
+      branch,
+      branchUrl,
+      gm: branchMeta.get(branch) ?? {
+        ahead: 0,
+        behind: 0,
+        lastCommitAt: null,
+      },
+      pr: branch === 'main' ? null : prCache.get(`${repo}/${branch}`),
+    };
+  }
+
   async function computeWorktrees() {
     const activePorts = new Set((await activePortsCached()).map((p) => p.port));
     return Promise.all(
@@ -1307,24 +1399,15 @@ export async function createPortalRuntime(options = {}) {
         const active = activePorts.has(port);
         const procEntry = lifecycle.snapshot(key);
 
-        // Worktree directory name isn't reliably the branch name — join
-        // through the real path->branch map, not an assumption (see
-        // worktreeBranchMap's comment in lib.js for the confirmed live case
-        // where this bit us).
         const { branchMeta, pathToBranch } = await repoGitMeta(repo, true);
-        const branch = pathToBranch.get(resolve(wtDir)) ?? name;
-        const branchUrl = meta.github ? `${meta.github}/tree/${branch}` : null;
-        // Badges refresh in the background; an offline GitHub must not hold up
-        // local start/stop state. fetchPR bounds and deduplicates the work.
-        if (branch !== 'main') {
-          void fetchPR(repo, branch);
-        }
-        const pr = branch === 'main' ? null : prCache.get(`${repo}/${branch}`);
-        const gm = branchMeta.get(branch) ?? {
-          ahead: 0,
-          behind: 0,
-          lastCommitAt: null,
-        };
+        const { branch, branchUrl, gm, pr } = worktreeBranchStatus(
+          repo,
+          name,
+          wtDir,
+          meta,
+          branchMeta,
+          pathToBranch
+        );
         const [dirty, memMb] = await Promise.all([
           fetchDirty(repo, name),
           active ? activeMemMb(procEntry, key) : Promise.resolve(null),
@@ -1449,7 +1532,7 @@ export async function createPortalRuntime(options = {}) {
   // The observation must distinguish command failure from confirmed absence.
   const checkedCommand =
     options.command ??
-    createCommandRunner((args, options) => Bun.spawn(args, options));
+    createCommandRunner((args, spawnOptions) => Bun.spawn(args, spawnOptions));
 
   async function readInventoryRuntime() {
     const ports = await listenerObservation.read().catch(() => []);
@@ -1466,15 +1549,18 @@ export async function createPortalRuntime(options = {}) {
           triggerProcs.has(key) ||
           convexDevProcs.has(key) ||
           sidecarKeys.has(key);
+        let active;
+        if (owned?.reserved || supporting) {
+          active = true;
+        } else if (known) {
+          active = listening.has(port);
+        } else {
+          active = null;
+        }
         return [
           key,
           {
-            active:
-              owned?.reserved || supporting
-                ? true
-                : known
-                  ? listening.has(port)
-                  : null,
+            active,
             lastPortalActivityAt: lastSeenAt.get(key) ?? null,
             operation:
               queuePosition(key) === null
@@ -1592,11 +1678,10 @@ export async function createPortalRuntime(options = {}) {
         '--format',
         '{{.ID}}',
       ]);
-      return result.code === 0 && !result.timedOut
-        ? result.stdout
-          ? 'alive'
-          : 'dead'
-        : 'unknown';
+      if (result.code !== 0 || result.timedOut) {
+        return 'unknown';
+      }
+      return result.stdout ? 'alive' : 'dead';
     } catch {
       return 'unknown';
     }
@@ -1611,31 +1696,48 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  async function discoverContainerRuntime(target) {
+    if (!existsSync(dockerComposePath(target.wtDir))) {
+      return null;
+    }
+    const state = await containerState(target.project);
+    if (
+      state !== 'alive' &&
+      !(state === 'unknown' && (await activePidAsync(target.port)))
+    ) {
+      return null;
+    }
+    return {
+      handle: {
+        container: target.project,
+        observedState: state,
+        ownedGroup: false,
+        pid: null,
+      },
+      state,
+    };
+  }
+
+  function listenerRuntime(listener) {
+    if (listener.code === 1 && !listener.stdout && !listener.stderr) {
+      return 'dead';
+    }
+    if (listener.code !== 0 || listener.timedOut) {
+      return 'unknown';
+    }
+    const pids = [
+      ...new Set(listener.stdout.split(WHITESPACE_RE).filter(Boolean)),
+    ];
+    if (pids.length !== 1 || !PID_RE.test(pids[0])) {
+      return 'unknown';
+    }
+    return Number(pids[0]);
+  }
+
   async function discoverDevRuntime(target) {
-    if (existsSync(dockerComposePath(target.wtDir))) {
-      const state = await containerState(target.project);
-      if (state === 'alive') {
-        return {
-          handle: {
-            container: target.project,
-            observedState: state,
-            ownedGroup: false,
-            pid: null,
-          },
-          state,
-        };
-      }
-      if (state === 'unknown' && (await activePidAsync(target.port))) {
-        return {
-          handle: {
-            container: target.project,
-            observedState: state,
-            ownedGroup: false,
-            pid: null,
-          },
-          state,
-        };
-      }
+    const container = await discoverContainerRuntime(target);
+    if (container) {
+      return container;
     }
     try {
       const listener = await checkedCommand([
@@ -1645,17 +1747,11 @@ export async function createPortalRuntime(options = {}) {
         '-sTCP:LISTEN',
         '-t',
       ]);
-      if (listener.code === 1 && !listener.stdout && !listener.stderr) {
-        return { state: 'dead' };
+      const runtime = listenerRuntime(listener);
+      if (typeof runtime !== 'number') {
+        return { state: runtime };
       }
-      if (listener.code !== 0 || listener.timedOut) {
-        return { state: 'unknown' };
-      }
-      const pids = [...new Set(listener.stdout.split(/\s+/).filter(Boolean))];
-      if (pids.length !== 1 || !/^\d+$/.test(pids[0])) {
-        return { state: 'unknown' };
-      }
-      const pid = Number(pids[0]);
+      const pid = runtime;
       const cwd = await checkedCommand([
         'lsof',
         '-a',
@@ -1723,17 +1819,17 @@ export async function createPortalRuntime(options = {}) {
         (target) => stopSidecars(target.repo, target.name),
       ],
       signal: (pid, signal) => process.kill(pid, signal),
-      spawn: (args, options) => Bun.spawn(args, options),
+      spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
       startSidecars: (target) =>
         startSidecars(target.repo, target.name, target.port),
-      verifyHandle: async (handle) => {
-        if (!handle.evidence) {
+      verifyHandle: async (runtimeHandle) => {
+        if (!runtimeHandle.evidence) {
           return false;
         }
         try {
           return (
-            JSON.stringify(await processEvidence(handle.pid)) ===
-            JSON.stringify(handle.evidence)
+            JSON.stringify(await processEvidence(runtimeHandle.pid)) ===
+            JSON.stringify(runtimeHandle.evidence)
           );
         } catch {
           return false;
@@ -1859,7 +1955,7 @@ export async function createPortalRuntime(options = {}) {
   const portalSockets = new Set();
   let updateShutdown = null;
 
-  function stopPortalForUpdate(server) {
+  function stopPortalForUpdate(portalServer) {
     if (updateShutdown) {
       return;
     }
@@ -1876,11 +1972,11 @@ export async function createPortalRuntime(options = {}) {
         runtimeTimers.clearInterval(logRetentionTimer);
         runtimeTimers.clearInterval(memoryCheckTimer);
         runtimeTimers.clearInterval(idleCheckTimer);
-        void managedAgents.dispose();
+        managedAgents.dispose();
         lifecycle.dispose();
       },
       exit: (code) => process.exit(code),
-      stopServer: () => server.stop(false),
+      stopServer: () => portalServer.stop(false),
     }).catch(() => {
       console.error(
         'Portal update stop is unconfirmed; admission remains closed.'
@@ -1900,6 +1996,7 @@ export async function createPortalRuntime(options = {}) {
   async function reconcileDevServers() {
     const entries = portEntries(WORKSPACE);
     for (let index = 0; index < entries.length; index += 8) {
+      // biome-ignore lint/performance/noAwaitInLoops: each bounded observation batch must settle before the next to retain the eight-runtime concurrency cap.
       await Promise.all(
         entries.slice(index, index + 8).map(async ({ repo, name, port }) => {
           const target = worktreeTarget(repo, name, port);
@@ -1907,12 +2004,13 @@ export async function createPortalRuntime(options = {}) {
           if (found.state === 'dead') {
             return;
           }
-          const handle = found.handle ?? {
+          // biome-ignore lint/suspicious/noUnnecessaryConditions: discovery is an injected runtime observer and may omit a handle for an unknown observation.
+          const runtimeHandle = found.handle ?? {
             observedState: 'unknown',
             ownedGroup: false,
             pid: null,
           };
-          lifecycle.adopt(target, handle);
+          lifecycle.adopt(target, runtimeHandle);
           openLogPaths.add(logPath(repo, name));
           touchLastSeen(repo, name);
         })
@@ -1930,6 +2028,7 @@ export async function createPortalRuntime(options = {}) {
   // Port + container-mode resolution wrapped around startWorktree/stopWorktree
   // so /api/start, /api/stop, and mcp-server.js's start_worktree/stop_worktree
   // tools share one implementation instead of three copies of this logic.
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP start callers require synchronous target and lifecycle failures to reject their Promise.
   async function startWorktreeByName(repo, name, container, source = 'portal') {
     const port = getPort(WORKSPACE, repo, name);
     if (!port) {
@@ -1960,6 +2059,7 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP stop callers require synchronous target and lifecycle failures to reject their Promise.
   async function stopWorktreeByName(repo, name, source = 'portal') {
     const port = getPort(WORKSPACE, repo, name);
     if (!port) {
@@ -1971,6 +2071,7 @@ export async function createPortalRuntime(options = {}) {
   }
 
   // Shared by /api/sync and mcp-server.js's sync_worktree tool.
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP sync callers require synchronous target and lifecycle failures to reject their Promise.
   async function syncWorktreeByName(repo, name, source = 'portal') {
     return recordPortalMutation('worktree-sync', repo, name, source, () =>
       lifecycle.runOperation(worktreeTarget(repo, name), 'sync', () =>
@@ -2006,6 +2107,7 @@ export async function createPortalRuntime(options = {}) {
         }
         continue;
       }
+      // biome-ignore lint/performance/noAwaitInLoops: each storage check follows the prior launch so later sidecars observe the current admitted state.
       await assertStorageHeadroom(WORKSPACE, readHostHealth);
       const fd = openLogFd(repo, name, `sidecar-${s.name}`);
       const env = { ...process.env, PORT: String(port), ...s.env };
@@ -2153,7 +2255,7 @@ export async function createPortalRuntime(options = {}) {
 
   async function startTrigger(repo, name) {
     const key = `${repo}/${name}`;
-    await reconcileTriggerSidecars();
+    await (options.reconcileTriggerSidecars ?? reconcileTriggerSidecars)();
     if (triggerProcs.has(key)) {
       return { error: 'already running', ok: false };
     }
@@ -2217,6 +2319,16 @@ export async function createPortalRuntime(options = {}) {
   // Startup-only: discover trigger dev processes already running (from before this
   // portal instance started) and adopt them into triggerProcs, keyed by matching
   // their cwd against a known worktree. Cheap because it only runs once at boot.
+  function cwdFromProbe(probe) {
+    if (probe.code !== 0) {
+      return null;
+    }
+    return probe.stdout
+      .split('\n')
+      .find((cwdLine) => cwdLine.startsWith('n'))
+      ?.slice(1);
+  }
+
   async function reconcileTriggerSidecars() {
     let raw;
     const probe = await checkedCommand(['ps', '-eo', 'pid=,command=']);
@@ -2233,11 +2345,12 @@ export async function createPortalRuntime(options = {}) {
       ])
     );
     for (const line of raw.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+.*\.bin\/trigger dev\b/);
+      const m = line.match(TRIGGER_PROCESS_RE);
       if (!m) {
         continue;
       }
       const pid = +m[1];
+      // biome-ignore lint/performance/noAwaitInLoops: triggerProcs adoption is ordered; each cwd result can claim its key before a later PID is considered.
       const cwdProbe = await checkedCommand([
         'lsof',
         '-a',
@@ -2247,13 +2360,7 @@ export async function createPortalRuntime(options = {}) {
         'cwd',
         '-Fn',
       ]);
-      const cwd =
-        cwdProbe.code === 0
-          ? cwdProbe.stdout
-              .split('\n')
-              .find((cwdLine) => cwdLine.startsWith('n'))
-              ?.slice(1)
-          : null;
+      const cwd = cwdFromProbe(cwdProbe);
       const key = cwd && dirToKey.get(cwd);
       if (key && !triggerProcs.has(key)) {
         const evidence = await processEvidence(pid);
@@ -2307,10 +2414,11 @@ export async function createPortalRuntime(options = {}) {
     }
     raw = probe.stdout;
     for (const line of raw.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+.*\bconvex dev\b/);
+      const m = line.match(CONVEX_PROCESS_RE);
       if (!m) {
         continue;
       }
+      // biome-ignore lint/performance/noAwaitInLoops: preserve ps-order failure and first-match behavior before deciding whether this worktree is already running.
       const cwd = await checkedCommand([
         'lsof',
         '-a',
@@ -2433,7 +2541,7 @@ export async function createPortalRuntime(options = {}) {
       }
     },
     openLog: openLogFd,
-    spawn: (args, options) => Bun.spawn(args, options),
+    spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
     stores: {
       convex: convexDeploys,
       netlify: netlifyDeploys,
@@ -2448,6 +2556,7 @@ export async function createPortalRuntime(options = {}) {
     // Project-local settings intentionally win over the inherited portal
     // environment. The key stays inside the launch binding and is never
     // returned by preflight/status or written to a log.
+    // biome-ignore lint/suspicious/useAwait: provider resolution awaits this injected adapter and must receive synchronous file/path errors as rejections.
     convexDeployKey: async (checkout) => {
       const directory =
         convexDir(checkout.repo, checkout.wtDir) ??
@@ -2536,7 +2645,7 @@ export async function createPortalRuntime(options = {}) {
     expectedContext,
     source = 'portal'
   ) {
-    const handle = await operationOutcomes.accept({
+    const outcomeHandle = await operationOutcomes.accept({
       kind: `${provider}-deploy`,
       source,
       target: { name, repo },
@@ -2544,23 +2653,23 @@ export async function createPortalRuntime(options = {}) {
     const result = await deploymentGuard.dispatch({
       expectedContext,
       name,
-      operationOutcome: handle,
+      operationOutcome: outcomeHandle,
       provider,
       repo,
       target,
     });
     if (result?.deploying) {
-      const running = await operationOutcomes.running(handle);
+      const running = await operationOutcomes.running(outcomeHandle);
       return {
         ...result,
-        operationId: handle.id,
-        ...(handle.outcomeRecorded === false ||
+        operationId: outcomeHandle.id,
+        ...(outcomeHandle.outcomeRecorded === false ||
         running.outcomeRecorded === false
           ? { outcomeRecorded: false }
           : {}),
       };
     }
-    return operationOutcomes.settle(handle, result);
+    return operationOutcomes.settle(outcomeHandle, result);
   }
   function deployToConvex(repo, name, target, expectedContext, source) {
     return deployWithOutcome(
@@ -2629,6 +2738,35 @@ export async function createPortalRuntime(options = {}) {
     return openSync(TUNNEL_LOG, 'a');
   }
 
+  async function waitForTunnelExit(pattern) {
+    const deadline = performance.now() + 5000;
+    for (;;) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each pgrep result decides whether the next absence poll may run; parallel polls cannot confirm teardown.
+      const remaining = await checkedCommand(['pgrep', '-f', pattern]);
+      if (
+        remaining.code === 1 &&
+        !remaining.stdout &&
+        !remaining.timedOut &&
+        !remaining.truncated
+      ) {
+        return;
+      }
+      if (
+        remaining.code !== 0 ||
+        remaining.timedOut ||
+        remaining.truncated ||
+        performance.now() >= deadline
+      ) {
+        throw new Error(
+          'Tunnel exit is unconfirmed; retry Disable before update cutover'
+        );
+      }
+      // Wait only after a confirmed live process before the next serial absence poll.
+      await Bun.sleep(50);
+    }
+  }
+
+  // biome-ignore lint/suspicious/useAwait: tunnel callers await routing serialization and must receive synchronous state failures as rejections.
   async function restartTunnel() {
     return portalState.withRouting(async () => {
       tunnelTeardownUnknown = true;
@@ -2642,29 +2780,7 @@ export async function createPortalRuntime(options = {}) {
       if (![0, 1].includes(reaped.code) || reaped.timedOut) {
         throw new Error('Previous tunnel process teardown is unconfirmed');
       }
-      const deadline = performance.now() + 5000;
-      for (;;) {
-        const remaining = await checkedCommand(['pgrep', '-f', pattern]);
-        if (
-          remaining.code === 1 &&
-          !remaining.stdout &&
-          !remaining.timedOut &&
-          !remaining.truncated
-        ) {
-          break;
-        }
-        if (
-          remaining.code !== 0 ||
-          remaining.timedOut ||
-          remaining.truncated ||
-          performance.now() >= deadline
-        ) {
-          throw new Error(
-            'Tunnel exit is unconfirmed; retry Disable before update cutover'
-          );
-        }
-        await Bun.sleep(50);
-      }
+      await waitForTunnelExit(pattern);
       tunnelProc = null;
       tunnelTeardownUnknown = false;
       if (activeTunnelMap.size === 0) {
@@ -2701,6 +2817,7 @@ export async function createPortalRuntime(options = {}) {
     });
   }
 
+  // biome-ignore lint/suspicious/useAwait: routing callers await this mutation boundary so synchronous state errors reject consistently.
   async function addTunnelRoute(repo, name, pubDom, port) {
     return portalState.withRouting(async () => {
       activeTunnelMap.set(`${repo}/${name}`, { port, pubDom });
@@ -2709,6 +2826,7 @@ export async function createPortalRuntime(options = {}) {
     });
   }
 
+  // biome-ignore lint/suspicious/useAwait: routing callers await this mutation boundary so synchronous state errors reject consistently.
   async function removeTunnelRoute(repo, name) {
     return portalState.withRouting(async () => {
       activeTunnelMap.delete(`${repo}/${name}`);
@@ -2727,6 +2845,7 @@ export async function createPortalRuntime(options = {}) {
     tunnelChange = result.catch(() => undefined);
     return result;
   }
+  // biome-ignore lint/suspicious/useAwait: enable/disable callers await this serialized mutation boundary and require synchronous failures as rejections.
   async function changeTunnel(repo, name, port, enabled) {
     const target = worktreeTarget(repo, name, port);
     const apply = () =>
@@ -2780,6 +2899,7 @@ export async function createPortalRuntime(options = {}) {
     return port;
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this target-validation boundary and require rejected synchronous failures.
   async function enableTunnelByName(repo, name, source = 'portal') {
     const port = registeredWorktreePort(repo, name);
     return typeof port === 'number'
@@ -2789,6 +2909,7 @@ export async function createPortalRuntime(options = {}) {
       : port;
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this target-validation boundary and require rejected synchronous failures.
   async function disableTunnelByName(repo, name, source = 'portal') {
     const port = registeredWorktreePort(repo, name);
     return typeof port === 'number'
@@ -2798,12 +2919,14 @@ export async function createPortalRuntime(options = {}) {
       : port;
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this sidecar mutation boundary and require rejected synchronous failures.
   async function startInngestByName(repo, name, source = 'portal') {
     return recordPortalMutation(
       'inngest-start',
       repo,
       name,
       source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
       async () => {
         const port = registeredWorktreePort(repo, name);
         return typeof port === 'number'
@@ -2817,12 +2940,14 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this sidecar mutation boundary and require rejected synchronous failures.
   async function stopInngestByName(repo, name, source = 'portal') {
     return recordPortalMutation(
       'inngest-stop',
       repo,
       name,
       source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
       async () => {
         const port = registeredWorktreePort(repo, name);
         return typeof port === 'number' ? stopInngest(repo, name, port) : port;
@@ -2836,6 +2961,7 @@ export async function createPortalRuntime(options = {}) {
       repo,
       name,
       source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
       async () => {
         const port = registeredWorktreePort(repo, name);
         if (typeof port !== 'number') {
@@ -2856,6 +2982,7 @@ export async function createPortalRuntime(options = {}) {
       repo,
       name,
       source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
       async () => {
         const port = registeredWorktreePort(repo, name);
         if (typeof port !== 'number') {
@@ -2870,12 +2997,14 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this sidecar mutation boundary and require rejected synchronous failures.
   async function stopTriggerByName(repo, name, source = 'portal') {
     return recordPortalMutation(
       'trigger-stop',
       repo,
       name,
       source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
       async () => {
         const port = registeredWorktreePort(repo, name);
         return typeof port === 'number' ? stopTrigger(repo, name) : port;
@@ -2883,11 +3012,19 @@ export async function createPortalRuntime(options = {}) {
     );
   }
 
+  // biome-ignore lint/suspicious/useAwait: HTTP and MCP callers await this sidecar mutation boundary and require rejected synchronous failures.
   async function stopConvexByName(repo, name, source = 'portal') {
-    return recordPortalMutation('convex-stop', repo, name, source, async () => {
-      const port = registeredWorktreePort(repo, name);
-      return typeof port === 'number' ? stopConvexDev(repo, name) : port;
-    });
+    return recordPortalMutation(
+      'convex-stop',
+      repo,
+      name,
+      source,
+      // biome-ignore lint/suspicious/useAwait: recordPortalMutation awaits this callback to convert synchronous worktree lookup failures into rejection.
+      async () => {
+        const port = registeredWorktreePort(repo, name);
+        return typeof port === 'number' ? stopConvexDev(repo, name) : port;
+      }
+    );
   }
 
   function listSidecarsForWorktree(repo, name) {
@@ -2920,6 +3057,61 @@ export async function createPortalRuntime(options = {}) {
   // ── create / remove worktree ──────────────────────────────────────────────────
 
   const setupContexts = new Map();
+
+  async function setupContextFor(target, repo, name, tunnel) {
+    let context = setupContexts.get(target.key);
+    if (context) {
+      const current = await inspectCheckoutIdentity(target, identityFs);
+      if (!(current.known && sameCheckoutIdentity(current, context.identity))) {
+        throw new Error(
+          'Setup checkout identity changed; automatic retry is blocked'
+        );
+      }
+      if (context.tunnel !== !!tunnel) {
+        throw new Error('Retry setup with the original tunnel choice');
+      }
+      if (context.ready) {
+        return {
+          kind: 'ready',
+          result: {
+            domain: context.res.localDom,
+            ok: true,
+            port: context.res.port,
+            setup: 'ready',
+          },
+        };
+      }
+      return { context, kind: 'setup' };
+    }
+    if (getPort(WORKSPACE, repo, name)) {
+      throw new Error(
+        'Worktree is already registered; existing setup cannot be replayed without its original operation'
+      );
+    }
+    context = { identity: null, ready: false, res: null, tunnel: !!tunnel };
+    return { context, kind: 'setup' };
+  }
+
+  async function createSetupCheckout(context, target, repo, name, tunnel) {
+    if (context.res) {
+      return;
+    }
+    try {
+      context.res = await libCreateWorktree(_cfg, repo, name, {
+        readStorage: readHostHealth,
+        tunnel,
+      });
+    } catch (error) {
+      context.identity = await inspectCheckoutIdentity(target, identityFs);
+      if (context.identity.known) {
+        setupContexts.set(target.key, context);
+      }
+      throw error;
+    }
+    context.identity = await inspectCheckoutIdentity(target, identityFs);
+    setupContexts.set(target.key, context);
+  }
+
   async function createWorktree(repo, name, tunnel, source = 'portal') {
     const target = worktreeTarget(repo, name, null, { registered: false });
     const sharing = dependencySharingForTarget(_cfg, repo, name);
@@ -2934,64 +3126,12 @@ export async function createPortalRuntime(options = {}) {
         operationId: outcome.id,
         target: { name, repo },
         task: async () => {
-          let context = setupContexts.get(target.key);
-          if (context) {
-            const current = await inspectCheckoutIdentity(target, identityFs);
-            if (
-              !(
-                current.known && sameCheckoutIdentity(current, context.identity)
-              )
-            ) {
-              throw new Error(
-                'Setup checkout identity changed; automatic retry is blocked'
-              );
-            }
-            if (context.tunnel !== !!tunnel) {
-              throw new Error('Retry setup with the original tunnel choice');
-            }
-            if (context.ready) {
-              return {
-                domain: context.res.localDom,
-                ok: true,
-                port: context.res.port,
-                setup: 'ready',
-              };
-            }
-          } else {
-            if (getPort(WORKSPACE, repo, name)) {
-              throw new Error(
-                'Worktree is already registered; existing setup cannot be replayed without its original operation'
-              );
-            }
-            context = {
-              identity: null,
-              ready: false,
-              res: null,
-              tunnel: !!tunnel,
-            };
+          const prepared = await setupContextFor(target, repo, name, tunnel);
+          if (prepared.kind === 'ready') {
+            return prepared.result;
           }
-          if (!context.res) {
-            try {
-              context.res = await libCreateWorktree(_cfg, repo, name, {
-                readStorage: readHostHealth,
-                tunnel,
-              });
-            } catch (error) {
-              context.identity = await inspectCheckoutIdentity(
-                target,
-                identityFs
-              );
-              if (context.identity.known) {
-                setupContexts.set(target.key, context);
-              }
-              throw error;
-            }
-            context.identity = await inspectCheckoutIdentity(
-              target,
-              identityFs
-            );
-            setupContexts.set(target.key, context);
-          }
+          const { context } = prepared;
+          await createSetupCheckout(context, target, repo, name, tunnel);
           const { res } = context;
           if (tunnel) {
             await addTunnelRoute(repo, name, publicDomain(_cfg), res.port);
@@ -3007,11 +3147,12 @@ export async function createPortalRuntime(options = {}) {
             openLog: () => openLogFd(repo, name, 'setup'),
             progress: setupProgress,
             sharing,
-            spawn: (args, options) => Bun.spawn(args, options),
+            spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
             state: b205State,
             stopProcess: devRuntime.stopProcess,
             target: { name, repo },
           });
+          // biome-ignore lint/suspicious/noUnnecessaryConditions: setup launch is collaborator output and completion is absent for immediate results.
           if (launched?.completion?.then) {
             const recording = await operationOutcomes.running(outcome);
             watchOutcome({ ...outcome, ...recording }, launched.completion);
@@ -3032,7 +3173,9 @@ export async function createPortalRuntime(options = {}) {
         : create());
     } catch (error) {
       return operationOutcomes.settle(outcome, {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         code: error?.code,
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         error: error?.message ?? String(error),
         ok: false,
       });
@@ -3056,7 +3199,9 @@ export async function createPortalRuntime(options = {}) {
       admit: (target, task) =>
         lifecycle.runOperation(target, 'remove', async (controls) => {
           // Older standalone Trigger processes may have appeared after boot.
-          await reconcileTriggerSidecars();
+          await (
+            options.reconcileTriggerSidecars ?? reconcileTriggerSidecars
+          )();
           return task(controls);
         }),
       assertClean: (target, force) =>
@@ -3119,8 +3264,11 @@ export async function createPortalRuntime(options = {}) {
           lastSeenAt.delete(record.key);
           setupContexts.delete(record.key);
         },
-        reloadCaddy: () => reloadCaddyAsync(WORKSPACE),
-        removeTunnelRoute,
+        reloadCaddy:
+          options.removalRouting?.reloadCaddy ??
+          (() => reloadCaddyAsync(WORKSPACE)),
+        removeTunnelRoute:
+          options.removalRouting?.removeTunnelRoute ?? removeTunnelRoute,
         snippetPath: (record) =>
           caddySnippetPath(WORKSPACE, record.repo, record.name),
         syncHosts: () => portalRouting.syncHosts(),
@@ -3147,10 +3295,13 @@ export async function createPortalRuntime(options = {}) {
       },
     });
 
+  // biome-ignore lint/suspicious/useAwait: CLI and MCP removal callers await this mutation boundary and require synchronous target failures as rejections.
   async function removeWorktree(
     repo,
     name,
+    // biome-ignore lint/style/useDefaultParameterLast: positional callers supply reason before force and operationId to preserve recorded-removal retry semantics.
     reason = 'manual',
+    // biome-ignore lint/style/useDefaultParameterLast: positional callers supply force before operationId, whose omission selects normal removal behavior.
     force = false,
     operationId,
     source = 'portal'
@@ -3167,13 +3318,14 @@ export async function createPortalRuntime(options = {}) {
 
   // ── project registration ──────────────────────────────────────────────────────
 
+  // biome-ignore lint/suspicious/useAwait: project-route callers await this lifecycle boundary and require synchronous validation failures as rejections.
   async function addProject({ github = '', name: nameArg = '', label = '' }) {
     // Normalise GitHub input → org/repo slug
     const slug = github
       .trim()
-      .replace(/^https?:\/\/github\.com\//, '')
-      .replace(/^git@github\.com:/, '')
-      .replace(/\.git$/, '');
+      .replace(GITHUB_HTTPS_PREFIX_RE, '')
+      .replace(GITHUB_SSH_PREFIX_RE, '')
+      .replace(GIT_SUFFIX_RE, '');
 
     const name = (nameArg.trim() || slug.split('/').at(-1) || '').replace(
       /[^a-zA-Z0-9._-]/g,
@@ -3334,6 +3486,7 @@ export async function createPortalRuntime(options = {}) {
           .map(([, entry]) => entry),
       ].filter(Boolean);
       for (const entry of matches) {
+        // biome-ignore lint/performance/noAwaitInLoops: native runtime status is the first known observation in the established map order; parallel probes could change unknown/alive precedence.
         const observed = await observeSidecarEntry(entry);
         if (observed === 'unknown') {
           return 'unknown';
@@ -3371,10 +3524,10 @@ export async function createPortalRuntime(options = {}) {
     events: portalB205.events,
   });
   const pendingOutcomes = new Set();
-  function watchOutcome(handle, completion) {
-    const done = operationOutcomes.watch(handle, completion);
+  function watchOutcome(outcomeHandle, completion) {
+    const done = operationOutcomes.watch(outcomeHandle, completion);
     pendingOutcomes.add(done);
-    void done.finally(() => pendingOutcomes.delete(done));
+    done.finally(() => pendingOutcomes.delete(done));
     return done;
   }
   async function recordPortalMutation(
@@ -3389,13 +3542,19 @@ export async function createPortalRuntime(options = {}) {
       typeof repo === 'string' && typeof name === 'string'
         ? { name, repo }
         : null;
-    const handle = await operationOutcomes.accept({ kind, source, target });
+    const outcomeHandle = await operationOutcomes.accept({
+      kind,
+      source,
+      target,
+    });
     let result;
     try {
-      result = await invoke(handle.id);
+      result = await invoke(outcomeHandle.id);
     } catch (error) {
-      return operationOutcomes.settle(handle, {
+      return operationOutcomes.settle(outcomeHandle, {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         code: error?.code,
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         error: error?.message ?? String(error),
         ok: false,
       });
@@ -3403,22 +3562,26 @@ export async function createPortalRuntime(options = {}) {
     const completion = pending?.(result);
     if (completion?.then) {
       const running = result?.queued
-        ? await operationOutcomes.settle(handle, result, { state: 'queued' })
-        : await operationOutcomes.running(handle);
-      watchOutcome({ ...handle, ...running }, completion);
+        ? await operationOutcomes.settle(outcomeHandle, result, {
+            state: 'queued',
+          })
+        : await operationOutcomes.running(outcomeHandle);
+      watchOutcome({ ...outcomeHandle, ...running }, completion);
       return {
         ...result,
-        operationId: result?.operationId ?? handle.id,
-        ...(handle.outcomeRecorded === false ||
+        operationId: result?.operationId ?? outcomeHandle.id,
+        ...(outcomeHandle.outcomeRecorded === false ||
         running.outcomeRecorded === false
           ? { outcomeRecorded: false }
           : {}),
       };
     }
     if (result?.queued) {
-      return operationOutcomes.settle(handle, result, { state: 'queued' });
+      return operationOutcomes.settle(outcomeHandle, result, {
+        state: 'queued',
+      });
     }
-    return operationOutcomes.settle(handle, result);
+    return operationOutcomes.settle(outcomeHandle, result);
   }
   function sameCheckoutIdentity(left, right) {
     if (left === right) {
@@ -3564,13 +3727,15 @@ export async function createPortalRuntime(options = {}) {
             progress: setupProgress,
             setupAttempt: accepted.record,
             sharing: dependencySharingForTarget(_cfg, locked.repo, locked.name),
-            spawn: (args, options) => Bun.spawn(args, options),
+            spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
             state: b205State,
             stopProcess: devRuntime.stopProcess,
             target: { name: locked.name, repo: locked.repo },
           });
+          // biome-ignore lint/suspicious/noUnnecessaryConditions: setup launch is collaborator output and completion is absent for immediate results.
           if (launched?.completion?.then) {
-            completion = launched.completion;
+            const { completion: launchedCompletion } = launched;
+            completion = launchedCompletion;
             recording = await operationOutcomes.running(outcome);
             watchOutcome({ ...outcome, ...recording }, completion);
           }
@@ -3581,7 +3746,9 @@ export async function createPortalRuntime(options = {}) {
       });
     } catch (error) {
       return operationOutcomes.settle(outcome, {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         code: error?.code,
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: caught values are untrusted and can be null, primitives, or Error-like objects.
         error: error?.message ?? 'Setup retry could not complete',
         ok: false,
       });
@@ -3629,7 +3796,7 @@ export async function createPortalRuntime(options = {}) {
     }
   }
 
-  async function updateRoutes(req, pathname, method, server) {
+  async function updateRoutes(req, pathname, method, portalServer) {
     if (pathname === '/api/update/capabilities' && method === 'GET') {
       return Response.json(updateControl.capabilities());
     }
@@ -3644,13 +3811,16 @@ export async function createPortalRuntime(options = {}) {
       return null;
     }
     const body = await req.json().catch(() => null);
-    const result = pathname.endsWith('/quiesce')
-      ? updateControl.quiesce(body)
-      : pathname.endsWith('/reopen')
-        ? await updateControl.reopen(body)
-        : updateControl.prepareStop(body);
+    let result;
+    if (pathname.endsWith('/quiesce')) {
+      result = updateControl.quiesce(body);
+    } else if (pathname.endsWith('/reopen')) {
+      result = await updateControl.reopen(body);
+    } else {
+      result = updateControl.prepareStop(body);
+    }
     if (result.ok && pathname.endsWith('/stop')) {
-      setImmediate(() => stopPortalForUpdate(server));
+      setImmediate(() => stopPortalForUpdate(portalServer));
     }
     return Response.json(result, { status: result.ok ? 200 : 409 });
   }
@@ -3679,7 +3849,7 @@ export async function createPortalRuntime(options = {}) {
   // to fall through to the next one. handle() tries them in order and 404s
   // if none match. Split by domain (worktree lifecycle, project/sweep,
   // settings, raycast) for size, not by rewriting the dispatch logic itself.
-  async function projectRoutes(req, pathname, method, server) {
+  async function projectRoutes(req, pathname, method, portalServer) {
     if (pathname === '/api/projects') {
       return Response.json(listProjectsSummary());
     }
@@ -3707,7 +3877,7 @@ export async function createPortalRuntime(options = {}) {
       // connection mid-scan and the client sees an empty response, not an
       // error (confirmed live: curl got "Empty reply from server" at ~9s
       // while the scan kept running server-side unharmed).
-      server?.timeout(req, 0);
+      portalServer?.timeout(req, 0);
       return jsonTry(() => discoverReposAsync(HOME));
     }
 
@@ -3752,7 +3922,354 @@ export async function createPortalRuntime(options = {}) {
     return null;
   }
 
-  async function settingsRoutes(req, pathname, method, server) {
+  async function saveSettingsRequest(req) {
+    const body = await req.json().catch(() => ({}));
+    try {
+      const patch = Object.fromEntries(
+        ['maxConcurrentDevServers', 'containerMemoryLimit', 'containerCpuLimit']
+          .filter((key) => body[key] !== null && body[key] !== undefined)
+          .map((key) => [key, body[key]])
+      );
+      resourceSettings({ ..._cfg, ...patch });
+      const committed = await portalState.update('config', (current) => {
+        const next = { ...current, ...patch };
+        resourceSettings(next);
+        return next;
+      });
+      configReconciled = committed.reconciled === true;
+      _cfg = installedStateValue(committed);
+      await lifecycle.updateSettings(_cfg);
+      return Response.json({
+        ...persistedAction(committed),
+        settings: {
+          containerCpuLimit: _cfg.containerCpuLimit,
+          containerMemoryLimit: _cfg.containerMemoryLimit,
+          maxConcurrentDevServers: _cfg.maxConcurrentDevServers,
+        },
+      });
+    } catch (error) {
+      return Response.json(
+        {
+          error: error.message,
+          ok: false,
+          ...(error.code ? { code: error.code } : {}),
+          ...(typeof error.committed === 'boolean'
+            ? { committed: error.committed }
+            : {}),
+          ...(error.phase ? { phase: error.phase } : {}),
+          ...(safeStateCauseCode(error.causeCode)
+            ? { causeCode: error.causeCode }
+            : {}),
+        },
+        { status: 400 }
+      );
+    }
+  }
+
+  async function settingsResource(req, method) {
+    if (method === 'GET') {
+      if (!configReconciled) {
+        const installed = portalState.read('config');
+        resourceSettings(installed);
+        if (installed.workspace !== WORKSPACE) {
+          throw new Error(
+            'Configured workspace changed; a reviewed portal restart is required.'
+          );
+        }
+        _cfg = installed;
+        configReconciled = true;
+        try {
+          await lifecycle.updateSettings(installed);
+        } catch (error) {
+          configReconciled = false;
+          throw error;
+        }
+      }
+      return Response.json({
+        containerCpuLimit: _cfg.containerCpuLimit ?? 2,
+        containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
+        docker: await cachedContainerRuntime(),
+        mac: macCapacity(),
+        maxConcurrentDevServers: lifecycle.status().max,
+      });
+    }
+    if (method === 'POST') {
+      return saveSettingsRequest(req);
+    }
+    return null;
+  }
+
+  async function sidecarSettingsResource(req, method) {
+    const p = new URL(req.url).searchParams;
+    if (method === 'GET') {
+      const repo = p.get('repo') ?? '';
+      // `approved` is computed, not stored on the sidecar itself, so the
+      // settings UI can show a per-row badge without a second request.
+      return Response.json(
+        loadAllSidecars(WORKSPACE, repo).map((s) => ({
+          ...s,
+          approved: isSidecarApproved(WORKSPACE, repo, s),
+        }))
+      );
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(async () => {
+        // Strip the computed `approved` field the GET above adds, in case
+        // the caller round-trips what it fetched. sidecars.json only ever
+        // owns name/enabled/command/args/env, approval lives in its own file.
+        const sidecars = (body.sidecars ?? []).map(({ approved, ...s }) => s);
+        return persistedAction(
+          await saveSidecars(WORKSPACE, body.repo, sidecars)
+        );
+      });
+    }
+    return null;
+  }
+
+  async function approveSidecarRequest(req) {
+    const body = await req.json().catch(() => ({}));
+    if (typeof body.command !== 'string') {
+      return Response.json({
+        error: 'Sidecar command is required for approval',
+        ok: false,
+      });
+    }
+    return jsonTry(async () =>
+      persistedAction(
+        await approveSidecar(
+          WORKSPACE,
+          body.repo,
+          body.name,
+          body.command,
+          body.args
+        )
+      )
+    );
+  }
+
+  async function fileSyncSettingsResource(req, method) {
+    const p = new URL(req.url).searchParams;
+    if (method === 'GET') {
+      return Response.json(loadFileSyncGlobs(WORKSPACE, p.get('repo') ?? ''));
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(async () =>
+        persistedAction(
+          await saveFileSyncGlobs(WORKSPACE, body.repo, body.globs ?? [])
+        )
+      );
+    }
+    return null;
+  }
+
+  async function customAgentsResource(req, method) {
+    if (method === 'GET') {
+      return Response.json(loadCustomAgents(WORKSPACE));
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(async () =>
+        persistedAction(await saveCustomAgents(WORKSPACE, body.agents ?? []))
+      );
+    }
+    return null;
+  }
+
+  async function mcpServersResource(req, method) {
+    if (method === 'GET') {
+      const statuses = mcpStatuses();
+      return Response.json(
+        loadMcpServers(WORKSPACE).map((s) => ({
+          ...s,
+          ...(statuses[s.id] ?? {
+            error: null,
+            status: 'disconnected',
+            stderrTail: [],
+            tools: [],
+          }),
+        }))
+      );
+    }
+    if (method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      return jsonTry(async () =>
+        persistedAction(await saveMcpServers(WORKSPACE, body.servers ?? []))
+      );
+    }
+    return null;
+  }
+
+  async function connectMcpRequest(req) {
+    const body = await req.json().catch(() => ({}));
+    const server = loadMcpServers(WORKSPACE).find((s) => s.id === body.id);
+    if (!server) {
+      return Response.json(
+        { error: 'server not found', ok: false },
+        { status: 404 }
+      );
+    }
+    const source = ['ui', 'cli', 'raycast'].includes(
+      req.headers.get('x-setu-source')
+    )
+      ? req.headers.get('x-setu-source')
+      : 'portal';
+    let completion;
+    return Response.json(
+      await recordPortalMutation(
+        'mcp-connect',
+        null,
+        null,
+        source,
+        () => {
+          completion = connectMcpServer(server, WORKSPACE).then(() => {
+            const status = mcpStatuses()[server.id];
+            if (status?.status === 'connected') {
+              return { ok: true };
+            }
+            if (status?.status === 'error') {
+              return { code: 'MCP_CONNECT_FAILED', ok: false };
+            }
+            return {
+              code: 'MCP_CONNECTION_PENDING',
+              ok: false,
+              state: 'unknown',
+            };
+          });
+          return { ok: true, state: 'running' };
+        },
+        { pending: () => completion }
+      )
+    );
+  }
+
+  async function mcpCallbackRequest(req, pathname) {
+    const serverId = pathname.slice('/api/mcp/oauth/callback/'.length);
+    const p = new URL(req.url).searchParams;
+    if (p.get('error')) {
+      return mcpCallbackHtml(
+        'Authorization denied',
+        `The authorization server reported: ${p.get('error_description') ?? p.get('error')}. You can close this tab and try again from Setu.`
+      );
+    }
+    const code = p.get('code');
+    const state = p.get('state');
+    if (!(code && state)) {
+      return mcpCallbackHtml(
+        'Bad callback',
+        'Missing code or state parameter. You can close this tab and try again from Setu.'
+      );
+    }
+    const server = loadMcpServers(WORKSPACE).find((s) => s.id === serverId);
+    if (!server) {
+      return mcpCallbackHtml(
+        'Unknown server',
+        'This server is no longer configured in Setu. You can close this tab.'
+      );
+    }
+    const result = await recordPortalMutation(
+      'mcp-authorize',
+      null,
+      null,
+      'portal',
+      () => finishMcpAuth(server, code, state)
+    );
+    if (!result.ok) {
+      return mcpCallbackHtml(
+        'Authorization failed',
+        `${result.error} You can close this tab and try again from Setu.`
+      );
+    }
+    return mcpCallbackHtml(
+      'Authorized',
+      'You can close this tab and return to Setu.'
+    );
+  }
+
+  function prReviewStatusRequest(req) {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    return jsonTry(() => prReviewStatus(repo, name));
+  }
+
+  async function prReviewRunRequest(req) {
+    const body = await req.json().catch(() => ({}));
+    const { repo, name, skill } = body;
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    if (!PR_REVIEW_SKILLS.has(skill)) {
+      return Response.json(
+        { error: 'unknown skill', ok: false },
+        { status: 400 }
+      );
+    }
+    const source = ['ui', 'cli', 'raycast'].includes(
+      req.headers.get('x-setu-source')
+    )
+      ? req.headers.get('x-setu-source')
+      : 'portal';
+    return jsonTry(() => prReviewRun(repo, name, skill, source));
+  }
+
+  async function prReviewArtifactRequest(req) {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name'),
+      skill = p.get('skill');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    if (!PR_REVIEW_SKILLS.has(skill)) {
+      return Response.json(
+        { error: 'unknown skill', ok: false },
+        { status: 400 }
+      );
+    }
+    const pr = await fetchPR(repo, await worktreeBranch(repo, name));
+    if (!pr.number) {
+      return new Response('No pull request for this worktree', {
+        status: 404,
+      });
+    }
+    const slug = REPO_META[repo]?.slug ?? repo;
+    const artifact = findLatestArtifact(slug, pr.number, skill, null);
+    const path =
+      artifact &&
+      artifactHtmlPath(
+        slug,
+        pr.number,
+        skill,
+        artifact.snapshot,
+        artifact.htmlFile
+      );
+    if (!(path && existsSync(path))) {
+      return new Response('No report generated yet', { status: 404 });
+    }
+    return new Response(Bun.file(path), {
+      headers: {
+        'Content-Security-Policy':
+          "sandbox allow-scripts; connect-src 'none'; form-action 'none'; base-uri 'none'",
+      },
+    });
+  }
+
+  // biome-ignore lint/suspicious/useAwait: Preserve the route handler's rejected-promise error boundary.
+  async function settingsRoutes(req, pathname, method, portalServer) {
     if (pathname === '/api/agents') {
       return Response.json(detectAgentClis(WORKSPACE));
     }
@@ -3761,7 +4278,7 @@ export async function createPortalRuntime(options = {}) {
     // trips (2 providers, each potentially paginated) — same idleTimeout
     // override /api/sweep documents, for the same reason.
     if (pathname === '/api/costs' && method === 'GET') {
-      server?.timeout(req, 0);
+      portalServer?.timeout(req, 0);
       return jsonTry(() => getCostsSummary());
     }
 
@@ -3770,79 +4287,7 @@ export async function createPortalRuntime(options = {}) {
     // Handled here, before worktreeRoutes' generic POST block, so a POST to
     // this path returns from here and never falls through to it.
     if (pathname === '/api/settings') {
-      if (method === 'GET') {
-        if (!configReconciled) {
-          const installed = portalState.read('config');
-          resourceSettings(installed);
-          if (installed.workspace !== WORKSPACE) {
-            throw new Error(
-              'Configured workspace changed; a reviewed portal restart is required.'
-            );
-          }
-          _cfg = installed;
-          configReconciled = true;
-          try {
-            await lifecycle.updateSettings(installed);
-          } catch (error) {
-            configReconciled = false;
-            throw error;
-          }
-        }
-        return Response.json({
-          containerCpuLimit: _cfg.containerCpuLimit ?? 2,
-          containerMemoryLimit: _cfg.containerMemoryLimit ?? '4g',
-          docker: await cachedContainerRuntime(),
-          mac: macCapacity(),
-          maxConcurrentDevServers: lifecycle.status().max,
-        });
-      }
-      if (method === 'POST') {
-        const body = await req.json().catch(() => ({}));
-        try {
-          const patch = Object.fromEntries(
-            [
-              'maxConcurrentDevServers',
-              'containerMemoryLimit',
-              'containerCpuLimit',
-            ]
-              .filter((key) => body[key] !== null && body[key] !== undefined)
-              .map((key) => [key, body[key]])
-          );
-          resourceSettings({ ..._cfg, ...patch });
-          const committed = await portalState.update('config', (current) => {
-            const next = { ...current, ...patch };
-            resourceSettings(next);
-            return next;
-          });
-          configReconciled = committed.reconciled === true;
-          _cfg = installedStateValue(committed);
-          await lifecycle.updateSettings(_cfg);
-          return Response.json({
-            ...persistedAction(committed),
-            settings: {
-              containerCpuLimit: _cfg.containerCpuLimit,
-              containerMemoryLimit: _cfg.containerMemoryLimit,
-              maxConcurrentDevServers: _cfg.maxConcurrentDevServers,
-            },
-          });
-        } catch (error) {
-          return Response.json(
-            {
-              error: error.message,
-              ok: false,
-              ...(error.code ? { code: error.code } : {}),
-              ...(typeof error.committed === 'boolean'
-                ? { committed: error.committed }
-                : {}),
-              ...(error.phase ? { phase: error.phase } : {}),
-              ...(safeStateCauseCode(error.causeCode)
-                ? { causeCode: error.causeCode }
-                : {}),
-            },
-            { status: 400 }
-          );
-        }
-      }
+      return settingsResource(req, method);
     }
 
     // Sidecars: GET returns every entry (including disabled) for the settings
@@ -3850,54 +4295,14 @@ export async function createPortalRuntime(options = {}) {
     // sends the full array back (add/remove/toggle are all client-side edits
     // to that array), matching saveSidecars()'s per-repo-overwrite shape.
     if (pathname === '/api/sidecars') {
-      const p = new URL(req.url).searchParams;
-      if (method === 'GET') {
-        const repo = p.get('repo') ?? '';
-        // `approved` is computed, not stored on the sidecar itself, so the
-        // settings UI can show a per-row badge without a second request.
-        return Response.json(
-          loadAllSidecars(WORKSPACE, repo).map((s) => ({
-            ...s,
-            approved: isSidecarApproved(WORKSPACE, repo, s),
-          }))
-        );
-      }
-      if (method === 'POST') {
-        const body = await req.json().catch(() => ({}));
-        return jsonTry(async () => {
-          // Strip the computed `approved` field the GET above adds, in case
-          // the caller round-trips what it fetched. sidecars.json only ever
-          // owns name/enabled/command/args/env, approval lives in its own file.
-          const sidecars = (body.sidecars ?? []).map(({ approved, ...s }) => s);
-          return persistedAction(
-            await saveSidecars(WORKSPACE, body.repo, sidecars)
-          );
-        });
-      }
+      return sidecarSettingsResource(req, method);
     }
 
     // Records the CURRENT command/args for one sidecar as approved, looked up
     // fresh from sidecars.json rather than trusted from the request body, so a
     // stale client can't approve a command it no longer matches.
     if (pathname === '/api/sidecar-approvals/approve' && method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      if (typeof body.command !== 'string') {
-        return Response.json({
-          error: 'Sidecar command is required for approval',
-          ok: false,
-        });
-      }
-      return jsonTry(async () =>
-        persistedAction(
-          await approveSidecar(
-            WORKSPACE,
-            body.repo,
-            body.name,
-            body.command,
-            body.args
-          )
-        )
-      );
+      return approveSidecarRequest(req);
     }
 
     // File sync globs: same per-repo GET/POST shape as sidecars above — GET
@@ -3905,39 +4310,20 @@ export async function createPortalRuntime(options = {}) {
     // it wholesale. Read by createWorktree on the next worktree it creates for
     // this repo, not retroactively applied to worktrees that already exist.
     if (pathname === '/api/file-sync-globs') {
-      const p = new URL(req.url).searchParams;
-      if (method === 'GET') {
-        return Response.json(loadFileSyncGlobs(WORKSPACE, p.get('repo') ?? ''));
-      }
-      if (method === 'POST') {
-        const body = await req.json().catch(() => ({}));
-        return jsonTry(async () =>
-          persistedAction(
-            await saveFileSyncGlobs(WORKSPACE, body.repo, body.globs ?? [])
-          )
-        );
-      }
+      return fileSyncSettingsResource(req, method);
     }
 
     // Custom agents: same shape as sidecars above — GET for the settings UI to
     // edit, POST replaces the whole (global, not per-repo) list.
     if (pathname === '/api/custom-agents') {
-      if (method === 'GET') {
-        return Response.json(loadCustomAgents(WORKSPACE));
-      }
-      if (method === 'POST') {
-        const body = await req.json().catch(() => ({}));
-        return jsonTry(async () =>
-          persistedAction(await saveCustomAgents(WORKSPACE, body.agents ?? []))
-        );
-      }
+      return customAgentsResource(req, method);
     }
 
     return null;
   }
 
   function mcpCallbackHtml(title, body) {
-    const escape = (value) =>
+    const escapeHtml = (value) =>
       String(value).replace(
         /[&<>'"]/g,
         (char) =>
@@ -3950,7 +4336,7 @@ export async function createPortalRuntime(options = {}) {
           })[char]
       );
     return new Response(
-      `<!doctype html><html><head><title>${escape(title)}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${escape(title)}</h2><p>${escape(body)}</p></body></html>`,
+      `<!doctype html><html><head><title>${escapeHtml(title)}</title><style>body{font:15px system-ui;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#27272a}</style></head><body><h2>${escapeHtml(title)}</h2><p>${escapeHtml(body)}</p></body></html>`,
       {
         headers: {
           'content-security-policy':
@@ -3975,26 +4361,7 @@ export async function createPortalRuntime(options = {}) {
     // its approved field. POST replaces the whole (global) list -- connecting
     // is a separate action below, saving config never connects anything.
     if (pathname === '/api/mcp-servers') {
-      if (method === 'GET') {
-        const statuses = mcpStatuses();
-        return Response.json(
-          loadMcpServers(WORKSPACE).map((s) => ({
-            ...s,
-            ...(statuses[s.id] ?? {
-              error: null,
-              status: 'disconnected',
-              stderrTail: [],
-              tools: [],
-            }),
-          }))
-        );
-      }
-      if (method === 'POST') {
-        const body = await req.json().catch(() => ({}));
-        return jsonTry(async () =>
-          persistedAction(await saveMcpServers(WORKSPACE, body.servers ?? []))
-        );
-      }
+      return mcpServersResource(req, method);
     }
 
     // Fire-and-forget, matching deployToVercel/deployToNetlify's shape: a
@@ -4003,44 +4370,7 @@ export async function createPortalRuntime(options = {}) {
     // the HTTP response. The actual outcome (connected/awaiting-auth/error)
     // shows up on the next /api/mcp-servers poll via mcp.js's own status map.
     if (pathname === '/api/mcp/connect' && method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      const server = loadMcpServers(WORKSPACE).find((s) => s.id === body.id);
-      if (!server) {
-        return Response.json(
-          { error: 'server not found', ok: false },
-          { status: 404 }
-        );
-      }
-      const source = ['ui', 'cli', 'raycast'].includes(
-        req.headers.get('x-setu-source')
-      )
-        ? req.headers.get('x-setu-source')
-        : 'portal';
-      let completion;
-      return Response.json(
-        await recordPortalMutation(
-          'mcp-connect',
-          null,
-          null,
-          source,
-          () => {
-            completion = connectMcpServer(server, WORKSPACE).then(() => {
-              const status = mcpStatuses()[server.id];
-              return status?.status === 'connected'
-                ? { ok: true }
-                : status?.status === 'error'
-                  ? { code: 'MCP_CONNECT_FAILED', ok: false }
-                  : {
-                      code: 'MCP_CONNECTION_PENDING',
-                      ok: false,
-                      state: 'unknown',
-                    };
-            });
-            return { ok: true, state: 'running' };
-          },
-          { pending: () => completion }
-        )
-      );
+      return connectMcpRequest(req);
     }
 
     if (pathname === '/api/mcp/disconnect' && method === 'POST') {
@@ -4052,46 +4382,7 @@ export async function createPortalRuntime(options = {}) {
     // not the SPA -- returns human-readable HTML on every leg, not JSON. This
     // is the one route in this domain that doesn't go through jsonTry.
     if (pathname.startsWith('/api/mcp/oauth/callback/') && method === 'GET') {
-      const serverId = pathname.slice('/api/mcp/oauth/callback/'.length);
-      const p = new URL(req.url).searchParams;
-      if (p.get('error')) {
-        return mcpCallbackHtml(
-          'Authorization denied',
-          `The authorization server reported: ${p.get('error_description') ?? p.get('error')}. You can close this tab and try again from Setu.`
-        );
-      }
-      const code = p.get('code');
-      const state = p.get('state');
-      if (!(code && state)) {
-        return mcpCallbackHtml(
-          'Bad callback',
-          'Missing code or state parameter. You can close this tab and try again from Setu.'
-        );
-      }
-      const server = loadMcpServers(WORKSPACE).find((s) => s.id === serverId);
-      if (!server) {
-        return mcpCallbackHtml(
-          'Unknown server',
-          'This server is no longer configured in Setu. You can close this tab.'
-        );
-      }
-      const result = await recordPortalMutation(
-        'mcp-authorize',
-        null,
-        null,
-        'portal',
-        () => finishMcpAuth(server, code, state)
-      );
-      if (!result.ok) {
-        return mcpCallbackHtml(
-          'Authorization failed',
-          `${result.error} You can close this tab and try again from Setu.`
-        );
-      }
-      return mcpCallbackHtml(
-        'Authorized',
-        'You can close this tab and return to Setu.'
-      );
+      return mcpCallbackRequest(req, pathname);
     }
 
     return null;
@@ -4180,7 +4471,7 @@ export async function createPortalRuntime(options = {}) {
         touchLastSeen(repo, name);
         const fd = openLogFd(repo, name, 'pr-review');
         let completion;
-        const result = runDeepReview(repo, name, skill, {
+        const reviewResult = runDeepReview(repo, name, skill, {
           logFd: fd,
           logPath: logPath(repo, name, 'pr-review'),
           onCompletion: async (promise) => {
@@ -4193,7 +4484,7 @@ export async function createPortalRuntime(options = {}) {
           spawnText: runText,
           wtDir: wtPath(repo, name),
         });
-        return { completion, result };
+        return { completion, result: reviewResult };
       }
     );
     return result?.ok === false
@@ -4207,89 +4498,21 @@ export async function createPortalRuntime(options = {}) {
 
   // prReviewRoutes must run before worktreeRoutes, same ordering constraint
   // as every other domain here (see worktreeRoutes' own comment on why).
+  // biome-ignore lint/suspicious/useAwait: Preserve the route handler's rejected-promise error boundary.
   async function prReviewRoutes(req, pathname, method) {
     if (pathname === '/api/pr-review/status' && method === 'GET') {
-      const p = new URL(req.url).searchParams;
-      const repo = p.get('repo'),
-        name = p.get('name');
-      if (!(repo && name)) {
-        return Response.json(
-          { error: 'repo and name required', ok: false },
-          { status: 400 }
-        );
-      }
-      return jsonTry(() => prReviewStatus(repo, name));
+      return prReviewStatusRequest(req);
     }
 
     if (pathname === '/api/pr-review/run' && method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      const { repo, name, skill } = body;
-      if (!(repo && name)) {
-        return Response.json(
-          { error: 'repo and name required', ok: false },
-          { status: 400 }
-        );
-      }
-      if (!PR_REVIEW_SKILLS.has(skill)) {
-        return Response.json(
-          { error: 'unknown skill', ok: false },
-          { status: 400 }
-        );
-      }
-      const source = ['ui', 'cli', 'raycast'].includes(
-        req.headers.get('x-setu-source')
-      )
-        ? req.headers.get('x-setu-source')
-        : 'portal';
-      return jsonTry(() => prReviewRun(repo, name, skill, source));
+      return prReviewRunRequest(req);
     }
 
     // Serves the report HTML directly (a genuinely self-contained file, only
     // external refs are Google Fonts <link> tags) — a new tab, not an iframe,
     // matching the existing "Open in browser" pattern for worktree URLs.
     if (pathname === '/api/pr-review/artifact' && method === 'GET') {
-      const p = new URL(req.url).searchParams;
-      const repo = p.get('repo'),
-        name = p.get('name'),
-        skill = p.get('skill');
-      if (!(repo && name)) {
-        return Response.json(
-          { error: 'repo and name required', ok: false },
-          { status: 400 }
-        );
-      }
-      if (!PR_REVIEW_SKILLS.has(skill)) {
-        return Response.json(
-          { error: 'unknown skill', ok: false },
-          { status: 400 }
-        );
-      }
-      const pr = await fetchPR(repo, await worktreeBranch(repo, name));
-      if (!pr.number) {
-        return new Response('No pull request for this worktree', {
-          status: 404,
-        });
-      }
-      const slug = REPO_META[repo]?.slug ?? repo;
-      const artifact = findLatestArtifact(slug, pr.number, skill, null);
-      const path =
-        artifact &&
-        artifactHtmlPath(
-          slug,
-          pr.number,
-          skill,
-          artifact.snapshot,
-          artifact.htmlFile
-        );
-      if (!(path && existsSync(path))) {
-        return new Response('No report generated yet', { status: 404 });
-      }
-      return new Response(Bun.file(path), {
-        headers: {
-          'Content-Security-Policy':
-            "sandbox allow-scripts; connect-src 'none'; form-action 'none'; base-uri 'none'",
-        },
-      });
+      return prReviewArtifactRequest(req);
     }
 
     return null;
@@ -4301,190 +4524,21 @@ export async function createPortalRuntime(options = {}) {
   // match first. That's why worktreeRoutes runs last in handle(): a body can
   // only be read once, and if this ran first it would swallow the body meant
   // for e.g. a POST to /api/settings before settingsRoutes ever saw it.
-  async function worktreeRoutes(req, pathname, method, server) {
-    const source = ['ui', 'cli', 'raycast'].includes(
-      req.headers.get('x-setu-source')
-    )
-      ? req.headers.get('x-setu-source')
-      : 'portal';
-    const query = Object.fromEntries(new URL(req.url).searchParams);
-    const resourceResponse = await dispatchPortalResourceRoute(
-      portalB205Composition,
-      req
-    );
-    if (resourceResponse) {
-      return resourceResponse;
-    }
-    if (pathname === '/api/setup-progress' && method === 'GET') {
-      if (!setupRecovery.ok) {
-        return Response.json(setupRecovery);
-      }
-      const records = [];
-      for (const row of portEntries(WORKSPACE)) {
-        if (
-          (query.repo && query.repo !== row.repo) ||
-          (query.name && query.name !== row.name)
-        ) {
-          continue;
-        }
-        const record = setupProgress.get({ name: row.name, repo: row.repo });
-        if (record?.ok === false) {
-          return Response.json(record);
-        }
-        if (record) {
-          records.push(record);
-        }
-      }
-      return Response.json({ ok: true, records });
-    }
-    if (pathname === '/api/setup-progress/retry' && method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      return Response.json(await retrySetupProgress(body, source));
-    }
-    if (pathname === '/api/workspace-inventory' && method === 'GET') {
-      server?.timeout(req, 0);
-      return Response.json(await workspaceInventory.read());
-    }
-    if (pathname === '/api/worktrees/adopt' && method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      const source = ['ui', 'cli', 'raycast'].includes(
-        req.headers.get('x-setu-source')
-      )
-        ? req.headers.get('x-setu-source')
-        : 'portal';
-      return jsonTry(() =>
-        adoptWorktree(body.repo, body.name, body.path, source)
-      );
-    }
-    if (pathname === '/api/worktrees') {
-      // Same idleTimeout hazard /api/sweep already documents and fixes (see
-      // its own comment) -- 45+ worktrees each potentially needing an
-      // uncached `gh pr view` subprocess (fetchPR's 60s TTL, cold right after
-      // a portal restart) can genuinely exceed Bun's default 10s idle timeout
-      // for a real HTTP client (web UI, Raycast) hitting this route directly.
-      server?.timeout(req, 0);
-      return Response.json(
-        new URL(req.url).searchParams.get('snapshot') === '1'
-          ? await getWorktreeSnapshot()
-          : await getWorktrees()
-      );
-    }
-
-    // Full list, most-recent-first: same client-side-pagination convention
-    // /api/worktrees already uses (the frontend slices into pages, not this
-    // endpoint), so the archive view stays consistent with the main list
-    // instead of inventing server-side pagination just for itself.
-    if (pathname === '/api/worktrees/archived') {
-      return Response.json([...loadArchivedWorktrees(WORKSPACE)].reverse());
-    }
-
-    if (pathname === '/api/status') {
-      return Response.json(
-        await computeStatus(
-          new URL(req.url).searchParams.get('refresh') === '1'
-        )
-      );
-    }
-
-    if (pathname === '/api/logs') {
-      const p = new URL(req.url).searchParams;
-      const repo = p.get('repo'),
-        name = p.get('name');
-      // Polling this endpoint only happens while a LogModal/LiveLog panel is
-      // actually mounted for this worktree (portal/components/logs.tsx). That's
-      // a real "someone is watching" signal, unlike the always-on
-      // /api/worktrees list poll. Counts toward the idle-timeout clock below.
-      if (repo && name) {
-        touchLastSeen(repo, name);
-      }
-      const res = tailLog(
-        repo,
-        name,
-        p.get('type') ?? 'dev',
-        Number(p.get('n') ?? 150)
-      );
-      return Response.json(res);
-    }
-
-    if (pathname === '/api/deploy/preflight' && method === 'GET') {
-      const p = new URL(req.url).searchParams;
-      return Response.json(
-        await deploymentGuard.preflight({
-          name: p.get('name'),
-          provider: p.get('provider'),
-          repo: p.get('repo'),
-          target: p.get('target'),
-        })
-      );
-    }
-
-    // Deploy status is also folded into /api/worktrees (vercelDeploy field,
-    // same convention as pr/tunnelRunning) for the poll loop the UI already
-    // runs. This exists alongside that fold for a caller that wants just one
-    // worktree's deploy state without fetching the whole list.
-    if (pathname === '/api/vercel/status') {
-      const p = new URL(req.url).searchParams;
-      return Response.json(vercelStatus(p.get('repo'), p.get('name')));
-    }
-
-    // Same "also reachable standalone" convention as /api/vercel/status above.
-    if (pathname === '/api/netlify/status') {
-      const p = new URL(req.url).searchParams;
-      return Response.json(netlifyStatus(p.get('repo'), p.get('name')));
-    }
-
-    // Same "also reachable standalone" convention as /api/vercel/status above.
-    if (pathname === '/api/convex/status') {
-      const p = new URL(req.url).searchParams;
-      return Response.json(convexDeployStatus(p.get('repo'), p.get('name')));
-    }
-
-    // Manual-fetch, not polled (see DiffViewer): a human actually looking at a
-    // worktree's diff is real activity, same as opening its log viewer above.
-    if (pathname === '/api/diff') {
-      const p = new URL(req.url).searchParams;
-      const repo = p.get('repo'),
-        name = p.get('name');
-      if (!(repo && name)) {
-        return Response.json(
-          { error: 'repo and name required', ok: false },
-          { status: 400 }
-        );
-      }
+  async function worktreeActionRequest(req, pathname, source) {
+    const body = await req.json().catch(() => ({}));
+    const { repo, name, tool, tunnel, container, target, reason } = body;
+    // Any POST action referencing a specific worktree (start/stop/sync/
+    // tunnel/inngest/trigger/open) is real, user-driven activity. Touch it
+    // once here rather than at each branch below.
+    if (repo && name) {
       touchLastSeen(repo, name);
-      return jsonTry(() => computeDiff(repo, name));
     }
 
-    // Repo-scoped, not worktree-scoped -- no touchLastSeen call, unlike every
-    // other route in this block (there's no single worktree this action is
-    // "about"). GET-only, so it's safe to sit inside worktreeRoutes despite
-    // that function's own POST-body-consuming hazard (see worktreeRoutes'
-    // comment above) -- a GET never reads req.json().
-    if (pathname === '/api/repo-prs') {
-      const repo = new URL(req.url).searchParams.get('repo');
-      if (!repo) {
-        return Response.json(
-          { error: 'repo required', ok: false },
-          { status: 400 }
-        );
-      }
-      return jsonTry(() => fetchRepoPRs(repo));
-    }
-
-    if (method === 'POST') {
-      const body = await req.json().catch(() => ({}));
-      const { repo, name, tool, tunnel, container, target, reason } = body;
-      // Any POST action referencing a specific worktree (start/stop/sync/
-      // tunnel/inngest/trigger/open) is real, user-driven activity. Touch it
-      // once here rather than at each branch below.
-      if (repo && name) {
-        touchLastSeen(repo, name);
-      }
-
-      if (pathname === '/api/create') {
+    switch (pathname) {
+      case '/api/create': {
         return jsonTry(() => createWorktree(repo, name, !!tunnel, source));
       }
-      if (pathname === '/api/remove') {
+      case '/api/remove': {
         return jsonTry(() =>
           removeWorktree(
             repo,
@@ -4496,10 +4550,10 @@ export async function createPortalRuntime(options = {}) {
           )
         );
       }
-      if (pathname === '/api/remove/cancel') {
+      case '/api/remove/cancel': {
         return Response.json(await removals.cancel(body.operationId));
       }
-      if (pathname === '/api/start') {
+      case '/api/start': {
         // Container is the default for dev servers, not opt-in — but ONLY when
         // nobody expressed a preference. `container` explicitly true/false
         // (a CLI --container/--bare flag) always wins. Omitted entirely (a
@@ -4515,43 +4569,43 @@ export async function createPortalRuntime(options = {}) {
           await startWorktreeByName(repo, name, container, source)
         );
       }
-      if (pathname === '/api/stop') {
+      case '/api/stop': {
         return Response.json(await stopWorktreeByName(repo, name, source));
       }
-      if (pathname === '/api/sync') {
+      case '/api/sync': {
         return jsonTry(() => syncWorktreeByName(repo, name, source));
       }
-      if (pathname === '/api/pr/create') {
+      case '/api/pr/create': {
         return jsonTry(() => createPr(repo, name, source));
       }
-      if (pathname === '/api/pr/ready') {
+      case '/api/pr/ready': {
         return jsonTry(() => setPrReady(repo, name, !!body.ready, source));
       }
-      if (pathname === '/api/tunnel/enable') {
+      case '/api/tunnel/enable': {
         return Response.json(await enableTunnelByName(repo, name, source));
       }
-      if (pathname === '/api/tunnel/disable') {
+      case '/api/tunnel/disable': {
         return Response.json(await disableTunnelByName(repo, name, source));
       }
-      if (pathname === '/api/inngest/start') {
+      case '/api/inngest/start': {
         return Response.json(await startInngestByName(repo, name, source));
       }
-      if (pathname === '/api/inngest/stop') {
+      case '/api/inngest/stop': {
         return Response.json(await stopInngestByName(repo, name, source));
       }
-      if (pathname === '/api/trigger/start') {
+      case '/api/trigger/start': {
         return Response.json(await startTriggerByName(repo, name, source));
       }
-      if (pathname === '/api/trigger/stop') {
+      case '/api/trigger/stop': {
         return Response.json(await stopTriggerByName(repo, name, source));
       }
-      if (pathname === '/api/convex/start') {
+      case '/api/convex/start': {
         return Response.json(await startConvexByName(repo, name, source));
       }
-      if (pathname === '/api/convex/stop') {
+      case '/api/convex/stop': {
         return Response.json(await stopConvexByName(repo, name, source));
       }
-      if (pathname === '/api/convex/deploy') {
+      case '/api/convex/deploy': {
         if (!target) {
           return Response.json({
             code: 'INVALID_DEPLOY_TARGET',
@@ -4563,7 +4617,7 @@ export async function createPortalRuntime(options = {}) {
           deployToConvex(repo, name, target, body.expectedContext, source)
         );
       }
-      if (pathname === '/api/vercel/deploy') {
+      case '/api/vercel/deploy': {
         if (!target) {
           return Response.json({
             code: 'INVALID_DEPLOY_TARGET',
@@ -4575,7 +4629,7 @@ export async function createPortalRuntime(options = {}) {
           deployToVercel(repo, name, target, body.expectedContext, source)
         );
       }
-      if (pathname === '/api/netlify/deploy') {
+      case '/api/netlify/deploy': {
         if (!target) {
           return Response.json({
             code: 'INVALID_DEPLOY_TARGET',
@@ -4587,7 +4641,7 @@ export async function createPortalRuntime(options = {}) {
           deployToNetlify(repo, name, target, body.expectedContext, source)
         );
       }
-      if (pathname === '/api/open') {
+      case '/api/open': {
         if (['claude', 'claude-code', 'codex'].includes(tool)) {
           return Response.json(
             await managedAgents.open({ name, repo, source, tool })
@@ -4599,9 +4653,226 @@ export async function createPortalRuntime(options = {}) {
           )
         );
       }
-      if (pathname === '/api/ports/kill') {
+      case '/api/ports/kill': {
         const { pid, port } = body;
         return Response.json(await killPort(port, pid));
+      }
+      default:
+        return null;
+    }
+  }
+
+  function setupProgressResponse(query) {
+    if (!setupRecovery.ok) {
+      return Response.json(setupRecovery);
+    }
+    const records = [];
+    for (const row of portEntries(WORKSPACE)) {
+      if (
+        (query.repo && query.repo !== row.repo) ||
+        (query.name && query.name !== row.name)
+      ) {
+        continue;
+      }
+      const record = setupProgress.get({ name: row.name, repo: row.repo });
+      if (record?.ok === false) {
+        return Response.json(record);
+      }
+      if (record) {
+        records.push(record);
+      }
+    }
+    return Response.json({ ok: true, records });
+  }
+
+  function worktreeLogsResponse(req) {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name');
+    // Polling this endpoint only happens while a LogModal/LiveLog panel is
+    // actually mounted for this worktree (portal/components/logs.tsx). That's
+    // a real "someone is watching" signal, unlike the always-on
+    // /api/worktrees list poll. Counts toward the idle-timeout clock below.
+    if (repo && name) {
+      touchLastSeen(repo, name);
+    }
+    const res = tailLog(
+      repo,
+      name,
+      p.get('type') ?? 'dev',
+      Number(p.get('n') ?? 150)
+    );
+    return Response.json(res);
+  }
+
+  function worktreeDiffResponse(req) {
+    const p = new URL(req.url).searchParams;
+    const repo = p.get('repo'),
+      name = p.get('name');
+    if (!(repo && name)) {
+      return Response.json(
+        { error: 'repo and name required', ok: false },
+        { status: 400 }
+      );
+    }
+    touchLastSeen(repo, name);
+    return jsonTry(() => computeDiff(repo, name));
+  }
+
+  async function worktreeDataRequest(req, pathname, portalServer) {
+    switch (pathname) {
+      case '/api/worktrees': {
+        // Same idleTimeout hazard /api/sweep already documents and fixes (see
+        // its own comment) -- 45+ worktrees each potentially needing an
+        // uncached `gh pr view` subprocess (fetchPR's 60s TTL, cold right after
+        // a portal restart) can genuinely exceed Bun's default 10s idle timeout
+        // for a real HTTP client (web UI, Raycast) hitting this route directly.
+        portalServer?.timeout(req, 0);
+        return Response.json(
+          new URL(req.url).searchParams.get('snapshot') === '1'
+            ? await getWorktreeSnapshot()
+            : await getWorktrees()
+        );
+      }
+
+      // Full list, most-recent-first: same client-side-pagination convention
+      // /api/worktrees already uses (the frontend slices into pages, not this
+      // endpoint), so the archive view stays consistent with the main list
+      // instead of inventing server-side pagination just for itself.
+      case '/api/worktrees/archived': {
+        return Response.json([...loadArchivedWorktrees(WORKSPACE)].reverse());
+      }
+
+      case '/api/status': {
+        return Response.json(
+          await computeStatus(
+            new URL(req.url).searchParams.get('refresh') === '1'
+          )
+        );
+      }
+
+      case '/api/logs': {
+        return worktreeLogsResponse(req);
+      }
+
+      // Deploy status is also folded into /api/worktrees (vercelDeploy field,
+      // same convention as pr/tunnelRunning) for the poll loop the UI already
+      // runs. This exists alongside that fold for a caller that wants just one
+      // worktree's deploy state without fetching the whole list.
+      case '/api/vercel/status': {
+        const p = new URL(req.url).searchParams;
+        return Response.json(vercelStatus(p.get('repo'), p.get('name')));
+      }
+
+      // Same "also reachable standalone" convention as /api/vercel/status above.
+      case '/api/netlify/status': {
+        const p = new URL(req.url).searchParams;
+        return Response.json(netlifyStatus(p.get('repo'), p.get('name')));
+      }
+
+      // Same "also reachable standalone" convention as /api/vercel/status above.
+      case '/api/convex/status': {
+        const p = new URL(req.url).searchParams;
+        return Response.json(convexDeployStatus(p.get('repo'), p.get('name')));
+      }
+
+      // Manual-fetch, not polled (see DiffViewer): a human actually looking at a
+      // worktree's diff is real activity, same as opening its log viewer above.
+      case '/api/diff': {
+        return worktreeDiffResponse(req);
+      }
+
+      // Repo-scoped, not worktree-scoped -- no touchLastSeen call, unlike every
+      // other route in this block (there's no single worktree this action is
+      // "about"). GET-only, so it's safe to sit inside worktreeRoutes despite
+      // that function's own POST-body-consuming hazard (see worktreeRoutes'
+      // comment above) -- a GET never reads req.json().
+      case '/api/repo-prs': {
+        const repo = new URL(req.url).searchParams.get('repo');
+        if (!repo) {
+          return Response.json(
+            { error: 'repo required', ok: false },
+            { status: 400 }
+          );
+        }
+        return jsonTry(() => fetchRepoPRs(repo));
+      }
+      default:
+        return null;
+    }
+  }
+
+  async function worktreeRoutes(req, pathname, method, portalServer) {
+    const source = ['ui', 'cli', 'raycast'].includes(
+      req.headers.get('x-setu-source')
+    )
+      ? req.headers.get('x-setu-source')
+      : 'portal';
+    const query = Object.fromEntries(new URL(req.url).searchParams);
+    const resourceResponse = await dispatchPortalResourceRoute(
+      portalB205Composition,
+      req
+    );
+    if (resourceResponse) {
+      return resourceResponse;
+    }
+    switch (`${method} ${pathname}`) {
+      case 'GET /api/setup-progress': {
+        return setupProgressResponse(query);
+      }
+      case 'POST /api/setup-progress/retry': {
+        const body = await req.json().catch(() => ({}));
+        return Response.json(await retrySetupProgress(body, source));
+      }
+      case 'GET /api/workspace-inventory': {
+        portalServer?.timeout(req, 0);
+        return Response.json(await workspaceInventory.read());
+      }
+      case 'POST /api/worktrees/adopt': {
+        const body = await req.json().catch(() => ({}));
+        const adoptionSource = ['ui', 'cli', 'raycast'].includes(
+          req.headers.get('x-setu-source')
+        )
+          ? req.headers.get('x-setu-source')
+          : 'portal';
+        return jsonTry(() =>
+          adoptWorktree(body.repo, body.name, body.path, adoptionSource)
+        );
+      }
+      case 'GET /api/deploy/preflight': {
+        const p = new URL(req.url).searchParams;
+        return Response.json(
+          await deploymentGuard.preflight({
+            name: p.get('name'),
+            provider: p.get('provider'),
+            repo: p.get('repo'),
+            target: p.get('target'),
+          })
+        );
+      }
+
+      default:
+        break;
+    }
+    switch (pathname) {
+      case '/api/worktrees':
+      case '/api/worktrees/archived':
+      case '/api/status':
+      case '/api/logs':
+      case '/api/vercel/status':
+      case '/api/netlify/status':
+      case '/api/convex/status':
+      case '/api/diff':
+      case '/api/repo-prs':
+        return worktreeDataRequest(req, pathname, portalServer);
+      default:
+        break;
+    }
+
+    if (method === 'POST') {
+      const response = await worktreeActionRequest(req, pathname, source);
+      if (response) {
+        return response;
       }
     }
 
@@ -4662,86 +4933,7 @@ export async function createPortalRuntime(options = {}) {
     }
   }
 
-  async function handle(req, server) {
-    const denied = portalRequestError(
-      req,
-      server.requestIP(req)?.address,
-      PORT
-    );
-    if (denied) {
-      return Response.json({ error: denied, ok: false }, { status: 403 });
-    }
-    const { pathname } = new URL(req.url);
-    const method = req.method;
-
-    if (method === 'POST' && pathname.startsWith('/api/')) {
-      server?.timeout(req, 0);
-    }
-
-    // OAuth's redirect is a GET, but its callback exchanges and persists tokens.
-    if (method === 'GET' && pathname.startsWith('/api/mcp/oauth/callback/')) {
-      const result = await updateControl.mutate(() =>
-        routeRequest(req, server, pathname, method)
-      );
-      return result instanceof Response
-        ? result
-        : Response.json(result, { status: 409 });
-    }
-
-    // The legacy actions.log only covers HTTP POST routes. Shared services
-    // separately record MCP and HTTP outcomes in the durable operation journal.
-    if (method !== 'POST' || !pathname.startsWith('/api/')) {
-      return routeRequest(req, server, pathname, method);
-    }
-
-    // Request bodies can only be read once and every route handler below
-    // already does its own req.json() internally -- clone before routing so
-    // this wrapper can independently read the same body for the log entry.
-    const bodyClone = req.clone();
-    const body = await bodyClone.json().catch(() => null);
-    const outcome = routeOutcomeKinds[pathname]
-      ? await operationOutcomes.accept({
-          kind: routeOutcomeKinds[pathname],
-          source: ['ui', 'cli', 'raycast'].includes(
-            req.headers.get('x-setu-source')
-          )
-            ? req.headers.get('x-setu-source')
-            : 'portal',
-          target:
-            typeof body?.repo === 'string' && typeof body?.name === 'string'
-              ? { name: body.name, repo: body.repo }
-              : null,
-        })
-      : null;
-    let routed;
-    try {
-      routed = pathname.startsWith('/api/update/')
-        ? await routeRequest(req, server, pathname, method)
-        : await updateControl.mutate(
-            () => routeRequest(req, server, pathname, method),
-            {
-              recovery: [
-                '/api/stop',
-                '/api/inngest/stop',
-                '/api/trigger/stop',
-                '/api/convex/stop',
-                '/api/raycast/stop',
-                '/api/mcp/disconnect',
-              ].includes(pathname),
-            }
-          );
-    } catch (error) {
-      logAction(pathname, body, false, error);
-      const result = {
-        error: String(error),
-        ok: false,
-        ...(error?.code ? { code: error.code } : {}),
-      };
-      return Response.json(
-        outcome ? await operationOutcomes.settle(outcome, result) : result,
-        { status: 500 }
-      );
-    }
+  async function completeMutationResponse(routed, pathname, body, outcome) {
     const res =
       routed instanceof Response
         ? routed
@@ -4766,7 +4958,95 @@ export async function createPortalRuntime(options = {}) {
     return Response.json(result, { headers: res.headers, status: res.status });
   }
 
-  async function routeRequest(req, server, pathname, method) {
+  async function handleMutationRequest(req, portalServer, pathname, method) {
+    // Request bodies can only be read once and every route handler below
+    // already does its own req.json() internally -- clone before routing so
+    // this wrapper can independently read the same body for the log entry.
+    const bodyClone = req.clone();
+    const body = await bodyClone.json().catch(() => null);
+    const outcome = routeOutcomeKinds[pathname]
+      ? await operationOutcomes.accept({
+          kind: routeOutcomeKinds[pathname],
+          source: ['ui', 'cli', 'raycast'].includes(
+            req.headers.get('x-setu-source')
+          )
+            ? req.headers.get('x-setu-source')
+            : 'portal',
+          target:
+            typeof body?.repo === 'string' && typeof body?.name === 'string'
+              ? { name: body.name, repo: body.repo }
+              : null,
+        })
+      : null;
+    let routed;
+    try {
+      routed = pathname.startsWith('/api/update/')
+        ? await routeRequest(req, portalServer, pathname, method)
+        : await updateControl.mutate(
+            () => routeRequest(req, portalServer, pathname, method),
+            {
+              recovery: [
+                '/api/stop',
+                '/api/inngest/stop',
+                '/api/trigger/stop',
+                '/api/convex/stop',
+                '/api/raycast/stop',
+                '/api/mcp/disconnect',
+              ].includes(pathname),
+            }
+          );
+    } catch (error) {
+      logAction(pathname, body, false, error);
+      const result = {
+        error: String(error),
+        ok: false,
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: route mutations may reject with null, primitives, or Error-like values.
+        ...(error?.code ? { code: error.code } : {}),
+      };
+      return Response.json(
+        outcome ? await operationOutcomes.settle(outcome, result) : result,
+        { status: 500 }
+      );
+    }
+    return completeMutationResponse(routed, pathname, body, outcome);
+  }
+
+  async function handle(req, portalServer) {
+    const denied = portalRequestError(
+      req,
+      portalServer.requestIP(req)?.address,
+      PORT
+    );
+    if (denied) {
+      return Response.json({ error: denied, ok: false }, { status: 403 });
+    }
+    const { pathname } = new URL(req.url);
+    const { method } = req;
+
+    if (method === 'POST' && pathname.startsWith('/api/')) {
+      portalServer?.timeout(req, 0);
+    }
+
+    // OAuth's redirect is a GET, but its callback exchanges and persists tokens.
+    if (method === 'GET' && pathname.startsWith('/api/mcp/oauth/callback/')) {
+      const result = await updateControl.mutate(() =>
+        routeRequest(req, portalServer, pathname, method)
+      );
+      return result instanceof Response
+        ? result
+        : Response.json(result, { status: 409 });
+    }
+
+    // The legacy actions.log only covers HTTP POST routes. Shared services
+    // separately record MCP and HTTP outcomes in the durable operation journal.
+    if (method !== 'POST' || !pathname.startsWith('/api/')) {
+      return routeRequest(req, portalServer, pathname, method);
+    }
+
+    return handleMutationRequest(req, portalServer, pathname, method);
+  }
+
+  async function routeRequest(req, portalServer, pathname, method) {
     // A successful upgrade must not fall through to the route handlers below,
     // hence the early return before the loop even starts. data seeds ws.data
     // with the per-connection Set that open/message/close use to track which
@@ -4774,7 +5054,7 @@ export async function createPortalRuntime(options = {}) {
     // time rather than reassigned later since ServerWebSocket.data is meant
     // to be set this way, not written to after the fact.
     if (pathname === '/ws') {
-      if (server.upgrade(req, { data: new Set() })) {
+      if (portalServer.upgrade(req, { data: new Set() })) {
         return;
       }
       return new Response('Upgrade failed', { status: 400 });
@@ -4792,8 +5072,8 @@ export async function createPortalRuntime(options = {}) {
     // request itself still needs the same idleTimeout override /api/sweep and
     // /api/worktrees already document.
     if (pathname === '/mcp') {
-      server?.timeout(req, 0);
-      return handleMcpRequest(req);
+      portalServer?.timeout(req, 0);
+      return handleMcpRequest(req, PORT);
     }
 
     if (pathname.startsWith('/api/') && !portalApiRoute(pathname, method)) {
@@ -4810,7 +5090,8 @@ export async function createPortalRuntime(options = {}) {
       raycastRoutes,
       worktreeRoutes,
     ]) {
-      const res = await routes(req, pathname, method, server);
+      // biome-ignore lint/performance/noAwaitInLoops: route order is contractual and handlers may consume the request body, so only the prior miss may fall through.
+      const res = await routes(req, pathname, method, portalServer);
       if (res) {
         return res;
       }
@@ -4830,7 +5111,7 @@ export async function createPortalRuntime(options = {}) {
 
   async function processFootprintMb(pid) {
     const out = await runText(['footprint', String(pid)], { timeoutMs: 3000 });
-    const match = out.match(/phys_footprint:\s*([\d.]+)\s*(KB|MB|GB)/i);
+    const match = out.match(FOOTPRINT_RE);
     if (match) {
       return (
         Number(match[1]) *
@@ -4844,6 +5125,7 @@ export async function createPortalRuntime(options = {}) {
   // script wrapper. Footprint sampling stays in the minute-scale watchdog.
   let processMemoryCache = null;
   let processMemoryAt = 0;
+  // biome-ignore lint/suspicious/useAwait: process-tree callers await this cache boundary and must receive synchronous command failures as rejections.
   async function processMemory() {
     if (!processMemoryCache || Date.now() - processMemoryAt > 5000) {
       processMemoryAt = Date.now();
@@ -4854,7 +5136,10 @@ export async function createPortalRuntime(options = {}) {
           .split('\n')
           .filter(Boolean)
           .map((line) => {
-            const [pid, ppid, pgid, rss] = line.trim().split(/\s+/).map(Number);
+            const [pid, ppid, pgid, rss] = line
+              .trim()
+              .split(WHITESPACE_RE)
+              .map(Number);
             return { pgid, pid, ppid, rss };
           })
       );
@@ -4899,18 +5184,24 @@ export async function createPortalRuntime(options = {}) {
     return [...new Map(rows.map((row) => [row.pid, row])).values()];
   }
 
-  async function checkMemoryCeilings() {
-    await Promise.all(
-      [inngestProcs, triggerProcs, convexDevProcs, sidecarProcs].map((map) =>
-        pruneDeadEntries(map, observeSidecarEntry)
-      )
-    );
-    for (const entry of lifecycle.snapshots()) {
-      if (entry.phase === 'unknown' && !entry.reserved) {
-        await lifecycle.reconcile(entry.key, entry.generation);
-      }
+  async function sampledMemory(rows) {
+    let mb = 0;
+    for (let i = 0; i < rows.length; i += 4) {
+      // biome-ignore lint/performance/noAwaitInLoops: process-footprint batches are intentionally capped at four before the next batch to bound probe pressure.
+      const samples = await Promise.all(
+        rows
+          .slice(i, i + 4)
+          .map(
+            async (row) => (await processFootprintMb(row.pid)) ?? row.rss / 1024
+          )
+      );
+      mb += samples.reduce((sum, value) => sum + value, 0);
     }
-    const sidecarKeys = new Set([
+    return mb;
+  }
+
+  function activeSidecarKeys() {
+    return new Set([
       ...inngestProcs.keys(),
       ...triggerProcs.keys(),
       ...convexDevProcs.keys(),
@@ -4918,25 +5209,16 @@ export async function createPortalRuntime(options = {}) {
         key.slice(0, key.lastIndexOf('/'))
       ),
     ]);
-    for (const key of sidecarKeys) {
+  }
+
+  async function checkSidecarMemory() {
+    for (const key of activeSidecarKeys()) {
       const entry = lifecycle.snapshot(key);
       if (entry?.reserved && !entry.container) {
         continue;
       }
-      const rows = await worktreeProcessTree(key, null);
-      let mb = 0;
-      for (let i = 0; i < rows.length; i += 4) {
-        mb += (
-          await Promise.all(
-            rows
-              .slice(i, i + 4)
-              .map(
-                async (row) =>
-                  (await processFootprintMb(row.pid)) ?? row.rss / 1024
-              )
-          )
-        ).reduce((a, b) => a + b, 0);
-      }
+      // biome-ignore lint/performance/noAwaitInLoops: stopping a prior over-limit sidecar changes shared lifecycle admission before the next key is measured.
+      const mb = await sampledMemory(await worktreeProcessTree(key, null));
       if (mb <= DEV_MEM_CEILING_MB) {
         continue;
       }
@@ -4955,41 +5237,41 @@ export async function createPortalRuntime(options = {}) {
         console.error(`${key} sidecar stop failed:`, failed.reason);
       }
     }
+  }
+
+  function currentBareRuntime(current, entry) {
+    return (
+      current?.reserved &&
+      current.generation === entry.generation &&
+      !current.stopping &&
+      current.phase !== 'unknown' &&
+      !current.container
+    );
+  }
+
+  function currentGeneration(latest, entry) {
+    return (
+      latest?.reserved &&
+      latest.generation === entry.generation &&
+      !latest.stopping
+    );
+  }
+
+  async function checkDevMemory() {
     for (const entry of lifecycle.snapshots()) {
       if (!entry.reserved || entry.stopping) {
         continue;
       }
       const { key } = entry;
+      // biome-ignore lint/performance/noAwaitInLoops: reconciliation establishes the generation checked below and must finish before restart eligibility is evaluated.
       await lifecycle.reconcile(key, entry.generation);
       const current = lifecycle.snapshot(key);
-      if (
-        !current?.reserved ||
-        current.generation !== entry.generation ||
-        current.stopping ||
-        current.phase === 'unknown' ||
-        current.container
-      ) {
+      if (!currentBareRuntime(current, entry)) {
         continue;
       }
-      const tree = await worktreeProcessTree(key, current);
-      let mb = 0;
-      for (let i = 0; i < tree.length; i += 4) {
-        const samples = await Promise.all(
-          tree
-            .slice(i, i + 4)
-            .map(
-              async (row) =>
-                (await processFootprintMb(row.pid)) ?? row.rss / 1024
-            )
-        );
-        mb += samples.reduce((sum, value) => sum + value, 0);
-      }
+      const mb = await sampledMemory(await worktreeProcessTree(key, current));
       const latest = lifecycle.snapshot(key);
-      if (
-        !latest?.reserved ||
-        latest.generation !== entry.generation ||
-        latest.stopping
-      ) {
+      if (!currentGeneration(latest, entry)) {
         continue;
       }
       if (mb > DEV_MEM_CEILING_MB) {
@@ -5002,6 +5284,22 @@ export async function createPortalRuntime(options = {}) {
         }
       }
     }
+  }
+
+  async function checkMemoryCeilings() {
+    await Promise.all(
+      [inngestProcs, triggerProcs, convexDevProcs, sidecarProcs].map((map) =>
+        pruneDeadEntries(map, observeSidecarEntry)
+      )
+    );
+    for (const entry of lifecycle.snapshots()) {
+      if (entry.phase === 'unknown' && !entry.reserved) {
+        // biome-ignore lint/performance/noAwaitInLoops: reconciliation mutates shared lifecycle state; preserve the snapshot's established order.
+        await lifecycle.reconcile(entry.key, entry.generation);
+      }
+    }
+    await checkSidecarMemory();
+    await checkDevMemory();
   }
 
   let memoryCheckRunning = false;
@@ -5047,6 +5345,21 @@ export async function createPortalRuntime(options = {}) {
   // server that's still booting can't get stopped mid-start.
   const IDLE_MIN_UPTIME_MS = 2 * 60_000;
 
+  function idleDuration(entry, now, threshold) {
+    if (!entry.reserved || entry.stopping || entry.container) {
+      return null;
+    }
+    if (activeTunnelMap.has(entry.key)) {
+      return null;
+    }
+    const seenAt = lastSeenAt.get(entry.key);
+    if (seenAt === null || seenAt === undefined) {
+      return null; // no baseline yet, nothing to measure against
+    }
+    const idleMs = now - seenAt;
+    return idleMs < threshold ? null : idleMs;
+  }
+
   function checkIdleTimeouts() {
     if (!IDLE_TIMEOUT_MS) {
       return;
@@ -5055,29 +5368,16 @@ export async function createPortalRuntime(options = {}) {
     const threshold = Math.max(IDLE_TIMEOUT_MS, IDLE_MIN_UPTIME_MS);
     for (const entry of lifecycle.snapshots()) {
       const { key } = entry;
-      if (!entry.reserved || entry.stopping) {
-        continue;
-      }
       // Container-mode worktrees already have Docker's own lifecycle (restart
       // policy, plus checkMemoryCeilings' dead-container reap above). This
       // check is bare-process-only.
-      if (entry.container) {
-        continue;
-      }
       // A worktree with an active public tunnel route can be getting real
       // traffic from outside this portal entirely (someone hitting the public
       // URL) — none of that shows up as a portal-side request, so lastSeenAt
       // can't see it. Leave tunneled worktrees out of idle-timeout scope
       // rather than risk stopping a server that's actually serving traffic.
-      if (activeTunnelMap.has(key)) {
-        continue;
-      }
-      const seenAt = lastSeenAt.get(key);
-      if (seenAt === null || seenAt === undefined) {
-        continue; // no baseline yet, nothing to measure against
-      }
-      const idleMs = now - seenAt;
-      if (idleMs < threshold) {
+      const idleMs = idleDuration(entry, now, threshold);
+      if (idleMs === null) {
         continue;
       }
       const { repo, name } = splitKey(key);
@@ -5116,6 +5416,7 @@ export async function createPortalRuntime(options = {}) {
     return lifecycle.refreshCapacity();
   }
 
+  // biome-ignore lint/suspicious/useAwait: status routes and stream snapshots await this boundary and require synchronous collaborator failures as rejections.
   async function computeStatus(refreshHealth = false) {
     return readPortalStatus(
       {
@@ -5287,6 +5588,26 @@ export async function createPortalRuntime(options = {}) {
     return path;
   }
 
+  function readSetupProgress(repo, name) {
+    if (!setupRecovery.ok) {
+      return setupRecovery;
+    }
+    const records = [];
+    for (const row of portEntries(WORKSPACE)) {
+      if ((repo && row.repo !== repo) || (name && row.name !== name)) {
+        continue;
+      }
+      const record = setupProgress.get({ name: row.name, repo: row.repo });
+      if (record?.ok === false) {
+        return record;
+      }
+      if (record) {
+        records.push(record);
+      }
+    }
+    return { ok: true, records };
+  }
+
   function installMcpTools() {
     (options.initializeMcp ?? initMcpServer)({
       admissionStatus: () => portalB205.admissionStatus(),
@@ -5343,25 +5664,9 @@ export async function createPortalRuntime(options = {}) {
         removeWorktree(repo, name, reason, force, operationId, 'mcp'),
       saveMcpAction: (input) => portalB205.saveMcpAction(input),
       setPrReady: (repo, name, ready) => setPrReady(repo, name, ready, 'mcp'),
-      setupProgress: async ({ repo, name } = {}) => {
-        if (!setupRecovery.ok) {
-          return setupRecovery;
-        }
-        const records = [];
-        for (const row of portEntries(WORKSPACE)) {
-          if ((repo && row.repo !== repo) || (name && row.name !== name)) {
-            continue;
-          }
-          const record = setupProgress.get({ name: row.name, repo: row.repo });
-          if (record?.ok === false) {
-            return record;
-          }
-          if (record) {
-            records.push(record);
-          }
-        }
-        return { ok: true, records };
-      },
+      // Keep this async so synchronous progress-store failures reject through MCP.
+      setupProgress: async ({ repo, name } = {}) =>
+        readSetupProgress(repo, name),
       setupRetry: (input) => retrySetupProgress(input, 'mcp'),
       sharedCaches: () => portalB205.sharedCaches(),
       startConvex: (repo, name) => startConvexByName(repo, name, 'mcp'),
@@ -5394,7 +5699,9 @@ export async function createPortalRuntime(options = {}) {
     );
     REPO_META = options.projects ?? loadProjects(WORKSPACE);
     setupRecovery = await setupProgress.recover();
-    await managedAgents.recover().catch(() => {});
+    await managedAgents.recover().catch(() => {
+      // Keep portal recovery access available if managed-agent reconciliation fails.
+    });
     updateControl = createPortalUpdateControl({
       hasSupportingWork: supportingWorkActive,
       lifecycle,
@@ -5439,7 +5746,7 @@ export async function createPortalRuntime(options = {}) {
     }, 5000);
     logRetentionTimer.unref?.();
     memoryCheckTimer = runtimeTimers.setInterval(() => {
-      void (async () => {
+      (async () => {
         if (memoryCheckRunning) {
           return;
         }
@@ -5509,7 +5816,7 @@ export async function createPortalRuntime(options = {}) {
       for (const signal of ['SIGINT', 'SIGTERM']) {
         processHooks.set(signal, () => {
           releaseHeldLocks();
-          void dispose().finally(() => process.exit(0));
+          dispose().finally(() => process.exit(0));
         });
       }
       for (const [event, listener] of processHooks) {
@@ -5535,7 +5842,7 @@ export async function createPortalRuntime(options = {}) {
       }
     }
     for (const entry of wsTopics.values()) {
-      if (entry.interval != null) {
+      if (entry.interval !== null && entry.interval !== undefined) {
         runtimeTimers.clearInterval(entry.interval);
       }
     }
@@ -5561,25 +5868,25 @@ export async function createPortalRuntime(options = {}) {
     handle,
     internals: {
       createPr,
-      setPrReady,
-      fetchDirty,
       dirtyCache,
-      killPort,
-      settingsRoutes,
-      runtimeState: {
-        inngestProcs,
-        triggerProcs,
-        convexDevProcs,
-        sidecarProcs,
-        lastSeenAt,
-      },
+      fetchDirty,
       fetchPR,
       getWorktrees,
+      killPort,
       mcpCallbackHtml,
       processTree,
       projectSetupTarget,
       readInventoryRuntime,
       repoGitMeta,
+      runtimeState: {
+        convexDevProcs,
+        inngestProcs,
+        lastSeenAt,
+        sidecarProcs,
+        triggerProcs,
+      },
+      setPrReady,
+      settingsRoutes,
       trimLog,
       waitForOutcomes: () => Promise.all([...pendingOutcomes]),
       worktreeContains,

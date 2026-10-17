@@ -33,7 +33,7 @@ test('an old topic lifecycle cannot publish or deliver into a replacement lifecy
   const first = socket(),
     second = socket();
   const opening = stream.open(first);
-  const oldTick = [...timers][0];
+  const [oldTick] = timers;
   oldTick();
   oldTick();
   expect(reads.length).toBe(2);
@@ -104,6 +104,7 @@ test('cold composition refreshes expired listeners before certifying its rows', 
   const result = await readFreshWorktreeSnapshot({
     listeners: {
       observation: () => ({ observedAt, state: 'ready' }),
+      // biome-ignore lint/suspicious/useAwait: Listener observations preserve the asynchronous refresh contract.
       read: async () => {
         reads += 1;
         observedAt = clock;
@@ -111,6 +112,7 @@ test('cold composition refreshes expired listeners before certifying its rows', 
     },
     now: () => clock,
     status: () => Promise.resolve({}),
+    // biome-ignore lint/suspicious/useAwait: Worktree composition preserves the asynchronous snapshot contract.
     worktrees: async () => {
       compositions += 1;
       if (compositions === 1) {

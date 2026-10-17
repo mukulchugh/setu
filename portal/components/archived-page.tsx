@@ -5,6 +5,7 @@
 // like ports-page.tsx/help-page.tsx: owns its own fetch, only needs
 // back-navigation and a recreate callback from the caller (the router
 // itself stays in app.tsx).
+import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import type { ArchivedWorktree } from '../app';
 import { inputCls, PageHeader } from '../ui';
@@ -50,6 +51,62 @@ export function ArchivedPage({
     currentPage * PAGE_SIZE,
     (currentPage + 1) * PAGE_SIZE
   );
+  let archiveContent: ComponentChildren;
+  if (loaded) {
+    if (matches.length) {
+      archiveContent = filtered.map((a, i) => (
+        <div
+          class="flex flex-wrap items-center gap-4 border-zinc-100 border-b px-4 py-3 transition-colors duration-150 last:border-0 hover:bg-white/50 dark:border-white/5 dark:hover:bg-white/5"
+          key={`${a.repo}/${a.name}/${a.removedAt}/${i}`}
+        >
+          <div class="min-w-0 flex-1">
+            <div class="flex min-w-0 flex-wrap items-baseline gap-2">
+              <span class="break-words font-medium text-zinc-900 dark:text-zinc-100">
+                {a.name}
+              </span>
+              <span class="board-mono shrink-0 font-bold text-[10px] text-zinc-300">
+                {a.label}
+              </span>
+              <Badge tone={a.reason === 'merged' ? 'emerald' : 'zinc'}>
+                {a.reason}
+              </Badge>
+            </div>
+            <div class="mt-0.5 flex min-w-0 flex-wrap items-center gap-3 text-xs text-zinc-400">
+              <span class="break-all font-mono">
+                {a.repo}/{a.branch}
+              </span>
+              <span class="shrink-0">Removed {relativeTime(a.removedAt)}</span>
+              {a.prUrl && (
+                <a
+                  class="shrink-0 transition-colors duration-150 hover:text-accent"
+                  href={a.prUrl}
+                  rel="noopener"
+                  target="_blank"
+                >
+                  View PR
+                </a>
+              )}
+            </div>
+          </div>
+          <Button compact onClick={() => onRecreate(a)} variant="secondary">
+            Recreate
+          </Button>
+        </div>
+      ));
+    } else {
+      archiveContent = (
+        <p class="px-4 py-6 text-center text-zinc-400">
+          {items.length
+            ? 'No archived worktrees match these filters.'
+            : 'No archived worktrees yet. Removed worktrees will appear here.'}
+        </p>
+      );
+    }
+  } else if (!failed) {
+    archiveContent = (
+      <p class="px-4 py-6 text-center text-zinc-400">Loading…</p>
+    );
+  }
 
   return (
     <div class="portal-page mx-auto max-w-4xl px-4 py-6 sm:px-6">
@@ -118,63 +175,7 @@ export function ArchivedPage({
         </p>
       )}
       <div class="overflow-hidden rounded-none border border-white/75 bg-white/70 text-sm shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/5">
-        {loaded ? (
-          matches.length ? (
-            filtered.map((a, i) => (
-              <div
-                class="flex flex-wrap items-center gap-4 border-zinc-100 border-b px-4 py-3 transition-colors duration-150 last:border-0 hover:bg-white/50 dark:border-white/5 dark:hover:bg-white/5"
-                key={`${a.repo}/${a.name}/${a.removedAt}/${i}`}
-              >
-                <div class="min-w-0 flex-1">
-                  <div class="flex min-w-0 flex-wrap items-baseline gap-2">
-                    <span class="break-words font-medium text-zinc-900 dark:text-zinc-100">
-                      {a.name}
-                    </span>
-                    <span class="board-mono shrink-0 font-bold text-[10px] text-zinc-300">
-                      {a.label}
-                    </span>
-                    <Badge tone={a.reason === 'merged' ? 'emerald' : 'zinc'}>
-                      {a.reason}
-                    </Badge>
-                  </div>
-                  <div class="mt-0.5 flex min-w-0 flex-wrap items-center gap-3 text-xs text-zinc-400">
-                    <span class="break-all font-mono">
-                      {a.repo}/{a.branch}
-                    </span>
-                    <span class="shrink-0">
-                      Removed {relativeTime(a.removedAt)}
-                    </span>
-                    {a.prUrl && (
-                      <a
-                        class="shrink-0 transition-colors duration-150 hover:text-accent"
-                        href={a.prUrl}
-                        rel="noopener"
-                        target="_blank"
-                      >
-                        View PR
-                      </a>
-                    )}
-                  </div>
-                </div>
-                <Button
-                  compact
-                  onClick={() => onRecreate(a)}
-                  variant="secondary"
-                >
-                  Recreate
-                </Button>
-              </div>
-            ))
-          ) : (
-            <p class="px-4 py-6 text-center text-zinc-400">
-              {items.length
-                ? 'No archived worktrees match these filters.'
-                : 'No archived worktrees yet. Removed worktrees will appear here.'}
-            </p>
-          )
-        ) : (
-          !failed && <p class="px-4 py-6 text-center text-zinc-400">Loading…</p>
-        )}
+        {archiveContent}
       </div>
 
       <Pagination onPage={setPage} page={currentPage} pageCount={pageCount} />

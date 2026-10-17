@@ -146,6 +146,68 @@ export function createWorkspaceStorage({
     const expired = () => now() - startedAt >= timeoutMs;
     const startedAt = now();
 
+    function inspectItem(item, isRoot) {
+      if (item.isSymbolicLink()) {
+        skippedSymlinks += 1;
+        if (isRoot) {
+          throw Object.assign(new Error('symbolic storage root'), {
+            code: 'ELOOP',
+          });
+        }
+        return false;
+      }
+      const key = inode(item);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      if (item.isFile()) {
+        logicalBytes += Number(item.size);
+        const bytes = allocation(item);
+        if (bytes === null) {
+          allocationKnown = false;
+        } else {
+          allocatedBytes += bytes;
+        }
+        return false;
+      }
+      return item.isDirectory();
+    }
+
+    async function childrenFor(path, isRoot) {
+      try {
+        const children = await readdirPath(path, { withFileTypes: true });
+        rootRead ||= isRoot;
+        return children;
+      } catch (error) {
+        if (isRoot) {
+          throw error;
+        }
+        stop(errorCode(error));
+        return null;
+      }
+    }
+
+    async function visitChildren(path, children) {
+      for (const child of children) {
+        if (partial || expired()) {
+          stop('TIME_LIMIT');
+          return;
+        }
+        const childPath = resolve(path, child.name);
+        if (excluded.has(childPath)) {
+          continue;
+        }
+        if (entries >= entryLimit) {
+          stop('ENTRY_LIMIT');
+          return;
+        }
+        entries += 1;
+        // biome-ignore lint/performance/noAwaitInLoops: Recursive scans share entry limits, time limits, and inode accounting in traversal order.
+        await visit(childPath);
+      }
+    }
+
     async function visit(path, isRoot = false) {
       if (partial || expired()) {
         stop('TIME_LIMIT');
@@ -161,59 +223,12 @@ export function createWorkspaceStorage({
         stop(errorCode(error));
         return;
       }
-      if (item.isSymbolicLink()) {
-        skippedSymlinks += 1;
-        if (isRoot) {
-          throw Object.assign(new Error('symbolic storage root'), {
-            code: 'ELOOP',
-          });
-        }
+      if (!inspectItem(item, isRoot)) {
         return;
       }
-      const key = inode(item);
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      if (item.isFile()) {
-        logicalBytes += Number(item.size);
-        const bytes = allocation(item);
-        if (bytes === null) {
-          allocationKnown = false;
-        } else {
-          allocatedBytes += bytes;
-        }
-        return;
-      }
-      if (!item.isDirectory()) {
-        return;
-      }
-      let children;
-      try {
-        children = await readdirPath(path, { withFileTypes: true });
-        rootRead ||= isRoot;
-      } catch (error) {
-        if (isRoot) {
-          throw error;
-        }
-        stop(errorCode(error));
-        return;
-      }
-      for (const child of children) {
-        if (partial || expired()) {
-          stop('TIME_LIMIT');
-          return;
-        }
-        const childPath = resolve(path, child.name);
-        if (excluded.has(childPath)) {
-          continue;
-        }
-        if (entries >= entryLimit) {
-          stop('ENTRY_LIMIT');
-          return;
-        }
-        entries += 1;
-        await visit(childPath);
+      const children = await childrenFor(path, isRoot);
+      if (children) {
+        await visitChildren(path, children);
       }
     }
 
@@ -305,6 +320,7 @@ export function createWorkspaceStorage({
       const observations = [];
       for (const root of configured) {
         // Sequential observations make the batch inode set deterministic.
+        // biome-ignore lint/performance/noAwaitInLoops: Roots share one inode set, so each scan must complete before the next reuses it.
         observations.push(await resultFor(root, seen, { refresh: true }));
       }
       return observations;
@@ -328,6 +344,7 @@ export function createWorkspaceStorage({
       const seen = new Set();
       const observations = [];
       for (const root of selected) {
+        // biome-ignore lint/performance/noAwaitInLoops: Selected roots share the same inode set for non-duplicated allocation totals.
         observations.push(await resultFor(root, seen, { refresh: true }));
       }
       return observations;

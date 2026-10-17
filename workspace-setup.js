@@ -7,13 +7,20 @@ import {
 } from './dependency-sharing.js';
 import { assertStorageHeadroom } from './host-health.js';
 
+const worktreePathPattern = /^worktree (.+)$/m;
+const worktreeBranchPattern = /^branch refs\/heads\/(.+)$/m;
+
 function dependencyInstallCommand(wtDir, exists) {
-  return exists(join(wtDir, 'package.json'))
-    ? ['bun', ['install']]
-    : exists(join(wtDir, 'pyproject.toml')) ||
-        exists(join(wtDir, 'requirements.txt'))
-      ? ['uv', ['sync']]
-      : null;
+  if (exists(join(wtDir, 'package.json'))) {
+    return ['bun', ['install']];
+  }
+  if (
+    exists(join(wtDir, 'pyproject.toml')) ||
+    exists(join(wtDir, 'requirements.txt'))
+  ) {
+    return ['uv', ['sync']];
+  }
+  return null;
 }
 
 function setupError(code, message) {
@@ -200,8 +207,7 @@ export function validateSetupAttempt({
     requireProgress(current);
   }
   if (
-    !current ||
-    current.state !== 'running' ||
+    current?.state !== 'running' ||
     current.attemptId !== setupAttempt.attemptId ||
     !sameValue(current.target, target) ||
     !sameValue(current.checkoutIdentity, checkoutIdentity) ||
@@ -217,7 +223,7 @@ export function validateSetupAttempt({
   return { completed: false, record: current };
 }
 
-async function resolveSetupAttempt(options) {
+function resolveSetupAttempt(options) {
   return options.setupAttempt
     ? validateSetupAttempt(options)
     : beginSetupAttempt(options);
@@ -251,14 +257,8 @@ async function setupFinish(progress, setup, outcome) {
   );
 }
 
-async function setupFailure(progress, setup, outcome) {
-  try {
-    await setupFinish(progress, setup, outcome);
-  } catch (error) {
-    // A late completion must not overwrite a newer attempt.  Preserve the
-    // precise mismatch rather than replacing the durable record again.
-    throw error;
-  }
+function setupFailure(progress, setup, outcome) {
+  return setupFinish(progress, setup, outcome);
 }
 
 async function preserveKnownFailure(progress, setup, error) {
@@ -295,6 +295,7 @@ function requireFreshSharedView(view, sharing, wtDir) {
     try {
       lstatSync(join(checkout, 'node_modules'));
     } catch (error) {
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: Filesystem adapters can throw non-Error values while probing an untrusted path.
       absent = error?.code === 'ENOENT';
     }
   }
@@ -313,7 +314,7 @@ export async function withSetupAdmission({
   admission,
   operationId,
   target,
-  withTarget = async (_target, task) => task(),
+  withTarget = async (_target, work) => work(),
   task,
 } = {}) {
   if (typeof task !== 'function' || typeof withTarget !== 'function') {
@@ -397,11 +398,11 @@ export async function startWorktreeSetupInstall(
   }
 ) {
   const { res } = context;
-  const result = (setup) => ({
+  const setupResult = (setupState) => ({
     domain: res.localDom,
     ok: true,
     port: res.port,
-    setup,
+    setup: setupState,
   });
   let command = dependencyInstallCommand(res.wtDir, exists);
   const setup = await resolveSetupAttempt({
@@ -413,13 +414,13 @@ export async function startWorktreeSetupInstall(
   });
   if (setup?.completed) {
     context.ready = true;
-    return result('ready');
+    return setupResult('ready');
   }
   if (!command) {
     await setupStage(progress, setup, 'no-dependencies');
     await setupFinish(progress, setup, 'completed');
     context.ready = true;
-    return result('ready');
+    return setupResult('ready');
   }
   let shared;
   try {
@@ -497,6 +498,7 @@ export async function startWorktreeSetupInstall(
       try {
         await stopProcess({ ownedGroup: true, pid: proc.pid });
       } catch {
+        // biome-ignore lint/style/useErrorCause: The existing unknown-outcome contract intentionally withholds process-stop details from setup callers.
         throw await unknownOutcome(
           progress,
           setup,
@@ -544,7 +546,7 @@ export async function startWorktreeSetupInstall(
       );
     }
   );
-  return { completion, result: result('installing') };
+  return { completion, result: setupResult('installing') };
 }
 
 export async function installWorktreeDependencies(
@@ -670,9 +672,9 @@ export async function createAndInstallWorktree({
     operationId,
     target,
     task: async () => {
-      const result = await create({ tunnel: false });
+      const created = await create({ tunnel: false });
       const identity = checkoutIdentity
-        ? await checkoutIdentity(result.wtDir)
+        ? await checkoutIdentity(created.wtDir)
         : undefined;
       const setup = await beginSetupAttempt({
         checkoutIdentity: identity,
@@ -681,10 +683,10 @@ export async function createAndInstallWorktree({
         target,
       });
       if (setup?.completed) {
-        return { ...result, setup: 'ready' };
+        return { ...created, setup: 'ready' };
       }
       try {
-        await install(result.wtDir, {
+        await install(created.wtDir, {
           checkoutIdentity: identity,
           logLocation,
           progress,
@@ -711,7 +713,7 @@ export async function createAndInstallWorktree({
         }
         throw error;
       }
-      return result;
+      return created;
     },
     withTarget: lock,
   });
@@ -791,6 +793,7 @@ export async function prepareWorktreeCheckout(
       `refs/heads/${branch}`,
       `refs/remotes/origin/${branch}`,
     ]) {
+      // biome-ignore lint/performance/noAwaitInLoops: Local branch lookup must precede the remote fallback and preserve its error result.
       const result = await run([
         'git',
         '-C',
@@ -825,7 +828,7 @@ export async function prepareWorktreeCheckout(
       .trim()
       .split('\n\n')
       .some((entry) => {
-        const path = entry.match(/^worktree (.+)$/m)?.[1];
+        const path = entry.match(worktreePathPattern)?.[1];
         return !!path && real(path) === real(wtDir);
       });
     if (!linked) {
@@ -836,8 +839,8 @@ export async function prepareWorktreeCheckout(
     return;
   }
   for (const entry of list.trim().split('\n\n')) {
-    const path = entry.match(/^worktree (.+)$/m)?.[1];
-    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
+    const path = entry.match(worktreePathPattern)?.[1];
+    const branch = entry.match(worktreeBranchPattern)?.[1];
     if (branch === name && path && resolve(path) !== resolve(wtDir)) {
       throw new Error(`Branch '${name}' is already checked out at ${path}`);
     }

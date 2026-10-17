@@ -16,9 +16,10 @@ test('malformed or contradictory mutation responses remain uncertain, never succ
         calls += 1;
         return Promise.resolve(response);
       }) as typeof fetch;
+      // biome-ignore lint/performance/noAwaitInLoops: Finish each request before replacing the shared global fetch fixture.
       expect(await post('/controlled-action', {})).toMatchObject({
-        ok: false,
         networkUncertain: true,
+        ok: false,
       });
       expect(calls).toBe(1);
     }
@@ -32,15 +33,15 @@ test('partial removal and committed save warnings retain their recovery identity
   try {
     for (const value of [
       {
+        error: 'Cleanup pending',
         ok: false,
-        removed: true,
         operationId: 'same-operation',
         pendingSteps: ['routing'],
-        error: 'Cleanup pending',
+        removed: true,
       },
       {
-        ok: true,
         committed: true,
+        ok: true,
         reconciled: true,
         warning: { code: 'STATE_DURABILITY_UNCONFIRMED' },
       },
@@ -49,6 +50,7 @@ test('partial removal and committed save warnings retain their recovery identity
         Promise.resolve(
           Response.json(value, { status: value.ok ? 200 : 409 })
         )) as typeof fetch;
+      // biome-ignore lint/performance/noAwaitInLoops: Finish each request before replacing the shared global fetch fixture.
       expect(await post('/controlled-action', {})).toEqual(value);
     }
   } finally {

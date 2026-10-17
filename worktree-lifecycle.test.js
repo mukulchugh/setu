@@ -29,7 +29,7 @@ function fixture(options = {}) {
   const launches = [];
   const stops = [];
   const runtime = {
-    async launch(t, spec, register, options) {
+    launch(t, spec, register, launchOptions) {
       const exit = deferred();
       const handle = {
         exit,
@@ -38,21 +38,22 @@ function fixture(options = {}) {
         pid: 100 + launches.length,
         state: 'alive',
       };
-      launches.push({ handle, options, spec, target: t });
+      launches.push({ handle, options: launchOptions, spec, target: t });
       running.set(t.key, handle);
       register(handle);
-      return { skippedSidecars: [] };
+      return Promise.resolve({ skippedSidecars: [] });
     },
-    async observe(_target, handle) {
-      return handle?.state ?? 'dead';
+    observe(_target, handle) {
+      return Promise.resolve(handle?.state ?? 'dead');
     },
-    async stop(t, handle, options) {
-      stops.push({ handle, options, target: t });
+    stop(t, handle, stopOptions) {
+      stops.push({ handle, options: stopOptions, target: t });
       if (handle) {
         handle.state = 'dead';
         handle.exit?.resolve(0);
       }
       running.delete(t.key);
+      return Promise.resolve();
     },
     ...options.runtime,
   };
@@ -93,6 +94,7 @@ function fixture(options = {}) {
       for (const [id, timer] of [...timers]) {
         if (timer.at <= now) {
           timers.delete(id);
+          // biome-ignore lint/performance/noAwaitInLoops: Each fake timer must finish updating lifecycle state before the next fires.
           await timer.fn();
         }
       }
@@ -135,7 +137,7 @@ test('waitForStart remains pending through queueing and starting, then resolves 
   const waiting = f.lifecycle.waitForStart(target('b'));
   expect(f.lifecycle.waitForStart(target('b'))).toBe(waiting);
   let settled = false;
-  void waiting.then(() => {
+  waiting.then(() => {
     settled = true;
   });
   await Promise.resolve();
@@ -153,9 +155,7 @@ test('waitForStart remains pending through queueing and starting, then resolves 
 test('waitForStart reports a known failure or queued cancellation before running', async () => {
   const failed = fixture({
     controller: {
-      validateTarget: async () => {
-        throw new Error('fixture target refused');
-      },
+      validateTarget: () => Promise.reject(new Error('fixture target refused')),
     },
   });
   await failed.lifecycle.start(target('a'), false);
@@ -399,7 +399,7 @@ test('VM shrink refuses restart before tearing down the previously admitted cont
 
 test('failure after spawn retains the registered handle and a failed Stop keeps the queue blocked', async () => {
   const f = fixture();
-  const launch = f.runtime.launch;
+  const { launch } = f.runtime;
   f.runtime.launch = async (...args) => {
     await launch(...args);
     throw new Error('sidecar startup failed');
@@ -410,7 +410,7 @@ test('failure after spawn retains the registered handle and a failed Stop keeps 
     reserved: true,
   });
   expect((await f.lifecycle.start(target('b'), false)).queued).toBe(true);
-  const stop = f.runtime.stop;
+  const { stop } = f.runtime;
   f.runtime.stop = () => Promise.reject(new Error('exit unknown'));
   expect((await f.lifecycle.stop(target('a'))).ok).toBe(false);
   expect(f.lifecycle.status().active).toBe(1);
@@ -424,11 +424,11 @@ test('failure after spawn retains the registered handle and a failed Stop keeps 
 test('a main Stop confirmed dead releases the slot despite sidecar warnings', async () => {
   const f = fixture({
     runtime: {
-      async stop(t, handle) {
+      stop(t, handle) {
         handle.state = 'dead';
         handle.exit.resolve(0);
         f.running.delete(t.key);
-        return { warnings: ['Inngest could not stop'] };
+        return Promise.resolve({ warnings: ['Inngest could not stop'] });
       },
     },
   });
@@ -448,6 +448,7 @@ test('a main Stop confirmed dead releases the slot despite sidecar warnings', as
 test('restart validation failure restores the running phase without Stop', async () => {
   const f = fixture({
     controller: {
+      // biome-ignore lint/suspicious/useAwait: Restart validation failure must reject without stopping the running handle.
       validateTarget: async (_target, { kind }) => {
         if (kind === 'restart') {
           throw new Error('target changed');
@@ -534,9 +535,9 @@ test('queued container capacity recovers with zero readers and no timer after th
     probes = 0;
   const f = fixture({
     capacity: {
-      refresh: async () => {
+      refresh: () => {
         probes += 1;
-        return { available, cpus: 4, memMb: 8192 };
+        return Promise.resolve({ available, cpus: 4, memMb: 8192 });
       },
     },
   });
@@ -703,8 +704,9 @@ test('Start reconciles a confirmed-dead adopted runtime without forgetting an un
   expect(f.launches).toHaveLength(1);
 });
 
-test('critical storage refuses the actual bare and container launch without reserving a slot', async () => {
-  for (const container of [false, true]) {
+test.each([false, true])(
+  'critical storage refuses launch with container=%s without reserving a slot',
+  async (container) => {
     const f = fixture({
       controller: {
         assertStorage: () =>
@@ -720,13 +722,15 @@ test('critical storage refuses the actual bare and container launch without rese
     expect(f.launches).toHaveLength(0);
     expect(f.lifecycle.status().active).toBe(0);
   }
-});
+);
 
 test('queue promotion rechecks storage and Stop and removal remain available after space falls', async () => {
   let low = false;
   const f = fixture({
     controller: {
+      // biome-ignore lint/suspicious/useAwait: Storage refusal must reject through the launch preflight adapter.
       assertStorage: async () => {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: The test sets low after the first launch and before queue promotion.
         if (low) {
           throw Object.assign(new Error('disk full'), { code: 'STORAGE_LOW' });
         }
@@ -757,7 +761,9 @@ test('a storage-denied restart preserves the exact running handle without Stop o
     changed = false;
   const f = fixture({
     controller: {
+      // biome-ignore lint/suspicious/useAwait: Storage refusal must reject through the restart preflight adapter.
       assertStorage: async () => {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: The test sets low after the initial successful launch.
         if (low) {
           throw Object.assign(new Error('disk full'), { code: 'STORAGE_LOW' });
         }
@@ -772,8 +778,9 @@ test('a storage-denied restart preserves the exact running handle without Stop o
   const before = f.lifecycle.snapshot('repo/a');
   low = true;
   expect(
-    await f.lifecycle.restart(target('a'), async () => {
+    await f.lifecycle.restart(target('a'), () => {
       changed = true;
+      return Promise.resolve();
     })
   ).toMatchObject({ code: 'STORAGE_LOW', ok: false });
   expect(changed).toBe(false);
@@ -831,7 +838,7 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
       },
       clock: { clearTimeout, now: Date.now, setTimeout },
       runtime: {
-        async launch(t, _spec, register) {
+        launch(t, _spec, register) {
           let resolve;
           const exited = new Promise((done) => {
             resolve = done;
@@ -839,14 +846,17 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
           exits.set(t.key, resolve);
           launched.push(t.key);
           register({ exited, ownedGroup: true, pid: 1000 + launched.length });
+          return Promise.resolve();
         },
-        async observe(t) {
-          return dead.has(t.key) ? 'dead' : 'alive';
+        observe(t) {
+          return Promise.resolve(dead.has(t.key) ? 'dead' : 'alive');
         },
-        async stop() {},
+        stop: () => Promise.resolve(),
       },
       settings: { maxConcurrentDevServers: 1 },
-      validateTarget: async () => {},
+      validateTarget: async () => {
+        /* This lifecycle fixture accepts every target. */
+      },
       withTarget: (t, task) => state.withTargets([t], task),
     });
     await lifecycle.start(makeTarget(first), false);
@@ -854,6 +864,7 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
     dead.add(`repo/${first}`);
     exits.get(`repo/${first}`)(0);
     for (let count = 0; count < 20 && launched.length < 2; count += 1) {
+      // biome-ignore lint/performance/noAwaitInLoops: Observe queue promotion between bounded polling attempts.
       await Bun.sleep(10);
     }
     expect(launched).toEqual([`repo/${first}`, `repo/${second}`]);
@@ -865,36 +876,55 @@ test('exit watchers and queue timers drain from a clean real workspace lock cont
   let tick = 0;
   const launched = [];
   const lifecycle = createWorktreeLifecycle({
-    capacity: { refresh: async () => ({ available: true, ...capacity }) },
+    capacity: {
+      refresh: () => Promise.resolve({ available: true, ...capacity }),
+    },
     clock: {
       clearTimeout,
-      now: () => (tick += 31_000),
+      now: () => {
+        tick += 31_000;
+        return tick;
+      },
       setTimeout: (task) => setTimeout(task, 10),
     },
     runtime: {
-      async launch(t, _spec, register) {
+      launch(t, _spec, register) {
         launched.push(t.key);
         register({ ownedGroup: true, pid: 2000 + launched.length });
+        return Promise.resolve();
       },
-      async observe() {
-        return 'alive';
-      },
-      async stop() {},
+      observe: () => Promise.resolve('alive'),
+      stop: () => Promise.resolve(),
     },
     settings: {
       containerCpuLimit: 1,
       containerMemoryLimit: '4g',
       maxConcurrentDevServers: 3,
     },
-    validateTarget: async () => {},
+    validateTarget: () => Promise.resolve(),
     withTarget: (t, task) => state.withTargets([t], task),
   });
   await lifecycle.start(makeTarget('timer-a'), true);
   await lifecycle.start(makeTarget('timer-b'), true);
   capacity = { cpus: 4, memMb: 16_384 };
   for (let count = 0; count < 20 && launched.length < 2; count += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: The capacity timer must run between bounded launch observations.
     await Bun.sleep(10);
   }
   expect(launched).toEqual(['repo/timer-a', 'repo/timer-b']);
   lifecycle.dispose();
+});
+
+test('a rejected replacement launch retains the restart failure classification', async () => {
+  const f = fixture();
+  await f.lifecycle.start(target('a'), false);
+  f.runtime.launch = () => Promise.reject(new Error('replacement refused'));
+  await expect(f.lifecycle.restart(target('a'))).resolves.toMatchObject({
+    code: 'RESTART_FAILED',
+    ok: false,
+  });
+  expect(f.lifecycle.snapshot('repo/a')).toMatchObject({
+    phase: 'stopped',
+    reserved: false,
+  });
 });

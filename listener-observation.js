@@ -1,5 +1,40 @@
 import { execFile } from 'node:child_process';
 
+const listenerPortPattern = /:(\d+)$/;
+
+function parseListenerRecord(line, current, seen, ports) {
+  if (line.startsWith('p')) {
+    return { pid: line.slice(1) };
+  }
+  if (line.startsWith('c')) {
+    current.cmd = line.slice(1);
+    return current;
+  }
+  if (!line.startsWith('n')) {
+    return current;
+  }
+  const match = line.match(listenerPortPattern);
+  if (!(match && current.pid)) {
+    return current;
+  }
+  const key = `${current.pid}:${match[1]}`;
+  if (!seen.has(key)) {
+    seen.add(key);
+    ports.push({ ...current, port: Number(match[1]) });
+  }
+  return current;
+}
+
+function parseListeningPorts(stdout) {
+  const ports = [];
+  const seen = new Set();
+  let current = {};
+  for (const line of (stdout ?? '').split('\n')) {
+    current = parseListenerRecord(line, current, seen, ports);
+  }
+  return ports;
+}
+
 export function probeListeningPorts(run = execFile) {
   return new Promise((resolve, reject) => {
     run(
@@ -25,28 +60,7 @@ export function probeListeningPorts(run = execFile) {
           );
           return;
         }
-        const ports = [],
-          seen = new Set();
-        let current = {};
-        for (const line of (stdout ?? '').split('\n')) {
-          if (line.startsWith('p')) {
-            current = { pid: line.slice(1) };
-          } else if (line.startsWith('c')) {
-            current.cmd = line.slice(1);
-          } else if (line.startsWith('n')) {
-            const match = line.match(/:(\d+)$/);
-            if (!(match && current.pid)) {
-              continue;
-            }
-            const key = `${current.pid}:${match[1]}`;
-            if (seen.has(key)) {
-              continue;
-            }
-            seen.add(key);
-            ports.push({ ...current, port: Number(match[1]) });
-          }
-        }
-        resolve(ports);
+        resolve(parseListeningPorts(stdout));
       }
     );
   });

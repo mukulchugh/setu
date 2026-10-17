@@ -158,6 +158,7 @@ test('records only allowed fields and recording failure remains an operation res
     now: () => 100,
     state: {
       read: () => ({}),
+      // biome-ignore lint/suspicious/useAwait: The journal fixture must reject persistence failures.
       update: async () => {
         throw new Error('storage unavailable');
       },
@@ -193,9 +194,11 @@ test('late startup recording cannot replace failure or uncertainty, but reconcil
         source: 'portal',
         target: null,
       };
+      // biome-ignore lint/performance/noAwaitInLoops: Persist the terminal state before testing later stale states in the same journal.
       await events.record({ ...entry, state: terminal });
       for (const pending of ['accepted', 'queued', 'running']) {
         expect(
+          // biome-ignore lint/performance/noAwaitInLoops: Each attempted stale transition must settle before the next observation of this shared event.
           await events.record({ ...entry, at: 2, state: pending })
         ).toMatchObject({
           event: { state: terminal },

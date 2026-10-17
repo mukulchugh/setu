@@ -11,15 +11,17 @@ const stages = [
   'registry',
   'routing',
 ];
-const uuid = (value) =>
-  typeof value === 'string' &&
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const decimalPattern = /^\d+$/;
+const unsafeWorktreePartPattern = /[\\\s:]/;
+const uuid = (value) => typeof value === 'string' && uuidPattern.test(value);
 const object = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const evidence = (value) =>
   object(value) &&
   ['dev', 'ino', 'birthtimeNs'].every(
-    (key) => typeof value[key] === 'string' && /^\d+$/.test(value[key])
+    (key) => typeof value[key] === 'string' && decimalPattern.test(value[key])
   ) &&
   value.ino !== '0' &&
   value.birthtimeNs !== '0';
@@ -33,66 +35,103 @@ const absentIdentity = (value) => value?.absent === true;
 function problem(code, message) {
   return Object.assign(new Error(message), { code });
 }
-
-export async function observeRemovalCheckout(record, target, { fs, run }) {
-  const fingerprint = (stat) => ({
-    birthtimeNs: String(stat.birthtimeNs),
-    dev: String(stat.dev),
-    ino: String(stat.ino),
-  });
-  async function canonical(path) {
-    const suffix = [];
-    while (true) {
-      try {
-        return resolve(await fs.realpath(path), ...suffix.reverse());
-      } catch (error) {
-        if (error.code !== 'ENOENT' || dirname(path) === path) {
-          throw error;
-        }
-        suffix.push(basename(path));
-        path = dirname(path);
+function removalState(record) {
+  if (record.completed.includes('git')) {
+    return true;
+  }
+  return record.attempting === 'git' ? null : false;
+}
+function removalStateAfterObservation(record, observation) {
+  if (record.completed.includes('git')) {
+    return true;
+  }
+  if (observation.state === 'original') {
+    return false;
+  }
+  return observation.state === 'absent' ? true : null;
+}
+function removalFailureCode(error, removed) {
+  if (error.code === 'REMOVAL_IDENTITY_CHANGED') {
+    return error.code;
+  }
+  if (removed === null) {
+    return 'REMOVAL_OUTCOME_UNKNOWN';
+  }
+  if (removed === true) {
+    return 'REMOVAL_INCOMPLETE';
+  }
+  return error.code ?? 'REMOVAL_FAILED';
+}
+const fingerprint = (stat) => ({
+  birthtimeNs: String(stat.birthtimeNs),
+  dev: String(stat.dev),
+  ino: String(stat.ino),
+});
+async function canonicalPath(fs, path) {
+  let currentPath = path;
+  const suffix = [];
+  for (;;) {
+    try {
+      // biome-ignore lint/performance/noAwaitInLoops: A missing child determines the next parent path, so canonicalization must ascend one component at a time.
+      return resolve(await fs.realpath(currentPath), ...suffix.reverse());
+    } catch (error) {
+      if (error.code !== 'ENOENT' || dirname(currentPath) === currentPath) {
+        throw error;
       }
+      suffix.push(basename(currentPath));
+      currentPath = dirname(currentPath);
     }
   }
-  if (absentIdentity(record.identity)) {
-    try {
-      await fs.lstat(target.wtDir);
-      return { state: 'conflict' };
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        return { state: 'unknown' };
-      }
-    }
-    try {
-      await fs.stat(target.repoDir);
-    } catch (error) {
-      return { state: error.code === 'ENOENT' ? 'absent' : 'unknown' };
-    }
-    try {
-      const list = await run([
-        'git',
-        '-C',
-        target.repoDir,
-        'worktree',
-        'list',
-        '--porcelain',
-        '-z',
-      ]);
-      if (list.code !== 0 || list.timedOut || list.truncated) {
-        return { state: 'unknown' };
-      }
-      const checkout = await canonical(target.wtDir);
-      const registered = (await Promise.all(
-        list.stdout
-          .split('\0')
-          .filter((line) => line.startsWith('worktree '))
-          .map((line) => canonical(line.slice(9)))
-      )).includes(checkout);
-      return { state: registered ? 'missing-checkout' : 'absent' };
-    } catch {
+}
+async function worktreeRegistration(target, run) {
+  const list = await run([
+    'git',
+    '-C',
+    target.repoDir,
+    'worktree',
+    'list',
+    '--porcelain',
+    '-z',
+  ]);
+  if (list.code !== 0 || list.timedOut || list.truncated) {
+    return { state: 'unknown' };
+  }
+  const paths = list.stdout
+    .split('\0')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => line.slice(9));
+  return { paths, state: 'known' };
+}
+async function observeAbsentCheckout(_record, target, { fs, run }) {
+  const canonical = (path) => canonicalPath(fs, path);
+  try {
+    await fs.lstat(target.wtDir);
+    return { state: 'conflict' };
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
       return { state: 'unknown' };
     }
   }
+  try {
+    await fs.stat(target.repoDir);
+  } catch (error) {
+    return { state: error.code === 'ENOENT' ? 'absent' : 'unknown' };
+  }
+  try {
+    const registration = await worktreeRegistration(target, run);
+    if (registration.state === 'unknown') {
+      return registration;
+    }
+    const checkout = await canonical(target.wtDir);
+    const paths = await Promise.all(registration.paths.map(canonical));
+    return {
+      state: paths.includes(checkout) ? 'missing-checkout' : 'absent',
+    };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+async function repositoryState(record, target, fs) {
   try {
     const repository = await fs.stat(target.repoDir, { bigint: true });
     if (
@@ -107,44 +146,48 @@ export async function observeRemovalCheckout(record, target, { fs, run }) {
     ) {
       return { state: 'conflict' };
     }
+    return { state: 'original' };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+async function checkoutPresence(target, fs) {
+  try {
+    const stat = await fs.lstat(target.wtDir);
+    return stat.isSymbolicLink() || !stat.isDirectory()
+      ? { state: 'conflict' }
+      : { exists: true };
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+    return { exists: false };
+  }
+}
+async function observeKnownCheckout(record, target, { fs, run }) {
+  try {
+    const repository = await repositoryState(record, target, fs);
+    if (repository.state !== 'original') {
+      return repository;
+    }
+    const canonical = (path) => canonicalPath(fs, path);
     if ((await canonical(target.wtDir)) !== record.identity.checkoutPath) {
       return { state: 'conflict' };
     }
-    let exists = true;
-    try {
-      const stat = await fs.lstat(target.wtDir);
-      if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        return { state: 'conflict' };
-      }
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
-      exists = false;
+    const checkout = await checkoutPresence(target, fs);
+    if ('state' in checkout) {
+      return checkout;
     }
-    const list = await run([
-      'git',
-      '-C',
-      target.repoDir,
-      'worktree',
-      'list',
-      '--porcelain',
-      '-z',
-    ]);
-    if (list.code !== 0 || list.timedOut || list.truncated) {
-      return { state: 'unknown' };
+    const registration = await worktreeRegistration(target, run);
+    if (registration.state === 'unknown') {
+      return registration;
     }
-    const paths = await Promise.all(
-      list.stdout
-        .split('\0')
-        .filter((line) => line.startsWith('worktree '))
-        .map((line) => canonical(line.slice(9)))
-    );
+    const paths = await Promise.all(registration.paths.map(canonical));
     const registered = paths.includes(record.identity.checkoutPath);
-    if (!exists && registered) {
+    if (!checkout.exists && registered) {
       return { state: 'missing-checkout' };
     }
-    if (!(exists || registered)) {
+    if (!(checkout.exists || registered)) {
       try {
         await fs.lstat(record.identity.adminPath);
         return { state: 'unknown' };
@@ -156,18 +199,24 @@ export async function observeRemovalCheckout(record, target, { fs, run }) {
       return { state: 'conflict' };
     }
     const current = await inspectCheckoutIdentity(target, fs);
-    if (!current.known) {
-      return { state: 'unknown' };
-    }
-    return {
-      state:
-        isDeepStrictEqual(current, record.identity)
-          ? 'original'
-          : 'conflict',
-    };
+    return current.known
+      ? {
+          state: isDeepStrictEqual(current, record.identity)
+            ? 'original'
+            : 'conflict',
+        }
+      : { state: 'unknown' };
   } catch {
     return { state: 'unknown' };
   }
+}
+
+// biome-ignore lint/suspicious/useAwait: The exported observer preserves its Promise rejection boundary for callers that await identity observation.
+export async function observeRemovalCheckout(record, target, dependencies) {
+  if (absentIdentity(record.identity)) {
+    return observeAbsentCheckout(record, target, dependencies);
+  }
+  return observeKnownCheckout(record, target, dependencies);
 }
 
 export function validateRemovalRecords(records) {
@@ -193,7 +242,7 @@ export function validateRemovalRecords(records) {
           part === '.' ||
           part === '..' ||
           part.startsWith('-') ||
-          /[\\\s:]/.test(part)
+          unsafeWorktreePartPattern.test(part)
       ) ||
       !Number.isInteger(row.port) ||
       row.port < 1 ||
@@ -261,13 +310,13 @@ export function createRemovalController({
     pendingSteps: [],
     removed: true,
   });
-  async function stores() {
+  function stores() {
     return state.withWorkspace(['removals', 'archive'], (scope) => ({
       archive: scope.read('archive'),
       pending: validateRemovalRecords(scope.read('removals')),
     }));
   }
-  async function checkpoint(record, stage) {
+  function checkpoint(record, stage) {
     return mutate(record, (current) => ({
       ...current,
       attempting: null,
@@ -277,7 +326,7 @@ export function createRemovalController({
       removed: stage === 'git' ? true : current.removed,
     }));
   }
-  async function mutate(record, change) {
+  function mutate(record, change) {
     return state.withWorkspace(['removals'], (scope) => {
       const all = validateRemovalRecords(scope.read('removals'));
       const current = all[record.operationId];
@@ -349,7 +398,7 @@ export function createRemovalController({
     };
     return installPrepared(target, record);
   }
-  async function installPrepared(target, record) {
+  function installPrepared(target, record) {
     return state.withWorkspace(['removals', 'ports'], (scope) => {
       const all = validateRemovalRecords(scope.read('removals'));
       const existing = Object.values(all).find((row) => row.key === target.key);
@@ -402,6 +451,268 @@ export function createRemovalController({
       );
     }
   }
+  async function initialRemoval(target, { force, operationId }) {
+    if (typeof force !== 'boolean') {
+      throw problem('INVALID_FORCE', 'force must be a boolean');
+    }
+    if (operationId !== undefined && !uuid(operationId)) {
+      throw problem(
+        'REMOVAL_NOT_FOUND',
+        'Unknown or expired removal operation; no new removal was started'
+      );
+    }
+    const saved = await stores();
+    const record = operationId
+      ? saved.pending[operationId]
+      : Object.values(saved.pending).find((row) => row.key === target.key);
+    if (!record && operationId) {
+      const archived = saved.archive.find(
+        (row) => row.operationId === operationId && row.removalComplete === true
+      );
+      if (archived && `${archived.repo}/${archived.name}` === target.key) {
+        return { outcome: done(operationId) };
+      }
+      throw problem(
+        'REMOVAL_NOT_FOUND',
+        'Unknown or expired removal operation; no new removal was started'
+      );
+    }
+    return { record };
+  }
+  async function admittedRemoval(
+    existingRecord,
+    target,
+    reason,
+    force,
+    progress
+  ) {
+    let record = existingRecord;
+    if (record) {
+      const latest = await stores();
+      const current = latest.pending[record.operationId];
+      if (!current) {
+        if (
+          latest.archive.some(
+            (row) =>
+              row.operationId === record.operationId &&
+              row.removalComplete === true
+          )
+        ) {
+          return { outcome: done(record.operationId) };
+        }
+        throw problem(
+          'REMOVAL_NOT_FOUND',
+          'Removal recovery state changed while waiting for admission'
+        );
+      }
+      record = current;
+    }
+    record ??= await prepare(target, reason, force);
+    progress.record = record;
+    let { removed } = record;
+    progress.removed = removed;
+    const observation = await observe(record);
+    removed = removalStateAfterObservation(record, observation);
+    progress.removed = removed;
+    if (observation.state === 'conflict') {
+      throw problem(
+        'REMOVAL_IDENTITY_CHANGED',
+        'A replacement checkout or registration exists; cleanup is blocked'
+      );
+    }
+    if (observation.state === 'missing-checkout') {
+      throw problem(
+        'REMOVAL_OUTCOME_UNKNOWN',
+        'Checkout is absent but Git registration remains; diagnosed repair is required'
+      );
+    }
+    if (!['original', 'absent'].includes(observation.state)) {
+      throw problem(
+        'REMOVAL_OUTCOME_UNKNOWN',
+        'Removal outcome is unknown; retry only this operation after checking its state'
+      );
+    }
+    return { observation, record, removed };
+  }
+  async function stageEffect(stage, record, controls) {
+    if (stage === 'volumes') {
+      return removeVolumes(record);
+    }
+    if (stage === 'tunnel') {
+      return detachTunnel(record);
+    }
+    const result = await controls.stop();
+    if (!result.ok) {
+      throw problem(
+        result.code ?? 'STOP_FAILED',
+        result.error ?? 'Runtime stop failed'
+      );
+    }
+  }
+  async function completeTeardown(
+    initialRecord,
+    controls,
+    requireOriginal,
+    progress
+  ) {
+    let record = initialRecord;
+    for (const stage of ['stop', 'volumes', 'tunnel']) {
+      if (record.completed.includes(stage)) {
+        continue;
+      }
+      if (requireOriginal) {
+        // biome-ignore lint/performance/noAwaitInLoops: Re-observe the checkout before every irreversible stage; each checkpoint becomes the next stage's input.
+        await assertOriginal(record);
+      }
+      record = await mutate(record, (current) => ({
+        ...current,
+        attempting: stage,
+      }));
+      progress.record = record;
+      await stageEffect(stage, record, controls);
+      record = await checkpoint(record, stage);
+      progress.record = record;
+    }
+    return record;
+  }
+  async function completeGitRemoval(initialRecord, target, force, progress) {
+    let record = initialRecord;
+    await assertOriginal(record);
+    await assertClean(target, force);
+    record = await mutate(record, (current) => ({
+      ...current,
+      attempting: 'git',
+    }));
+    progress.record = record;
+    try {
+      await removeGit(record, force);
+    } catch (error) {
+      if (error.code === 'OPERATION_UNKNOWN') {
+        progress.removed = null;
+        throw error;
+      }
+      const afterFailure = await observe(record);
+      if (afterFailure.state !== 'absent') {
+        progress.removed = afterFailure.state === 'original' ? false : null;
+        throw error;
+      }
+    }
+    const after = await observe(record);
+    if (after.state !== 'absent') {
+      progress.removed = after.state === 'original' ? false : null;
+      throw problem(
+        'REMOVAL_OUTCOME_UNKNOWN',
+        'Git deletion could not be confirmed'
+      );
+    }
+    progress.removed = true;
+    record = await checkpoint(record, 'git');
+    progress.record = record;
+    return record;
+  }
+  async function finishRemoval(initialRecord, progress) {
+    let record = initialRecord;
+    if (!record.completed.includes('archive')) {
+      await assertAbsent(record);
+      await writeArchive(record, false);
+      record = await checkpoint(record, 'archive');
+      progress.record = record;
+    }
+    if (!record.completed.includes('registry')) {
+      await assertAbsent(record);
+      await state.withWorkspace(['ports', 'removals'], (scope) => {
+        const pendingRecords = validateRemovalRecords(scope.read('removals'));
+        if (!pendingRecords[record.operationId]) {
+          throw problem(
+            'REMOVAL_IDENTITY_CHANGED',
+            'Recovery record disappeared before registry cleanup'
+          );
+        }
+        const ports = scope.read('ports');
+        const portEntry = ports.find((row) => row.key === record.key);
+        if (portEntry && portEntry.port !== record.port) {
+          throw problem(
+            'REMOVAL_IDENTITY_CHANGED',
+            'Port registration belongs to a replacement'
+          );
+        }
+        installed(
+          scope.replace(
+            'ports',
+            ports.filter((row) => row.key !== record.key)
+          )
+        );
+      });
+      record = await checkpoint(record, 'registry');
+      progress.record = record;
+    }
+    if (!record.completed.includes('routing')) {
+      await assertAbsent(record);
+      const result = await cleanupRouting(record);
+      if (result === false) {
+        throw problem(
+          'ROUTING_FAILED',
+          'Routing reload failed; the original port remains reserved'
+        );
+      }
+      record = await checkpoint(record, 'routing');
+      progress.record = record;
+    }
+    await assertAbsent(record);
+    await writeArchive(record, true);
+    await state.withWorkspace(['removals', 'archive'], (scope) => {
+      const all = validateRemovalRecords(scope.read('removals'));
+      if (
+        !scope
+          .read('archive')
+          .some(
+            (row) =>
+              row.operationId === record.operationId &&
+              row.removalComplete === true
+          )
+      ) {
+        throw problem(
+          'REMOVAL_INCOMPLETE',
+          'Final archive completion is not confirmed'
+        );
+      }
+      const { [record.operationId]: cleared, ...remaining } = all;
+      installed(scope.replace('removals', remaining));
+    });
+    return done(record.operationId);
+  }
+  async function runAdmittedRemoval(progress, target, reason, force, controls) {
+    const admitted = await admittedRemoval(
+      progress.record,
+      target,
+      reason,
+      force,
+      progress
+    );
+    if ('outcome' in admitted) {
+      return admitted.outcome;
+    }
+    let { record, observation } = admitted;
+    if (observation.state === 'absent') {
+      progress.removed = true;
+      record = await completeTeardown(record, controls, false, progress);
+      if (!record.completed.includes('git')) {
+        record = await checkpoint(record, 'git');
+        progress.record = record;
+      }
+    } else if (record.completed.includes('git')) {
+      throw problem(
+        'REMOVAL_IDENTITY_CHANGED',
+        'A checkout exists after confirmed removal; cleanup is blocked'
+      );
+    }
+    if (!record.completed.includes('git')) {
+      await assertClean(target, force);
+      record = await completeTeardown(record, controls, true, progress);
+      record = await completeGitRemoval(record, target, force, progress);
+    }
+    return finishRemoval(record, progress);
+  }
   async function execute(
     target,
     { operationId, force = false, reason = 'manual' } = {}
@@ -409,32 +720,11 @@ export function createRemovalController({
     let record,
       removed = false;
     try {
-      if (typeof force !== 'boolean') {
-        throw problem('INVALID_FORCE', 'force must be a boolean');
+      const initial = await initialRemoval(target, { force, operationId });
+      if ('outcome' in initial) {
+        return initial.outcome;
       }
-      if (operationId !== undefined && !uuid(operationId)) {
-        throw problem(
-          'REMOVAL_NOT_FOUND',
-          'Unknown or expired removal operation; no new removal was started'
-        );
-      }
-      const saved = await stores();
-      record = operationId
-        ? saved.pending[operationId]
-        : Object.values(saved.pending).find((row) => row.key === target.key);
-      if (!record && operationId) {
-        const archived = saved.archive.find(
-          (row) =>
-            row.operationId === operationId && row.removalComplete === true
-        );
-        if (archived && `${archived.repo}/${archived.name}` === target.key) {
-          return done(operationId);
-        }
-        throw problem(
-          'REMOVAL_NOT_FOUND',
-          'Unknown or expired removal operation; no new removal was started'
-        );
-      }
+      ({ record } = initial);
       if (record && record.key !== target.key) {
         throw problem(
           'REMOVAL_IDENTITY_CHANGED',
@@ -442,225 +732,23 @@ export function createRemovalController({
         );
       }
       if (record) {
-        removed = record.completed.includes('git')
-          ? true
-          : record.attempting === 'git'
-            ? null
-            : false;
+        removed = removalState(record);
       }
       const outcome = await serialize(() =>
         admit(target, async (controls) => {
+          const progress = { record, removed };
           try {
-            if (record) {
-              const latest = await stores();
-              const current = latest.pending[record.operationId];
-              if (!current) {
-                if (
-                  latest.archive.some(
-                    (row) =>
-                      row.operationId === record.operationId &&
-                      row.removalComplete === true
-                  )
-                ) {
-                  return done(record.operationId);
-                }
-                throw problem(
-                  'REMOVAL_NOT_FOUND',
-                  'Removal recovery state changed while waiting for admission'
-                );
-              }
-              record = current;
-            }
-            record ??= await prepare(target, reason, force);
-            removed = record.removed;
-            const observation = await observe(record);
-            removed = record.completed.includes('git')
-              ? true
-              : observation.state === 'original'
-                ? false
-                : observation.state === 'absent'
-                  ? true
-                  : null;
-            if (observation.state === 'conflict') {
-              throw problem(
-                'REMOVAL_IDENTITY_CHANGED',
-                'A replacement checkout or registration exists; cleanup is blocked'
-              );
-            }
-            if (observation.state === 'missing-checkout') {
-              throw problem(
-                'REMOVAL_OUTCOME_UNKNOWN',
-                'Checkout is absent but Git registration remains; diagnosed repair is required'
-              );
-            }
-            if (!['original', 'absent'].includes(observation.state)) {
-              throw problem(
-                'REMOVAL_OUTCOME_UNKNOWN',
-                'Removal outcome is unknown; retry only this operation after checking its state'
-              );
-            }
-            if (observation.state === 'absent') {
-              removed = true;
-              for (const [stage, effect] of [
-                [
-                  'stop',
-                  async () => {
-                    const result = await controls.stop();
-                    if (!result.ok) {
-                      throw problem(
-                        result.code ?? 'STOP_FAILED',
-                        result.error ?? 'Runtime stop failed'
-                      );
-                    }
-                  },
-                ],
-                ['volumes', () => removeVolumes(record)],
-                ['tunnel', () => detachTunnel(record)],
-              ]) {
-                if (record.completed.includes(stage)) {
-                  continue;
-                }
-                record = await mutate(record, (current) => ({
-                  ...current,
-                  attempting: stage,
-                }));
-                await effect();
-                record = await checkpoint(record, stage);
-              }
-              if (!record.completed.includes('git')) {
-                record = await checkpoint(record, 'git');
-              }
-            } else if (record.completed.includes('git')) {
-              throw problem(
-                'REMOVAL_IDENTITY_CHANGED',
-                'A checkout exists after confirmed removal; cleanup is blocked'
-              );
-            }
-            if (!record.completed.includes('git')) {
-              await assertClean(target, force);
-              for (const [stage, effect] of [
-                [
-                  'stop',
-                  async () => {
-                    const result = await controls.stop();
-                    if (!result.ok) {
-                      throw problem(
-                        result.code ?? 'STOP_FAILED',
-                        result.error ?? 'Runtime stop failed'
-                      );
-                    }
-                  },
-                ],
-                ['volumes', () => removeVolumes(record)],
-                ['tunnel', () => detachTunnel(record)],
-              ]) {
-                if (record.completed.includes(stage)) {
-                  continue;
-                }
-                await assertOriginal(record);
-                record = await mutate(record, (current) => ({
-                  ...current,
-                  attempting: stage,
-                }));
-                await effect();
-                record = await checkpoint(record, stage);
-              }
-              await assertOriginal(record);
-              await assertClean(target, force);
-              record = await mutate(record, (current) => ({
-                ...current,
-                attempting: 'git',
-              }));
-              try {
-                await removeGit(record, force);
-              } catch (error) {
-                if (error.code === 'OPERATION_UNKNOWN') {
-                  removed = null;
-                  throw error;
-                }
-                const after = await observe(record);
-                if (after.state !== 'absent') {
-                  removed = after.state === 'original' ? false : null;
-                  throw error;
-                }
-              }
-              const after = await observe(record);
-              if (after.state !== 'absent') {
-                removed = after.state === 'original' ? false : null;
-                throw problem(
-                  'REMOVAL_OUTCOME_UNKNOWN',
-                  'Git deletion could not be confirmed'
-                );
-              }
-              removed = true;
-              record = await checkpoint(record, 'git');
-            }
-            if (!record.completed.includes('archive')) {
-              await assertAbsent(record);
-              await writeArchive(record, false);
-              record = await checkpoint(record, 'archive');
-            }
-            if (!record.completed.includes('registry')) {
-              await assertAbsent(record);
-              await state.withWorkspace(['ports', 'removals'], (scope) => {
-                const pending = validateRemovalRecords(scope.read('removals'));
-                if (!pending[record.operationId]) {
-                  throw problem(
-                    'REMOVAL_IDENTITY_CHANGED',
-                    'Recovery record disappeared before registry cleanup'
-                  );
-                }
-                const ports = scope.read('ports'),
-                  current = ports.find((row) => row.key === record.key);
-                if (current && current.port !== record.port) {
-                  throw problem(
-                    'REMOVAL_IDENTITY_CHANGED',
-                    'Port registration belongs to a replacement'
-                  );
-                }
-                installed(
-                  scope.replace(
-                    'ports',
-                    ports.filter((row) => row.key !== record.key)
-                  )
-                );
-              });
-              record = await checkpoint(record, 'registry');
-            }
-            if (!record.completed.includes('routing')) {
-              await assertAbsent(record);
-              const result = await cleanupRouting(record);
-              if (result === false) {
-                throw problem(
-                  'ROUTING_FAILED',
-                  'Routing reload failed; the original port remains reserved'
-                );
-              }
-              record = await checkpoint(record, 'routing');
-            }
-            await assertAbsent(record);
-            await writeArchive(record, true);
-            await state.withWorkspace(['removals', 'archive'], (scope) => {
-              const all = validateRemovalRecords(scope.read('removals'));
-              if (
-                !scope
-                  .read('archive')
-                  .some(
-                    (row) =>
-                      row.operationId === record.operationId &&
-                      row.removalComplete === true
-                  )
-              ) {
-                throw problem(
-                  'REMOVAL_INCOMPLETE',
-                  'Final archive completion is not confirmed'
-                );
-              }
-              const { [record.operationId]: cleared, ...remaining } = all;
-              installed(scope.replace('removals', remaining));
-            });
-            return done(record.operationId);
+            const result = await runAdmittedRemoval(
+              progress,
+              target,
+              reason,
+              force,
+              controls
+            );
+            ({ record, removed } = progress);
+            return result;
           } catch (error) {
+            ({ record, removed } = progress);
             if (error.code === 'OPERATION_UNKNOWN') {
               throw error;
             }
@@ -681,14 +769,7 @@ export function createRemovalController({
     }
     function failed(error) {
       record ??= error.preparedRecord;
-      const code =
-        error.code === 'REMOVAL_IDENTITY_CHANGED'
-          ? error.code
-          : removed === null
-            ? 'REMOVAL_OUTCOME_UNKNOWN'
-            : removed === true
-              ? 'REMOVAL_INCOMPLETE'
-              : (error.code ?? 'REMOVAL_FAILED');
+      const code = removalFailureCode(error, removed);
       return {
         code,
         error: `${removed === true ? 'Worktree removed; cleanup remains. ' : ''}${error.message ?? error}`,
@@ -711,7 +792,7 @@ export function createRemovalController({
       };
     }
   }
-  async function writeArchive(record, complete) {
+  function writeArchive(record, complete) {
     return state.withWorkspace(['archive', 'removals'], (scope) => {
       if (!validateRemovalRecords(scope.read('removals'))[record.operationId]) {
         throw problem('REMOVAL_IDENTITY_CHANGED', 'Recovery record is missing');
@@ -766,11 +847,7 @@ export function createRemovalController({
         name: row.name,
         operationId: row.operationId,
         pendingSteps: pendingSteps(row),
-        removed: row.completed.includes('git')
-          ? true
-          : row.attempting === 'git'
-            ? null
-            : false,
+        removed: removalState(row),
         repo: row.repo,
       })
     );
@@ -802,14 +879,18 @@ export function createRemovalController({
     if (observation.state !== 'original') {
       return {
         code: 'REMOVAL_NOT_CANCELLABLE',
-        error: 'Removal cannot be cancelled after checkout removal or an unknown outcome',
+        error:
+          'Removal cannot be cancelled after checkout removal or an unknown outcome',
         ok: false,
       };
     }
     await state.withWorkspace(['removals', 'ports'], (scope) => {
       const all = validateRemovalRecords(scope.read('removals'));
       if (!isDeepStrictEqual(all[operationId], record)) {
-        throw problem('REMOVAL_IDENTITY_CHANGED', 'Removal changed before cancellation');
+        throw problem(
+          'REMOVAL_IDENTITY_CHANGED',
+          'Removal changed before cancellation'
+        );
       }
       const { [operationId]: discarded, ...remaining } = all;
       installed(scope.replace('removals', remaining));
@@ -850,10 +931,12 @@ export function createRemovalController({
     await state.withWorkspace(['removals', 'ports'], (scope) => {
       const fresh = validateRemovalRecords(scope.read('removals'));
       if (
-        !isDeepStrictEqual(fresh[record.operationId], record) ||
-        !scope
-          .read('ports')
-          .some((row) => row.key === record.key && row.port === record.port)
+        !(
+          isDeepStrictEqual(fresh[record.operationId], record) &&
+          scope
+            .read('ports')
+            .some((row) => row.key === record.key && row.port === record.port)
+        )
       ) {
         throw problem(
           'REMOVAL_IDENTITY_CHANGED',

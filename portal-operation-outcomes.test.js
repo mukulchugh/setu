@@ -5,6 +5,7 @@ test('completion-aware outcome recorder preserves accepted/running/final states 
   const events = [];
   const outcomes = createPortalOperationOutcomes({
     events: {
+      // biome-ignore lint/suspicious/useAwait: The recorder fixture preserves the asynchronous event journal contract.
       record: async (event) => {
         events.push(event);
         return { ok: true };
@@ -31,6 +32,7 @@ test('completion-aware outcome recorder preserves accepted/running/final states 
 
   const unavailable = createPortalOperationOutcomes({
     events: {
+      // biome-ignore lint/suspicious/useAwait: Unavailable journal writes must reject at the recorder boundary.
       record: async () => {
         throw new Error('journal unavailable');
       },
@@ -54,6 +56,7 @@ test('unknown completion remains unknown instead of becoming a successful HTTP o
   const events = [];
   const outcomes = createPortalOperationOutcomes({
     events: {
+      // biome-ignore lint/suspicious/useAwait: The recorder fixture preserves the asynchronous event journal contract.
       record: async (event) => {
         events.push(event);
         return { ok: true };

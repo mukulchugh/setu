@@ -12,7 +12,11 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import * as fsPromises from 'node:fs/promises';
+import {
+  readFile as readFileAsync,
+  realpath as realpathAsync,
+  stat as statAsync,
+} from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -68,6 +72,7 @@ import {
   requireConfig,
   SETU_DIR,
   saveConfig,
+  shellQuote,
   spawnText,
   syncHosts,
   tunnelCredentials,
@@ -94,6 +99,14 @@ import { releaseHeldLocks } from './workspace-state.js';
 const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
 
 const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
+
+const DEV_TUNNEL_PREFIX_RE = /^dev-/;
+const CADDY_SERVICE_STARTED_RE = /^caddy\s+started/m;
+const HEADLESS_MODEL_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+const DNSMASQ_SERVICE_STARTED_RE = /^dnsmasq\s+started/;
+const ERROR_RE = /error/;
+const TRAILING_NEWLINES_RE = /\n*$/;
+const WORKTREE_LIST_ENTRY_RE = /^worktree (.+)$/m;
 
 function cfg() {
   try {
@@ -182,6 +195,7 @@ let cliReadFile = readFileSync;
 let dispatching = false;
 let newCommandOverrides = {};
 let localCommandOverrides = {};
+let lifecycleCommandOverrides = {};
 
 export const commandHandlers = {
   actions: cmdActions,
@@ -228,15 +242,19 @@ export const commandHandlers = {
 
 export async function runCli(
   argv = process.argv.slice(2),
-  { localCommand, newCommand, request, readFile } = {}
+  { lifecycleCommand, localCommand, newCommand, request, readFile } = {}
 ) {
   const previousApi = cliApi;
   const previousReadFile = cliReadFile;
   const previousDispatching = dispatching;
   const previousNewCommandOverrides = newCommandOverrides;
   const previousLocalCommandOverrides = localCommandOverrides;
+  const previousLifecycleCommandOverrides = lifecycleCommandOverrides;
   const injectedRequest =
-    typeof request === 'function' || !!newCommand || !!localCommand;
+    typeof request === 'function' ||
+    !!lifecycleCommand ||
+    !!newCommand ||
+    !!localCommand;
   if (request) {
     cliApi = createCliApi({ request });
   }
@@ -248,6 +266,9 @@ export async function runCli(
   }
   if (localCommand) {
     localCommandOverrides = localCommand;
+  }
+  if (lifecycleCommand) {
+    lifecycleCommandOverrides = lifecycleCommand;
   }
   dispatching = true;
   try {
@@ -293,9 +314,10 @@ export async function runCli(
     ) {
       await updateNudge();
     }
-    await handler();
+    await (cmd === 'setup' ? handler(rest) : handler());
     return process.exitCode ?? 0;
   } catch (error) {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: Command handlers may reject non-Error or nullish values.
     if (error?.exitCode === 1) {
       process.exitCode = 1;
       return 1;
@@ -306,6 +328,7 @@ export async function runCli(
     cliReadFile = previousReadFile;
     newCommandOverrides = previousNewCommandOverrides;
     localCommandOverrides = previousLocalCommandOverrides;
+    lifecycleCommandOverrides = previousLifecycleCommandOverrides;
     dispatching = previousDispatching;
   }
 }
@@ -390,6 +413,7 @@ async function portalCall(path, body, failMsg) {
   return res;
 }
 
+// biome-ignore lint/suspicious/useAwait: Portal and tunnel callers await this boundary; synchronous startup failures must reject.
 async function ensurePortal(c) {
   return workspaceState(c.workspace).withUpdate(async () => {
     if (portalPid()) {
@@ -409,6 +433,7 @@ async function ensurePortal(c) {
     child.unref();
     for (let i = 0; i < 40; i += 1) {
       try {
+        // biome-ignore lint/performance/noAwaitInLoops: A readiness probe must fail before the next retry delay and probe.
         await portalRequest('/api/worktrees');
         return;
       } catch {
@@ -432,65 +457,70 @@ function autoInstall(wtDir, sharing, stdio, options = {}) {
 
 // ── setu setup [--name x] [--workspace p] [--zone z] [--yes] ─────────────────
 
-async function cmdSetup() {
+async function cmdSetup(setupArgs) {
   box('setu setup');
   const interactive = process.stdin.isTTY && !flags.yes;
 
-  // 1. deps
-  step(1, 9, 'Dependencies');
-  if (!commandExists('brew')) {
-    spin('Homebrew');
-    try {
-      const installer = execFileSync(
-        'curl',
-        [
-          '-fsSL',
-          'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh',
-        ],
-        { encoding: 'utf8' }
+  function setupDependencies() {
+    // 1. deps
+    step(1, 9, 'Dependencies');
+    if (!commandExists('brew')) {
+      spin('Homebrew');
+      try {
+        const installer = execFileSync(
+          'curl',
+          [
+            '-fsSL',
+            'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh',
+          ],
+          { encoding: 'utf8' }
+        );
+        // As the published one-liner does: the script is bash's -c argument, so
+        // stdin stays the terminal and the installer can ask for a password.
+        execFileSync('/bin/bash', ['-c', installer], { stdio: 'inherit' });
+        done();
+      } catch {
+        die(
+          'Homebrew install failed — install manually from https://brew.sh, then re-run setu setup.'
+        );
+      }
+      // BREW_PREFIX/CADDY_BIN/CLOUDFLARED_BIN (lib.js) are computed once at
+      // module load, before this function ever runs — with brew missing at
+      // that point they're already frozen to a fallback that's wrong on Intel
+      // Macs (and merely stale, not re-verified, on Apple Silicon). Patching
+      // process.env.PATH here would fix `brew`/`gh` lookups for the rest of
+      // this process but not those already-baked constants — cleanest correct
+      // fix is a fresh process, not a partial in-place patch.
+      console.log(
+        `\n  ${G}✓${R} Homebrew installed. Re-run this exact command to continue:\n`
       );
-      // As the published one-liner does: the script is bash's -c argument, so
-      // stdin stays the terminal and the installer can ask for a password.
-      execFileSync('/bin/bash', ['-c', installer], { stdio: 'inherit' });
-      done();
-    } catch {
-      die(
-        'Homebrew install failed — install manually from https://brew.sh, then re-run setu setup.'
+      console.log(
+        `  ${GR}setu setup ${setupArgs.map(shellQuote).join(' ')}${R}\n`
       );
+      process.exit(0);
     }
-    // BREW_PREFIX/CADDY_BIN/CLOUDFLARED_BIN (lib.js) are computed once at
-    // module load, before this function ever runs — with brew missing at
-    // that point they're already frozen to a fallback that's wrong on Intel
-    // Macs (and merely stale, not re-verified, on Apple Silicon). Patching
-    // process.env.PATH here would fix `brew`/`gh` lookups for the rest of
-    // this process but not those already-baked constants — cleanest correct
-    // fix is a fresh process, not a partial in-place patch.
-    console.log(
-      `\n  ${G}✓${R} Homebrew installed. Re-run this exact command to continue:\n`
-    );
-    console.log(`  ${GR}${['setu', 'setup', ...rest].join(' ')}${R}\n`);
-    process.exit(0);
-  }
-  ok('homebrew');
-  if (!commandExists('bun')) {
-    die('bun not found');
-  }
-  ok('bun');
-  for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv', 'gh']) {
-    brewInstall(pkg);
-  }
-  if (spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0) {
-    ok('gh authenticated');
-  } else {
-    console.log(`  ${GR}○${R} gh not authenticated — logging in...`);
-    try {
-      execFileSync('gh', ['auth', 'login'], { stdio: 'inherit' });
+    ok('homebrew');
+    if (!commandExists('bun')) {
+      die('bun not found');
+    }
+    ok('bun');
+    for (const pkg of ['caddy', 'cloudflared', 'dnsmasq', 'direnv', 'gh']) {
+      brewInstall(pkg);
+    }
+    if (spawnSync('gh', ['auth', 'status'], { stdio: 'ignore' }).status === 0) {
       ok('gh authenticated');
-    } catch {
-      fail('gh auth failed — run manually: gh auth login');
+    } else {
+      console.log(`  ${GR}○${R} gh not authenticated — logging in...`);
+      try {
+        execFileSync('gh', ['auth', 'login'], { stdio: 'inherit' });
+        ok('gh authenticated');
+      } catch {
+        fail('gh auth failed — run manually: gh auth login');
+      }
     }
+    console.log();
   }
-  console.log();
+  setupDependencies();
 
   // 2. container engine — `setu start` containerizes by default (real
   // memory/CPU caps); `setu start --bare` works with no engine at all, so
@@ -502,137 +532,167 @@ async function cmdSetup() {
   // two. Colima is the only genuinely headless option (brew services, no
   // GUI at all) — what a non-interactive `--yes` run defaults to absent an
   // explicit --engine flag.
-  step(2, 9, 'Container engine');
-  const rt = containerRuntimeAvailable();
-  if (rt.available) {
-    ok(`${rt.engine} already running`);
-  } else {
-    let engine = (flags.engine ?? '').toLowerCase();
-    if (interactive && !engine) {
+  async function setupContainerEngine() {
+    step(2, 9, 'Container engine');
+    const rt = containerRuntimeAvailable();
+    if (rt.available) {
+      ok(`${rt.engine} already running`);
+    } else {
+      async function selectEngine() {
+        let engine = (flags.engine ?? '').toLowerCase();
+        if (interactive && !engine) {
+          const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout,
+          });
+          console.log(
+            '  No container engine detected. setu start containerizes by default —'
+          );
+          console.log(
+            `  setu start --bare skips this entirely if you'd rather not install one.`
+          );
+          console.log(
+            `  ${GR}1${R}) OrbStack (recommended, lightweight)   ${GR}2${R}) Docker Desktop   ${GR}3${R}) Colima (CLI-only, no GUI)   ${GR}4${R}) Skip`
+          );
+          try {
+            let choice = '';
+            while (
+              ![
+                '1',
+                '2',
+                '3',
+                '4',
+                'orbstack',
+                'docker',
+                'colima',
+                'skip',
+              ].includes(choice)
+            ) {
+              // biome-ignore lint/performance/noAwaitInLoops: Each invalid answer must be received before prompting again.
+              choice = (await ask(rl, 'Choice', '1')).toLowerCase();
+            }
+            engine =
+              { 1: 'orbstack', 2: 'docker', 3: 'colima', 4: 'skip' }[choice] ??
+              choice;
+          } finally {
+            rl.close();
+          }
+        } else if (!engine) {
+          engine = 'colima'; // non-interactive default — the only fully headless option
+        }
+        return engine;
+      }
+
+      function installEngine(runtime) {
+        function installColima() {
+          spin('colima');
+          try {
+            execFileSync('brew', ['install', 'colima', 'docker'], {
+              stdio: 'ignore',
+            });
+            execFileSync('brew', ['services', 'start', 'colima'], {
+              stdio: 'ignore',
+            });
+            done();
+          } catch {
+            fail(
+              'colima install/start failed — run manually: brew install colima docker && brew services start colima'
+            );
+          }
+        }
+        function installDesktopEngine(engine) {
+          const cask = engine === 'orbstack' ? 'orbstack' : 'docker-desktop';
+          const appName = engine === 'orbstack' ? 'OrbStack' : 'Docker';
+          spin(cask);
+          try {
+            execFileSync('brew', ['install', '--cask', cask], {
+              stdio: 'ignore',
+            });
+            execFileSync('open', ['-a', appName], { stdio: 'ignore' });
+            done();
+            console.log(
+              `  ${GR}○${R} ${appName} needs one manual first launch to finish setup — it should now be opening. Run \`setu doctor\` after to confirm.`
+            );
+          } catch {
+            fail(
+              `${appName} install failed — run manually: brew install --cask ${cask}`
+            );
+          }
+        }
+        if (runtime === 'skip') {
+          console.log(
+            `  ${GR}○${R} skipped — use \`setu start --bare\` until an engine is set up`
+          );
+        } else if (runtime === 'colima') {
+          installColima();
+        } else if (runtime === 'orbstack' || runtime === 'docker') {
+          installDesktopEngine(runtime);
+        } else {
+          fail(
+            `unknown engine '${runtime}' — pass --engine orbstack|docker|colima|skip`
+          );
+        }
+      }
+      const selectedEngine = await selectEngine();
+      installEngine(selectedEngine);
+    }
+    console.log();
+  }
+  await setupContainerEngine();
+
+  // 3. configure — flags first, prompts only for what's missing (agents pass flags)
+  async function setupConfiguration() {
+    step(3, 9, 'Configuration');
+    const existing = loadConfig();
+    let name =
+      flags.name ??
+      (existing.tunnel
+        ? existing.tunnel.replace(DEV_TUNNEL_PREFIX_RE, '')
+        : '');
+    let workspace = resolvePath(
+      flags.workspace ?? existing.workspace ?? join(HOME, 'workspace')
+    );
+    let zone =
+      flags.zone ??
+      existing.domain?.split('.').slice(1).join('.') ??
+      'getquivly.ai';
+
+    if (interactive) {
       const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
       });
-      console.log(
-        '  No container engine detected. setu start containerizes by default —'
-      );
-      console.log(
-        `  setu start --bare skips this entirely if you'd rather not install one.`
-      );
-      console.log(
-        `  ${GR}1${R}) OrbStack (recommended, lightweight)   ${GR}2${R}) Docker Desktop   ${GR}3${R}) Colima (CLI-only, no GUI)   ${GR}4${R}) Skip`
-      );
       try {
-        let choice = '';
-        while (
-          ![
-            '1',
-            '2',
-            '3',
-            '4',
-            'orbstack',
-            'docker',
-            'colima',
-            'skip',
-          ].includes(choice)
-        ) {
-          choice = (await ask(rl, 'Choice', '1')).toLowerCase();
-        }
-        engine =
-          { 1: 'orbstack', 2: 'docker', 3: 'colima', 4: 'skip' }[choice] ??
-          choice;
+        name = await ask(
+          rl,
+          'Your name (e.g. "alice" → tunnel dev-alice)',
+          name
+        );
+        workspace = resolvePath(
+          await ask(rl, 'Workspace path', workspace.replace(HOME, '~'))
+        );
+        zone = await ask(rl, 'Zone domain', zone);
       } finally {
         rl.close();
       }
-    } else if (!engine) {
-      engine = 'colima'; // non-interactive default — the only fully headless option
     }
-
-    if (engine === 'skip') {
-      console.log(
-        `  ${GR}○${R} skipped — use \`setu start --bare\` until an engine is set up`
-      );
-    } else if (engine === 'colima') {
-      spin('colima');
-      try {
-        execFileSync('brew', ['install', 'colima', 'docker'], {
-          stdio: 'ignore',
-        });
-        execFileSync('brew', ['services', 'start', 'colima'], {
-          stdio: 'ignore',
-        });
-        done();
-      } catch {
-        fail(
-          'colima install/start failed — run manually: brew install colima docker && brew services start colima'
-        );
-      }
-    } else if (engine === 'orbstack' || engine === 'docker') {
-      const cask = engine === 'orbstack' ? 'orbstack' : 'docker-desktop';
-      const appName = engine === 'orbstack' ? 'OrbStack' : 'Docker';
-      spin(cask);
-      try {
-        execFileSync('brew', ['install', '--cask', cask], { stdio: 'ignore' });
-        execFileSync('open', ['-a', appName], { stdio: 'ignore' });
-        done();
-        console.log(
-          `  ${GR}○${R} ${appName} needs one manual first launch to finish setup — it should now be opening. Run \`setu doctor\` after to confirm.`
-        );
-      } catch {
-        fail(
-          `${appName} install failed — run manually: brew install --cask ${cask}`
-        );
-      }
-    } else {
-      fail(
-        `unknown engine '${engine}' — pass --engine orbstack|docker|colima|skip`
+    if (!name) {
+      die(
+        'Name is required — pass --name <you> (non-interactive) or run in a terminal.'
       );
     }
+    const input = {
+      domain: `dev-${name}.${zone}`,
+      name,
+      tunnel: `dev-${name}`,
+      workspace,
+      zone,
+    };
+    ok(`${input.tunnel} → ${input.domain}, workspace ${workspace}`);
+    console.log();
+    return input;
   }
-  console.log();
-
-  // 3. configure — flags first, prompts only for what's missing (agents pass flags)
-  step(3, 9, 'Configuration');
-  const existing = loadConfig();
-  let name =
-    flags.name ?? (existing.tunnel ? existing.tunnel.replace(/^dev-/, '') : '');
-  let workspace = resolvePath(
-    flags.workspace ?? existing.workspace ?? join(HOME, 'workspace')
-  );
-  let zone =
-    flags.zone ??
-    existing.domain?.split('.').slice(1).join('.') ??
-    'getquivly.ai';
-
-  if (interactive) {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    try {
-      name = await ask(rl, 'Your name (e.g. "alice" → tunnel dev-alice)', name);
-      workspace = resolvePath(
-        await ask(rl, 'Workspace path', workspace.replace(HOME, '~'))
-      );
-      zone = await ask(rl, 'Zone domain', zone);
-    } finally {
-      rl.close();
-    }
-  }
-  if (!name) {
-    die(
-      'Name is required — pass --name <you> (non-interactive) or run in a terminal.'
-    );
-  }
-  const input = {
-    domain: `dev-${name}.${zone}`,
-    name,
-    tunnel: `dev-${name}`,
-    workspace,
-    zone,
-  };
-  ok(`${input.tunnel} → ${input.domain}, workspace ${workspace}`);
-  console.log();
+  const input = await setupConfiguration();
 
   // 3. Cloudflare
   step(4, 9, 'Cloudflare tunnel');
@@ -731,7 +791,7 @@ async function cmdSetup() {
   const services = execFileSync('brew', ['services', 'list'], {
     encoding: 'utf8',
   });
-  if (/^caddy\s+started/m.test(services)) {
+  if (CADDY_SERVICE_STARTED_RE.test(services)) {
     process.stdout.write(`${G}✓${R} already running\n`);
   } else {
     try {
@@ -795,9 +855,11 @@ async function cmdSetup() {
 
   // 7. first hosts sync
   step(8, 9, 'Verify');
-  (await syncHosts(input.workspace))
-    ? ok('/etc/hosts synced')
-    : fail('/etc/hosts sync');
+  if (await syncHosts(input.workspace)) {
+    ok('/etc/hosts synced');
+  } else {
+    fail('/etc/hosts sync');
+  }
   console.log();
 
   // 8. Raycast extension — optional, skipped silently if Raycast isn't
@@ -829,24 +891,10 @@ async function cmdSetup() {
 
 // ── setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json] ─
 
-async function cmdNew() {
-  const [repo, name] = args;
-  if (!(repo && name)) {
-    die(
-      'Usage: setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json]'
-    );
-  }
-  const deps = newCommandOverrides;
-  const c = (deps.config ?? cfg)();
-  const withTunnel = !!flags.tunnel;
-  const target = { name, repo };
-  const operationId = (
-    deps.operationId ?? (() => `setup-${crypto.randomUUID()}`)
-  )();
-  let state;
+function createNewOutcomeTracker(operationTarget, operationId) {
   let events;
   let outcomeRecorded = true;
-  const recordOutcome = async (stateName, code) => {
+  const recordOutcome = async (state, code) => {
     try {
       const recorded = await events?.record({
         ...(code ? { code } : {}),
@@ -855,8 +903,8 @@ async function cmdNew() {
         kind: 'setup',
         operationId,
         source: 'cli',
-        state: stateName,
-        target,
+        state,
+        target: operationTarget,
       });
       if (recorded?.ok !== true) {
         outcomeRecorded = false;
@@ -869,133 +917,150 @@ async function cmdNew() {
     operationId,
     ...(outcomeRecorded ? {} : { outcomeRecorded: false }),
   });
-  const reportFailure = async (result, stateName) => {
-    await recordOutcome(stateName, result.code);
-    process.exitCode = 1;
-    if (asJson) {
-      console.log(JSON.stringify({ ...result, ...outcomeMetadata() }));
-    } else {
-      console.error(`${Y}error:${R} ${result.code}: ${result.error}`);
-    }
-  };
-  const failureState = (result) =>
-    result?.state === 'unknown' ||
-    String(result?.code ?? '').endsWith('UNKNOWN')
-      ? 'unknown'
-      : 'failed';
-
-  let res;
-  try {
-    const sharing = (
-      deps.dependencySharingForTarget ?? dependencySharingForTarget
-    )(c, repo, name);
-    state = (deps.workspaceState ?? workspaceState)(c.workspace);
-    events = (deps.createOperationEvents ?? createOperationEvents)({ state });
-    const admission = (deps.createResourceAdmission ?? createResourceAdmission)(
-      {
-        hostHealth: (deps.createHostHealth ?? createHostHealth)(c.workspace),
-        state,
-      }
-    );
-    const progress = (deps.createSetupProgress ?? createSetupProgress)({
-      newAttemptId: () => crypto.randomUUID(),
-      state,
-    });
-    const logLocation = join(c.workspace, 'logs', repo, name, 'setup.log');
-    await recordOutcome('accepted');
-    res = await (deps.createAndInstallWorktree ?? createAndInstallWorktree)({
-      admission,
-      checkoutIdentity: async (wtDir) => {
-        const identity = await (
-          deps.inspectCheckoutIdentity ?? inspectCheckoutIdentity
-        )({ repoDir: join(c.workspace, `${repo}.git`), wtDir }, fsPromises);
-        if (!identity.known) {
-          throw Object.assign(new Error(identity.reason), {
-            code: 'CHECKOUT_IDENTITY_UNKNOWN',
-          });
-        }
-        return identity;
-      },
-      create: (options) =>
-        (deps.createWorktree ?? createWorktree)(c, repo, name, options),
-      enableTunnel: async () => {
-        await (deps.ensureTunnel ?? ensureTunnel)(c, repo, name);
-        return publicDomain(c);
-      },
-      install: (wtDir, setup) =>
-        autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined, {
-          ...setup,
-          state,
-        }),
-      logLocation,
-      name,
-      operationId,
-      progress,
-      repo,
-      state,
-      target,
-      tunnel: withTunnel,
-      withTarget: (lockedTarget, task) =>
-        state.withTargets([lockedTarget], task),
-    });
-  } catch (e) {
-    const result = {
-      ...(e?.recovery === undefined ? {} : { recovery: e.recovery }),
-      code: e?.code ?? 'SETUP_FAILED',
-      error: e?.message ?? String(e),
-      ok: false,
-    };
-    await reportFailure(result, failureState(result));
-    return;
-  }
-
-  if (res?.ok === false) {
-    await reportFailure(res, failureState(res));
-    return;
-  }
-
-  await recordOutcome('completed');
-
-  let started = false;
-  if (flags.start) {
-    await (deps.ensurePortal ?? ensurePortal)(c);
-    const startBody = { name, repo };
-    if (flags.container) {
-      startBody.container = true;
-    } else if (flags.bare) {
-      startBody.container = false;
-    }
-    // Neither flag: a brand-new worktree has no prior history either way, so
-    // the portal's sticky default naturally resolves to the intended global
-    // default (container) here — same call shape as `setu start`, not a
-    // special case.
-    const startRes = await cliApi
-      .post('/api/start', startBody)
-      .catch((e) => ({ error: String(e), ok: false }));
-    const outcome = startOutcome(startRes);
-    started = outcome.started;
-    if (!started) {
-      if (outcome.queued) {
-        console.log(
-          `  ${GR}○${R} dev server queued at position ${outcome.position} (${outcome.reason})`
-        );
+  return {
+    outcomeMetadata,
+    recordOutcome,
+    reportFailure: async (result, state) => {
+      await recordOutcome(state, result.code);
+      process.exitCode = 1;
+      if (asJson) {
+        console.log(JSON.stringify({ ...result, ...outcomeMetadata() }));
       } else {
-        fail(`dev server start failed: ${startRes.error ?? 'unknown'}`);
-        process.exitCode = 1;
+        console.error(`${Y}error:${R} ${result.code}: ${result.error}`);
       }
-      Object.assign(res, outcome);
-    }
-  }
+    },
+    setEvents: (value) => {
+      events = value;
+    },
+  };
+}
 
+function newFailureState(result) {
+  return result?.state === 'unknown' ||
+    String(result?.code ?? '').endsWith('UNKNOWN')
+    ? 'unknown'
+    : 'failed';
+}
+
+function newSetupFailureResult(error) {
+  return {
+    ...(error?.recovery === undefined ? {} : { recovery: error.recovery }),
+    code: error?.code ?? 'SETUP_FAILED',
+    error: error?.message ?? String(error),
+    ok: false,
+  };
+}
+
+async function createNewWorktreeResult({
+  c,
+  deps,
+  name,
+  operationId,
+  operationTarget,
+  repo,
+  tracker,
+  withTunnel,
+}) {
+  const sharing = (
+    deps.dependencySharingForTarget ?? dependencySharingForTarget
+  )(c, repo, name);
+  const state = (deps.workspaceState ?? workspaceState)(c.workspace);
+  tracker.setEvents(
+    (deps.createOperationEvents ?? createOperationEvents)({ state })
+  );
+  const admission = (deps.createResourceAdmission ?? createResourceAdmission)({
+    hostHealth: (deps.createHostHealth ?? createHostHealth)(c.workspace),
+    state,
+  });
+  const progress = (deps.createSetupProgress ?? createSetupProgress)({
+    newAttemptId: () => crypto.randomUUID(),
+    state,
+  });
+  const logLocation = join(c.workspace, 'logs', repo, name, 'setup.log');
+  await tracker.recordOutcome('accepted');
+  return (deps.createAndInstallWorktree ?? createAndInstallWorktree)({
+    admission,
+    checkoutIdentity: async (wtDir) => {
+      const identity = await (
+        deps.inspectCheckoutIdentity ?? inspectCheckoutIdentity
+      )(
+        { repoDir: join(c.workspace, `${repo}.git`), wtDir },
+        { readFile: readFileAsync, realpath: realpathAsync, stat: statAsync }
+      );
+      if (!identity.known) {
+        throw Object.assign(new Error(identity.reason), {
+          code: 'CHECKOUT_IDENTITY_UNKNOWN',
+        });
+      }
+      return identity;
+    },
+    create: (options) =>
+      (deps.createWorktree ?? createWorktree)(c, repo, name, options),
+    enableTunnel: async () => {
+      await (deps.ensureTunnel ?? ensureTunnel)(c, repo, name);
+      return publicDomain(c);
+    },
+    install: (wtDir, setup) =>
+      autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined, {
+        ...setup,
+        state,
+      }),
+    logLocation,
+    name,
+    operationId,
+    progress,
+    repo,
+    state,
+    target: operationTarget,
+    tunnel: withTunnel,
+    withTarget: (lockedTarget, task) => state.withTargets([lockedTarget], task),
+  });
+}
+
+async function startNewWorktree(deps, c, repo, name, result) {
+  if (!flags.start) {
+    return false;
+  }
+  await (deps.ensurePortal ?? ensurePortal)(c);
+  const startBody = { name, repo };
+  if (flags.container) {
+    startBody.container = true;
+  } else if (flags.bare) {
+    startBody.container = false;
+  }
+  // Neither flag: a brand-new worktree has no prior history either way, so
+  // the portal's sticky default naturally resolves to the intended global
+  // default (container) here — same call shape as `setu start`, not a
+  // special case.
+  const startResult = await cliApi
+    .post('/api/start', startBody)
+    .catch((error) => ({ error: String(error), ok: false }));
+  const outcome = startOutcome(startResult);
+  if (outcome.started) {
+    return true;
+  }
+  if (outcome.queued) {
+    console.log(
+      `  ${GR}○${R} dev server queued at position ${outcome.position} (${outcome.reason})`
+    );
+  } else {
+    fail(`dev server start failed: ${startResult.error ?? 'unknown'}`);
+    process.exitCode = 1;
+  }
+  Object.assign(result, outcome);
+  return false;
+}
+
+function reportNewWorktree(result, started, withTunnel, outcomeMetadata) {
   if (asJson) {
-    console.log(JSON.stringify({ ...res, started, ...outcomeMetadata() }));
+    console.log(JSON.stringify({ ...result, started, ...outcomeMetadata() }));
     return;
   }
-  console.log(`\n  ${G}✓${R} worktree  ${res.wtDir}`);
-  console.log(`  ${G}✓${R} port      :${res.port}`);
-  console.log(`  ${G}✓${R} local     http://${res.localDom}`);
+  console.log(`\n  ${G}✓${R} worktree  ${result.wtDir}`);
+  console.log(`  ${G}✓${R} port      :${result.port}`);
+  console.log(`  ${G}✓${R} local     http://${result.localDom}`);
   if (withTunnel) {
-    console.log(`  ${G}✓${R} public    https://${res.pubDom}`);
+    console.log(`  ${G}✓${R} public    https://${result.pubDom}`);
   }
   if (started) {
     console.log(`  ${G}✓${R} dev server started`);
@@ -1003,10 +1068,55 @@ async function cmdNew() {
   console.log();
 }
 
+async function cmdNew() {
+  const [repo, name] = args;
+  if (!(repo && name)) {
+    die(
+      'Usage: setu new <repo> <branch> [--tunnel] [--start] [--container|--bare] [--json]'
+    );
+  }
+  const deps = newCommandOverrides;
+  const c = (deps.config ?? cfg)();
+  const withTunnel = !!flags.tunnel;
+  const operationTarget = { name, repo };
+  const operationId = (
+    deps.operationId ?? (() => `setup-${crypto.randomUUID()}`)
+  )();
+  const tracker = createNewOutcomeTracker(operationTarget, operationId);
+  let res;
+  try {
+    res = await createNewWorktreeResult({
+      c,
+      deps,
+      name,
+      operationId,
+      operationTarget,
+      repo,
+      tracker,
+      withTunnel,
+    });
+  } catch (error) {
+    const result = newSetupFailureResult(error);
+    await tracker.reportFailure(result, newFailureState(result));
+    return;
+  }
+
+  if (res?.ok === false) {
+    await tracker.reportFailure(res, newFailureState(res));
+    return;
+  }
+
+  await tracker.recordOutcome('completed');
+
+  const started = await startNewWorktree(deps, c, repo, name, res);
+  reportNewWorktree(res, started, withTunnel, tracker.outcomeMetadata);
+}
+
 // ── setu rm <repo> <branch> ───────────────────────────────────────────────────
 
 async function cmdRm() {
   const [repo, name] = args;
+  const deps = lifecycleCommandOverrides;
   const outcome = await runRemoveCommand(
     {
       force: flags.force ?? false,
@@ -1017,7 +1127,7 @@ async function cmdRm() {
     },
     {
       request: (body) =>
-        requestRemoval(body, {
+        (deps.requestRemoval ?? requestRemoval)(body, {
           url: `http://127.0.0.1:${PORTAL_PORT}/api/remove`,
         }),
       stderr: (text) => console.error(`error: ${text}`),
@@ -1039,11 +1149,12 @@ async function cmdStart() {
   if (!(repo && name)) {
     die('Usage: setu start <repo> <branch> [--container|--bare]');
   }
-  const c = cfg();
-  if (!getPort(c.workspace, repo, name)) {
+  const deps = lifecycleCommandOverrides;
+  const c = (deps.cfg ?? cfg)();
+  if (!(deps.getPort ?? getPort)(c.workspace, repo, name)) {
     die(`No worktree for ${repo}/${name} — run: setu new ${repo} ${name}`);
   }
-  await ensurePortal(c);
+  await (deps.ensurePortal ?? ensurePortal)(c);
   // --container/--bare force a mode explicitly. Neither flag omits `container`
   // entirely so the portal applies its sticky per-worktree default instead of
   // blindly forcing one — found live: a flat "container unless --bare" default
@@ -1070,14 +1181,14 @@ async function cmdStop() {
   if (!(repo && name)) {
     die('Usage: setu stop <repo> <branch>');
   }
-  if (!portalPid()) {
+  if (!(lifecycleCommandOverrides.portalPid ?? portalPid)()) {
     die('PORTAL_REQUIRED: Portal must be running to stop a worktree.');
   }
   await portalCall('/api/stop', { name, repo }, 'stop failed');
   ok(`stopped ${repo}/${name}`);
 }
 
-function createLocalWorkspaceOperation(c, kind, target = null) {
+function createLocalWorkspaceOperation(c, kind, operationTarget = null) {
   const deps = localCommandOverrides;
   const operationId = (
     deps.operationId ?? ((name) => `${name}-${crypto.randomUUID()}`)
@@ -1099,7 +1210,7 @@ function createLocalWorkspaceOperation(c, kind, target = null) {
         operationId,
         source: 'cli',
         state,
-        target,
+        target: operationTarget,
       });
     } catch {
       // The child outcome remains authoritative if recording is unavailable.
@@ -1188,6 +1299,7 @@ async function cmdPrune() {
 
 // ── setu ls [repo] [--json] ───────────────────────────────────────────────────
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdLs() {
   const [repo] = args;
   const c = cfg();
@@ -1195,7 +1307,11 @@ async function cmdLs() {
     (e) => !repo || e.repo === repo
   );
   if (!entries.length) {
-    asJson ? console.log('[]') : console.log('No worktrees yet.');
+    if (asJson) {
+      console.log('[]');
+    } else {
+      console.log('No worktrees yet.');
+    }
     return;
   }
 
@@ -1250,6 +1366,7 @@ async function cmdInit() {
       state,
       state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
     );
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: The import collaborator can reject an untrusted non-Error value.
     die(`${e?.code ? `${e.code}: ` : ''}${e.message}`);
   }
   await operation.record('completed');
@@ -1263,6 +1380,61 @@ async function cmdInit() {
 // Finds plain git clones already on disk that were never brought into Setu's
 // bare-repo+worktree layout, and can bring one in on request. Read-only
 // until --import is passed.
+
+function sweepStatusLabel(candidate) {
+  if (candidate.status === 'importable') {
+    return `${G}importable${R}`;
+  }
+  if (candidate.status === 'no-remote') {
+    return `${GR}no remote${R}`;
+  }
+  return `${Y}conflict with ${candidate.conflictWith}${R}`;
+}
+
+function reportSweepCandidates(candidates) {
+  if (asJson) {
+    console.log(JSON.stringify(candidates, null, 2));
+    return;
+  }
+  if (!candidates.length) {
+    console.log('Nothing to sweep in, everything found is already registered.');
+    return;
+  }
+  console.log();
+  for (const candidate of candidates) {
+    const remote = candidate.remoteUrl ?? 'no remote';
+    const dirtyFlag = candidate.dirty ? `${Y}dirty${R}` : `${GR}clean${R}`;
+    console.log(`  ${B}${candidate.name}${R}  ${GR}${candidate.path}${R}`);
+    console.log(`    ${remote}  ${dirtyFlag}  ${sweepStatusLabel(candidate)}`);
+  }
+  console.log(
+    `\n  ${candidates.length} candidate${candidates.length === 1 ? '' : 's'} found. Use --import <name> to bring one in.\n`
+  );
+}
+
+async function importSweepCandidate(c, deps, candidate) {
+  const operation = createLocalWorkspaceOperation(c, 'import', {
+    name: 'main',
+    repo: candidate.name,
+  });
+  await operation.record('accepted');
+  try {
+    await (deps.importRepo ?? importRepo)(c, {
+      label: candidate.name,
+      name: candidate.name,
+      remoteUrl: candidate.remoteUrl,
+    });
+  } catch (error) {
+    const state = importFailureState(error);
+    await operation.record(
+      state,
+      state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
+    );
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: The import collaborator can reject an untrusted non-Error value.
+    die(`${error?.code ? `${error.code}: ` : ''}${error.message}`);
+  }
+  await operation.record('completed');
+}
 
 async function cmdSweep() {
   const deps = localCommandOverrides;
@@ -1280,32 +1452,7 @@ async function cmdSweep() {
   }
 
   if (!flags.import) {
-    if (asJson) {
-      console.log(JSON.stringify(candidates, null, 2));
-      return;
-    }
-    if (!candidates.length) {
-      console.log(
-        'Nothing to sweep in, everything found is already registered.'
-      );
-      return;
-    }
-    console.log();
-    for (const cand of candidates) {
-      const remote = cand.remoteUrl ?? 'no remote';
-      const dirtyFlag = cand.dirty ? `${Y}dirty${R}` : `${GR}clean${R}`;
-      const statusLabel =
-        cand.status === 'importable'
-          ? `${G}importable${R}`
-          : cand.status === 'no-remote'
-            ? `${GR}no remote${R}`
-            : `${Y}conflict with ${cand.conflictWith}${R}`;
-      console.log(`  ${B}${cand.name}${R}  ${GR}${cand.path}${R}`);
-      console.log(`    ${remote}  ${dirtyFlag}  ${statusLabel}`);
-    }
-    console.log(
-      `\n  ${candidates.length} candidate${candidates.length === 1 ? '' : 's'} found. Use --import <name> to bring one in.\n`
-    );
+    reportSweepCandidates(candidates);
     return;
   }
 
@@ -1326,26 +1473,7 @@ async function cmdSweep() {
   }
 
   console.log(`  Importing ${name} from ${cand.remoteUrl}...`);
-  const operation = createLocalWorkspaceOperation(c, 'import', {
-    name: 'main',
-    repo: cand.name,
-  });
-  await operation.record('accepted');
-  try {
-    await (deps.importRepo ?? importRepo)(c, {
-      label: cand.name,
-      name: cand.name,
-      remoteUrl: cand.remoteUrl,
-    });
-  } catch (e) {
-    const state = importFailureState(e);
-    await operation.record(
-      state,
-      state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
-    );
-    die(`${e?.code ? `${e.code}: ` : ''}${e.message}`);
-  }
-  await operation.record('completed');
+  await importSweepCandidate(c, deps, cand);
   ok(`imported ${name} into ${c.workspace}/${name}.git, worktree main ready`);
 }
 
@@ -1406,7 +1534,7 @@ export function mcpInstallCodex({
   }
   writeAtomic(
     path,
-    `${text.replace(/\n*$/, '\n')}\n[mcp_servers.setu]\nurl = "${MCP_URL}"\n`
+    `${text.replace(TRAILING_NEWLINES_RE, '\n')}\n[mcp_servers.setu]\nurl = "${MCP_URL}"\n`
   );
   ok(`Added Setu MCP server to ${path}`);
   console.log(
@@ -1501,9 +1629,9 @@ const verifiedMcpInstallers = {
   opencode: mcpInstallOpenCode,
 };
 
-function genericMcpConfig(target) {
+function genericMcpConfig(client) {
   console.log(
-    `${target} could not be verified on this machine. Add this Streamable HTTP MCP entry using its configuration UI or documentation:\n` +
+    `${client} could not be verified on this machine. Add this Streamable HTTP MCP entry using its configuration UI or documentation:\n` +
       `${JSON.stringify({ mcpServers: { setu: { type: 'http', url: MCP_URL } } }, null, 2)}`
   );
 }
@@ -1560,17 +1688,18 @@ function mcpStatus() {
   }
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdMcp() {
   const [sub, targetArg] = args;
-  const target = targetArg ?? (flags.all ? '--all' : undefined);
-  if (sub === 'status' && !target) {
+  const clientTarget = targetArg ?? (flags.all ? '--all' : undefined);
+  if (sub === 'status' && !clientTarget) {
     mcpStatus();
     return;
   }
-  if (sub !== 'install' || !target) {
+  if (sub !== 'install' || !clientTarget) {
     die('Usage: setu mcp install <client|--all> | setu mcp status');
   }
-  if (target === '--all') {
+  if (clientTarget === '--all') {
     for (const [id, install] of Object.entries(verifiedMcpInstallers)) {
       if (
         ['codex', 'cursor'].includes(id) ||
@@ -1581,14 +1710,14 @@ async function cmdMcp() {
     }
     return;
   }
-  if (verifiedMcpInstallers[target]) {
-    return verifiedMcpInstallers[target]();
+  if (verifiedMcpInstallers[clientTarget]) {
+    return verifiedMcpInstallers[clientTarget]();
   }
-  if (Object.hasOwn(AGENT_CLIS, target)) {
-    return genericMcpConfig(target);
+  if (Object.hasOwn(AGENT_CLIS, clientTarget)) {
+    return genericMcpConfig(clientTarget);
   }
   die(
-    `Unknown target '${target}'. Supported: ${Object.keys(AGENT_CLIS).join(', ')}, --all.`
+    `Unknown target '${clientTarget}'. Supported: ${Object.keys(AGENT_CLIS).join(', ')}, --all.`
   );
 }
 
@@ -1880,6 +2009,7 @@ async function apiResult(call) {
   }
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdStorage() {
   validateCommand({
     allowedFlags: ['store'],
@@ -1914,6 +2044,7 @@ async function cmdStorage() {
   return apiResult(() => cliApi.post('/api/workspace-storage/inspect', body));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdOperations() {
   validateCommand({
     allowedFlags: ['limit', 'since'],
@@ -1931,6 +2062,7 @@ async function cmdOperations() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSessions() {
   validateCommand({
     allowedFlags: ['checkout', 'session'],
@@ -1964,6 +2096,7 @@ async function cmdSessions() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdCaches() {
   validateCommand({
     allowedFlags: ['confirmation', 'manifest', 'retry'],
@@ -2007,11 +2140,13 @@ async function cmdCaches() {
   return apiResult(() => cliApi.post(`/api/worktree-cache/${action}`, body));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdAdmission() {
   validateCommand({ argCounts: [0], usage: 'setu admission [--json]' });
   return apiResult(() => cliApi.get('/api/resource-admission'));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSetupProgress() {
   validateCommand({
     allowedFlags: ['attempt', 'checkout'],
@@ -2047,6 +2182,7 @@ async function cmdSetupProgress() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdAttention() {
   validateCommand({
     allowedFlags: ['checkout', 'session'],
@@ -2084,7 +2220,7 @@ async function cmdAttention() {
 
 function headlessLimits() {
   const model = optionalFlag('model');
-  if (model !== undefined && !/^[a-zA-Z0-9._-]{1,128}$/.test(model)) {
+  if (model !== undefined && !HEADLESS_MODEL_RE.test(model)) {
     die('--model must be a valid headless model name');
   }
   return {
@@ -2101,6 +2237,7 @@ function headlessLimits() {
   };
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdHeadless() {
   validateCommand({
     allowedFlags: [
@@ -2170,6 +2307,7 @@ async function cmdHeadless() {
   return apiResult(() => cliApi.post(`/api/headless-runs/${action}`, body));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdDependencies() {
   validateCommand({
     argCounts: [0, 1, 2, 3],
@@ -2198,11 +2336,13 @@ async function cmdDependencies() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSharedCaches() {
   validateCommand({ argCounts: [0], usage: 'setu shared-caches [--json]' });
   return apiResult(() => cliApi.get('/api/shared-caches'));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdWorkflows() {
   validateCommand({
     allowedFlags: ['confirmation', 'inputs', 'ref', 'workflow'],
@@ -2237,6 +2377,7 @@ async function cmdWorkflows() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdActions() {
   validateCommand({
     allowedFlags: ['action', 'confirmation', 'input'],
@@ -2254,18 +2395,19 @@ async function cmdActions() {
       'Usage: setu actions list | save --input <file|-> | preflight --action <id> --input <file|-> | invoke --action <id> --input <file|-> --confirmation <token> [--json]'
     );
   }
-  validateFlags(
-    action === 'save'
-      ? ['input']
-      : action === 'preflight'
-        ? ['action', 'input']
-        : ['action', 'confirmation', 'input'],
-    action === 'save'
-      ? 'setu actions save --input <file|-> [--json]'
-      : action === 'preflight'
-        ? 'setu actions preflight --action <id> --input <file|-> [--json]'
-        : 'setu actions invoke --action <id> --input <file|-> --confirmation <token> [--json]'
-  );
+  let allowedFlags, usage;
+  if (action === 'save') {
+    allowedFlags = ['input'];
+    usage = 'setu actions save --input <file|-> [--json]';
+  } else if (action === 'preflight') {
+    allowedFlags = ['action', 'input'];
+    usage = 'setu actions preflight --action <id> --input <file|-> [--json]';
+  } else {
+    allowedFlags = ['action', 'confirmation', 'input'];
+    usage =
+      'setu actions invoke --action <id> --input <file|-> --confirmation <token> [--json]';
+  }
+  validateFlags(allowedFlags, usage);
   const body =
     action === 'save'
       ? jsonInput()
@@ -2279,6 +2421,7 @@ async function cmdActions() {
   return apiResult(() => cliApi.post(`/api/mcp-actions/${action}`, body));
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdAdopt() {
   validateCommand({
     allowedFlags: ['path'],
@@ -2295,6 +2438,7 @@ async function cmdAdopt() {
   );
 }
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdReview() {
   validateCommand({
     allowedFlags: ['artifact', 'checkout', 'findings', 'session'],
@@ -2368,6 +2512,7 @@ async function cmdFetch() {
       state,
       state === 'unknown' ? 'FETCH_UNKNOWN' : 'FETCH_FAILED'
     );
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: The Git command can throw an untrusted non-Error value.
     die(`${error?.code ? `${error.code}: ` : ''}${error.message}`);
   }
   await operation.record('completed');
@@ -2376,6 +2521,7 @@ async function cmdFetch() {
 // ── setu path <repo> <branch> ────────────────────────────────────────────────
 // Used by the `wt()` shell function to cd into a worktree — stdout must stay clean.
 
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdPath() {
   const [repo, name] = args;
   if (!(repo && name)) {
@@ -2484,9 +2630,9 @@ function cmdVersion() {
 // the process exit code to tell "denied" from "allowed". spawnText() only
 // returns stdout text, so this stays a thin local variant instead of forcing
 // that shape onto every caller.
-async function spawnTextCode(cmd, args) {
+async function spawnTextCode(command, argv) {
   try {
-    const proc = Bun.spawn([cmd, ...args], {
+    const proc = Bun.spawn([command, ...argv], {
       stderr: 'ignore',
       stdout: 'pipe',
     });
@@ -2518,6 +2664,90 @@ function composeProjectStates(rawPsOutput) {
     }
   }
   return projectState;
+}
+
+function registeredPortMismatch(entry, active, workspace, projectState) {
+  const process = active.find((candidate) => candidate.port === entry.port);
+  if (!process) {
+    return;
+  }
+  const cwd = processCwd(process.pid);
+  const expected = resolve(join(workspace, entry.repo, entry.name));
+  if (
+    projectState.get(composeProjectName(entry.repo, entry.name)) ===
+      'running' ||
+    !hasIdentifiableWorktreeCwd(cwd)
+  ) {
+    return;
+  }
+  // Nx/monorepo dev servers end up with cwd nested inside apps/<app> — only
+  // flag a cwd that is neither the worktree root nor a descendant of it.
+  if (
+    cwd &&
+    resolve(cwd) !== expected &&
+    !resolve(cwd).startsWith(`${expected}/`)
+  ) {
+    return `${entry.key} :${entry.port} is actually serving ${cwd}`;
+  }
+}
+
+async function registeredPortWorktreeCheck(entries, active, workspace) {
+  const raw = await spawnText([
+    'docker',
+    'ps',
+    '--format',
+    '{{.Label "com.docker.compose.project"}}\t{{.State}}',
+  ]);
+  const projectState = composeProjectStates(raw);
+  const mismatches = entries
+    .map((entry) =>
+      registeredPortMismatch(entry, active, workspace, projectState)
+    )
+    .filter(Boolean);
+  return {
+    fix: mismatches.join('; ') || undefined,
+    name: 'registered ports match their worktree',
+    ok: mismatches.length === 0,
+  };
+}
+
+function gitWorktreePaths(repoDir) {
+  try {
+    return git(repoDir, ['worktree', 'list', '--porcelain'])
+      .trim()
+      .split('\n\n')
+      .flatMap((worktree) => {
+        const path = worktree.match(WORKTREE_LIST_ENTRY_RE)?.[1];
+        return path && path !== repoDir && !path.includes('/.claude/worktrees/')
+          ? [path]
+          : [];
+      });
+  } catch {
+    // This repository cannot contribute paths to the best-effort scan.
+    return [];
+  }
+}
+
+function unregisteredWorktreeCheck(entries, workspace) {
+  const registeredDirs = new Set(
+    entries.map((entry) => join(workspace, entry.repo, entry.name))
+  );
+  const gitWorktreeDirs = new Set(
+    Object.keys(loadProjects(workspace)).flatMap((repo) => {
+      const repoDir = join(workspace, `${repo}.git`);
+      return existsSync(repoDir) ? gitWorktreePaths(repoDir) : [];
+    })
+  );
+  const unregistered = [...gitWorktreeDirs].filter(
+    (directory) => !registeredDirs.has(directory)
+  );
+  return {
+    fix: unregistered.length
+      ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)`
+      : undefined,
+    name: 'all git worktrees are registered with setu',
+    ok: unregistered.length === 0,
+  };
 }
 
 async function cmdDoctor() {
@@ -2579,7 +2809,9 @@ async function cmdDoctor() {
     async () => ({
       fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
       name: 'dnsmasq service',
-      ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
+      ok:
+        DNSMASQ_SERVICE_STARTED_RE.test(dnsmasqLine) &&
+        !ERROR_RE.test(dnsmasqLine),
     }),
     async () => ({
       fix: 'sudo brew services restart dnsmasq (then re-check)',
@@ -2594,7 +2826,7 @@ async function cmdDoctor() {
     async () => ({
       fix: 'brew services restart caddy',
       name: 'caddy service',
-      ok: /^caddy\s+started/m.test(services),
+      ok: CADDY_SERVICE_STARTED_RE.test(services),
     }),
     async () => ({
       fix: 'brew services restart caddy',
@@ -2617,6 +2849,7 @@ async function cmdDoctor() {
     // will fail until either the engine is running or `--bare` is passed.
     // Reports whichever engine answered (OrbStack, Docker Desktop, Colima, …)
     // without requiring one specifically — see the containerization plan.
+    // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
     async () => {
       const rt = containerRuntimeAvailable();
       return {
@@ -2627,6 +2860,7 @@ async function cmdDoctor() {
         ok: rt.available,
       };
     },
+    // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
     async () => {
       const cap = engineCapacity();
       if (!(cap.memMb && cap.cpus)) {
@@ -2698,18 +2932,25 @@ async function cmdDoctor() {
       name: '~/.setu clean',
       ok: setuGit(['status', '--porcelain']).trim() === '',
     }));
-    checkThunks.push(async () => {
-      let behind = 0;
-      try {
-        behind = Number.parseInt(
-          setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(),
-          10
-        );
-      } catch {
-        // Continue collecting the other independent diagnostic results.
+    checkThunks.push(
+      // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
+      async () => {
+        let behind = 0;
+        try {
+          behind = Number.parseInt(
+            setuGit(['rev-list', '--count', 'HEAD..origin/main']).trim(),
+            10
+          );
+        } catch {
+          // Continue collecting the other independent diagnostic results.
+        }
+        return {
+          fix: 'setu update',
+          name: 'setu up to date',
+          ok: behind === 0,
+        };
       }
-      return { fix: 'setu update', name: 'setu up to date', ok: behind === 0 };
-    });
+    );
   }
 
   // worktree hygiene — the class of bug that let a worktree ("orb") run fully
@@ -2722,124 +2963,66 @@ async function cmdDoctor() {
     const entries = portEntries(workspace);
     const active = listActivePorts();
 
-    checkThunks.push(async () => {
-      const locks = workspaceState(workspace).inspectLocks();
-      const bad = locks.filter((lock) => lock.retained || lock.alive === false);
-      return {
-        fix: bad.length
-          ? `${bad.map((lock) => lock.path).join(', ')}${bad.some((lock) => lock.alive === false) ? ' — it is safe to delete a lock whose process is dead' : ''}`
-          : undefined,
-        name: 'no stale Setu locks',
-        ok: bad.length === 0,
-      };
-    });
-
-    checkThunks.push(async () => {
-      const orphanProcs = pruneCandidates(
-        entries,
-        active,
-        processCwd,
-        workspace
-      );
-      return {
-        fix: orphanProcs.length
-          ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map((p) => `pid ${p.pid} :${p.port}`).join(', ')})`
-          : undefined,
-        name: 'no unregistered dev-server processes',
-        ok: orphanProcs.length === 0,
-      };
-    });
-
-    checkThunks.push(async () => {
-      const mismatches = [];
-      const raw = await spawnText([
-        'docker',
-        'ps',
-        '--format',
-        '{{.Label "com.docker.compose.project"}}\t{{.State}}',
-      ]);
-      const projectState = composeProjectStates(raw);
-      for (const e of entries) {
-        const p = active.find((a) => a.port === e.port);
-        if (!p) {
-          continue;
-        }
-        const cwd = processCwd(p.pid);
-        const expected = resolve(join(workspace, e.repo, e.name));
-        if (
-          projectState.get(composeProjectName(e.repo, e.name)) === 'running'
-        ) {
-          continue;
-        }
-        if (!hasIdentifiableWorktreeCwd(cwd)) {
-          continue;
-        }
-        // Nx/monorepo dev servers end up with cwd nested inside apps/<app> —
-        // only flag it if cwd isn't the worktree root or underneath it.
-        if (
-          cwd &&
-          resolve(cwd) !== expected &&
-          !resolve(cwd).startsWith(`${expected}/`)
-        ) {
-          mismatches.push(`${e.key} :${e.port} is actually serving ${cwd}`);
-        }
+    checkThunks.push(
+      // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
+      async () => {
+        const locks = workspaceState(workspace).inspectLocks();
+        const bad = locks.filter(
+          (lock) => lock.retained || lock.alive === false
+        );
+        return {
+          fix: bad.length
+            ? `${bad.map((lock) => lock.path).join(', ')}${bad.some((lock) => lock.alive === false) ? ' — it is safe to delete a lock whose process is dead' : ''}`
+            : undefined,
+          name: 'no stale Setu locks',
+          ok: bad.length === 0,
+        };
       }
-      return {
-        fix: mismatches.join('; ') || undefined,
-        name: 'registered ports match their worktree',
-        ok: mismatches.length === 0,
-      };
-    });
+    );
 
-    checkThunks.push(async () => {
-      const registeredDirs = new Set(
-        entries.map((e) => join(workspace, e.repo, e.name))
-      );
-      const gitWorktreeDirs = new Set();
-      for (const repo of Object.keys(loadProjects(workspace))) {
-        const repoDir = join(workspace, `${repo}.git`);
-        if (!existsSync(repoDir)) {
-          continue;
-        }
-        try {
-          const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
-          for (const wt of porcelain.trim().split('\n\n')) {
-            const p = wt.match(/^worktree (.+)$/m)?.[1];
-            if (p && p !== repoDir && !p.includes('/.claude/worktrees/')) {
-              gitWorktreeDirs.add(p);
-            }
-          }
-        } catch {
-          // This repository cannot contribute paths to the best-effort scan.
-        }
+    checkThunks.push(
+      // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
+      async () => {
+        const orphanProcs = pruneCandidates(
+          entries,
+          active,
+          processCwd,
+          workspace
+        );
+        return {
+          fix: orphanProcs.length
+            ? `setu prune  (${orphanProcs.length} found: ${orphanProcs.map((p) => `pid ${p.pid} :${p.port}`).join(', ')})`
+            : undefined,
+          name: 'no unregistered dev-server processes',
+          ok: orphanProcs.length === 0,
+        };
       }
-      const unregistered = [...gitWorktreeDirs].filter(
-        (d) => !registeredDirs.has(d)
-      );
-      return {
-        fix: unregistered.length
-          ? `setu new for: ${unregistered.join(', ')}  (or setu rm if abandoned)`
-          : undefined,
-        name: 'all git worktrees are registered with setu',
-        ok: unregistered.length === 0,
-      };
-    });
+    );
+
+    checkThunks.push(() =>
+      registeredPortWorktreeCheck(entries, active, workspace)
+    );
+
+    checkThunks.push(async () => unregisteredWorktreeCheck(entries, workspace));
 
     // mirror case: registry entries for worktrees removed via raw `git worktree
     // remove` instead of `setu rm` — the port/domain registration outlives the
     // directory it pointed at.
-    checkThunks.push(async () => {
-      const stale = entries.filter(
-        (e) => !existsSync(join(workspace, e.repo, e.name))
-      );
-      return {
-        fix: stale.length
-          ? `stale: ${stale.map((e) => e.key).join(', ')}  — setu rm <repo> <branch>`
-          : undefined,
-        name: 'no registry entries for missing worktrees',
-        ok: stale.length === 0,
-      };
-    });
+    checkThunks.push(
+      // biome-ignore lint/suspicious/useAwait: checkThunks are invoked by Promise.all below, so synchronous probe failures must reject.
+      async () => {
+        const stale = entries.filter(
+          (e) => !existsSync(join(workspace, e.repo, e.name))
+        );
+        return {
+          fix: stale.length
+            ? `stale: ${stale.map((e) => e.key).join(', ')}  — setu rm <repo> <branch>`
+            : undefined,
+          name: 'no registry entries for missing worktrees',
+          ok: stale.length === 0,
+        };
+      }
+    );
 
     // A container Setu itself stops always goes through `compose down`
     // (composeDownAsync — confirmed the only teardown path: every stop

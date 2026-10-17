@@ -90,7 +90,7 @@ test('no socket without visible consumers; hide and final unsubscribe cancel vie
   h.show(true);
   h.show(true);
   expect(h.sockets.length).toBe(1);
-  const old = h.sockets[0];
+  const [old] = h.sockets;
   h.show(false);
   expect(old.closed).toBe(true);
   expect(h.timers.size).toBe(0);

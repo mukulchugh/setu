@@ -16,7 +16,11 @@ function fixture({ reloadCaddy, run, writeCaddy } = {}) {
       snapshot: async () => ({ ports: [{ name: 'topic', repo: 'r' }] }),
       withRouting: (task) => task(),
     },
-    writeCaddy: writeCaddy ?? (async () => {}),
+    writeCaddy:
+      writeCaddy ??
+      (async () => {
+        // The fixture does not write a real Caddy configuration.
+      }),
   });
   return { routing, writes };
 }
@@ -50,13 +54,15 @@ test('adoption routing retries each pending hosts or Caddy stage', async () => {
   let hostsAttempts = 0;
   let caddyAttempts = 0;
   const { routing } = fixture({
+    // biome-ignore lint/suspicious/useAwait: The reload fixture preserves the asynchronous routing contract.
     reloadCaddy: async () => {
       caddyAttempts += 1;
       return caddyAttempts > 1;
     },
-    run: () => ({
-      exited: Promise.resolve(++hostsAttempts === 1 ? 1 : 0),
-    }),
+    run: () => {
+      hostsAttempts += 1;
+      return { exited: Promise.resolve(hostsAttempts === 1 ? 1 : 0) };
+    },
   });
   await expect(
     routing.writeAdoptionRouting('r', 'topic', 3201)

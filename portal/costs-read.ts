@@ -25,6 +25,55 @@ export interface CostsSummary {
   openai: ProviderCosts;
 }
 
+function assertProviderCosts(
+  row: ProviderCosts,
+  provider: ProviderCosts['provider']
+) {
+  if (
+    !row ||
+    row.provider !== provider ||
+    typeof row.configured !== 'boolean'
+  ) {
+    throw new Error('Invalid provider costs');
+  }
+  for (const field of ['reason', 'error'] as const) {
+    if (row[field] !== undefined && typeof row[field] !== 'string') {
+      throw new Error('Invalid provider message');
+    }
+  }
+  for (const field of ['totalCostUsd', 'windowDays'] as const) {
+    if (row[field] !== undefined && !Number.isFinite(row[field])) {
+      throw new Error('Invalid cost total');
+    }
+  }
+  if (
+    row.byModel !== undefined &&
+    (!Array.isArray(row.byModel) ||
+      row.byModel.some(
+        (model) =>
+          !model ||
+          typeof model.model !== 'string' ||
+          !Number.isFinite(model.costUsd)
+      ))
+  ) {
+    throw new Error('Invalid model costs');
+  }
+}
+
+function assertBudgetPeriod(row: BudgetPeriod | undefined) {
+  if (
+    row !== undefined &&
+    (!row ||
+      typeof row !== 'object' ||
+      !Number.isFinite(row.limit) ||
+      !Number.isFinite(row.spent) ||
+      (row.incomplete !== undefined && typeof row.incomplete !== 'boolean') ||
+      !['ok', 'warning', 'over', 'incomplete'].includes(row.status))
+  ) {
+    throw new Error('Invalid budget period');
+  }
+}
+
 // Reject malformed reads so a refresh keeps the previous totals, never invents zero spend.
 export function parseCostsSummary(value: unknown): CostsSummary {
   if (!value || typeof value !== 'object') {
@@ -32,55 +81,14 @@ export function parseCostsSummary(value: unknown): CostsSummary {
   }
   const summary = value as CostsSummary;
   for (const provider of ['anthropic', 'openai', 'gemini'] as const) {
-    const row = summary[provider];
-    if (
-      !row ||
-      row.provider !== provider ||
-      typeof row.configured !== 'boolean'
-    ) {
-      throw new Error('Invalid provider costs');
-    }
-    for (const field of ['reason', 'error'] as const) {
-      if (row[field] !== undefined && typeof row[field] !== 'string') {
-        throw new Error('Invalid provider message');
-      }
-    }
-    for (const field of ['totalCostUsd', 'windowDays'] as const) {
-      if (row[field] !== undefined && !Number.isFinite(row[field])) {
-        throw new Error('Invalid cost total');
-      }
-    }
-    if (
-      row.byModel !== undefined &&
-      (!Array.isArray(row.byModel) ||
-        row.byModel.some(
-          (model) =>
-            !model ||
-            typeof model.model !== 'string' ||
-            !Number.isFinite(model.costUsd)
-        ))
-    ) {
-      throw new Error('Invalid model costs');
-    }
+    assertProviderCosts(summary[provider], provider);
   }
-  if (summary.budgets != null) {
+  if (summary.budgets !== null && summary.budgets !== undefined) {
     if (typeof summary.budgets !== 'object' || Array.isArray(summary.budgets)) {
       throw new Error('Invalid budgets');
     }
     for (const period of ['daily', 'weekly', 'monthly'] as const) {
-      const row = summary.budgets[period];
-      if (
-        row !== undefined &&
-        (!row ||
-          typeof row !== 'object' ||
-          !Number.isFinite(row.limit) ||
-          !Number.isFinite(row.spent) ||
-          (row.incomplete !== undefined &&
-            typeof row.incomplete !== 'boolean') ||
-          !['ok', 'warning', 'over', 'incomplete'].includes(row.status))
-      ) {
-        throw new Error('Invalid budget period');
-      }
+      assertBudgetPeriod(summary.budgets[period]);
     }
   }
   return summary;
