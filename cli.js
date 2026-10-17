@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 // setu — workspace bridge: git worktrees, local domains, Cloudflare tunnels
-// quivly internal tool — https://github.com/mukulchugh/setu
+// setu — https://github.com/mukulchugh/setu
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
@@ -63,6 +63,7 @@ import {
   loadConfig,
   loadProjects,
   localDomain,
+  localZone,
   PORTAL_PORT,
   portalPid,
   portalRequest,
@@ -101,6 +102,7 @@ const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
 
 const MCP_URL = `http://localhost:${PORTAL_PORT}/mcp`;
 
+const DNS_LISTEN_ADDRESS_RE = /^listen-address=/m;
 const DEV_TUNNEL_PREFIX_RE = /^dev-/;
 const CADDY_SERVICE_STARTED_RE = /^caddy\s+started/m;
 const HEADLESS_MODEL_RE = /^[a-zA-Z0-9._-]{1,128}$/;
@@ -464,7 +466,7 @@ function autoInstall(wtDir, sharing, stdio, options = {}) {
   });
 }
 
-// ── setu setup [--name x] [--workspace p] [--zone z] [--yes] ─────────────────
+// ── setu setup [--name x] [--workspace p] [--zone z] [--local-zone l] [--yes] ─────────────────
 
 async function cmdSetup(setupArgs) {
   box('setu setup');
@@ -661,10 +663,9 @@ async function cmdSetup(setupArgs) {
     let workspace = resolvePath(
       flags.workspace ?? existing.workspace ?? join(HOME, 'workspace')
     );
+    let lz = flags['local-zone'] ?? localZone(existing);
     let zone =
-      flags.zone ??
-      existing.domain?.split('.').slice(1).join('.') ??
-      'getquivly.ai';
+      flags.zone ?? existing.domain?.split('.').slice(1).join('.') ?? '';
 
     if (interactive) {
       const rl = readline.createInterface({
@@ -680,10 +681,14 @@ async function cmdSetup(setupArgs) {
         workspace = resolvePath(
           await ask(rl, 'Workspace path', workspace.replace(HOME, '~'))
         );
-        zone = await ask(rl, 'Zone domain', zone);
+        zone = await ask(rl, 'Cloudflare zone domain (e.g. example.com)', zone);
+        lz = await ask(rl, 'Local domain', lz);
       } finally {
         rl.close();
       }
+    }
+    if (!zone) {
+      die('Zone is required — pass --zone <your-cloudflare-domain>.');
     }
     if (!name) {
       die(
@@ -692,16 +697,20 @@ async function cmdSetup(setupArgs) {
     }
     const input = {
       domain: `dev-${name}.${zone}`,
+      localZone: lz,
       name,
       tunnel: `dev-${name}`,
       workspace,
       zone,
     };
-    ok(`${input.tunnel} → ${input.domain}, workspace ${workspace}`);
+    ok(
+      `${input.tunnel} → ${input.domain}, local *.${lz}, workspace ${workspace}`
+    );
     console.log();
     return input;
   }
   const input = await setupConfiguration();
+  const lz = input.localZone;
 
   // 3. Cloudflare
   step(4, 9, 'Cloudflare tunnel');
@@ -714,13 +723,16 @@ async function cmdSetup(setupArgs) {
   }
 
   spin(`tunnel ${input.tunnel}`);
+  // cloudflared prints `null` (not `[]`) when no tunnel matches
   const findTunnel = () =>
-    JSON.parse(
-      execFileSync(
-        CLOUDFLARED_BIN,
-        ['tunnel', 'list', '--output', 'json', '--name', input.tunnel],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
-      )
+    (
+      JSON.parse(
+        execFileSync(
+          CLOUDFLARED_BIN,
+          ['tunnel', 'list', '--output', 'json', '--name', input.tunnel],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+        )
+      ) ?? []
     ).filter((t) => t.name === input.tunnel);
   let tunnels = findTunnel();
   if (!tunnels.length) {
@@ -749,71 +761,93 @@ async function cmdSetup(setupArgs) {
   done();
   console.log();
 
-  // 4. DNS & proxy
-  step(5, 9, 'DNS & proxy');
-  spin('dnsmasq');
-  const dnsConf = join(BREW_PREFIX, 'etc', 'dnsmasq.conf');
-  const dnsText = existsSync(dnsConf) ? readFileSync(dnsConf, 'utf8') : '';
-  if (!dnsText.includes('address=/.quivly.local/127.0.0.1')) {
-    appendFileSync(dnsConf, '\naddress=/.quivly.local/127.0.0.1\n');
-  }
-  // port 53 needs root — a user-level dnsmasq service silently fails to bind
-  try {
-    execFileSync('sudo', ['brew', 'services', 'restart', 'dnsmasq'], {
-      stdio: ['inherit', 'ignore', 'ignore'],
-    });
-    done();
-  } catch {
-    fail('failed — run: sudo brew services restart dnsmasq');
-  }
-
-  spin('/etc/resolver/quivly.local');
-  execFileSync('sudo', ['mkdir', '-p', '/etc/resolver'], { stdio: 'ignore' });
-  sudoTee('nameserver 127.0.0.1\n', '/etc/resolver/quivly.local');
-  done();
-
-  spin('Caddyfile');
-  mkdirSync(join(input.workspace, 'caddy.d'), { recursive: true });
-  mkdirSync(join(input.workspace, 'logs'), { recursive: true });
-  const caddyfile = join(input.workspace, 'Caddyfile');
-  await workspaceState(input.workspace).withRouting(async () => {
-    if (!existsSync(caddyfile)) {
-      installedStateValue(
-        await workspaceState(input.workspace).replaceText(
-          caddyfile,
-          caddyfileText(input.workspace)
-        )
-      );
+  async function setupDnsProxy() {
+    // 4. DNS & proxy
+    step(5, 9, 'DNS & proxy');
+    spin('dnsmasq');
+    const dnsConf = join(BREW_PREFIX, 'etc', 'dnsmasq.conf');
+    const dnsText = existsSync(dnsConf) ? readFileSync(dnsConf, 'utf8') : '';
+    if (!dnsText.includes(`address=/.${lz}/127.0.0.1`)) {
+      appendFileSync(dnsConf, `\naddress=/.${lz}/127.0.0.1\n`);
     }
-  });
-  await workspaceState(input.workspace).withRouting(async () => {
-    installedStateValue(
-      await workspaceState(input.workspace).replaceText(
-        join(input.workspace, 'caddy.d', 'portal.caddy'),
-        portalCaddyRoute(PORTAL_PORT)
-      )
-    );
-  });
-  done();
-
-  spin('caddy service');
-  const services = execFileSync('brew', ['services', 'list'], {
-    encoding: 'utf8',
-  });
-  if (CADDY_SERVICE_STARTED_RE.test(services)) {
-    process.stdout.write(`${G}✓${R} already running\n`);
-  } else {
+    // Loopback only: a wildcard bind collides with other local resolvers on :53
+    // (Cloudflare WARP, VPN clients) and dnsmasq exits at startup.
+    if (!DNS_LISTEN_ADDRESS_RE.test(dnsText)) {
+      appendFileSync(dnsConf, 'listen-address=127.0.0.1\nbind-interfaces\n');
+    }
+    // port 53 needs root — a user-level dnsmasq service silently fails to bind
     try {
-      execFileSync('brew', ['services', 'restart', 'caddy'], {
-        stdio: 'ignore',
+      execFileSync('sudo', ['brew', 'services', 'restart', 'dnsmasq'], {
+        stdio: ['inherit', 'ignore', 'ignore'],
       });
       done();
     } catch {
-      fail('failed — run: brew services restart caddy');
+      fail('failed — run: sudo brew services restart dnsmasq');
     }
+
+    spin(`/etc/resolver/${lz}`);
+    execFileSync('sudo', ['mkdir', '-p', '/etc/resolver'], { stdio: 'ignore' });
+    sudoTee('nameserver 127.0.0.1\n', `/etc/resolver/${lz}`);
+    done();
+
+    spin('Caddyfile');
+    mkdirSync(join(input.workspace, 'caddy.d'), { recursive: true });
+    mkdirSync(join(input.workspace, 'logs'), { recursive: true });
+    const caddyfile = join(input.workspace, 'Caddyfile');
+    await workspaceState(input.workspace).withRouting(async () => {
+      if (!existsSync(caddyfile)) {
+        installedStateValue(
+          await workspaceState(input.workspace).replaceText(
+            caddyfile,
+            caddyfileText(input.workspace)
+          )
+        );
+      }
+    });
+    await workspaceState(input.workspace).withRouting(async () => {
+      installedStateValue(
+        await workspaceState(input.workspace).replaceText(
+          join(input.workspace, 'caddy.d', 'portal.caddy'),
+          portalCaddyRoute(PORTAL_PORT, lz)
+        )
+      );
+    });
+    // `brew services` runs caddy with BREW_PREFIX/etc/Caddyfile; without it the
+    // service crash-loops and `caddy reload` has no admin API to talk to.
+    const brewCaddyfile = join(BREW_PREFIX, 'etc', 'Caddyfile');
+    const brewImport = `import ${caddyfile}\n`;
+    const brewCaddyText = existsSync(brewCaddyfile)
+      ? readFileSync(brewCaddyfile, 'utf8')
+      : '';
+    if (!brewCaddyText.includes(brewImport.trim())) {
+      if (brewCaddyText.trim()) {
+        fail(`${brewCaddyfile} exists — add this line to it: ${brewImport}`);
+      } else {
+        writeFileSync(brewCaddyfile, brewImport);
+      }
+    }
+    done();
+
+    spin('caddy service');
+    const services = execFileSync('brew', ['services', 'list'], {
+      encoding: 'utf8',
+    });
+    if (CADDY_SERVICE_STARTED_RE.test(services)) {
+      process.stdout.write(`${G}✓${R} already running\n`);
+    } else {
+      try {
+        execFileSync('brew', ['services', 'restart', 'caddy'], {
+          stdio: 'ignore',
+        });
+        done();
+      } catch {
+        fail('failed — run: brew services restart caddy');
+      }
+    }
+    await reloadCaddy(input.workspace);
+    console.log();
   }
-  await reloadCaddy(input.workspace);
-  console.log();
+  await setupDnsProxy();
 
   // 5. Passwordless sudo — rules must match EXACTLY what lib.js runs
   step(6, 9, 'Passwordless sudo');
@@ -836,6 +870,7 @@ async function cmdSetup(setupArgs) {
     await saveConfig({
       cfCredentials,
       domain: input.domain,
+      localZone: lz,
       tunnel: input.tunnel,
       workspace: input.workspace,
     })
@@ -892,8 +927,8 @@ async function cmdSetup(setupArgs) {
   box('All done!');
   console.log(`  ${G}1.${R} source ~/.zshrc`);
   console.log(`  ${G}2.${R} setu portal`);
-  console.log(`  ${G}3.${R} open http://quivly.local`);
-  console.log(`  ${G}4.${R} setu init quivly/quivly-app`);
+  console.log(`  ${G}3.${R} open http://${lz}`);
+  console.log(`  ${G}4.${R} setu init <owner>/<repo>`);
   console.log();
   console.log(`  ${GR}run \`setu doctor\` if anything misbehaves${R}\n`);
 }
@@ -1349,7 +1384,7 @@ async function cmdLs() {
 async function cmdInit() {
   const [slug, label] = args;
   if (!slug) {
-    die('Usage: setu init quivly/quivly-app [label]');
+    die('Usage: setu init <owner>/<repo> [label]');
   }
   const deps = localCommandOverrides;
   const c = (deps.config ?? cfg)();
@@ -1504,13 +1539,13 @@ async function cmdPortal() {
   }
 
   if (pid) {
-    console.log(`Portal already running (pid ${pid}) → http://quivly.local`);
+    console.log(`Portal already running (pid ${pid}) → http://${localZone(c)}`);
     return;
   }
 
   await ensurePortal(c);
   await reloadCaddy(c.workspace);
-  ok('Portal → http://quivly.local');
+  ok(`Portal → http://${localZone(c)}`);
 }
 
 // ── setu mcp install <target> ─────────────────────────────────────────────────
@@ -3050,7 +3085,7 @@ async function cmdDoctor() {
       '+short',
       '+time=1',
       '+tries=1',
-      'test.quivly.local',
+      `test.${localZone(c)}`,
       '@127.0.0.1',
     ]),
     fetch('http://localhost:2019/config/', {
@@ -3093,18 +3128,19 @@ async function cmdDoctor() {
       fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
       name: 'dnsmasq service',
       ok:
-        DNSMASQ_SERVICE_STARTED_RE.test(dnsmasqLine) &&
-        !ERROR_RE.test(dnsmasqLine),
+        digText.includes('127.0.0.1') ||
+        (DNSMASQ_SERVICE_STARTED_RE.test(dnsmasqLine) &&
+          !ERROR_RE.test(dnsmasqLine)),
     }),
     async () => ({
       fix: 'sudo brew services restart dnsmasq (then re-check)',
-      name: 'dnsmasq resolves *.quivly.local',
+      name: `dnsmasq resolves *.${localZone(c)}`,
       ok: digText.includes('127.0.0.1'),
     }),
     async () => ({
       fix: 'setu setup',
-      name: '/etc/resolver/quivly.local',
-      ok: existsSync('/etc/resolver/quivly.local'),
+      name: `/etc/resolver/${localZone(c)}`,
+      ok: existsSync(`/etc/resolver/${localZone(c)}`),
     }),
     async () => ({
       fix: 'brew services restart caddy',
@@ -3118,13 +3154,14 @@ async function cmdDoctor() {
     }),
     async () => ({
       fix: 'setu setup',
-      name: 'quivly.local portal route',
+      name: `${localZone(c)} portal route`,
       ok:
         !!workspace &&
         existsSync(join(workspace, 'caddy.d', 'portal.caddy')) &&
         hasPortalCaddyRoute(
           readFileSync(join(workspace, 'caddy.d', 'portal.caddy'), 'utf8'),
-          PORTAL_PORT
+          PORTAL_PORT,
+          localZone(c)
         ),
     }),
     // `setu start` containerizes by default now (real memory/CPU cap) — a
@@ -3187,7 +3224,7 @@ async function cmdDoctor() {
     }),
     async () => ({
       fix: 'setu new <repo> <branch> (or any command that syncs hosts)',
-      name: '/etc/hosts quivly block',
+      name: '/etc/hosts setu block',
       ok: readFileSync('/etc/hosts', 'utf8').includes(HOSTS_START),
     }),
     async () => ({
@@ -3409,7 +3446,7 @@ async function cmdDoctor() {
 
 function cmdHelp() {
   console.log(`
-  ${B}setu${R} — workspace bridge for quivly developers
+  ${B}setu${R} — workspace bridge for parallel dev worktrees
 
   ${C}Setup${R}
     setu setup                       First-time onboarding (interactive)
@@ -3491,7 +3528,7 @@ function cmdHelp() {
     setu review handoff <repo> <branch> --session <id> --checkout <file|-> --artifact <file|-> --findings <file|-> [--json]
 
   ${C}Portal${R}
-    setu portal                      Start web UI at http://quivly.local
+    setu portal                      Start web UI at http://setu.local (--local-zone in setup)
     setu portal stop                 Stop portal
 
   ${C}Writer claims${R}

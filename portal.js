@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-// Dev portal — http://quivly.local
+// Dev portal — http://setu.local (configurable via config.localZone)
 
 import {
   appendFileSync,
@@ -68,6 +68,7 @@ import {
   loadProjects,
   loadSidecars,
   localDomain,
+  localZone,
   macCapacity,
   managedWorktreePath,
   markMigrationPrompted,
@@ -217,6 +218,7 @@ export async function createPortalRuntime(options = {}) {
       hostsEnd: HOSTS_END,
       hostsStart: HOSTS_START,
       localDomain,
+      portalHost: localZone(),
       readFile: identityFs.readFile,
       reloadCaddy: () => reloadCaddyAsync(WORKSPACE),
       run: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
@@ -442,6 +444,14 @@ export async function createPortalRuntime(options = {}) {
   // ── repo metadata ─────────────────────────────────────────────────────────────
 
   let REPO_META = options.projects ?? {};
+  // `setu init` from the CLI registers projects without telling a running
+  // portal; reload on a miss instead of serving a stale registry.
+  const repoMeta = (repo) => {
+    if (!(REPO_META[repo] || options.projects)) {
+      REPO_META = loadProjects(WORKSPACE);
+    }
+    return REPO_META[repo];
+  };
 
   // ── git metadata cache (last-commit / ahead-behind, batched per repo) ────────
   // branchMetadata()+worktreeBranchMap() are each one call per REPO, not per
@@ -679,7 +689,7 @@ export async function createPortalRuntime(options = {}) {
             'view',
             name,
             '--repo',
-            REPO_META[repo]?.slug ?? repo,
+            repoMeta(repo)?.slug ?? repo,
             '--json',
             'number,title,url,state,isDraft,statusCheckRollup',
           ],
@@ -728,7 +738,7 @@ export async function createPortalRuntime(options = {}) {
   const repoPrsCache = new Map();
 
   async function fetchRepoPRs(repo) {
-    const slug = REPO_META[repo]?.slug;
+    const slug = repoMeta(repo)?.slug;
     if (!slug) {
       return { error: 'no GitHub repo configured for this project', prs: [] };
     }
@@ -809,7 +819,7 @@ export async function createPortalRuntime(options = {}) {
   async function createPr(repo, name, source = 'portal') {
     return recordPortalMutation('pr-create', repo, name, source, () =>
       lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
-        const slug = REPO_META[repo]?.slug;
+        const slug = repoMeta(repo)?.slug;
         if (!slug) {
           throw new Error('no GitHub repo configured for this project');
         }
@@ -874,7 +884,7 @@ export async function createPortalRuntime(options = {}) {
   async function setPrReady(repo, name, ready, source = 'portal') {
     return recordPortalMutation('pr-ready', repo, name, source, () =>
       lifecycle.runOperation(worktreeTarget(repo, name), 'pr', async () => {
-        const slug = REPO_META[repo]?.slug;
+        const slug = repoMeta(repo)?.slug;
         if (!slug) {
           throw new Error('no GitHub repo configured for this project');
         }
@@ -2084,7 +2094,7 @@ export async function createPortalRuntime(options = {}) {
   // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
   // Generic version of what startInngest/startTrigger already do, for anything
   // project-specific that isn't Inngest or Trigger — a plain cloudflared tunnel,
-  // a queue worker, whatever a future project needs. Not hardcoded to quivly-app.
+  // a queue worker, whatever a future project needs. Not hardcoded to any project.
 
   // Returns the names of any sidecars skipped for lacking approval, so the
   // start path (spawnWorktree/spawnContainer -> startWorktree) can surface it
@@ -4249,7 +4259,7 @@ export async function createPortalRuntime(options = {}) {
         status: 404,
       });
     }
-    const slug = REPO_META[repo]?.slug ?? repo;
+    const slug = repoMeta(repo)?.slug ?? repo;
     const artifact = findLatestArtifact(slug, pr.number, skill, null);
     const path =
       artifact &&
@@ -4434,7 +4444,7 @@ export async function createPortalRuntime(options = {}) {
     if (!pr.number) {
       return { artifacts: {}, pluginInstalled, pr: null, run: null };
     }
-    const slug = REPO_META[repo]?.slug ?? repo;
+    const slug = repoMeta(repo)?.slug ?? repo;
     const headSha =
       (await runText(['git', '-C', wtDir, 'rev-parse', 'HEAD'])).trim() || null;
     const artifacts = {};
@@ -4470,7 +4480,7 @@ export async function createPortalRuntime(options = {}) {
             ok: false,
           };
         }
-        const slug = REPO_META[repo]?.slug ?? repo;
+        const slug = repoMeta(repo)?.slug ?? repo;
         touchLastSeen(repo, name);
         const fd = openLogFd(repo, name, 'pr-review');
         let completion;
@@ -5923,7 +5933,7 @@ if (import.meta.main) {
   createPortalRuntime()
     .then(async (runtime) => {
       await runtime.start();
-      console.log(`Portal → http://quivly.local  (localhost:${PORTAL_PORT})`);
+      console.log(`Portal → http://${localZone()}  (localhost:${PORTAL_PORT})`);
     })
     .catch((error) => {
       console.error(`setu portal: ${error.message}`);

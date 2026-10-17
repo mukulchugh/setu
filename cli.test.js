@@ -321,7 +321,7 @@ test('cmdNew refuses admission and preserves unknown setup outcomes without port
         newCommand: {
           config: () => ({ workspace: root }),
           createAndInstallWorktree: async () => ({
-            localDom: 'completed.quivly.local',
+            localDom: 'completed.setu.local',
             port: 3101,
             wtDir: join(root, 'repo', 'completed'),
           }),
@@ -411,7 +411,7 @@ test('local workspace mutations record outcomes without making read-only sweep w
         newCommand: {
           config: () => ({ workspace: root }),
           createAndInstallWorktree: async () => ({
-            localDom: 'initialized.quivly.local',
+            localDom: 'initialized.setu.local',
             port: 3102,
             wtDir: join(root, 'initialized', 'main'),
           }),

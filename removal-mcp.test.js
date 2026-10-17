@@ -376,7 +376,7 @@ test('MCP discovery reads dispatch independently and keep compact PR state', asy
     branch: 'feature/a',
     container: 'setu-a',
     dirty: null,
-    domain: 'a.quivly.local',
+    domain: 'a.setu.local',
     label: 'Example',
     memMb: 900,
     name: 'a',

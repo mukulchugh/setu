@@ -41,7 +41,7 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
         <HelpTopic title="What's a worktree, here?">
           A separate checkout of one branch from a shared bare repo — its own
           directory, own dev server, own port and local domain (
-          <span class="font-mono text-xs">*.quivly.local</span>), so you can run
+          <span class="font-mono text-xs">*.setu.local</span>), so you can run
           several branches of the same project side by side without switching
           branches in one folder.
         </HelpTopic>

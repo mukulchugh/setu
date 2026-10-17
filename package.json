@@ -1,5 +1,5 @@
 {
-  "name": "@quivly/setu",
+  "name": "setu",
   "version": "0.3.0",
   "description": "Workspace bridge \u2014 git worktrees, local domains, Docker/bare dev servers, and a Raycast extension",
   "type": "module",

@@ -5,6 +5,7 @@ import {
   pumpLines,
   RUN_TIMEOUT_MS,
 } from './agent.js';
+import { claudeSubscriptionEnv } from './cli-helpers.js';
 import { observeProcessIdentity } from './process-observation.js';
 
 const ACTIVE = new Set(['starting', 'running', 'cancelling', 'unknown']);
@@ -124,7 +125,8 @@ const validRun = (run, key) => {
 function providerArgs({ maxBudgetUsd, model, permissionMode, resumeSession }) {
   const args = [
     'claude',
-    '--bare',
+    // No user MCP servers: they add hundreds of tool schemas per turn.
+    '--strict-mcp-config',
     '-p',
     '-',
     '--output-format',
@@ -287,6 +289,7 @@ export function createHeadlessRun({
     const child = Bun.spawn(args, {
       cwd,
       detached: true,
+      env: claudeSubscriptionEnv(),
       stderr: 'pipe',
       stdin: 'pipe',
       stdout: 'pipe',
@@ -306,6 +309,9 @@ export function createHeadlessRun({
       },
     };
   },
+  // Hooks/plugins can outlive the claude process by a moment on exit; poll the
+  // group this long before calling a finished run ambiguous.
+  exitGraceMs = 5000,
   now = () => Date.now(),
   observeGroup,
   observeProcess = observeProcessIdentity,
@@ -599,6 +605,15 @@ export function createHeadlessRun({
         let descendants = 'unknown';
         try {
           descendants = record.ownedGroup ? await groupState(record) : 'absent';
+          for (
+            let waited = 0;
+            descendants === 'alive' && waited < exitGraceMs;
+            waited += 100
+          ) {
+            // biome-ignore lint/performance/noAwaitInLoops: Poll owned children sequentially until exit or the grace deadline.
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            descendants = await groupState(record);
+          }
         } catch {
           descendants = 'unknown';
         }

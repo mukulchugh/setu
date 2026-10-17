@@ -11,7 +11,7 @@ import { useVisiblePoll } from '../use-visible-poll';
 // facts that actually say something about how the tool works.
 const SETU_FACTS = [
   'Projects live as one bare repo plus lightweight worktrees, so every branch shares history instead of a full clone.',
-  'Every worktree gets its own *.quivly.local subdomain, wired up by Caddy and dnsmasq automatically.',
+  'Every worktree gets its own *.setu.local subdomain, wired up by Caddy and dnsmasq automatically.',
   'Port bands are handed out in blocks of 100 starting at 3000, one block per project.',
   "Sync with staging only ever does a clean merge. If it can't merge cleanly, it aborts and leaves your branch exactly as it was.",
   "Container mode works with any Docker daemon, OrbStack included. It's engine agnostic by design.",

@@ -3,6 +3,7 @@ export function createPortalRouting({
   hostsPath = '/etc/hosts',
   hostsStart,
   localDomain,
+  portalHost,
   readFile,
   reloadCaddy,
   run,
@@ -19,9 +20,12 @@ export function createPortalRouting({
         ''
       );
       const { ports } = await state.snapshot(['ports']);
-      const entries = ports.map(
-        ({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`
-      );
+      const entries = [
+        ...(portalHost ? [`127.0.0.1\t${portalHost}`] : []),
+        ...ports.map(
+          ({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`
+        ),
+      ];
       const next =
         cleaned.trimEnd() +
         `\n${hostsStart}\n` +

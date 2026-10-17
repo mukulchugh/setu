@@ -40,6 +40,7 @@ function reviewRunFixture({
         throw new Error('fixture close error');
       }
     },
+    ensureDir: () => undefined,
     logFd: openSync(join(root, 'review.log'), 'w'),
     logPath: join(root, 'review.log'),
     onCompletion: (promise) => {
@@ -164,7 +165,9 @@ test('deep review arguments fail closed for write-shaped Bash commands', () => {
   expect(args[args.indexOf('--settings') + 1]).toContain(
     '/reviews/owner/repo/pr-42'
   );
-  expect(args[1]).toContain('--no-ext-diff and --no-textconv');
+  expect(args[args.indexOf('-p') + 1]).toContain(
+    '--no-ext-diff and --no-textconv'
+  );
   for (const command of [
     'gh pr merge 42',
     'gh pr close 42',
@@ -179,6 +182,9 @@ test('deep review arguments fail closed for write-shaped Bash commands', () => {
 });
 
 test.each([
+  ['git log --oneline -3 origin/staging..HEAD', true],
+  ['gh pr view 19 -R owner/repo --json files', true],
+  ['git diff -3 --no-ext-diff --no-textconv', false],
   ['git diff --stat', false],
   ['git show --name-only', false],
   ['git diff -- --no-ext-diff --no-textconv', false],
@@ -231,4 +237,35 @@ test('review write guard rejects existing, dangling, and intermediate symlink an
       tool_input: { file_path: join(report, 'intermediate', 'result.html') },
     })
   ).toBe(2);
+});
+
+test('guard explicitly approves allowlisted commands for the prompt-less run', async () => {
+  const proc = Bun.spawn(['bun', './pr-review-guard.js', 'bash'], {
+    cwd: import.meta.dir,
+    stdin: new Blob([
+      JSON.stringify({ tool_input: { command: 'git status' } }),
+    ]).stream(),
+    stdout: 'pipe',
+  });
+  const out = JSON.parse(await new Response(proc.stdout).text());
+  expect(await proc.exited).toBe(0);
+  expect(out.hookSpecificOutput.permissionDecision).toBe('allow');
+});
+
+test('guard allows only the installed plugin scripts', () => {
+  const root = '/plugins/pr-walkthrough/1.4.0';
+  expect(
+    reviewBashAllowed(
+      `python3 ${root}/skills/pr-walkthrough/scripts/render_review.py --list-reviews`,
+      root
+    )
+  ).toBe(true);
+  expect(
+    reviewBashAllowed('python3 /tmp/evil/scripts/render_review.py', root)
+  ).toBe(false);
+  expect(
+    reviewBashAllowed(
+      `python3 ${root}/skills/pr-walkthrough/scripts/render_review.py`
+    )
+  ).toBe(false);
 });

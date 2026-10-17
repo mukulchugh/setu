@@ -275,7 +275,7 @@ export function InventoryPage({
     (repo) => repo.state !== 'ready'
   );
 
-  // navigator.clipboard is undefined on non-secure origins such as http://quivly.local.
+  // navigator.clipboard is undefined on non-secure origins such as http://setu.local.
   async function copyPath(path: string) {
     try {
       await navigator.clipboard.writeText(path);

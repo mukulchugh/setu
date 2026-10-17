@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   caddyfileText,
+  claudeSubscriptionEnv,
   cursorConfigText,
   hasCodexServerTable,
   hasIdentifiableWorktreeCwd,
@@ -18,13 +19,13 @@ test('caddyfileText uses a valid multiline global options block', () => {
   );
 });
 
-test('portalCaddyRoute keeps quivly.local on the portal port', () => {
-  const route = portalCaddyRoute(2999);
+test('portalCaddyRoute keeps setu.local on the portal port', () => {
+  const route = portalCaddyRoute(2999, 'setu.local');
   expect(route).toBe(
-    'http://quivly.local {\n  reverse_proxy localhost:2999\n}\n'
+    'http://setu.local {\n  reverse_proxy localhost:2999\n}\n'
   );
-  expect(hasPortalCaddyRoute(route, 2999)).toBe(true);
-  expect(hasPortalCaddyRoute(route, 3000)).toBe(false);
+  expect(hasPortalCaddyRoute(route, 2999, 'setu.local')).toBe(true);
+  expect(hasPortalCaddyRoute(route, 3000, 'setu.local')).toBe(false);
 });
 
 test('withSetuBlock preserves text after a start marker without an end marker', () => {
@@ -161,4 +162,15 @@ test('sudoRuleCovers joins a rule that sudo wrapped onto a second line', () => {
       '/Users/x/other/Caddyfile',
     ])
   ).toBe(false);
+});
+
+test('claudeSubscriptionEnv strips API auth and session vars, keeps OAuth token', () => {
+  const env = claudeSubscriptionEnv({
+    ANTHROPIC_API_KEY: 'k',
+    ANTHROPIC_AUTH_TOKEN: 't',
+    CLAUDE_CODE_OAUTH_TOKEN: 'o',
+    CLAUDE_CODE_SESSION_ID: 's',
+    PATH: '/bin',
+  });
+  expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'o', PATH: '/bin' });
 });

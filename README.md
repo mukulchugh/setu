@@ -2,7 +2,7 @@
 
 ![setu](./banner.webp)
 
-Workspace bridge for Quivly engineers — git worktrees, local `.quivly.local` domains, and a shared Cloudflare tunnel.
+Workspace bridge — git worktrees, local `.setu.local` domains, and a shared Cloudflare tunnel.
 
 ## Install
 
@@ -191,7 +191,7 @@ local. Their presence must be measured rather than reported as full deduplicatio
 External-SSD migration is not enabled by this configuration example. It requires
 verified volume identity and missing-drive handling before existing consumers
 are converted. Real application builds and migrations remain separate acceptance
-checks; tiny shared-store fixtures do not establish Quivly compatibility.
+checks; tiny shared-store fixtures do not establish compatibility with a real project.
 
 The protected store contains **live dependency targets**. Keep it after removing
 a checkout, exclude it from cache cleanup, and do not prune it while consumers
@@ -203,9 +203,9 @@ Production deployment requires a current target preflight and explicit confirmat
 
 ## How it works
 
-- Each worktree gets an auto-assigned port and a `<branch>.quivly.local` domain via Caddy
-- One shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) — `setu tunnel` moves it between worktrees
-- The portal (`http://quivly.local`) owns all long-running processes: dev servers, inngest, trigger.dev, cloudflared, and any configured sidecars — `setu start`/`setu stop` (or the portal UI) reach it directly, so nothing gets started outside its tracking
+- Each worktree gets an auto-assigned port and a `<branch>.setu.local` domain via Caddy
+- One shared Cloudflare tunnel URL (`dev-<name>.<your-zone>`) — `setu tunnel` moves it between worktrees
+- The portal (`http://setu.local`) owns all long-running processes: dev servers, inngest, trigger.dev, cloudflared, and any configured sidecars — `setu start`/`setu stop` (or the portal UI) reach it directly, so nothing gets started outside its tracking
 - Concurrent dev servers are capped (`maxConcurrentDevServers` in `~/.setu.json`, default 3) — starting beyond the cap queues automatically and starts as a slot frees up, backed by a memory watchdog that restarts any single server that grows past a configured ceiling
 - `setu start` runs a worktree's dev server in a Docker-compatible container — real cgroup-enforced `containerMemoryLimit`/`containerCpuLimit` (`~/.setu.json`, defaults `4g`/`2`, auto-clamped to whatever the engine itself actually has available) instead of the polling watchdog — **unless that worktree has only ever run bare before, in which case plain `setu start` keeps it bare.** The default is sticky per worktree, not a flat global switch: a brand-new worktree (or one that's already containerized once) defaults to a container; an established worktree with bare-only history stays bare until you explicitly pass `--container`. `--bare`/`--container` always force a specific mode regardless of history. Only the dev server itself is containerized — the portal, Caddy, dnsmasq, and git all stay native on the host, this only governs how the dev server process runs. Works with any Docker-API-compatible engine (OrbStack, Docker Desktop, Colima, …), not hardcoded to OrbStack — Caddy always proxies to `localhost:<port>` exactly like the bare path, so nothing about routing changes between the two. Full details are in [AGENTS.md](./AGENTS.md#container-mode-the-default-since-2026-08-10) (heading: "Container mode")
 - Which "open in &lt;agent&gt;" buttons the portal shows isn't hardcoded — it detects installed AI coding CLIs live via `which` (see `AGENT_CLIS` in `lib.js`)
@@ -216,7 +216,7 @@ Production deployment requires a current target preflight and explicit confirmat
 ## Safety and resource behavior
 
 The portal listens on `127.0.0.1:2999`. HTTP, WebSocket, and MCP requests must come from
-loopback with a trusted local Host and Origin. The local Caddy address `quivly.local`
+loopback with a trusted local Host and Origin. The local Caddy address `setu.local`
 works; forwarded remote clients are rejected. This is a local tool, without multi-user authentication.
 
 Removal checks tracked and untracked changes before stopping a worktree. Use `--force`

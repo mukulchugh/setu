@@ -34,7 +34,7 @@ function logPopup(opener: HTMLElement) {
   const dialog = renderWithHooks(LogModal, {
     name: 'feat/projects-automation',
     onClose: () => undefined,
-    repo: 'quivly-app',
+    repo: 'my-app',
     returnFocus: opener,
   });
   const content = dialog.props.children;

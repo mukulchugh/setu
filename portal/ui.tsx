@@ -147,7 +147,7 @@ export function IconButton({
 // Glass + tactile: frosted translucency (modern/SaaS) with a hard offset
 // shadow that collapses on press (a real button being pushed), not a soft
 // glow. The accent color is reserved for these primary actions only — see
-// --color-accent (Quivly's brand forest green).
+// --color-accent (forest green).
 // No flex-1 here — it only worked at the original modal-footer call sites by
 // coincidence (a shrink-to-fit wrapper absorbed the grow), and stretched to
 // fill the row anywhere it was reused unwrapped (e.g. a Section's actions

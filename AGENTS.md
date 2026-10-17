@@ -1,8 +1,8 @@
 # setu — agent reference
 
-Setu manages Quivly dev worktrees: bare repos in `$WORKSPACE/<repo>.git`, worktrees at
-`$WORKSPACE/<repo>/<branch>`, one auto-assigned port + `*.quivly.local` domain each, and a
-single shared Cloudflare tunnel URL (`dev-<name>.getquivly.ai`) that one worktree owns at a time.
+Setu manages dev worktrees: bare repos in `$WORKSPACE/<repo>.git`, worktrees at
+`$WORKSPACE/<repo>/<branch>`, one auto-assigned port + `*.setu.local` domain each, and a
+single shared Cloudflare tunnel URL (`dev-<name>.<your-zone>`) that one worktree owns at a time.
 
 **Debugging anything setu-related? Start with `setu doctor --json`.** It checks every layer
 (brew deps, dnsmasq, resolver, caddy, sudoers, cloudflared, git sync, worktree-registry
@@ -15,7 +15,7 @@ sequentially — don't assume output order reflects check duration.
 ## CLI (machine-friendly)
 
 ```
-setu setup --name <you> [--workspace ~/workspace] [--zone getquivly.ai] [--engine orbstack|docker|colima|skip] --yes
+setu setup --name <you> [--workspace ~/workspace] --zone <your-cloudflare-domain> [--local-zone setu.local] [--engine orbstack|docker|colima|skip] --yes
                                      # non-interactive onboarding (needs sudo TTY once). Installs
                                      # Homebrew itself if missing (then asks for one re-run — see
                                      # Conventions), brew deps incl. gh (+ gh auth login if needed),
@@ -353,7 +353,7 @@ would leak forever with nothing left pointing at it.
 - `mise.toml` pins this repo's own `bun` version (`mise trust` once per clone to activate). Unrelated to `createWorktree`'s own `mise trust ...` call, which best-effort-trusts a *managed project's* own mise config on worktree creation — that's a different repo's config, not this one's. `setu doctor` reports whether `mise` itself is installed (optional, not a hard `setu setup` dependency).
 - `cmdSetup` (`cli.js`) installing Homebrew itself, when missing, exits after the install and asks the user to re-run the exact same command rather than continuing in-process. Not laziness: `BREW_PREFIX`/`CADDY_BIN`/`CLOUDFLARED_BIN` (`lib.js`) are computed once at module load, before `cmdSetup` runs — with brew missing at that point they're already frozen to a fallback (wrong on Intel Macs, merely unverified on Apple Silicon) that a mid-process `PATH` patch can't fix, since they're already-evaluated constants, not lazy lookups. A fresh process re-evaluates them correctly.
 - New branches fork from `origin/staging`.
-- `importRepo` (`lib.js`, `writeSetuAgentMarkers`) writes `.setu.json` + a `## Managed by Setu` AGENTS.md section into a brand-new project's `main` worktree — so an agent working in a *managed* project (quivly-app, etc.) knows Setu owns its dev servers/worktrees, without having to already know Setu exists. Project-level only (repo name, portal URL, CLI reference, install one-liner) — never a specific worktree's port/domain, since these files are meant to be committed once to the project's default branch and inherited by every future worktree via git; baking in one worktree's assigned port would be stale for the next. Non-destructive to an existing AGENTS.md (appends, idempotent — checks for the marker heading before writing again) and never auto-committed, only `git add`-staged: committing into a project this tool doesn't own is the user's call. Only runs on first registration (`setu init`/sweep `--import`), not on every subsequent `setu new` — once committed, later worktrees inherit the files via normal git checkout.
+- `importRepo` (`lib.js`, `writeSetuAgentMarkers`) writes `.setu.json` + a `## Managed by Setu` AGENTS.md section into a brand-new project's `main` worktree — so an agent working in a *managed* project (any registered repo) knows Setu owns its dev servers/worktrees, without having to already know Setu exists. Project-level only (repo name, portal URL, CLI reference, install one-liner) — never a specific worktree's port/domain, since these files are meant to be committed once to the project's default branch and inherited by every future worktree via git; baking in one worktree's assigned port would be stale for the next. Non-destructive to an existing AGENTS.md (appends, idempotent — checks for the marker heading before writing again) and never auto-committed, only `git add`-staged: committing into a project this tool doesn't own is the user's call. Only runs on first registration (`setu init`/sweep `--import`), not on every subsequent `setu new` — once committed, later worktrees inherit the files via normal git checkout.
   - Don't confuse this with `~/.setu-costs.json` (`COSTS_CFG_PATH` in `lib.js`) below — same filename stem, opposite everything else: that one lives in `$HOME` (not a managed project's repo), is never written by this tool at all (the user hand-writes it), and is never committed anywhere.
 - `~/.setu-costs.json` (`COSTS_CFG_PATH`/`loadCostsConfig` in `lib.js`, consumed by `costs.js`) holds `anthropicAdminKey`/`openaiAdminKey` for the portal's `/api/costs` page — org-admin-scope credentials, a materially bigger blast radius than the rest of `~/.setu.json`, so they get their own file rather than a section of it. Read-only from this tool's side: nothing in `lib.js`/`portal.js` ever writes to it, and no route ever echoes its values back (the local portal never returns provider keys). The user writes it by hand. Either key falls back to `$ANTHROPIC_ADMIN_KEY`/`$OPENAI_ADMIN_KEY` if absent from the file — still same-machine/already-trusted, not a new input surface, since nothing ever reads a credential from the request itself. Optional `"budgets": {"daily": N, "weekly": N, "monthly": N}` (USD, any subset) drives the Costs page's budget bar — combined spend across whichever providers are actually configured, compared against each configured threshold; an unset period is simply omitted from `/api/costs`'s response, not defaulted.
   ```json
@@ -363,8 +363,8 @@ would leak forever with nothing left pointing at it.
     "budgets": { "daily": 20, "weekly": 100, "monthly": 300 }
   }
   ```
-- `.env.local` is symlinked from the repo's `main` worktree (for `quivly-app`: `apps/quivly-app/.env.local`).
-- The non-tunnel `.envrc` (`NEXT_PUBLIC_APP_BASE_URL`/`NEXT_PUBLIC_WORKOS_REDIRECT_URI`) both point at the worktree's own `<branch>.quivly.local` domain, not `localhost` — if you ever see a `localhost:<port>` redirect after login, that's an env mismatch, not a Caddy problem (verified: Caddy always forwards the correct `Host`/`X-Forwarded-Host`).
+- `.env.local` is symlinked from the repo's `main` worktree (`apps/<repo>/.env.local` when that dir exists).
+- The non-tunnel `.envrc` (`NEXT_PUBLIC_APP_BASE_URL`) points at the worktree's own `<branch>.setu.local` domain, not `localhost` — if you ever see a `localhost:<port>` redirect after login, that's an env mismatch, not a Caddy problem (verified: Caddy always forwards the correct `Host`/`X-Forwarded-Host`).
 - Ports registry: `$WORKSPACE/.ports` (`repo/branch:port`); projects: `$WORKSPACE/.projects` (`name:base:slug:label`).
 - Sidecars registry (optional): `$WORKSPACE/sidecars.json` — `{ [repo]: [{name, enabled, command, args, env}] }`, Procfile-shaped. Loaded by the portal and spawned/stopped alongside the worktree's dev server. Not for Inngest/Trigger — those stay first-class endpoints; this is for anything else a project needs (a plain `cloudflared` tunnel, a queue worker, etc.).
 - Concurrency: `maxConcurrentDevServers` in `~/.setu.json` (default 3) caps how many dev servers the portal will run at once; anything beyond that queues via `/api/start`'s `queued`/`position` response. Applies identically to bare and containerized worktrees — they share one cap. See "Container mode" above for the same-worktree-restart edge case this cap has to account for.
@@ -681,7 +681,7 @@ and Raycast typecheck require the root dependencies `typescript`, `@raycast/api`
 Native dependency sharing is source/fixture verified only for Bun 1.3.14 on
 macOS arm64, an explicitly opted-in fresh checkout, `[install] linker =
 "isolated"`, and a private 0700 store outside the workspace. Hoisted or
-unspecified linkers are explicitly incompatible. No Quivly rollout has happened.
+unspecified linkers are explicitly incompatible. No production rollout has happened.
 An existing `node_modules` is never replaced automatically. Dependency repair
 currently returns a plan. APFS copy-on-write and directory-size observations are
 observations, not a guarantee of physical reclaim. No server, browser,

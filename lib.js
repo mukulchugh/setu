@@ -84,8 +84,8 @@ export const PACKAGE_VERSION = JSON.parse(
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
 export const HOSTS_TMP = '/tmp/setu-hosts';
-export const HOSTS_START = '# quivly-start';
-export const HOSTS_END = '# quivly-end';
+export const HOSTS_START = '# setu-start';
+export const HOSTS_END = '# setu-end';
 
 // Importing shared helpers must not spawn Homebrew (including offline `setu rm`).
 export const BREW_PREFIX =
@@ -110,6 +110,13 @@ export function workspaceState(workspace, options = {}) {
 
 export function loadConfig(options = {}) {
   return workspaceState(undefined, options).read('config');
+}
+
+export const DEFAULT_LOCAL_ZONE = 'setu.local';
+
+// Local suffix for the portal and every worktree domain (`setu setup --local-zone`).
+export function localZone(c = loadConfig()) {
+  return c.localZone || DEFAULT_LOCAL_ZONE;
 }
 
 // Only fields the caller intends to change belong in patch. Never pass a stale full snapshot.
@@ -175,8 +182,8 @@ export function portalRequestError(req, address, port = PORTAL_PORT) {
     `localhost:${port}`,
     `127.0.0.1:${port}`,
     `[::1]:${port}`,
-    'quivly.local',
-    'quivly.local:80',
+    localZone(),
+    `${localZone()}:80`,
   ]);
   const url = new URL(req.url);
   if (!hosts.has((req.headers.get('host') || url.host).toLowerCase())) {
@@ -254,10 +261,8 @@ export function slugify(name) {
   return name.replace(/\//g, '-');
 }
 
-export function localDomain(repo, name) {
-  return name === 'main'
-    ? `${repo}.quivly.local`
-    : `${slugify(name)}.quivly.local`;
+export function localDomain(repo, name, zone = localZone()) {
+  return `${name === 'main' ? repo : slugify(name)}.${zone}`;
 }
 
 // Single shared public URL per developer (dev-<name>.<zone>). One worktree at a
@@ -268,10 +273,11 @@ export function publicDomain(c) {
 
 // ── env files ─────────────────────────────────────────────────────────────────
 
+// ponytail: monorepo convention — apps/<repo>/ wins when present; add a
+// per-project envDir setting if a repo ever breaks this convention.
 export function envLocalPath(repo, wtDir) {
-  return repo === 'quivly-app'
-    ? join(wtDir, 'apps', 'quivly-app', '.env.local')
-    : join(wtDir, '.env.local');
+  const appDir = join(wtDir, 'apps', repo);
+  return join(existsSync(appDir) ? appDir : wtDir, '.env.local');
 }
 
 export function parseEnvFile(path) {
@@ -309,8 +315,7 @@ function hasConvexEnv(dir) {
 // some setups). Checked at both the worktree root and the envLocalPath-
 // resolved app dir, root first -- covers a plain repo (the two resolve to the
 // same directory) and a monorepo where the app -- and therefore convex/ --
-// lives nested (apps/quivly-app for the quivly-app repo, the one case
-// envLocalPath already special-cases). Returns the directory Convex actually
+// lives nested (apps/<repo>, the monorepo convention envLocalPath follows). Returns the directory Convex actually
 // lives in rather than a bare boolean, so callers spawn `npx convex dev`/
 // `deploy` from the right cwd instead of re-deriving this same resolution
 // themselves.
@@ -354,11 +359,11 @@ export function tunnelEnabled(wtDir, c) {
   return readEnvrc(wtDir).includes(`https://${c.domain}`);
 }
 
-export async function writeEnvrc(wtDir, port, appUrl, redirectUri) {
+export async function writeEnvrc(wtDir, port, appUrl) {
   installedStateValue(
     await workspaceState(undefined).replaceText(
       join(wtDir, '.envrc'),
-      `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`
+      `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\n`
     )
   );
   await allowDirenvAsync(wtDir);
@@ -385,26 +390,12 @@ export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
   const wtDir = join(c.workspace, repo, name);
   if (withTunnel) {
     const pd = publicDomain(c);
-    await writeEnvrc(
-      wtDir,
-      port,
-      `https://${pd}`,
-      `https://${pd}/authentication/callback`
-    );
+    await writeEnvrc(wtDir, port, `https://${pd}`);
   } else {
-    // Was http://localhost:${port}/... — inconsistent with APP_BASE_URL on the
-    // line above, and the actual root cause of "redirected to localhost" after
-    // login: WORKOS_REDIRECT_URI is read once from this env var at process
-    // startup by @workos-inc/authkit-nextjs and used verbatim as the OAuth
-    // redirect destination, so a mismatched value here sends the browser to
-    // localhost regardless of what domain the user actually visited through Caddy.
+    // The worktree's own domain, not localhost: OAuth callbacks built from
+    // this URL must land back on the domain the browser actually visited.
     const ld = localDomain(repo, name);
-    await writeEnvrc(
-      wtDir,
-      port,
-      `http://${ld}`,
-      `http://${ld}/authentication/callback`
-    );
+    await writeEnvrc(wtDir, port, `http://${ld}`);
   }
   await writeCaddy(c, repo, name, port, withTunnel);
 }
@@ -518,9 +509,12 @@ export function syncHosts(
       ''
     );
     const { ports } = await state.snapshot(['ports']);
-    const entries = ports.map(
-      ({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`
-    );
+    // Portal host too: /etc/hosts still resolves when a VPN/WARP bypasses
+    // /etc/resolver, so dnsmasq is never the only path to the portal.
+    const entries = [
+      `127.0.0.1\t${localZone()}`,
+      ...ports.map(({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`),
+    ];
     const next =
       cleaned.trimEnd() +
       `\n${HOSTS_START}\n` +
@@ -1994,9 +1988,9 @@ export function branchMetadata(repoDir, raw) {
 // needed. Copy, not symlink, unlike the .env.local step in createWorktree
 // below: these files are meant to be independently editable per worktree.
 // Globs resolve against mainDir itself (the worktree root), the same base
-// the repo checks out into — not envLocalPath's quivly-app special-case, so
+// the repo checks out into — not envLocalPath's apps/<repo> convention, so
 // a project needing an app-subdir file uses a glob with that subdir already
-// in it, e.g. apps/quivly-app/.env.development.local.
+// in it, e.g. apps/my-app/.env.development.local.
 // Never throws: a missing main worktree (first worktree ever) or a glob
 // that matches nothing are both expected, logged, and skipped, not fatal to
 // worktree creation.
@@ -2075,11 +2069,12 @@ export async function createWorktree(
       );
     }
 
-    const domain = localDomain(repo, name);
+    const zone = localZone(c);
+    const domain = localDomain(repo, name, zone);
     const collision = portEntries(c.workspace).find(
       (entry) =>
         (entry.repo !== repo || entry.name !== name) &&
-        localDomain(entry.repo, entry.name) === domain
+        localDomain(entry.repo, entry.name, zone) === domain
     );
     if (collision) {
       throw Object.assign(

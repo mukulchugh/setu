@@ -9,12 +9,12 @@ export function caddyfileText(workspace) {
   return `{\n  auto_https off\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
 }
 
-export function portalCaddyRoute(port) {
-  return `http://quivly.local {\n  reverse_proxy localhost:${port}\n}\n`;
+export function portalCaddyRoute(port, zone) {
+  return `http://${zone} {\n  reverse_proxy localhost:${port}\n}\n`;
 }
 
-export function hasPortalCaddyRoute(text, port) {
-  return text === portalCaddyRoute(port);
+export function hasPortalCaddyRoute(text, port, zone) {
+  return text === portalCaddyRoute(port, zone);
 }
 
 // Replaces an existing Setu block. The caller appends when no start marker exists.
@@ -92,4 +92,29 @@ export function startOutcome(response) {
     };
   }
   return { queued: false, started: !!response.ok };
+}
+
+// Agent CLIs (claude, codex, cursor-agent, ...) must run on their own
+// subscription login, never a pay-per-use API key.
+export const API_KEY_VARS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'OPENAI_API_KEY',
+  'CURSOR_API_KEY',
+];
+
+// Env for every `claude` Setu spawns: subscription (OAuth) auth only. Drops
+// API-key vars so a stray key can never bill the API, and the
+// CLAUDE_CODE_* session vars a portal inherits when launched from inside a
+// Claude Code session. CLAUDE_CODE_OAUTH_TOKEN (subscription) is kept.
+const API_AUTH_VARS = new Set(API_KEY_VARS);
+export function claudeSubscriptionEnv(env = process.env) {
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([k]) =>
+        !API_AUTH_VARS.has(k) &&
+        (k === 'CLAUDE_CODE_OAUTH_TOKEN' || !k.startsWith('CLAUDE_CODE_'))
+    )
+  );
 }

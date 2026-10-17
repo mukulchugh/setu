@@ -104,6 +104,9 @@ export function createGithubActions({ target, branch, run, readWorkflow }) {
   }
 
   async function dispatchableWorkflow(context, workflow) {
+    if (workflow?.path?.startsWith('dynamic/')) {
+      return { kind: 'skip' };
+    }
     if (
       workflow?.state !== 'active' ||
       !(typeof workflow.id === 'number' || typeof workflow.id === 'string')
