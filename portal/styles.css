@@ -25,9 +25,7 @@
   --color-signal-amber: #a85f09;
   --color-signal-red: #d1402f;
   --color-rail: #8a8f87;
-  /* Quivly's own core brand forest green (landing/marketing site, not the
-     app's indigo primary — confirmed against apps/quivly-app/lib/constants
-     /integrations.ts). Every primary action (Create, Start, Stop,
+  /* Forest green accent. Every primary action (Create, Start, Stop,
      +Worktree) shares it, so "this is the thing to click" always means the
      same color. */
   --color-accent: #085041;

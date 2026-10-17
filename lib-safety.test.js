@@ -21,6 +21,8 @@ import {
   baseBranchRefAsync,
   createWorktree,
   ensureSetuExcludes,
+  envLocalPath,
+  localDomain,
   linkWorktreeEnv,
   PACKAGE_VERSION,
   portalRequestError,
@@ -312,14 +314,19 @@ test('worktree creation refuses a local-domain collision before checkout setup',
     writeFileSync(join(root, '.projects'), 'repo:3000::Repository\n');
     writeFileSync(join(root, '.ports'), 'other/topic:3000\n');
     await expect(
-      createWorktree(
-        { domain: 'quivly.local', workspace: root },
-        'repo',
-        'topic'
-      )
+      createWorktree({ domain: 'setu.local', workspace: root }, 'repo', 'topic')
     ).rejects.toMatchObject({ code: 'DOMAIN_COLLISION' });
     expect(existsSync(join(root, 'repo', 'topic'))).toBe(false);
   } finally {
     rmSync(root, { force: true, recursive: true });
   }
+});
+
+test('localDomain uses the configured zone; envLocalPath follows apps/<repo>', () => {
+  expect(localDomain('app', 'main', 'x.test')).toBe('app.x.test');
+  expect(localDomain('app', 'feat/a', 'x.test')).toBe('feat-a.x.test');
+  const dir = mkdtempSync(join(tmpdir(), 'setu-env-'));
+  expect(envLocalPath('app', dir)).toBe(join(dir, '.env.local'));
+  mkdirSync(join(dir, 'apps', 'app'), { recursive: true });
+  expect(envLocalPath('app', dir)).toBe(join(dir, 'apps', 'app', '.env.local'));
 });

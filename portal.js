@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-// Dev portal — http://quivly.local
+// Dev portal — http://setu.local (configurable via config.localZone)
 
 import {
   appendFileSync,
@@ -67,6 +67,7 @@ import {
   loadProjects,
   loadSidecars,
   localDomain,
+  localZone,
   macCapacity,
   managedWorktreePath,
   markMigrationPrompted,
@@ -1982,7 +1983,7 @@ export async function createPortalRuntime(options = {}) {
   // ── configurable per-project sidecars (workspace/sidecars.json) ──────────────
   // Generic version of what startInngest/startTrigger already do, for anything
   // project-specific that isn't Inngest or Trigger — a plain cloudflared tunnel,
-  // a queue worker, whatever a future project needs. Not hardcoded to quivly-app.
+  // a queue worker, whatever a future project needs. Not hardcoded to any project.
 
   // Returns the names of any sidecars skipped for lacking approval, so the
   // start path (spawnWorktree/spawnContainer -> startWorktree) can surface it
@@ -5599,7 +5600,7 @@ if (import.meta.main) {
   createPortalRuntime()
     .then(async (runtime) => {
       await runtime.start();
-      console.log(`Portal → http://quivly.local  (localhost:${PORTAL_PORT})`);
+      console.log(`Portal → http://${localZone()}  (localhost:${PORTAL_PORT})`);
     })
     .catch((error) => {
       console.error(`setu portal: ${error.message}`);

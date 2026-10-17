@@ -1163,7 +1163,7 @@ function WorktreeActions({
     leavingMenu.current = true;
     navigate(`${detailPath}#${section}`);
   }
-  // navigator.clipboard is undefined on non-secure origins such as http://quivly.local.
+  // navigator.clipboard is undefined on non-secure origins such as http://setu.local.
   async function copyCD() {
     try {
       await navigator.clipboard.writeText(cdCommand(w));
@@ -4571,8 +4571,8 @@ function SettingsPage({
                 copied (not symlinked, unlike .env.local) from the main worktree
                 into every newly created worktree, so each one gets its own
                 editable copy. Patterns resolve against the main worktree's
-                root, not an app subdir — for quivly-app include the subdir,
-                e.g. apps/quivly-app/.env.development.local.
+                root, not an app subdir — for a monorepo include the subdir,
+                e.g. apps/my-app/.env.development.local.
               </p>
             </div>
           ) : (

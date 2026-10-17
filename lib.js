@@ -54,8 +54,8 @@ export const PACKAGE_VERSION = JSON.parse(
 export const PORTAL_PORT = 2999;
 // Must match the sudoers rule written by `setu setup` — keep the two in sync.
 export const HOSTS_TMP = '/tmp/setu-hosts';
-export const HOSTS_START = '# quivly-start';
-export const HOSTS_END = '# quivly-end';
+export const HOSTS_START = '# setu-start';
+export const HOSTS_END = '# setu-end';
 
 // Importing shared helpers must not spawn Homebrew (including offline `setu rm`).
 export const BREW_PREFIX =
@@ -80,6 +80,13 @@ export function workspaceState(workspace, options = {}) {
 
 export function loadConfig(options = {}) {
   return workspaceState(undefined, options).read('config');
+}
+
+export const DEFAULT_LOCAL_ZONE = 'setu.local';
+
+// Local suffix for the portal and every worktree domain (`setu setup --local-zone`).
+export function localZone(c = loadConfig()) {
+  return c.localZone || DEFAULT_LOCAL_ZONE;
 }
 
 // Only fields the caller intends to change belong in patch. Never pass a stale full snapshot.
@@ -145,8 +152,8 @@ export function portalRequestError(req, address, port = PORTAL_PORT) {
     `localhost:${port}`,
     `127.0.0.1:${port}`,
     `[::1]:${port}`,
-    'quivly.local',
-    'quivly.local:80',
+    localZone(),
+    `${localZone()}:80`,
   ]);
   const url = new URL(req.url);
   if (!hosts.has((req.headers.get('host') || url.host).toLowerCase())) {
@@ -223,10 +230,8 @@ export function slugify(name) {
   return name.replace(/\//g, '-');
 }
 
-export function localDomain(repo, name) {
-  return name === 'main'
-    ? `${repo}.quivly.local`
-    : `${slugify(name)}.quivly.local`;
+export function localDomain(repo, name, zone = localZone()) {
+  return `${name === 'main' ? repo : slugify(name)}.${zone}`;
 }
 
 // Single shared public URL per developer (dev-<name>.<zone>). One worktree at a
@@ -237,10 +242,11 @@ export function publicDomain(c) {
 
 // ── env files ─────────────────────────────────────────────────────────────────
 
+// ponytail: monorepo convention — apps/<repo>/ wins when present; add a
+// per-project envDir setting if a repo ever breaks this convention.
 export function envLocalPath(repo, wtDir) {
-  return repo === 'quivly-app'
-    ? join(wtDir, 'apps', 'quivly-app', '.env.local')
-    : join(wtDir, '.env.local');
+  const appDir = join(wtDir, 'apps', repo);
+  return join(existsSync(appDir) ? appDir : wtDir, '.env.local');
 }
 
 export function parseEnvFile(path) {
@@ -278,8 +284,7 @@ function hasConvexEnv(dir) {
 // some setups). Checked at both the worktree root and the envLocalPath-
 // resolved app dir, root first -- covers a plain repo (the two resolve to the
 // same directory) and a monorepo where the app -- and therefore convex/ --
-// lives nested (apps/quivly-app for the quivly-app repo, the one case
-// envLocalPath already special-cases). Returns the directory Convex actually
+// lives nested (apps/<repo>, the monorepo convention envLocalPath follows). Returns the directory Convex actually
 // lives in rather than a bare boolean, so callers spawn `npx convex dev`/
 // `deploy` from the right cwd instead of re-deriving this same resolution
 // themselves.
@@ -1939,9 +1944,9 @@ export function branchMetadata(repoDir, raw) {
 // needed. Copy, not symlink, unlike the .env.local step in createWorktree
 // below: these files are meant to be independently editable per worktree.
 // Globs resolve against mainDir itself (the worktree root), the same base
-// the repo checks out into — not envLocalPath's quivly-app special-case, so
+// the repo checks out into — not envLocalPath's apps/<repo> convention, so
 // a project needing an app-subdir file uses a glob with that subdir already
-// in it, e.g. apps/quivly-app/.env.development.local.
+// in it, e.g. apps/my-app/.env.development.local.
 // Never throws: a missing main worktree (first worktree ever) or a glob
 // that matches nothing are both expected, logged, and skipped, not fatal to
 // worktree creation.
@@ -2019,11 +2024,12 @@ export async function createWorktree(
       );
     }
 
-    const domain = localDomain(repo, name);
+    const zone = localZone(c);
+    const domain = localDomain(repo, name, zone);
     const collision = portEntries(c.workspace).find(
       (entry) =>
         (entry.repo !== repo || entry.name !== name) &&
-        localDomain(entry.repo, entry.name) === domain
+        localDomain(entry.repo, entry.name, zone) === domain
     );
     if (collision) {
       throw Object.assign(

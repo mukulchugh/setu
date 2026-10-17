@@ -592,7 +592,7 @@ test.each([
     expect(await second.closed).toEqual({ code: 0, stderr: '' });
     if (storeName === 'routing') {
       expect(fs.readFileSync(join(root, 'hosts'), 'utf8')).not.toContain(
-        'r.quivly.local'
+        'r.setu.local'
       );
     } else if (storeName === 'ports') {
       expect(store.read('ports').map((row) => row.port)).toEqual([3200, 3201]);

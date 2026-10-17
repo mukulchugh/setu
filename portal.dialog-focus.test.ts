@@ -34,8 +34,10 @@ function renderWithHooks(component: (props: any) => any, props: object) {
 
 function logPopup(opener: HTMLElement) {
   const dialog = renderWithHooks(LogModal, {
-    repo: 'quivly-app', name: 'feat/projects-automation',
-    onClose: () => {}, returnFocus: opener,
+    repo: 'my-app',
+    name: 'feat/projects-automation',
+    onClose: () => {},
+    returnFocus: opener,
   });
   const content = dialog.props.children;
   expect(content.type).toBe(DialogContent);
@@ -51,7 +53,8 @@ test('menu-to-logs keeps the explicit More opener after the menu retakes focus',
   const menuItem = element(true);
   const body = element(true);
   Object.defineProperty(globalThis, 'document', {
-    configurable: true, value: { activeElement: menuItem, body },
+    configurable: true,
+    value: { activeElement: menuItem, body },
   });
   try {
     const popup = logPopup(more);
@@ -70,7 +73,8 @@ test('menu-to-logs keeps the explicit More opener after the menu retakes focus',
 test('DialogContent preserves explicit finalFocus policies unchanged', () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
   Object.defineProperty(globalThis, 'document', {
-    configurable: true, value: { activeElement: element(true), body: element(true) },
+    configurable: true,
+    value: { activeElement: element(true), body: element(true) },
   });
   try {
     const callback = () => false;

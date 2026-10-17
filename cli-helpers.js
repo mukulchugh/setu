@@ -4,12 +4,12 @@ export function caddyfileText(workspace) {
   return `{\n  auto_https off\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
 }
 
-export function portalCaddyRoute(port) {
-  return `http://quivly.local {\n  reverse_proxy localhost:${port}\n}\n`;
+export function portalCaddyRoute(port, zone) {
+  return `http://${zone} {\n  reverse_proxy localhost:${port}\n}\n`;
 }
 
-export function hasPortalCaddyRoute(text, port) {
-  return text === portalCaddyRoute(port);
+export function hasPortalCaddyRoute(text, port, zone) {
+  return text === portalCaddyRoute(port, zone);
 }
 
 // Replaces an existing Setu block. The caller appends when no start marker exists.

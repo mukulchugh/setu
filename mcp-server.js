@@ -277,7 +277,7 @@ function registerTools(server) {
         "Create a new Setu worktree for a branch (forks from the repo's base branch if the branch doesn't exist yet). Does not start the dev server.",
       inputSchema: {
         name: z.string().describe('branch name'),
-        repo: z.string().describe('registered project name, e.g. "quivly-app"'),
+        repo: z.string().describe('registered project name, e.g. "my-app"'),
         tunnel: z
           .boolean()
           .optional()
@@ -1038,7 +1038,7 @@ function registerTools(server) {
 // response verbatim) -- not a tool, not per-call, the one place to brief an
 // agent on how this whole server fits together before it starts picking
 // tools one at a time from titles/descriptions alone.
-const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.quivly.local\` domain).
+const INSTRUCTIONS = `Setu manages parallel git worktrees for local development: one bare repo per project (\`<repo>.git\`), lightweight worktrees under it (one per branch, each with its own dev server, port, and \`<branch>.setu.local\` domain).
 
 TOOL GROUPS
 - Writer coordination: claim_worktree -> edit (refresh the same session periodically) -> release_worktree; list_claims shows current owners. Supply the local agent PID when claiming. If another session holds the claim, use a separate worktree.

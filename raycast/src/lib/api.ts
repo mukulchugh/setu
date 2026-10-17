@@ -10,7 +10,7 @@ import { getPreferenceValues } from "@raycast/api";
 // argument schemas, and the JSDoc descriptions Raycast surfaces to the model,
 // can't drift apart between the three files.
 export type WorktreeRef = {
-  /** The repo/project the worktree belongs to, e.g. "quivly-app". */
+  /** The repo/project the worktree belongs to, e.g. "my-app". */
   repo: string;
   /** The worktree's name — usually its branch name. */
   name: string;

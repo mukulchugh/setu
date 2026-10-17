@@ -116,7 +116,7 @@ function setupFixture(manifest) {
   const context = {
     ready: false,
     res: {
-      localDom: 'r-topic.quivly.local',
+      localDom: 'r-topic.setu.local',
       port: 3301,
       wtDir: '/isolated/r/topic',
     },
@@ -213,7 +213,7 @@ test('portal setup without a dependency manifest becomes ready without any insta
   const f = setupFixture(null);
   try {
     expect(await f.create()).toEqual({
-      domain: 'r-topic.quivly.local',
+      domain: 'r-topic.setu.local',
       ok: true,
       port: 3301,
       setup: 'ready',

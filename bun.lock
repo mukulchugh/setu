@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@quivly/setu",
+      "name": "setu",
       "dependencies": {
         "@ai-hero/sandcastle": "^0.12.0",
         "@base-ui/react": "^1.7.0",

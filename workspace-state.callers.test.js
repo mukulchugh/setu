@@ -292,7 +292,7 @@ test('actual routing wrappers stage fresh registry values inside shared routing 
     );
     expect(await reloadCaddy(root, { run, state })).toBe(true);
   });
-  expect(readFileSync(hostsPath, 'utf8')).toContain('r.quivly.local');
+  expect(readFileSync(hostsPath, 'utf8')).toContain('r.setu.local');
   await state.replace('ports', []);
   await expect(
     writeCaddy({ workspace: root }, 'r', 'main', 3200, false, { state })
