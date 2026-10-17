@@ -426,7 +426,7 @@ export async function createPortalRuntime(options = {}) {
   // `setu init` from the CLI registers projects without telling a running
   // portal; reload on a miss instead of serving a stale registry.
   const repoMeta = (repo) => {
-    if (!REPO_META[repo]) {
+    if (!(REPO_META[repo] || options.projects)) {
       REPO_META = loadProjects(WORKSPACE);
     }
     return REPO_META[repo];

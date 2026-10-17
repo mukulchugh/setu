@@ -5,6 +5,7 @@ import {
   pumpLines,
   RUN_TIMEOUT_MS,
 } from './agent.js';
+import { claudeSubscriptionEnv } from './cli-helpers.js';
 import { observeProcessIdentity } from './process-observation.js';
 
 const ACTIVE = new Set(['starting', 'running', 'cancelling', 'unknown']);
@@ -105,7 +106,6 @@ const validRun = (run, key) => {
 function providerArgs({ maxBudgetUsd, model, permissionMode, resumeSession }) {
   const args = [
     'claude',
-    '--bare',
     '-p',
     '-',
     '--output-format',
@@ -154,6 +154,7 @@ export function createHeadlessRun({
     const child = Bun.spawn(args, {
       cwd,
       detached: true,
+      env: claudeSubscriptionEnv(),
       stderr: 'pipe',
       stdin: 'pipe',
       stdout: 'pipe',

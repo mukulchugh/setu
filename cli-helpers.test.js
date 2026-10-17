@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   caddyfileText,
+  claudeSubscriptionEnv,
   cursorConfigText,
   hasCodexServerTable,
   hasIdentifiableWorktreeCwd,
@@ -161,4 +162,15 @@ test('sudoRuleCovers joins a rule that sudo wrapped onto a second line', () => {
       '/Users/x/other/Caddyfile',
     ])
   ).toBe(false);
+});
+
+test('claudeSubscriptionEnv strips API auth and session vars, keeps OAuth token', () => {
+  const env = claudeSubscriptionEnv({
+    ANTHROPIC_API_KEY: 'k',
+    ANTHROPIC_AUTH_TOKEN: 't',
+    CLAUDE_CODE_OAUTH_TOKEN: 'o',
+    CLAUDE_CODE_SESSION_ID: 's',
+    PATH: '/bin',
+  });
+  expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'o', PATH: '/bin' });
 });

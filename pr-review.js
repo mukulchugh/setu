@@ -20,6 +20,7 @@
 
 import { closeSync, readFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
+import { claudeSubscriptionEnv } from './cli-helpers.js';
 import { HOME } from './lib.js';
 
 const RUN_TIMEOUT_MS = 20 * 60 * 1000; // wall-clock cap on a single run
@@ -411,6 +412,7 @@ export function runDeepReview(
       ['claude', ...buildDeepReviewArgs(skill, slug, prNumber)],
       {
         cwd: wtDir,
+        env: claudeSubscriptionEnv(),
         stderr: logFd,
         stdin: 'ignore',
         stdout: logFd,

@@ -1,3 +1,5 @@
+import { API_KEY_VARS } from './cli-helpers.js';
+
 const startIdentity =
   /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 
@@ -49,6 +51,7 @@ export function buildAgentSessionLaunch({
     registration: { path: registrationPath, sessionId },
     script: `#!/bin/zsh -i
 source "$HOME/.zshrc"
+unset ${API_KEY_VARS.join(' ')}
 cd -- ${shellQuote(checkoutPath)} || exit
 foreground_job=0
 if [[ -t 0 ]] && setopt monitor 2>/dev/null; then
