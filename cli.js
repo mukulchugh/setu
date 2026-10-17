@@ -645,13 +645,16 @@ async function cmdSetup() {
   }
 
   spin(`tunnel ${input.tunnel}`);
+  // cloudflared prints `null` (not `[]`) when no tunnel matches
   const findTunnel = () =>
-    JSON.parse(
-      execFileSync(
-        CLOUDFLARED_BIN,
-        ['tunnel', 'list', '--output', 'json', '--name', input.tunnel],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
-      )
+    (
+      JSON.parse(
+        execFileSync(
+          CLOUDFLARED_BIN,
+          ['tunnel', 'list', '--output', 'json', '--name', input.tunnel],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+        )
+      ) ?? []
     ).filter((t) => t.name === input.tunnel);
   let tunnels = findTunnel();
   if (!tunnels.length) {
