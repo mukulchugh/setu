@@ -131,6 +131,11 @@ export function createGithubActions({ target, branch, run, readWorkflow }) {
       ) {
         continue;
       }
+      // GitHub-managed workflows (e.g. dynamic/dependabot/...) have no YAML in
+      // the repo and can't be dispatched; skip them rather than fail the list.
+      if (workflow.path?.startsWith('dynamic/')) {
+        continue;
+      }
       if (
         !(
           typeof workflow.name === 'string' &&
