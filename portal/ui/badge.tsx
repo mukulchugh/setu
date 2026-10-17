@@ -91,13 +91,11 @@ const badgeVariants = cva(
     variants: {
       tone: {
         amber: 'bg-signal-amber/10 text-signal-amber dark:bg-signal-amber/15',
-        emerald: 'bg-signal-green/10 text-signal-green dark:bg-signal-green/15',
+        emerald:
+          'bg-signal-green/10 text-emerald-800 dark:bg-signal-green/15 dark:text-signal-green',
         red: 'bg-signal-red/10 text-signal-red dark:bg-signal-red/15',
-        // The one tone the old Badge left without a dark: pair — bg-zinc-100/
-        // text-zinc-500 is a light-surface color, unreadable washed onto a
-        // dark background. Every other tone rides transparent-alpha signal
-        // colors that already hold up on either surface.
-        zinc: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
+        // Opaque neutral surfaces need separate light and dark contrast pairs.
+        zinc: 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400',
       },
     },
   }

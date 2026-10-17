@@ -1,0 +1,201 @@
+import { useState } from 'preact/hooks';
+import { parseSpansLocation, spansLocationSearch } from '../spans-location';
+import {
+  readSpansArtifact,
+  readSpansEvents,
+  readSpansRun,
+  readSpansRuns,
+} from '../spans-read';
+import type { SpansPhase } from '../spans-types';
+import { Button } from '../ui/button';
+import { useVisiblePoll } from '../use-visible-poll';
+import { SpansConversation } from './spans-conversation';
+import { SpansDetail } from './spans-detail';
+import { SpansEvidence } from './spans-evidence';
+import { SpansList } from './spans-list';
+
+export function SpansPage({
+  runId,
+  onBack,
+  onSelect,
+}: {
+  runId?: string;
+  onBack: () => void;
+  onSelect: (runId: string) => void;
+}) {
+  return runId ? (
+    <RunPage key={runId} onBack={onBack} runId={runId} />
+  ) : (
+    <RunList onBack={onBack} onSelect={onSelect} />
+  );
+}
+
+function updateLocation(changes: Record<string, string | number | null>) {
+  const search = spansLocationSearch(window.location.search, changes);
+  window.history.replaceState(null, '', `${window.location.pathname}${search}`);
+}
+
+function RunList({
+  onBack,
+  onSelect,
+}: {
+  onBack: () => void;
+  onSelect: (runId: string) => void;
+}) {
+  const [initial] = useState(() => parseSpansLocation(window.location.search));
+  const [phase, setPhase] = useState<SpansPhase>(initial.phase);
+  const [query, setQuery] = useState(initial.query);
+  const [cursors, setCursors] = useState(['']);
+  const cursor = cursors.at(-1) ?? '';
+  const page = useVisiblePoll(
+    JSON.stringify(['spans', phase, query, cursor]),
+    15_000,
+    (signal) => readSpansRuns(phase, query, cursor, signal)
+  );
+  return (
+    <SpansList
+      error={page.failed ? 'Refresh to retry.' : null}
+      hasMore={page.data?.hasMore ?? false}
+      hasPrevious={cursors.length > 1}
+      loading={!(page.data || page.failed)}
+      onBack={onBack}
+      onNext={() => {
+        if (page.data?.hasMore && page.data.nextRunId) {
+          setCursors([...cursors, page.data.nextRunId]);
+        }
+      }}
+      onPhaseChange={(value) => {
+        setPhase(value);
+        updateLocation({ phase: value });
+        setCursors(['']);
+      }}
+      onPrevious={() => setCursors(cursors.slice(0, -1))}
+      onQueryChange={(value) => {
+        setQuery(value);
+        updateLocation({ query: value });
+        setCursors(['']);
+      }}
+      onRefresh={page.refresh}
+      onSelect={onSelect}
+      phase={phase}
+      query={query}
+      records={page.data?.records ?? []}
+      stale={page.failed && !!page.data}
+    />
+  );
+}
+
+function RunPage({ runId, onBack }: { runId: string; onBack: () => void }) {
+  const [initial] = useState(() => parseSpansLocation(window.location.search));
+  const [tab, setTab] = useState(initial.tab);
+  const [artifactId, setArtifactId] = useState<string | null>(
+    initial.artifactId || null
+  );
+  const [cursors, setCursors] = useState([initial.after]);
+  const after = cursors.at(-1) ?? 0;
+  const run = useVisiblePoll(`spans-run:${runId}`, 15_000, (signal) =>
+    readSpansRun(runId, signal)
+  );
+  const history = useVisiblePoll(
+    `spans-events:${runId}:${after}`,
+    15_000,
+    (signal) => readSpansEvents(runId, after, signal)
+  );
+  const next = () => {
+    if (history.data?.hasMore && history.data.nextSequence > after) {
+      setCursors([...cursors, history.data.nextSequence]);
+      updateLocation({ after: history.data.nextSequence });
+    }
+  };
+  const paging = (
+    <nav aria-label="History pages" class="flex flex-wrap gap-3 py-3">
+      <Button
+        disabled={after === 0}
+        onClick={() => {
+          setCursors([0]);
+          updateLocation({ after: 0 });
+        }}
+        variant="secondary"
+      >
+        First history page
+      </Button>
+      <Button
+        disabled={cursors.length < 2}
+        onClick={() => {
+          setCursors(cursors.slice(0, -1));
+          updateLocation({ after: cursors.at(-2) ?? 0 });
+        }}
+        variant="secondary"
+      >
+        Previous history page
+      </Button>
+      <Button
+        disabled={!history.data?.hasMore}
+        onClick={next}
+        variant="secondary"
+      >
+        Next history page
+      </Button>
+      <span class="text-sm">
+        Events after sequence {after}. Evidence below belongs to this page.
+      </span>
+    </nav>
+  );
+  const historyError = history.failed
+    ? 'History could not be refreshed. Try Refresh.'
+    : null;
+  return (
+    <SpansDetail
+      conversation={
+        <>
+          {paging}
+          <SpansConversation
+            error={historyError}
+            events={history.data?.events ?? []}
+            hasMore={false}
+            loading={!(history.data || history.failed)}
+            onLoadMore={next}
+            readArtifact={readSpansArtifact}
+            runId={runId}
+            stale={history.failed && !!history.data}
+          />
+        </>
+      }
+      error={
+        run.failed ? 'This run could not be refreshed. Try Refresh.' : null
+      }
+      evidence={
+        <>
+          {paging}
+          {historyError && <p role="alert">{historyError}</p>}
+          {!(history.data || history.failed) && (
+            <p role="status">Loading evidence…</p>
+          )}
+          <SpansEvidence
+            artifactId={artifactId}
+            events={history.data?.events ?? []}
+            onArtifactChange={(value) => {
+              setArtifactId(value);
+              updateLocation({ artifact: value });
+            }}
+            readArtifact={readSpansArtifact}
+            runId={runId}
+          />
+        </>
+      }
+      loading={!(run.data || run.failed)}
+      onBack={onBack}
+      onRefresh={() => {
+        run.refresh();
+        history.refresh();
+      }}
+      onTabChange={(value) => {
+        setTab(value);
+        updateLocation({ tab: value });
+      }}
+      record={run.data ?? null}
+      stale={run.failed && !!run.data}
+      tab={tab}
+    />
+  );
+}

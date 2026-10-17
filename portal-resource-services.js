@@ -581,6 +581,27 @@ export async function dispatchPortalResourceRoute(services, request) {
     },
     '/api/resource-admission': { action: 'admissionStatus', input: {} },
     '/api/shared-caches': { action: 'sharedCaches', input: {} },
+    '/api/spans/artifact': { action: 'spansArtifact', optional: true },
+    '/api/spans/events': {
+      action: 'spansEvents',
+      input: {
+        ...query,
+        ...(query.limit === undefined ? {} : { limit: Number(query.limit) }),
+        ...(query.afterSequence === undefined
+          ? {}
+          : { afterSequence: Number(query.afterSequence) }),
+      },
+      optional: true,
+    },
+    '/api/spans/run': { action: 'spansRun', optional: true },
+    '/api/spans/runs': {
+      action: 'spansRuns',
+      input: {
+        ...query,
+        ...(query.limit === undefined ? {} : { limit: Number(query.limit) }),
+      },
+      optional: true,
+    },
     '/api/workspace-storage': { action: 'workspaceStorage', input: {} },
   };
   if (request.method === 'GET') {

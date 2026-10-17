@@ -147,6 +147,7 @@ import {
   createRemovalRouting,
 } from './removal-routing.js';
 import { createSetupProgress } from './setup-progress.js';
+import { createSpansRuntime } from './spans-runtime.js';
 import {
   createWorkspaceInventory,
   parseLinkedWorktrees,
@@ -3628,7 +3629,9 @@ export async function createPortalRuntime(options = {}) {
       runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
       state: b205State,
     });
+  const spans = createSpansRuntime({ root: options.spansRoot });
   const portalB205Composition = Object.freeze({
+    ...spans,
     ...portalB205,
     agentSessions: (input) => managedAgents.listSessions(input),
     attention: (input) => managedAgents.listAttention(input),
@@ -5669,6 +5672,10 @@ export async function createPortalRuntime(options = {}) {
         readSetupProgress(repo, name),
       setupRetry: (input) => retrySetupProgress(input, 'mcp'),
       sharedCaches: () => portalB205.sharedCaches(),
+      spansArtifact: spans.spansArtifact,
+      spansEvents: spans.spansEvents,
+      spansRun: spans.spansRun,
+      spansRuns: spans.spansRuns,
       startConvex: (repo, name) => startConvexByName(repo, name, 'mcp'),
       startInngest: (repo, name) => startInngestByName(repo, name, 'mcp'),
       startTrigger: (repo, name) => startTriggerByName(repo, name, 'mcp'),
@@ -5801,6 +5808,8 @@ export async function createPortalRuntime(options = {}) {
           '/ports': indexPage,
           '/repo/:repo': indexPage,
           '/settings': indexPage,
+          '/spans': indexPage,
+          '/spans/:runId': indexPage,
           '/worktree/:repo/:name': indexPage,
         },
         websocket: { close, message, open },
@@ -5856,6 +5865,7 @@ export async function createPortalRuntime(options = {}) {
     const boundServer = server;
     server = null;
     try {
+      spans.close();
       await managedAgents.dispose();
     } finally {
       await boundServer?.stop(true);

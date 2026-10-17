@@ -48,6 +48,10 @@ function toolJson(response) {
 }
 
 const TOOL_NAMES = [
+  'list_spans_runs',
+  'get_spans_run',
+  'get_spans_events',
+  'get_spans_artifact',
   'adopt_worktree',
   'cancel_headless_run',
   'claim_worktree',

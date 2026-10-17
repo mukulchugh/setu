@@ -541,6 +541,10 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/setup-progress` | `repo?`,`name?`; list durable setup records. | H W C M |
 | `POST` | `/api/setup-progress/retry` | T plus `attemptId`,`checkoutIdentity`; retry exact recorded attempt. | H W C M |
 | `GET` | `/api/shared-caches` | List shared-cache catalog records. | H W C M |
+| `GET` | `/api/spans/runs` | `afterRunId?`,`limit?`,`phase?`,`query?`; bounded retained run summaries. | H W C M |
+| `GET` | `/api/spans/run` | `runId`; full retained run view. | H W C M |
+| `GET` | `/api/spans/events` | `runId`,`afterSequence?`,`limit?`; bounded append-only history. | H W C M |
+| `GET` | `/api/spans/artifact` | `runId`,`artifactId`; inert redacted artifact referenced by that run. | H W C M |
 | `POST` | `/api/sidecar-approvals/approve` | `repo`,`name`,`command`,`args`; must match reviewed sidecar. | H W |
 | `GET` | `/api/sidecars` | `repo`; list project sidecars. | H W M |
 | `POST` | `/api/sidecars` | `repo`,`sidecars`; replace project sidecars. | H W |

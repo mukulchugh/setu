@@ -522,6 +522,67 @@ function registerTools(server) {
       {},
     ],
   ];
+  const spansReadTools = [
+    [
+      'list_spans_runs',
+      'List retained Spans run summaries.',
+      'spansRuns',
+      {
+        afterRunId: z.string().min(1).max(128).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+        phase: z.enum(['all', 'past', 'live', 'planned']).optional(),
+        query: z.string().max(256).optional(),
+      },
+    ],
+    [
+      'get_spans_run',
+      'Read a Spans run and its retained plan.',
+      'spansRun',
+      {
+        runId: z.string().min(1).max(128),
+      },
+    ],
+    [
+      'get_spans_events',
+      'Read one bounded page of retained Spans events.',
+      'spansEvents',
+      {
+        afterSequence: z.number().int().nonnegative().optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+        runId: z.string().min(1).max(128),
+      },
+    ],
+    [
+      'get_spans_artifact',
+      'Read an inert artifact referenced by this Spans run.',
+      'spansArtifact',
+      {
+        artifactId: z.string().min(1).max(80),
+        runId: z.string().min(1).max(128),
+      },
+    ],
+  ];
+  for (const [tool, description, action, inputSchema] of spansReadTools) {
+    server.registerTool(
+      tool,
+      {
+        annotations: { readOnlyHint: true },
+        description,
+        inputSchema,
+        title: description,
+      },
+      (input) =>
+        mutationResult(() =>
+          typeof deps[action] === 'function'
+            ? deps[action](input)
+            : {
+                code: 'SPANS_SERVICE_UNAVAILABLE',
+                error: 'Spans history is unavailable.',
+                ok: false,
+              }
+        )
+    );
+  }
   for (const [tool, description, action, inputSchema] of readTools) {
     server.registerTool(
       tool,

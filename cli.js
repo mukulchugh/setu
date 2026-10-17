@@ -227,6 +227,7 @@ export const commandHandlers = {
   setup: cmdSetup,
   'setup-progress': cmdSetupProgress,
   'shared-caches': cmdSharedCaches,
+  spans: cmdSpans,
   start: cmdStart,
   status: cmdLs,
   stop: cmdStop,
@@ -2062,6 +2063,53 @@ async function cmdOperations() {
   );
 }
 
+async function cmdSpans() {
+  const usage =
+    'setu spans [list | show <run> | events <run> | artifact <run> <artifact>] [--after <run> --since <sequence> --limit <N>] [--json]';
+  validateCommand({
+    allowedFlags: ['after', 'limit', 'phase', 'query', 'since'],
+    argCounts: [0, 1, 2, 3],
+    usage,
+  });
+  const [action = 'list', runId, artifactId] = args;
+  let path;
+  let query;
+  if (action === 'list' && args.length <= 1) {
+    validateFlags(['after', 'limit', 'phase', 'query'], usage);
+    path = '/api/spans/runs';
+    query = {
+      afterRunId: optionalFlag('after'),
+      limit: positiveNumber('limit', { integer: true, maximum: 200 }),
+      phase: optionalFlag('phase'),
+      query: optionalFlag('query'),
+    };
+  } else if (action === 'show' && args.length === 2) {
+    validateFlags([], usage);
+    path = '/api/spans/run';
+    query = { runId };
+  } else if (action === 'events' && args.length === 2) {
+    validateFlags(['limit', 'since'], usage);
+    const since = optionalFlag('since');
+    const afterSequence = since === undefined ? 0 : Number(since);
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+      die('Sequence must be a nonnegative integer.');
+    }
+    path = '/api/spans/events';
+    query = {
+      afterSequence,
+      limit: positiveNumber('limit', { integer: true, maximum: 200 }),
+      runId,
+    };
+  } else if (action === 'artifact' && args.length === 3) {
+    validateFlags([], usage);
+    path = '/api/spans/artifact';
+    query = { artifactId, runId };
+  } else {
+    die(usage);
+  }
+  return await apiResult(() => cliApi.get(path, query));
+}
+
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSessions() {
   validateCommand({
@@ -3171,6 +3219,7 @@ function cmdHelp() {
   ${C}Workspace operations${R}
     setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]
     setu operations [repo branch] [--since <ISO> --limit <N>] [--json]
+    setu spans [list | show <run> | events <run> | artifact <run> <artifact>] [--json]
     setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
     setu caches prepare <repo> <branch> [--json]
     setu caches execute <repo> <branch> --manifest <id> --confirmation <token> [--json]

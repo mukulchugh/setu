@@ -49,6 +49,7 @@ import {
   McpSection,
   RaycastSection,
 } from './components/settings-sections';
+import { SpansPage } from './components/spans-page';
 import { TriviaCard } from './components/trivia-card';
 import { WorkspaceSidebar } from './components/workspace-sidebar';
 import {
@@ -340,13 +341,24 @@ type Route =
   | { page: 'ports' }
   | { page: 'archived' }
   | { page: 'inventory' }
-  | { page: 'costs' };
+  | { page: 'costs' }
+  | { page: 'spans'; runId?: string };
 
 const WORKTREE_ROUTE_PATTERN = /^\/worktree\/([^/]+)\/(.+)$/;
 const REPOSITORY_ROUTE_PATTERN = /^\/repo\/([^/]+)$/;
 const BRANCH_TREE_PATH_PATTERN = /\/tree\/.*$/;
 
 function parseRoute(pathname: string): Route {
+  if (pathname === '/spans') {
+    return { page: 'spans' };
+  }
+  if (pathname.startsWith('/spans/')) {
+    try {
+      return { page: 'spans', runId: decodeURIComponent(pathname.slice(7)) };
+    } catch {
+      return { page: 'spans' };
+    }
+  }
   if (pathname === '/settings') {
     return { page: 'settings' };
   }
@@ -5700,6 +5712,15 @@ function App() {
   }
 
   const pageContent = (() => {
+    if (route.page === 'spans') {
+      return (
+        <SpansPage
+          onBack={() => navigate(route.runId ? '/spans' : '/')}
+          onSelect={(runId) => navigate(`/spans/${encodeURIComponent(runId)}`)}
+          runId={route.runId}
+        />
+      );
+    }
     if (route.page === 'detail') {
       const w = worktrees.find(
         (x) => x.repo === route.repo && x.name === route.name
