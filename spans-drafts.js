@@ -2,7 +2,10 @@
 // it never inspects Git, resolves paths, starts agents, or grants approvals.
 
 import { createHash } from 'node:crypto';
-import { redactSpansValue } from './spans-redaction.js';
+import {
+  isSpansRedactionSafeKey,
+  redactSpansValue,
+} from './spans-redaction.js';
 import { validateSpanDependencies } from './spans-transitions.js';
 
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -111,12 +114,16 @@ function isValidSpanInput(span, identifiers) {
   return Boolean(
     span &&
       isIdentifier(span.spanId) &&
+      isSpansRedactionSafeKey(span.spanId) &&
       typeof span.title === 'string' &&
       span.title.length > 0 &&
       span.title.length <= 16_000 &&
       Array.isArray(span.dependencies) &&
       span.dependencies.length <= 200 &&
-      span.dependencies.every(isIdentifier) &&
+      span.dependencies.every(
+        (dependency) =>
+          isIdentifier(dependency) && isSpansRedactionSafeKey(dependency)
+      ) &&
       new Set(span.dependencies).size === span.dependencies.length &&
       !identifiers.has(span.spanId)
   );

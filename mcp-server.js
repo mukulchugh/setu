@@ -522,6 +522,60 @@ function registerTools(server) {
       {},
     ],
   ];
+  const planningTools = [
+    [
+      'list_spans_workflows',
+      'List offline Spans workflow templates.',
+      'spansWorkflows',
+      true,
+    ],
+    [
+      'preview_spans_workflow',
+      'Preview a workflow from input without storing or starting work.',
+      'spansWorkflowPreview',
+      true,
+    ],
+    [
+      'create_spans_workflow',
+      'Save a Planned draft from the exact preview input plus digest. Does not approve or dispatch work.',
+      'spansWorkflowCreate',
+      false,
+    ],
+    [
+      'create_spans_draft',
+      'Save an offline Planned draft from input. Does not approve or dispatch work.',
+      'spansDraftCreate',
+      false,
+    ],
+    [
+      'revise_spans_plan',
+      'Revise an offline plan using input with expectedRevision and expectedGeneration. Does not approve or dispatch work.',
+      'spansPlanRevise',
+      false,
+    ],
+  ];
+  for (const [tool, description, action, readOnlyHint] of planningTools) {
+    const listing = action === 'spansWorkflows';
+    server.registerTool(
+      tool,
+      {
+        annotations: { destructiveHint: false, readOnlyHint },
+        description,
+        inputSchema: listing ? {} : { input: z.object({}).passthrough() },
+        title: description,
+      },
+      (input) =>
+        mutationResult(() =>
+          typeof deps[action] === 'function'
+            ? deps[action](listing ? {} : input.input)
+            : {
+                code: 'SPANS_SERVICE_UNAVAILABLE',
+                error: 'Spans planning is unavailable.',
+                ok: false,
+              }
+        )
+    );
+  }
   const spansReadTools = [
     [
       'list_spans_runs',
@@ -551,6 +605,25 @@ function registerTools(server) {
         limit: z.number().int().min(1).max(200).optional(),
         runId: z.string().min(1).max(128),
       },
+    ],
+    [
+      'search_spans',
+      'Search the retained Spans index. Results are historical; a missing index is unavailable, not empty.',
+      'spansSearch',
+      {
+        afterSequence: z.number().int().nonnegative().optional(),
+        expectedGeneration: z.number().int().nonnegative().optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+        query: z.string().min(1).max(512),
+        runId: z.string().min(1).max(128).optional(),
+        throughSequence: z.number().int().nonnegative().optional(),
+      },
+    ],
+    [
+      'get_spans_search_status',
+      'Read Spans search index generation and coverage without indexing.',
+      'spansSearchStatus',
+      {},
     ],
     [
       'get_spans_artifact',

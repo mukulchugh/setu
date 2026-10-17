@@ -2,15 +2,27 @@
 // Import and construction perform no I/O. Opening touches only the explicit
 // private root it is given and never falls back to a live Setu path. Redaction
 // is a caller boundary: payloads must already be redacted before they get here.
+// biome-ignore-all lint/style/useErrorCause: filesystem errors are reduced to an allowlisted causeCode to keep paths and raw messages out of the public error contract.
 
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { createSpansArtifacts } from './spans-artifacts.js';
 import {
   createSpansModelStore,
   inspectSpansModelSchema,
 } from './spans-model-store.js';
+import {
+  createSpansSearch,
+  initializeSpansSearchSchema,
+  inspectSpansSearchSchema,
+  spansSearchFailure,
+} from './spans-search.js';
+import {
+  createSpansSearchText,
+  SPANS_SEARCH_TEXT_LIMITS,
+} from './spans-search-text.js';
 
 export const SPANS_STORE_SCHEMA_VERSION = 1;
 export const SPANS_STORE_DATABASE_FILE = 'spans.sqlite3';
@@ -370,7 +382,6 @@ function inspectPath(path, phase) {
     if (error.code === 'ENOENT') {
       return;
     }
-    // biome-ignore lint/style/useErrorCause: SpansStoreError intentionally exposes only sanitized cause codes, never raw filesystem errors or paths.
     throw new SpansStoreError(
       'SPANS_STORE_UNAVAILABLE',
       `${phase}-inspect`,
@@ -422,7 +433,6 @@ function prepareRoot(root, readonly) {
       // Not recursive: a missing parent is a caller error, not something to create.
       fs.mkdirSync(root, { mode: 0o700 });
     } catch (error) {
-      // biome-ignore lint/style/useErrorCause: SpansStoreError intentionally exposes only sanitized cause codes, never raw filesystem errors or paths.
       throw new SpansStoreError(
         'SPANS_STORE_UNAVAILABLE',
         'root-create',
@@ -444,7 +454,6 @@ function createPrivateFile(path) {
     fd = fs.openSync(path, 'wx', 0o600);
     fs.fchmodSync(fd, 0o600);
   } catch (error) {
-    // biome-ignore lint/style/useErrorCause: SpansStoreError intentionally exposes only sanitized cause codes, never raw filesystem errors or paths.
     throw new SpansStoreError(
       'SPANS_STORE_UNAVAILABLE',
       'database-create',
@@ -697,7 +706,29 @@ function rowToEvent(row) {
 const eventColumns =
   'sequence, event_id, run_id, type, payload_json, input_digest';
 
-function createStore(db) {
+// Reads one artifact under the explicit archive root for search text. The file
+// size is bounded before the artifact helper reads it whole, and a missing or
+// oversized file is a refusal, never empty text.
+function boundedArtifactReader(root) {
+  const artifacts = createSpansArtifacts({ root });
+  return ({ artifactId }) => {
+    if (typeof artifactId === 'string' && artifactIdPattern.test(artifactId)) {
+      try {
+        const stat = fs.lstatSync(
+          join(root, 'artifacts', artifactId.slice('sha256:'.length))
+        );
+        if (stat.size > SPANS_SEARCH_TEXT_LIMITS.artifactBytes) {
+          return { code: 'ARTIFACT_INVALID', ok: false };
+        }
+      } catch {
+        // A missing or unreadable file is reported by the artifact reader.
+      }
+    }
+    return artifacts.read({ artifactId });
+  };
+}
+
+function createStore(db, { readonly, root }) {
   // Uncached statements owned by this store; close() finalizes them before the
   // connection is released so no statement can keep the file locked.
   const selectByEventId = db.prepare(
@@ -739,6 +770,30 @@ function createStore(db) {
   const closedResult = () =>
     failure('SPANS_STORE_CLOSED', 'Spans store is closed.');
 
+  // Search is derived and lazy: nothing is created, prepared or indexed until a
+  // caller asks, and an absent schema is reported rather than created.
+  let searchService;
+  const searchText = createSpansSearchText({
+    readArtifact: boundedArtifactReader(root),
+  });
+  const readonlyRefusal = () => spansSearchFailure('SPANS_SEARCH_READONLY');
+  const withSearch = (work) => {
+    if (closed) {
+      return closedResult();
+    }
+    try {
+      if (!searchService) {
+        if (inspectSpansSearchSchema(db) !== 'current') {
+          return spansSearchFailure('SPANS_SEARCH_UNAVAILABLE');
+        }
+        searchService = createSpansSearch({ db, textForEvent: searchText });
+      }
+      return work(searchService);
+    } catch (error) {
+      return spansSearchFailure(error);
+    }
+  };
+
   let models;
   const store = {
     appendEvent(input) {
@@ -770,6 +825,11 @@ function createStore(db) {
         const modelClose = models.closeStatements();
         if (!modelClose.ok) {
           return modelClose;
+        }
+        // Derived search statements are finalized before the connection closes.
+        const searchClose = searchService?.close();
+        if (searchClose && searchClose.ok !== true) {
+          return failure('SPANS_STORE_UNAVAILABLE', unavailableMessages.close);
         }
         // finalize() is safe to repeat, so a retried close after a failure works.
         for (const statement of [
@@ -845,6 +905,33 @@ function createStore(db) {
         return storageFailure(error, 'read');
       }
     },
+    // Search. Only initializeSearch creates the derived schema, and only on a
+    // writable store. Reads and writes report fixed { ok: false, code, error }.
+    indexSearchPage(input) {
+      if (readonly) {
+        return closed ? closedResult() : readonlyRefusal();
+      }
+      return withSearch((search) => search.indexPage(input));
+    },
+    initializeSearch() {
+      if (closed) {
+        return closedResult();
+      }
+      if (readonly) {
+        return readonlyRefusal();
+      }
+      try {
+        return initializeSpansSearchSchema(db);
+      } catch (error) {
+        return spansSearchFailure(error);
+      }
+    },
+    invalidateSearch() {
+      if (readonly) {
+        return closed ? closedResult() : readonlyRefusal();
+      }
+      return withSearch((search) => search.invalidate());
+    },
     readEvents(query) {
       if (closed) {
         return closedResult();
@@ -871,6 +958,8 @@ function createStore(db) {
         return storageFailure(error, 'read');
       }
     },
+    search: (input) => withSearch((search) => search.query(input)),
+    searchStatus: () => withSearch((search) => search.status()),
   };
   models = createSpansModelStore({ appendEvent: store.appendEvent, db });
   const { closeStatements, ...modelMethods } = models;
@@ -967,7 +1056,7 @@ export function openSpansStore(options = {}) {
       initializeSchema(db);
     }
     assertSameFile(path, identity);
-    return createStore(db);
+    return createStore(db, { readonly, root });
   } catch (error) {
     closeQuietly(db);
     throw openFailure(error);

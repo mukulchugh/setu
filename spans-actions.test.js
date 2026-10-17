@@ -1651,3 +1651,36 @@ test('real store: secrets are redacted from persisted views and events and never
     }
   });
 });
+
+test('real store: secret-field-like action keys refuse before revisions or events change', async () => {
+  await withRealStore(async (store) => {
+    seedRun(store, 'run-1');
+    const actions = realActions(store);
+    const before = readState(store, 'run-1');
+    const beforeEvents = eventsOf(store, 'run-1');
+
+    const unsafeIds = ['api_key', 'Password', 'access-token'];
+    const refusals = await Promise.all(
+      unsafeIds.flatMap((unsafe) => [
+        actions.prepareAction(prepareInput({ actionId: unsafe })),
+        actions.prepareAction(prepareInput({ spanId: unsafe })),
+      ])
+    );
+    for (const refusal of refusals) {
+      expect(refusal).toMatchObject({ code: 'SENSITIVE_VALUE', ok: false });
+    }
+
+    expect(readState(store, 'run-1')).toEqual(before);
+    expect(eventsOf(store, 'run-1')).toEqual(beforeEvents);
+
+    expect(await actions.prepareAction(prepareInput())).toMatchObject({
+      actionId: 'action-a',
+      created: true,
+      ok: true,
+    });
+    expect(readState(store, 'run-1').view.actions['action-a'].state).toBe(
+      'intent'
+    );
+    expect(eventsOf(store, 'run-1')).toHaveLength(1);
+  });
+});

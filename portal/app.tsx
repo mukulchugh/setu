@@ -3001,7 +3001,10 @@ function PortalStatus({
   loaded: boolean;
 }) {
   return (
-    <div class="portal-status flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+    <section
+      aria-label="Workspace status"
+      class="portal-status flex flex-wrap items-center gap-x-4 gap-y-1 text-xs"
+    >
       {/* biome-ignore lint/a11y/useValidAnchor: Biome 2.5.6 rejects fragment hrefs with onClick; /#active-work is a real section and followRoute preserves modified-click navigation. */}
       <a
         class="font-semibold text-accent dark:text-emerald-300"
@@ -3022,7 +3025,7 @@ function PortalStatus({
         </a>
       )}
       <ConnectionIndicator />
-    </div>
+    </section>
   );
 }
 

@@ -190,6 +190,89 @@ describe('offline Spans drafts', () => {
     }
   });
 
+  test('refuses secret-field-like span and dependency keys before SQLite writes', () => {
+    const { drafts, store } = fixture();
+    try {
+      const valid = drafts.createRun(
+        draft('safe-key-run', {
+          goal: 'The password field name is ordinary prose.',
+          spans: [
+            {
+              dependencies: [],
+              spanId: 'normal-span',
+              title: 'The password field name is ordinary prose.',
+            },
+          ],
+        })
+      );
+      expect(valid.ok).toBe(true);
+      expect(valid.run.goal).toBe('The password field name is ordinary prose.');
+      expect(valid.run.spans['normal-span'].title).toBe(
+        'The password field name is ordinary prose.'
+      );
+
+      const before = store.readRun({ runId: 'safe-key-run' });
+      const beforeEvents = store.readEvents({ runId: 'safe-key-run' });
+      for (const [index, unsafe] of [
+        'api_key',
+        'Password',
+        'access-token',
+      ].entries()) {
+        expect(
+          drafts.createRun(
+            draft(`unsafe-span-${index}`, {
+              spans: [
+                { dependencies: [], spanId: unsafe, title: 'Unsafe key' },
+              ],
+            })
+          )
+        ).toMatchObject({ code: 'SPANS_DRAFT_INVALID', ok: false });
+        expect(
+          drafts.createRun(
+            draft(`unsafe-dependency-${index}`, {
+              spans: [
+                {
+                  dependencies: [unsafe],
+                  spanId: 'normal',
+                  title: 'Unsafe edge',
+                },
+              ],
+            })
+          )
+        ).toMatchObject({ code: 'SPANS_DRAFT_INVALID', ok: false });
+        expect(
+          drafts.revisePlan({
+            expectedGeneration: 0,
+            expectedRevision: 1,
+            goal: 'Revised plan',
+            runId: 'safe-key-run',
+            spans: [{ dependencies: [], spanId: unsafe, title: 'Unsafe key' }],
+          })
+        ).toMatchObject({ code: 'SPANS_DRAFT_INVALID', ok: false });
+        expect(
+          drafts.revisePlan({
+            expectedGeneration: 0,
+            expectedRevision: 1,
+            goal: 'Revised plan',
+            runId: 'safe-key-run',
+            spans: [
+              {
+                dependencies: [unsafe],
+                spanId: 'normal',
+                title: 'Unsafe edge',
+              },
+            ],
+          })
+        ).toMatchObject({ code: 'SPANS_DRAFT_INVALID', ok: false });
+      }
+      expect(store.readRun({ runId: 'safe-key-run' })).toEqual(before);
+      expect(store.readEvents({ runId: 'safe-key-run' })).toEqual(beforeEvents);
+      expect(store.listRuns().runs).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
   test('replays an identical initial draft and conflicts on changed input', () => {
     const { drafts, store } = fixture();
     try {

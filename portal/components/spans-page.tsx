@@ -13,6 +13,8 @@ import { SpansConversation } from './spans-conversation';
 import { SpansDetail } from './spans-detail';
 import { SpansEvidence } from './spans-evidence';
 import { SpansList } from './spans-list';
+import { SpansPlanning } from './spans-planning';
+import { SpansSearch } from './spans-search';
 
 export function SpansPage({
   runId,
@@ -42,6 +44,7 @@ function RunList({
   onBack: () => void;
   onSelect: (runId: string) => void;
 }) {
+  const [planning, setPlanning] = useState(false);
   const [initial] = useState(() => parseSpansLocation(window.location.search));
   const [phase, setPhase] = useState<SpansPhase>(initial.phase);
   const [query, setQuery] = useState(initial.query);
@@ -52,36 +55,54 @@ function RunList({
     15_000,
     (signal) => readSpansRuns(phase, query, cursor, signal)
   );
+  if (planning) {
+    return (
+      <>
+        <div class="mx-auto max-w-4xl px-4 pt-4 sm:px-6">
+          <Button onClick={() => setPlanning(false)} variant="secondary">
+            Back to runs
+          </Button>
+        </div>
+        <SpansPlanning onCreated={onSelect} />
+      </>
+    );
+  }
   return (
-    <SpansList
-      error={page.failed ? 'Refresh to retry.' : null}
-      hasMore={page.data?.hasMore ?? false}
-      hasPrevious={cursors.length > 1}
-      loading={!(page.data || page.failed)}
-      onBack={onBack}
-      onNext={() => {
-        if (page.data?.hasMore && page.data.nextRunId) {
-          setCursors([...cursors, page.data.nextRunId]);
-        }
-      }}
-      onPhaseChange={(value) => {
-        setPhase(value);
-        updateLocation({ phase: value });
-        setCursors(['']);
-      }}
-      onPrevious={() => setCursors(cursors.slice(0, -1))}
-      onQueryChange={(value) => {
-        setQuery(value);
-        updateLocation({ query: value });
-        setCursors(['']);
-      }}
-      onRefresh={page.refresh}
-      onSelect={onSelect}
-      phase={phase}
-      query={query}
-      records={page.data?.records ?? []}
-      stale={page.failed && !!page.data}
-    />
+    <>
+      <div class="px-4 pt-4 sm:px-6">
+        <Button onClick={() => setPlanning(true)}>Plan a workflow</Button>
+      </div>
+      <SpansList
+        error={page.failed ? 'Refresh to retry.' : null}
+        hasMore={page.data?.hasMore ?? false}
+        hasPrevious={cursors.length > 1}
+        loading={!(page.data || page.failed)}
+        onBack={onBack}
+        onNext={() => {
+          if (page.data?.hasMore && page.data.nextRunId) {
+            setCursors([...cursors, page.data.nextRunId]);
+          }
+        }}
+        onPhaseChange={(value) => {
+          setPhase(value);
+          updateLocation({ phase: value });
+          setCursors(['']);
+        }}
+        onPrevious={() => setCursors(cursors.slice(0, -1))}
+        onQueryChange={(value) => {
+          setQuery(value);
+          updateLocation({ query: value });
+          setCursors(['']);
+        }}
+        onRefresh={page.refresh}
+        onSelect={onSelect}
+        phase={phase}
+        query={query}
+        records={page.data?.records ?? []}
+        stale={page.failed && !!page.data}
+      />
+      <SpansSearch onSelect={onSelect} />
+    </>
   );
 }
 

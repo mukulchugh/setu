@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  isSpansRedactionSafeKey,
   redactSpansValue,
   validateSpansSourcePath,
 } from './spans-redaction.js';
@@ -8,6 +9,17 @@ const REDACTED = '[REDACTED]';
 const CYCLIC_ERROR = /cyclic/i;
 const JSON_COMPATIBLE_ERROR = /JSON-compatible/i;
 const CREDENTIAL_ERROR = /credential|secret|private/i;
+
+test('identifiers used as object keys follow the redaction field policy', () => {
+  for (const value of ['api_key', 'Password', 'access-token']) {
+    expect(isSpansRedactionSafeKey(value)).toBe(false);
+  }
+  for (const value of ['span-1', 'action.plan:2', 'review']) {
+    expect(isSpansRedactionSafeKey(value)).toBe(true);
+  }
+  expect(isSpansRedactionSafeKey('api_key=seeded')).toBe(false);
+  expect(isSpansRedactionSafeKey(null)).toBe(false);
+});
 
 describe('redactSpansValue', () => {
   test('redacts known secret fields recursively in objects and arrays', () => {

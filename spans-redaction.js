@@ -55,6 +55,19 @@ function redactText(value) {
     .replace(RECOGNIZABLE_API_KEY, REDACTION_MARKER);
 }
 
+function normalizeFieldName(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Whether a string is safe to use as a key in persisted Spans objects. */
+export function isSpansRedactionSafeKey(value) {
+  return (
+    typeof value === 'string' &&
+    redactText(value) === value &&
+    !SECRET_FIELD_NAMES.has(normalizeFieldName(value))
+  );
+}
+
 function invalidJsonValue(reason) {
   return new TypeError(
     `redactSpansValue requires a JSON-compatible value: ${reason}`
@@ -112,7 +125,7 @@ function copyObject(value, copy) {
         'non-enumerable properties and accessors are unsupported'
       );
     }
-    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalizedKey = normalizeFieldName(key);
     const child = SECRET_FIELD_NAMES.has(normalizedKey)
       ? REDACTION_MARKER
       : copy(descriptor.value);

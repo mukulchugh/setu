@@ -139,3 +139,134 @@ test('opening the read runtime does not create an archive, including after faile
     rmSync(parent, { force: true, recursive: true });
   }
 });
+
+test('portal, CLI and MCP preview and save the same offline workflow without dispatch', async () => {
+  await fixture(async ({ request, store }) => {
+    const input = {
+      owner: 'fixture',
+      runId: 'planned-workflow',
+      substitutions: {
+        behavior: 'a retained draft',
+        change: 'offline planning',
+        scope: 'fixture only',
+      },
+      templateId: 'engineering.feature',
+      templateVersion: 1,
+    };
+    const send = (path, body) =>
+      request(path, {
+        body: JSON.stringify(body),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+    const workflows = await (await request('/api/spans/workflows')).json();
+    expect(workflows.ok).toBe(true);
+    expect(
+      (await callMcp(request, 'list_spans_workflows', {})).result
+        .structuredContent
+    ).toEqual(workflows);
+    const preview = await (
+      await send('/api/spans/workflows/preview', input)
+    ).json();
+    expect(preview.ok).toBe(true);
+    expect(store.listRuns().runs).toEqual([]);
+    expect(
+      (await callMcp(request, 'preview_spans_workflow', { input })).result
+        .structuredContent
+    ).toEqual(preview);
+    const save = { ...input, digest: preview.digest };
+    let cliResult;
+    expect(
+      await runCli(
+        ['spans', 'create-workflow', '--input', JSON.stringify(save), '--json'],
+        {
+          request: async ({ path, body }) => {
+            cliResult = await (await send(path, body)).json();
+            return cliResult;
+          },
+        }
+      )
+    ).toBe(0);
+    expect(cliResult).toMatchObject({
+      ok: true,
+      replayed: false,
+      run: { actions: {}, state: 'planned' },
+    });
+    const replay = (
+      await callMcp(request, 'create_spans_workflow', { input: save })
+    ).result;
+    expect(replay.isError).toBe(false);
+    expect(replay.structuredContent).toMatchObject({
+      ok: true,
+      replayed: true,
+      revision: 1,
+    });
+    expect(
+      store.readEvents({ runId: input.runId }).events.map((event) => event.type)
+    ).toEqual(['spans.plan.created']);
+    const revised = {
+      expectedGeneration: 0,
+      expectedRevision: 1,
+      goal: 'Revised offline goal',
+      runId: input.runId,
+      spans: [
+        { dependencies: [], spanId: 'review', title: 'Review the fixture' },
+      ],
+    };
+    expect(
+      (await callMcp(request, 'revise_spans_plan', { input: revised })).result
+        .structuredContent
+    ).toMatchObject({ generation: 1, ok: true, planVersion: 2 });
+    expect((await send('/api/spans/plans/revise', revised)).status).toBe(200);
+    const stale = (
+      await callMcp(request, 'revise_spans_plan', { input: revised })
+    ).result;
+    expect(stale.isError).toBe(true);
+    expect(stale.structuredContent.code).toBe('SPANS_DRAFT_STALE');
+  });
+});
+
+test('planning front doors refuse malformed and approval-bearing requests without writes', async () => {
+  await fixture(async ({ request, store }) => {
+    const draft = {
+      goal: 'Fixture plan',
+      owner: 'fixture',
+      runId: 'invalid-plan',
+      spans: [],
+    };
+    const rejected = await callMcp(request, 'create_spans_draft', {
+      input: { ...draft, approved: true },
+    });
+    expect(rejected.result.isError).toBe(true);
+    expect(rejected.result.structuredContent.code).toBe('SPANS_DRAFT_INVALID');
+    for (const body of ['{', 'null', '[]', 'x'.repeat(1024 * 1024 + 1)]) {
+      // biome-ignore lint/performance/noAwaitInLoops: Exercise sequential body refusals against the same isolated archive.
+      const response = await request('/api/spans/drafts/create', {
+        body,
+        method: 'POST',
+      });
+      expect(response.status).toBe(400);
+    }
+    let calls = 0;
+    const previousExitCode = process.exitCode;
+    try {
+      expect(
+        await runCli(['spans', 'create-draft', '--input', '{', '--json'], {
+          request: () => {
+            calls += 1;
+            return { ok: true };
+          },
+        })
+      ).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+    expect(calls).toBe(0);
+    expect(store.listRuns().runs).toEqual([]);
+    const created = await callMcp(request, 'create_spans_draft', {
+      input: draft,
+    });
+    expect(created.result.isError).toBe(false);
+    expect(created.result.structuredContent.run.state).toBe('planned');
+  });
+});

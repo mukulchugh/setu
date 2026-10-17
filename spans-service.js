@@ -1,16 +1,22 @@
 // Shared READ-ONLY Spans service for the portal, CLI and MCP front doors.
 // Import and construction perform no I/O: the caller injects an already opened
 // store and artifact reader, and there is no default root. The service never
-// imports, mutates, approves or dispatches, and it offers no search until an
-// index exists. Every outbound value passes through the seeded redactor, and
-// every failure is a fixed { ok: false, code, error } that never carries an
-// adapter's message, path or cause.
+// imports, mutates, approves or dispatches. It exposes getSearch and
+// getSearchStatus only when the injected store has search readers, and it never
+// initializes, indexes or invalidates search; a missing index is unavailable.
+// Every outbound value passes through the seeded redactor, and every failure is
+// a fixed { ok: false, code, error } that never carries an adapter's message,
+// path or cause.
 
 import { redactSpansValue } from './spans-redaction.js';
 
-export const SPANS_SERVICE_LIMITS = Object.freeze({ pageLimit: 200 });
+export const SPANS_SERVICE_LIMITS = Object.freeze({
+  pageLimit: 200,
+  searchPageLimit: 100,
+});
 
 const DEFAULT_PAGE_LIMIT = 50;
+const MAX_SEARCH_SNIPPET_BYTES = 4096;
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const artifactIdPattern = /^sha256:[a-f0-9]{64}$/;
 // List rows carry only these view fields, and only scalar values, so a page
@@ -33,12 +39,22 @@ const listPhases = new Set(['all', 'past', 'live', 'planned']);
 const eventKeys = new Set(['afterSequence', 'limit', 'runId']);
 const artifactKeys = new Set(['artifactId', 'runId']);
 const runKeys = new Set(['runId']);
+const searchKeys = new Set([
+  'afterSequence',
+  'expectedGeneration',
+  'limit',
+  'query',
+  'runId',
+  'throughSequence',
+]);
 
 const messages = Object.freeze({
   SPANS_SERVICE_BUSY: 'Spans history is busy; try again.',
   SPANS_SERVICE_CORRUPT: 'Spans history failed an integrity check.',
   SPANS_SERVICE_INVALID: 'Invalid spans request.',
   SPANS_SERVICE_NOT_FOUND: 'Spans record was not found.',
+  SPANS_SERVICE_STALE:
+    'Spans search results changed; restart from the first page.',
   SPANS_SERVICE_UNAVAILABLE: 'Spans history is unavailable.',
 });
 
@@ -49,6 +65,17 @@ const storeCodes = new Map([
   ['SPANS_MODEL_INVALID', 'SPANS_SERVICE_INVALID'],
   ['SPANS_MODEL_NOT_FOUND', 'SPANS_SERVICE_NOT_FOUND'],
   ['SPANS_QUERY_INVALID', 'SPANS_SERVICE_INVALID'],
+  ['SPANS_STORE_BUSY', 'SPANS_SERVICE_BUSY'],
+  ['SPANS_STORE_CORRUPT', 'SPANS_SERVICE_CORRUPT'],
+]);
+// Search codes the caller can act on are mapped; the rest (absent, newer or
+// partial index, closed, read-only) are unavailable. Nothing is forwarded.
+const searchCodes = new Map([
+  ['SPANS_SEARCH_BUSY', 'SPANS_SERVICE_BUSY'],
+  ['SPANS_SEARCH_CORRUPT', 'SPANS_SERVICE_CORRUPT'],
+  ['SPANS_SEARCH_INVALID', 'SPANS_SERVICE_INVALID'],
+  ['SPANS_SEARCH_QUERY_INVALID', 'SPANS_SERVICE_INVALID'],
+  ['SPANS_SEARCH_STALE_GENERATION', 'SPANS_SERVICE_STALE'],
   ['SPANS_STORE_BUSY', 'SPANS_SERVICE_BUSY'],
   ['SPANS_STORE_CORRUPT', 'SPANS_SERVICE_CORRUPT'],
 ]);
@@ -335,6 +362,159 @@ function inertText(artifact) {
   }
 }
 
+// Absent keys stay absent; the search module owns every other validation, so
+// an invalid cursor, limit or query answers SPANS_SERVICE_INVALID from there.
+function normalizeSearch(input) {
+  const request = {};
+  for (const [key, value] of Object.entries(readInput(input, searchKeys))) {
+    if (value !== undefined) {
+      request[key] = value;
+    }
+  }
+  if (!('limit' in request)) {
+    request.limit = DEFAULT_PAGE_LIMIT;
+  }
+  if (
+    !(
+      Number.isInteger(request.limit) &&
+      request.limit >= 1 &&
+      request.limit <= SPANS_SERVICE_LIMITS.searchPageLimit
+    )
+  ) {
+    refuse('SPANS_SERVICE_INVALID');
+  }
+  if (
+    (request.afterSequence !== undefined && !isCount(request.afterSequence)) ||
+    (request.expectedGeneration !== undefined &&
+      !isCount(request.expectedGeneration)) ||
+    (request.throughSequence !== undefined &&
+      !isCount(request.throughSequence)) ||
+    (request.runId !== undefined && !isIdentifier(request.runId)) ||
+    ((request.afterSequence ?? 0) > 0 &&
+      request.expectedGeneration === undefined)
+  ) {
+    refuse('SPANS_SERVICE_INVALID');
+  }
+  return request;
+}
+
+function validatedCoverage(coverage, generation) {
+  if (
+    !(
+      isPlainObject(coverage) &&
+      typeof coverage.complete === 'boolean' &&
+      typeof coverage.stale === 'boolean' &&
+      isCount(coverage.generation) &&
+      coverage.generation === generation &&
+      isCount(coverage.indexedSequence) &&
+      isCount(coverage.latestSequence) &&
+      coverage.indexedSequence <= coverage.latestSequence &&
+      coverage.complete ===
+        coverage.indexedSequence >= coverage.latestSequence &&
+      coverage.stale === coverage.indexedSequence < coverage.latestSequence
+    )
+  ) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  return {
+    complete: coverage.complete,
+    generation: coverage.generation,
+    indexedSequence: coverage.indexedSequence,
+    latestSequence: coverage.latestSequence,
+    stale: coverage.stale,
+  };
+}
+
+// Hits are rebuilt field by field so nothing but the bounded view leaves.
+function validatedHits(hits, request) {
+  if (!(Array.isArray(hits) && hits.length <= request.limit)) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  let previous = request.afterSequence ?? 0;
+  return hits.map((hit) => {
+    if (
+      !(
+        isPlainObject(hit) &&
+        isCount(hit.sequence) &&
+        hit.sequence > previous &&
+        isIdentifier(hit.eventId) &&
+        isIdentifier(hit.runId) &&
+        (request.runId === undefined || hit.runId === request.runId) &&
+        hit.historical === true &&
+        typeof hit.snippet === 'string' &&
+        Buffer.byteLength(hit.snippet, 'utf8') <= MAX_SEARCH_SNIPPET_BYTES &&
+        redact(hit.eventId) === hit.eventId &&
+        redact(hit.runId) === hit.runId
+      )
+    ) {
+      return refuse('SPANS_SERVICE_CORRUPT');
+    }
+    const snippet = redact(hit.snippet);
+    if (
+      typeof snippet !== 'string' ||
+      Buffer.byteLength(snippet, 'utf8') > MAX_SEARCH_SNIPPET_BYTES
+    ) {
+      return refuse('SPANS_SERVICE_CORRUPT');
+    }
+    previous = hit.sequence;
+    return {
+      eventId: hit.eventId,
+      historical: true,
+      runId: hit.runId,
+      sequence: hit.sequence,
+      snippet,
+    };
+  });
+}
+
+function validatedSearch(result, request) {
+  if (
+    !(
+      isCount(result.generation) &&
+      typeof result.hasMore === 'boolean' &&
+      isCount(result.nextSequence) &&
+      isCount(result.throughSequence)
+    )
+  ) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  if (
+    (request.expectedGeneration !== undefined &&
+      result.generation !== request.expectedGeneration) ||
+    (request.throughSequence !== undefined &&
+      result.throughSequence !== request.throughSequence)
+  ) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  const coverage = validatedCoverage(result.coverage, result.generation);
+  if (
+    result.throughSequence > coverage.indexedSequence ||
+    (request.throughSequence === undefined &&
+      result.throughSequence !== coverage.indexedSequence)
+  ) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  const hits = validatedHits(result.hits, request);
+  const afterSequence = request.afterSequence ?? 0;
+  if (
+    result.throughSequence < afterSequence ||
+    hits.some((hit) => hit.sequence > result.throughSequence) ||
+    (result.hasMore && hits.length === 0) ||
+    result.nextSequence !== (hits.at(-1)?.sequence ?? afterSequence)
+  ) {
+    return refuse('SPANS_SERVICE_CORRUPT');
+  }
+  return {
+    coverage,
+    generation: result.generation,
+    hasMore: result.hasMore,
+    hits,
+    nextSequence: result.nextSequence,
+    ok: true,
+    throughSequence: result.throughSequence,
+  };
+}
+
 function validatedOptions(options) {
   const keys = isPlainObject(options) ? Reflect.ownKeys(options) : [];
   if (!(keys.length > 0 && keys.every((key) => optionKeys.has(key)))) {
@@ -376,6 +556,14 @@ export function createSpansService(options) {
   const storeReadEvents = store.readEvents.bind(store);
   const readArtifact = artifacts.read.bind(artifacts);
   const referenceOf = getArtifactReference ?? undefined;
+  const searchReaders =
+    typeof store.search === 'function' &&
+    typeof store.searchStatus === 'function'
+      ? {
+          search: store.search.bind(store),
+          status: store.searchStatus.bind(store),
+        }
+      : undefined;
 
   const readRecord = async (
     runId,
@@ -396,7 +584,36 @@ export function createSpansService(options) {
     return toRecord(runId, result, summary);
   };
 
+  const searchMethods = searchReaders
+    ? {
+        getSearch: (input) =>
+          guarded(async () => {
+            const request = normalizeSearch(input);
+            const result = unwrap(
+              await searchReaders.search(request),
+              searchCodes
+            );
+            return validatedSearch(result, request);
+          }),
+
+        getSearchStatus: (input = {}) =>
+          guarded(async () => {
+            readInput(input, new Set());
+            const result = unwrap(await searchReaders.status(), searchCodes);
+            if (!isCount(result.generation)) {
+              return refuse('SPANS_SERVICE_CORRUPT');
+            }
+            return {
+              coverage: validatedCoverage(result.coverage, result.generation),
+              generation: result.generation,
+              ok: true,
+            };
+          }),
+      }
+    : {};
+
   return Object.freeze({
+    ...searchMethods,
     getArtifact: (input) =>
       guarded(async () => {
         const request = normalizeArtifactRef(input);

@@ -83,6 +83,7 @@ export interface ButtonProps extends VariantProps<typeof buttonVariants> {
   class?: string;
   disabled?: boolean;
   onClick?: () => void;
+  type?: 'button' | 'submit' | 'reset';
 }
 
 export function Button({

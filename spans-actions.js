@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { redactSpansValue as redactValue } from './spans-redaction.js';
+import {
+  isSpansRedactionSafeKey,
+  redactSpansValue as redactValue,
+} from './spans-redaction.js';
 import {
   evaluateDependencyReadiness,
   validateCoordinatorGeneration,
@@ -140,6 +143,15 @@ function parseIds(input, names) {
     if (!isExplicitId(input[name])) {
       return refuse('ID_INVALID');
     }
+  }
+  if (
+    names.some(
+      (name) =>
+        (name === 'actionId' || name === 'spanId') &&
+        !isSpansRedactionSafeKey(input[name])
+    )
+  ) {
+    return refuse('SENSITIVE_VALUE');
   }
   if (!isGeneration(input.generation)) {
     return refuse('GENERATION_INVALID');

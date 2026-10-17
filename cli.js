@@ -7,6 +7,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   appendFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -17,7 +18,7 @@ import {
   realpath as realpathAsync,
   stat as statAsync,
 } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
@@ -107,6 +108,10 @@ const DNSMASQ_SERVICE_STARTED_RE = /^dnsmasq\s+started/;
 const ERROR_RE = /error/;
 const TRAILING_NEWLINES_RE = /\n*$/;
 const WORKTREE_LIST_ENTRY_RE = /^worktree (.+)$/m;
+const SPANS_COUNT_RE = /^(?:0|[1-9]\d{0,14})$/;
+const SPANS_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SPANS_INDEX_CODE_RE = /^SPANS_[A-Z0-9_]{1,64}$/;
+const PATH_SEPARATOR_RE = /[\\/]/;
 
 function cfg() {
   try {
@@ -297,9 +302,12 @@ export async function runCli(
       return 1;
     }
 
+    // The offline index command touches only its explicit archive root, so the
+    // update nudge (config write, git fetch) must not run for it.
     if (
       !(
         injectedRequest ||
+        (cmd === 'spans' && args[0] === 'index') ||
         [
           'rm',
           'trigger',
@@ -1431,7 +1439,7 @@ async function importSweepCandidate(c, deps, candidate) {
       state,
       state === 'unknown' ? 'IMPORT_UNKNOWN' : 'IMPORT_FAILED'
     );
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: The import collaborator can reject an untrusted non-Error value.
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: The Git command can throw an untrusted non-Error value.
     die(`${error?.code ? `${error.code}: ` : ''}${error.message}`);
   }
   await operation.record('completed');
@@ -2063,18 +2071,254 @@ async function cmdOperations() {
   );
 }
 
+function spansCountFlag(name) {
+  const value = optionalFlag(name);
+  if (value === undefined) {
+    return;
+  }
+  if (!SPANS_COUNT_RE.test(value)) {
+    die(`--${name} must be a nonnegative integer.`);
+  }
+  return Number(value);
+}
+
+// Strict decimal digits only: unlike positiveNumber, a bare flag, exponent or
+// hex form is refused rather than coerced.
+function spansPageFlag(name, maximum) {
+  const value = spansCountFlag(name);
+  if (value !== undefined && (value < 1 || value > maximum)) {
+    die(`--${name} must be an integer from 1 to ${maximum}.`);
+  }
+  return value;
+}
+
+// Everything is checked before any request is made, so a malformed search
+// never reaches the portal.
+function spansSearchQuery(text) {
+  if (!text.trim() || text.length > 512) {
+    die('Search query must be 1 to 512 characters and not blank.');
+  }
+  const run = optionalFlag('run');
+  if (run !== undefined && !SPANS_RUN_ID_RE.test(run)) {
+    die('--run must be a Spans run id.');
+  }
+  const afterSequence = spansCountFlag('since');
+  const expectedGeneration = spansCountFlag('generation');
+  if (afterSequence > 0 && expectedGeneration === undefined) {
+    die('--since above 0 requires --generation from the previous page.');
+  }
+  return {
+    afterSequence,
+    expectedGeneration,
+    limit: spansPageFlag('limit', 100),
+    query: text,
+    runId: run,
+    throughSequence: spansCountFlag('through'),
+  };
+}
+
+function spansIndexFailure(code, progress = {}) {
+  return {
+    code: SPANS_INDEX_CODE_RE.test(code) ? code : 'SPANS_INDEX_FAILED',
+    error: 'Spans search indexing did not complete.',
+    ok: false,
+    ...progress,
+  };
+}
+
+// Pages are bounded; the checkpoint lives in the archive, so a rerun resumes.
+// Coverage is reported exactly as the store states it, never inferred.
+function runSpansIndex(store, limit, maxPages) {
+  const initialized = store.initializeSearch();
+  if (initialized?.ok !== true) {
+    return spansIndexFailure(initialized?.code, { indexed: 0, pages: 0 });
+  }
+  let indexed = 0;
+  let pages = 0;
+  let page;
+  do {
+    page = store.indexSearchPage({ limit });
+    if (page?.ok !== true) {
+      return spansIndexFailure(page?.code, { indexed, pages });
+    }
+    const pageIndexed = Number.isSafeInteger(page.indexed) ? page.indexed : 0;
+    indexed += pageIndexed;
+    pages += 1;
+    if (page.hasMore === true && pageIndexed === 0) {
+      return spansIndexFailure('SPANS_INDEX_STALLED', { indexed, pages });
+    }
+  } while (page.hasMore === true && pages < maxPages);
+  const resumable = page.hasMore === true;
+  const complete = !resumable && page.coverage?.complete === true;
+  let note = 'The search index covers every archived event.';
+  if (resumable) {
+    note =
+      'Page budget reached; rerun the same command to resume from the archived checkpoint.';
+  } else if (!complete) {
+    note =
+      'The search index does not cover every archived event; see coverage.';
+  }
+  return {
+    complete,
+    coverage: page.coverage,
+    generation: page.generation,
+    indexed,
+    nextSequence: page.nextSequence,
+    note,
+    ok: true,
+    pages,
+    resumable,
+  };
+}
+
+// Offline and explicit: no portal, no default or live root, no import or
+// dispatch. An existing archive is required, so this never creates one.
+async function cmdSpansIndex() {
+  const deps = localCommandOverrides;
+  const root = requireFlag('root');
+  if (
+    !(
+      isAbsolute(root) &&
+      !root.includes('\0') &&
+      !root.split(PATH_SEPARATOR_RE).includes('..')
+    )
+  ) {
+    die('--root must be an absolute path without ".." segments.');
+  }
+  const limit = spansPageFlag('limit', 200) ?? 50;
+  const maxPages = spansPageFlag('pages', 10_000) ?? 100;
+  let result;
+  let store;
+  let closeFailed = false;
+  try {
+    const { SPANS_STORE_DATABASE_FILE, openSpansStore } = await (
+      deps.loadSpansStore ?? (() => import('./spans-store.js'))
+    )();
+    let database;
+    try {
+      database = lstatSync(join(root, SPANS_STORE_DATABASE_FILE));
+    } catch {
+      // Absent or unreadable alike: there is no archive to index.
+    }
+    if (database?.isFile() && database.size > 0) {
+      store = openSpansStore({ root });
+      result = runSpansIndex(store, limit, maxPages);
+    } else {
+      result = spansIndexFailure('SPANS_INDEX_NO_ARCHIVE');
+    }
+  } catch (error) {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: An injected store loader may reject with null or undefined.
+    result = spansIndexFailure(error?.code);
+  } finally {
+    if (store) {
+      try {
+        closeFailed = store.close()?.ok === false;
+      } catch {
+        closeFailed = true;
+      }
+    }
+  }
+  if (closeFailed) {
+    result = {
+      ...result,
+      code: 'SPANS_INDEX_CLOSE_FAILED',
+      error: 'Spans archive did not close cleanly.',
+      ok: false,
+    };
+  }
+  return apiResult(() => result);
+}
+
+function spansPlanningInput() {
+  const text = requireFlag('input');
+  if (Buffer.from(text, 'utf8').byteLength > 1024 * 1024) {
+    die('Spans planning input exceeds 1 MiB.');
+  }
+  try {
+    const input = JSON.parse(text);
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      return input;
+    }
+  } catch {
+    // Do not expose parser excerpts that could contain private plan text.
+  }
+  die('--input must be a JSON object.');
+}
+
+function spansPlanningCommand(action, usage) {
+  if (args.length !== 1) {
+    return null;
+  }
+  if (action === 'workflows') {
+    validateFlags([], usage);
+    return apiResult(() => cliApi.get('/api/spans/workflows'));
+  }
+  const planningRoutes = {
+    'create-draft': '/api/spans/drafts/create',
+    'create-workflow': '/api/spans/workflows/create',
+    preview: '/api/spans/workflows/preview',
+    'revise-plan': '/api/spans/plans/revise',
+  };
+  if (Object.hasOwn(planningRoutes, action)) {
+    validateFlags(['input'], usage);
+    const input = spansPlanningInput();
+    return apiResult(() => cliApi.post(planningRoutes[action], input));
+  }
+  return null;
+}
+
+function spansEventQuery(runId) {
+  const since = optionalFlag('since');
+  const afterSequence = since === undefined ? 0 : Number(since);
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+    die('Sequence must be a nonnegative integer.');
+  }
+  return {
+    afterSequence,
+    limit: positiveNumber('limit', { integer: true, maximum: 200 }),
+    runId,
+  };
+}
+
 async function cmdSpans() {
   const usage =
-    'setu spans [list | show <run> | events <run> | artifact <run> <artifact>] [--after <run> --since <sequence> --limit <N>] [--json]';
+    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path>] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
   validateCommand({
-    allowedFlags: ['after', 'limit', 'phase', 'query', 'since'],
+    allowedFlags: [
+      'after',
+      'generation',
+      'input',
+      'limit',
+      'pages',
+      'phase',
+      'query',
+      'root',
+      'run',
+      'since',
+      'through',
+    ],
     argCounts: [0, 1, 2, 3],
     usage,
   });
   const [action = 'list', runId, artifactId] = args;
   let path;
   let query;
-  if (action === 'list' && args.length <= 1) {
+  const planning = spansPlanningCommand(action, usage);
+  if (planning) {
+    return await planning;
+  }
+  if (action === 'index' && args.length === 1) {
+    validateFlags(['limit', 'pages', 'root'], usage);
+    return await cmdSpansIndex();
+  }
+  if (action === 'search' && args.length === 2) {
+    validateFlags(['generation', 'limit', 'run', 'since', 'through'], usage);
+    path = '/api/spans/search';
+    query = spansSearchQuery(args[1]);
+  } else if (action === 'search-status' && args.length === 1) {
+    validateFlags([], usage);
+    path = '/api/spans/search/status';
+  } else if (action === 'list' && args.length <= 1) {
     validateFlags(['after', 'limit', 'phase', 'query'], usage);
     path = '/api/spans/runs';
     query = {
@@ -2089,17 +2333,8 @@ async function cmdSpans() {
     query = { runId };
   } else if (action === 'events' && args.length === 2) {
     validateFlags(['limit', 'since'], usage);
-    const since = optionalFlag('since');
-    const afterSequence = since === undefined ? 0 : Number(since);
-    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
-      die('Sequence must be a nonnegative integer.');
-    }
     path = '/api/spans/events';
-    query = {
-      afterSequence,
-      limit: positiveNumber('limit', { integer: true, maximum: 200 }),
-      runId,
-    };
+    query = spansEventQuery(runId);
   } else if (action === 'artifact' && args.length === 3) {
     validateFlags([], usage);
     path = '/api/spans/artifact';
@@ -3220,6 +3455,18 @@ function cmdHelp() {
     setu storage [inspect <repo> <branch> | inspect --store <id>] [--json]
     setu operations [repo branch] [--since <ISO> --limit <N>] [--json]
     setu spans [list | show <run> | events <run> | artifact <run> <artifact>] [--json]
+    setu spans workflows [--json]
+    setu spans preview --input '<workflow JSON>' [--json]
+    setu spans create-workflow --input '<original workflow JSON plus digest>' [--json]
+    setu spans create-draft --input '<draft JSON>' [--json]
+    setu spans revise-plan --input '<revision JSON with expectedRevision and expectedGeneration>' [--json]
+                                      Saves offline plans only; does not approve or start work
+    setu spans search <query> [--run <run> --since <sequence> --through <sequence> --generation <N> --limit <N>] [--json]
+                                      A page after --since needs the --generation it returned; a
+                                      missing index is unavailable, never zero results
+    setu spans search-status [--json]
+    setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
+                                      Offline: indexes an existing archive in bounded pages; rerun to resume
     setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
     setu caches prepare <repo> <branch> [--json]
     setu caches execute <repo> <branch> --manifest <id> --confirmation <token> [--json]
