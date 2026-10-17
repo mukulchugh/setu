@@ -2608,7 +2608,11 @@ async function cmdDoctor() {
     async () => ({
       fix: 'sudo brew services stop dnsmasq && sudo brew services restart dnsmasq',
       name: 'dnsmasq service',
-      ok: /^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine),
+      // Runs as root, so the user-level `brew services list` can't see it
+      // start — answering a query proves it's up.
+      ok:
+        digText.includes('127.0.0.1') ||
+        (/^dnsmasq\s+started/.test(dnsmasqLine) && !/error/.test(dnsmasqLine)),
     }),
     async () => ({
       fix: 'sudo brew services restart dnsmasq (then re-check)',
