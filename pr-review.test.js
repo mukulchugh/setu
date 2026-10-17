@@ -33,6 +33,7 @@ function reviewRunFixture({
   const name = `topic-${++reviewNumber}`;
   let completion;
   const started = runDeepReview('repo', name, 'pr-walkthrough', {
+    ensureDir: () => {},
     closeLog: (fd) => {
       closeSync(fd);
       if (closeError) {
@@ -176,6 +177,15 @@ test('deep review arguments fail closed for write-shaped Bash commands', async (
     expect(args).not.toContain(`Bash(${command})`);
   }
   expect(reviewBashAllowed('git status')).toBe(true);
+  expect(reviewBashAllowed('git log --oneline -3 origin/staging..HEAD')).toBe(
+    true
+  );
+  expect(reviewBashAllowed('gh pr view 19 -R owner/repo --json files')).toBe(
+    true
+  );
+  expect(reviewBashAllowed('git diff -3 --no-ext-diff --no-textconv')).toBe(
+    false
+  );
   for (const command of [
     'git diff --stat',
     'git show --name-only',
@@ -238,4 +248,35 @@ test('review write guard rejects existing, dangling, and intermediate symlink an
       tool_input: { file_path: join(report, 'intermediate', 'result.html') },
     })
   ).toBe(2);
+});
+
+test('guard explicitly approves allowlisted commands for the prompt-less run', async () => {
+  const proc = Bun.spawn(['bun', './pr-review-guard.js', 'bash'], {
+    cwd: import.meta.dir,
+    stdin: new Blob([
+      JSON.stringify({ tool_input: { command: 'git status' } }),
+    ]).stream(),
+    stdout: 'pipe',
+  });
+  const out = JSON.parse(await new Response(proc.stdout).text());
+  expect(await proc.exited).toBe(0);
+  expect(out.hookSpecificOutput.permissionDecision).toBe('allow');
+});
+
+test('guard allows only the installed plugin scripts', () => {
+  const root = '/plugins/pr-walkthrough/1.4.0';
+  expect(
+    reviewBashAllowed(
+      `python3 ${root}/skills/pr-walkthrough/scripts/render_review.py --list-reviews`,
+      root
+    )
+  ).toBe(true);
+  expect(
+    reviewBashAllowed('python3 /tmp/evil/scripts/render_review.py', root)
+  ).toBe(false);
+  expect(
+    reviewBashAllowed(
+      `python3 ${root}/skills/pr-walkthrough/scripts/render_review.py`
+    )
+  ).toBe(false);
 });

@@ -18,7 +18,7 @@
 // permission check. --output-format stream-json requires --verbose in
 // --print mode (undocumented, confirmed via a hard CLI error).
 
-import { closeSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { claudeSubscriptionEnv } from './cli-helpers.js';
 import { HOME } from './lib.js';
@@ -35,20 +35,27 @@ const PLUGIN_KEY = 'pr-walkthrough@mukulchugh-skills';
 // "installed anywhere" check would show the button for a worktree where
 // only a mismatched project-scoped install exists, and the invocation would
 // then fail to resolve /pr-walkthrough at all.
-export function detectPrWalkthroughPlugin(wtDir) {
+export function prWalkthroughInstallPath(wtDir) {
   try {
     const raw = readFileSync(
       `${HOME}/.claude/plugins/installed_plugins.json`,
       'utf8'
     );
     const installs = JSON.parse(raw).plugins?.[PLUGIN_KEY] ?? [];
-    return installs.some(
-      (i) =>
-        i.scope === 'user' || (i.scope === 'project' && i.projectPath === wtDir)
+    return (
+      installs.find(
+        (i) =>
+          i.scope === 'user' ||
+          (i.scope === 'project' && i.projectPath === wtDir)
+      )?.installPath ?? null
     );
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function detectPrWalkthroughPlugin(wtDir) {
+  return prWalkthroughInstallPath(wtDir) !== null;
 }
 
 // ── artifact lookup ──────────────────────────────────────────────────────────
@@ -153,7 +160,7 @@ export function reviewRunStatus(repo, name) {
 // it is the primary Bash guard, not permission mode or the plugin hook.
 const REVIEW_GUARD = new URL('./pr-review-guard.js', import.meta.url).pathname;
 
-export function reviewBashAllowed(command) {
+export function reviewBashAllowed(command, pluginRoot) {
   if (
     typeof command !== 'string' ||
     !command.trim() ||
@@ -176,6 +183,7 @@ export function reviewBashAllowed(command) {
         '--',
       ]),
       log: new Set(['--oneline', '--decorate', '--']),
+      'merge-base': new Set(['--']),
       'ls-files': new Set(['--cached', '--others', '--exclude-standard', '--']),
       'rev-parse': new Set(['--verify', '--quiet']),
       show: new Set([
@@ -194,7 +202,10 @@ export function reviewBashAllowed(command) {
       ]),
     };
     if (flags[words[1]]) {
-      const values = words.slice(2);
+      // A bare commit count (`git log -3`) only limits read output.
+      const values = words
+        .slice(2)
+        .filter((word) => !(words[1] === 'log' && /^-\d+$/.test(word)));
       if (!flagsOnly(values, flags[words[1]])) {
         return false;
       }
@@ -211,11 +222,19 @@ export function reviewBashAllowed(command) {
       words[2] === '--show-current'
     );
   }
+  // The installed plugin's own renderer/parser scripts (trusted plugin code).
+  // ponytail: script output paths aren't confined; Write stays report-only.
+  if (pluginRoot && ['python3', 'python'].includes(words[0]) && words[1]) {
+    const script = relative(`${pluginRoot}/skills`, words[1]);
+    if (/^[a-z-]+\/scripts\/[a-z_]+\.py$/.test(script)) {
+      return true;
+    }
+  }
   if (words[0] === 'gh') {
     return (
       words[1] === 'pr' &&
       ['view', 'diff', 'checks'].includes(words[2]) &&
-      flagsOnly(words.slice(3), new Set(['--json', '--jq', '--repo']))
+      flagsOnly(words.slice(3), new Set(['--json', '--jq', '--repo', '-R']))
     );
   }
   if (words[0] === 'pwd') {
@@ -242,14 +261,22 @@ export function reviewBashAllowed(command) {
   return false;
 }
 
-export function buildDeepReviewArgs(skill, slug, prNumber) {
-  const reportDir = `${DATA_ROOT}/${SKILL_DIR[skill]}/${slug}/pr-${prNumber}`;
+export function deepReviewDir(skill, slug, prNumber) {
+  return `${DATA_ROOT}/${SKILL_DIR[skill]}/${slug}/pr-${prNumber}`;
+}
+
+export function buildDeepReviewArgs(skill, slug, prNumber, pluginRoot) {
+  const reportDir = deepReviewDir(skill, slug, prNumber);
   const settings = JSON.stringify({
     hooks: {
       PreToolUse: [
         {
           hooks: [
-            { args: [REVIEW_GUARD, 'bash'], command: 'bun', type: 'command' },
+            {
+              args: [REVIEW_GUARD, 'bash', pluginRoot ?? ''],
+              command: 'bun',
+              type: 'command',
+            },
           ],
           matcher: 'Bash',
         },
@@ -270,8 +297,12 @@ export function buildDeepReviewArgs(skill, slug, prNumber) {
     // No user MCP servers: they add hundreds of tool schemas per turn and
     // blew the budget cap on the first message in testing.
     '--strict-mcp-config',
+    // Read access to the skill's references/scripts and its own report dir.
+    ...(pluginRoot ? ['--add-dir', pluginRoot] : []),
+    '--add-dir',
+    reportDir,
     '-p',
-    `/${skill} ${slug}#${prNumber}\nFor git diff or git show, include both --no-ext-diff and --no-textconv.`,
+    `/${skill} ${slug}#${prNumber}\nFor git diff or git show, include both --no-ext-diff and --no-textconv.\nBash is limited to one plain read-only command per call: no pipes, &&, ;, quotes, redirects or $(...). Run commands separately instead of chaining them.`,
     '--permission-mode',
     'acceptEdits',
     '--tools',
@@ -347,6 +378,7 @@ export function runDeepReview(
     spawn = Bun.spawn,
     readLog = readFileSync,
     closeLog = closeSync,
+    ensureDir = (dir) => mkdirSync(dir, { recursive: true }),
   }
 ) {
   const key = `${repo}/${name}`;
@@ -411,8 +443,18 @@ export function runDeepReview(
         }
       );
     const before = await snapshot();
+    // The Write guard only accepts paths inside an existing report dir.
+    ensureDir(deepReviewDir(skill, slug, prNumber));
     const proc = spawn(
-      ['claude', ...buildDeepReviewArgs(skill, slug, prNumber)],
+      [
+        'claude',
+        ...buildDeepReviewArgs(
+          skill,
+          slug,
+          prNumber,
+          prWalkthroughInstallPath(wtDir)
+        ),
+      ],
       {
         cwd: wtDir,
         env: claudeSubscriptionEnv(),

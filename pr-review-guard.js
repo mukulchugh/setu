@@ -65,17 +65,27 @@ async function input() {
 }
 
 if (import.meta.main) {
-  const [kind, reportDir] = process.argv.slice(2);
+  const [kind, scope] = process.argv.slice(2);
   const event = await input();
   const allowed =
     kind === 'bash'
-      ? reviewBashAllowed(event?.tool_input?.command)
+      ? reviewBashAllowed(event?.tool_input?.command, scope || undefined)
       : kind === 'write' &&
-        reviewWriteAllowed(event?.tool_input?.file_path, reportDir);
+        reviewWriteAllowed(event?.tool_input?.file_path, scope);
   if (!allowed) {
     console.error(
       'This headless review permits only its saved report output and read-only commands.'
     );
     process.exit(2);
   }
+  // The run has no approval surface (--permission-prompts none), so a plain
+  // pass would still be auto-denied. This allowlist is the approval.
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+      },
+    })
+  );
 }
