@@ -17,6 +17,10 @@ export async function runUpdateTransaction(
   const fail = (code, message) => {
     throw Object.assign(new Error(message), { code });
   };
+  const blockedMessage = (blockers) =>
+    blockers?.length
+      ? `Update cutover blocked by: ${blockers.join(', ')}`
+      : 'Active or unknown work blocks update cutover';
   const validOid = (value) => oidPattern.test(value);
   async function findOwnStash() {
     const entries = (
@@ -110,7 +114,7 @@ export async function runUpdateTransaction(
       if (!result.ok) {
         fail(
           result.code || 'OWNED_WORK_ACTIVE',
-          'Active or unknown work blocks update cutover'
+          blockedMessage(result.blockers)
         );
       }
     }

@@ -18,6 +18,7 @@ export function createPortalUpdateControl({
   lifecycle,
   processIdentity = {},
   hasSupportingWork = () => false,
+  describeBlockers = () => [],
   randomId = randomUUID,
   ownerProcessAlive = (pid) => {
     try {
@@ -43,6 +44,17 @@ export function createPortalUpdateControl({
   const refused = (code, error) => envelope({ code, error, ok: false });
   const matches = (body) =>
     owner && body?.instanceId === instanceId && body?.token === owner.token;
+  function blockers() {
+    try {
+      return [
+        ...(mutations > 0 ? ['portal mutation in flight'] : []),
+        ...(unknownMutation ? ['earlier portal mutation outcome unknown'] : []),
+        ...describeBlockers(),
+      ];
+    } catch {
+      return ['supporting work state unreadable'];
+    }
+  }
   function busy() {
     try {
       return mutations > 0 || unknownMutation || hasSupportingWork();
@@ -113,6 +125,9 @@ export function createPortalUpdateControl({
       token,
       ...(blocked
         ? {
+            blockers: result.ok
+              ? blockers()
+              : [...blockers(), 'worktree lifecycle work active'],
             code: result.code ?? 'OWNED_WORK_ACTIVE',
             error:
               'Active or unknown work blocks cutover; stop Raycast and disable the shared tunnel explicitly before retrying',

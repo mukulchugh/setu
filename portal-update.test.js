@@ -93,6 +93,7 @@ test('cutover closes ordinary mutation admission atomically while an admitted re
   const mutation = control.mutate(() => held);
   const owner = control.quiesce(control.capabilities());
   expect(owner).toMatchObject({
+    blockers: ['portal mutation in flight'],
     code: 'OWNED_WORK_ACTIVE',
     ok: false,
     token: 'opaque-2',
