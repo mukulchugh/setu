@@ -328,11 +328,11 @@ export function tunnelEnabled(wtDir, c) {
   return readEnvrc(wtDir).includes(`https://${c.domain}`);
 }
 
-export async function writeEnvrc(wtDir, port, appUrl, redirectUri) {
+export async function writeEnvrc(wtDir, port, appUrl) {
   installedStateValue(
     await workspaceState(undefined).replaceText(
       join(wtDir, '.envrc'),
-      `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=${redirectUri}\n`
+      `export PORT=${port}\nexport NEXT_PUBLIC_APP_BASE_URL=${appUrl}\n`
     )
   );
   await allowDirenvAsync(wtDir);
@@ -359,26 +359,12 @@ export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
   const wtDir = join(c.workspace, repo, name);
   if (withTunnel) {
     const pd = publicDomain(c);
-    await writeEnvrc(
-      wtDir,
-      port,
-      `https://${pd}`,
-      `https://${pd}/authentication/callback`
-    );
+    await writeEnvrc(wtDir, port, `https://${pd}`);
   } else {
-    // Was http://localhost:${port}/... — inconsistent with APP_BASE_URL on the
-    // line above, and the actual root cause of "redirected to localhost" after
-    // login: WORKOS_REDIRECT_URI is read once from this env var at process
-    // startup by @workos-inc/authkit-nextjs and used verbatim as the OAuth
-    // redirect destination, so a mismatched value here sends the browser to
-    // localhost regardless of what domain the user actually visited through Caddy.
+    // The worktree's own domain, not localhost: OAuth callbacks built from
+    // this URL must land back on the domain the browser actually visited.
     const ld = localDomain(repo, name);
-    await writeEnvrc(
-      wtDir,
-      port,
-      `http://${ld}`,
-      `http://${ld}/authentication/callback`
-    );
+    await writeEnvrc(wtDir, port, `http://${ld}`);
   }
   await writeCaddy(c, repo, name, port, withTunnel);
 }
