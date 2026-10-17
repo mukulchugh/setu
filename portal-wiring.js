@@ -1,3 +1,5 @@
+import { publicSession, publicSessionResult } from './agent-sessions.js';
+
 function failure(code, error) {
   return { code, error, ok: false };
 }
@@ -144,7 +146,9 @@ export function createPortalWiring({
     admissionStatus: () => admission.status(),
     agentSessions: (query = {}) => ({
       ok: true,
-      sessions: filterTarget(sessions.list(), query.repo, query.name),
+      sessions: filterTarget(sessions.list(), query.repo, query.name).map(
+        publicSession
+      ),
     }),
     attention: (query = {}) => {
       const listed = attention.list();
@@ -186,10 +190,12 @@ export function createPortalWiring({
       }),
     dependencyViews: async (input = {}) => dependency.views(input),
     endAgentSession: (input) =>
-      withTarget('session-end', input, input.source, () =>
-        sessions.end(input.sessionId, {
-          checkoutIdentity: input.checkoutIdentity,
-        })
+      withTarget('session-end', input, input.source, async () =>
+        publicSessionResult(
+          await sessions.end(input.sessionId, {
+            checkoutIdentity: input.checkoutIdentity,
+          })
+        )
       ),
     githubDispatch: (input) =>
       withTarget('github-dispatch', input, input.source, (value) =>

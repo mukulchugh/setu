@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createAgentSessions, launchProofDigest } from './agent-sessions.js';
 import {
   createTerminalAttention,
   createTrustedHookIngress,
@@ -243,62 +244,72 @@ test('native hook ids require a trusted mapping and never trust wrong checkout o
   ).resolves.toMatchObject({ attention: { state: 'unknown' }, ok: true });
 });
 
-test('private launch bindings connect hook session ids without persisting a raw hook payload', async () => {
+test('the hook ingress binds native ids through the durable session record and attention resolves them with proof', async () => {
   const fixture = stateFixture();
-  const session = {
+  const sessions = createAgentSessions({
+    now: () => 1,
+    observeCheckout: () => Promise.resolve('checkout-a'),
+    observeProcess: () =>
+      Promise.resolve({
+        processId: 7,
+        processStartIdentity: 'Mon Oct 5 12:00:00 2026',
+        state: 'alive',
+      }),
+    signal: () => Promise.resolve(),
+    state: fixture.state,
+  });
+  await sessions.register({
     checkoutIdentity: 'checkout-a',
     checkoutPath: '/worktree',
     id: 'setu-1',
-    ownership: 'owned',
-    state: 'running',
-    tool: 'claude',
-  };
-  const sessions = {
-    get: (id) => (id === 'setu-1' ? session : null),
-    list: () => [],
-  };
+    launchProofDigest: launchProofDigest('token_1234567890123456'),
+    name: 'topic',
+    pid: 7,
+    processStart: 'Mon Oct 5 12:00:00 2026',
+    repo: 'repo',
+    tool: 'claude-code',
+  });
   const ingress = createTrustedHookIngress({ sessions });
-  expect(
-    ingress.registerLaunch({
-      checkoutIdentity: 'checkout-a',
-      checkoutPath: '/worktree',
-      launchToken: 'token_1234567890123456',
-      provider: 'claude-code',
-      sessionId: 'setu-1',
-    })
-  ).toEqual({ ok: true, sessionId: 'setu-1' });
-  expect(
+  const bind = (launchToken) =>
     ingress.bind({
       checkoutPath: '/worktree',
-      launchToken: 'wrong_1234567890123456',
+      launchToken,
       nativeSessionId: 'native-1',
       provider: 'claude-code',
-    })
-  ).toMatchObject({ code: 'HOOK_BINDING_UNAUTHORIZED', ok: false });
-  expect(
-    ingress.bind({
-      checkoutPath: '/worktree',
-      launchToken: 'token_1234567890123456',
-      nativeSessionId: 'native-1',
-      provider: 'claude-code',
-    })
-  ).toEqual({ ok: true, sessionId: 'setu-1' });
+    });
+  await expect(bind('wrong_1234567890123456')).resolves.toMatchObject({
+    code: 'HOOK_BINDING_UNAUTHORIZED',
+    ok: false,
+    reason: 'launch-proof-invalid',
+  });
+  await expect(bind('token_1234567890123456')).resolves.toEqual({
+    ok: true,
+    sessionId: 'setu-1',
+  });
   const attention = createTerminalAttention({
     now: () => 1,
     resolveHookSession: ingress.resolveHookSession,
     sessions,
     state: fixture.state,
   });
-  await expect(
+  const stop = (launchToken) =>
     attention.receive({
+      launchToken,
       payload: {
         cwd: '/worktree',
         hook_event_name: 'Stop',
         session_id: 'native-1',
       },
       provider: 'claude-code',
-    })
-  ).resolves.toMatchObject({ attention: { sessionId: 'setu-1' }, ok: true });
+    });
+  await expect(stop('token_1234567890123456')).resolves.toMatchObject({
+    attention: { sessionId: 'setu-1' },
+    ok: true,
+  });
+  await expect(stop(undefined)).resolves.toMatchObject({
+    attention: { state: 'unknown' },
+    reason: 'launch-proof-missing',
+  });
   expect(JSON.stringify(fixture.state.read('attention'))).not.toContain(
     'native-1'
   );

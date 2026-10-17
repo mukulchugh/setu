@@ -272,8 +272,24 @@ test('composes a token-bound Ghostty launch, trusted Claude hook and exact exist
       provider: 'claude-code',
     })
   ).resolves.toEqual({ ok: true, sessionId: 'session-1' });
+  // A native id and cwd alone only locate a session; they never resolve it.
   await expect(
     f.service.receiveHook({
+      payload: {
+        cwd: f.target.wtDir,
+        hook_event_name: 'Stop',
+        session_id: 'native-1',
+      },
+      provider: 'claude-code',
+    })
+  ).resolves.toMatchObject({
+    attention: { state: 'unknown' },
+    ok: true,
+    reason: 'launch-proof-missing',
+  });
+  await expect(
+    f.service.receiveHook({
+      launchToken: 'token_1234567890123456',
       payload: {
         cwd: f.target.wtDir,
         hook_event_name: 'Stop',

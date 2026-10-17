@@ -473,7 +473,7 @@ never downloads a provider tool to make a deployment possible.
 <!-- PORTAL_API_ROUTES_START -->
 | Method | Path | Operation, target, confirmation/recovery | Front doors |
 | --- | --- | --- | --- |
-| `GET` | `/api/agent-sessions` | `repo?`,`name?`; list durable sessions. | H W C M |
+| `GET` | `/api/agent-sessions` | `repo?`,`name?`; list durable sessions, each with a `nativeConversation` binding (`bound` with `provider`,`id`,`boundAt`; `pending`; or `unavailable` with `provider-unverified`). | H W C M |
 | `POST` | `/api/agent-sessions/end` | T plus `sessionId`,`checkoutIdentity`; end only after owned PID/process-start identity is proven. | H W C M |
 | `GET` | `/api/agents` | List installed agent CLIs. | H W R |
 | `GET` | `/api/attention` | `repo?`,`name?`; list normalized attention events. | H W C M |
@@ -646,10 +646,21 @@ and its immutable SHA-256 ID. Execution rechecks each condition. A partial
 result reports only `removedPaths` plus a new `retryId`; use it with the same
 manifest ID after a fresh review.
 
-Claude Code has trusted hook wiring. A launch token binds the owned session,
-checkout identity, and native session before it accepts `PermissionRequest`,
-`Notification:agent_needs_input`, or `Stop`. Codex has no native trusted-hook
-wiring. Setu can launch a managed Codex process and track its checkout, PID,
+Claude Code has trusted hook wiring. The launch token is a per-launch capability:
+only its SHA-256 digest is stored, on the private managed-session record, and it
+stays valid for the life of that session (it is not consumed at first bind). Every
+hook (`SessionStart`, `PermissionRequest`, `Notification:agent_needs_input`, `Stop`)
+must present it; a native session ID and working directory only locate the session.
+Setu also checks the provider, the owned running session, and a freshly observed
+checkout incarnation (filesystem identity, never HEAD). A missing, wrong,
+cross-session, ended or replaced credential resolves nothing and names a stable
+non-secret reason. The verified native conversation is stored on the session record
+(provider, ID, bound-at, and up to eight replaced IDs kept privately), survives a
+portal restart, and is shown as `nativeConversation` in session listings. A second
+`SessionStart` with a new ID is a replacement; an earlier ID of the same session
+resumes. One native ID is refused on a second live session, and an ID that an ended
+or unconfirmed session held is never adopted by a new launch. Codex has no native
+trusted-hook wiring. Setu can launch a managed Codex process and track its checkout, PID,
 and process-start ownership. Its normalized parser recognizes `PermissionRequest`
 and `Stop` shapes, which does not establish support for a native Codex hook.
 The native focus/paste adapter was derived from Ghostty 1.3.1's scripting

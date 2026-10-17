@@ -216,3 +216,41 @@ test('a selected worktree filters the durable event query before its result limi
     wiring.operations({ limit: 1, name: 'topic', repo: 'r' })
   ).toMatchObject({ events: [{ id: 'topic' }], ok: true });
 });
+
+test('the composed session lister and end result never expose the capability digest or replaced ids', async () => {
+  const record = {
+    id: 'session-a',
+    launchProofDigest: 'f'.repeat(64),
+    name: 'topic',
+    nativeConversation: {
+      boundAt: 5,
+      history: [{ boundAt: 1, id: 'native-old', replacedAt: 5 }],
+      id: 'native-now',
+      provider: 'claude-code',
+    },
+    repo: 'r',
+    state: 'running',
+    tool: 'claude-code',
+  };
+  const { wiring } = fixture({
+    sessions: {
+      end: async () => ({ ok: false, session: record }),
+      list: () => [record],
+      reconcile: async () => ({ ok: true }),
+      register: async () => ({ ok: true }),
+    },
+  });
+  const listed = wiring.agentSessions({});
+  const ended = await wiring.endAgentSession({
+    checkoutIdentity: {},
+    name: 'topic',
+    repo: 'r',
+    sessionId: 'session-a',
+  });
+  for (const output of [listed, ended]) {
+    const text = JSON.stringify(output);
+    expect(text).not.toContain('launchProofDigest');
+    expect(text).not.toContain('native-old');
+    expect(text).toContain('native-now');
+  }
+});

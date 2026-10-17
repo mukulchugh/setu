@@ -1,9 +1,10 @@
 // Hook ingress is explicit. This module never polls terminals or providers.
 
+import { launchProofDigest } from './agent-sessions.js';
+
 const DEFAULT_LIMIT = 100;
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 const launchTokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
-const unsafeTextPattern = /[\0\r\n]/;
 
 export const attentionHookEvents = {
   'claude-code': [
@@ -28,14 +29,6 @@ function validLaunchToken(value) {
 
 function validSessionId(value) {
   return typeof value === 'string' && value.length > 0;
-}
-
-function validText(value) {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    !unsafeTextPattern.test(value)
-  );
 }
 
 function canonicalProvider(value) {
@@ -137,121 +130,78 @@ function validMapping(value) {
 }
 
 export function createTrustedHookIngress({ sessions } = {}) {
-  const launchBindings = new Map();
-  const nativeBindings = new Map();
-  const key = (provider, nativeSessionId) => `${provider}:${nativeSessionId}`;
+  const refused = (reason) => ({
+    code: reason.startsWith('launch-proof')
+      ? 'HOOK_BINDING_UNAUTHORIZED'
+      : 'HOOK_BINDING_UNVERIFIED',
+    error: 'The hook cannot prove its launch binding',
+    ok: false,
+    reason,
+  });
+  const proof = (launchToken) =>
+    validLaunchToken(launchToken) ? launchProofDigest(launchToken) : null;
 
-  function sessionMatches(
-    session,
-    { checkoutIdentity, checkoutPath, provider, sessionId }
-  ) {
-    return (
-      session?.id === sessionId &&
-      session.ownership === 'owned' &&
-      canonicalProvider(session.tool) === provider &&
-      session.checkoutPath === checkoutPath &&
-      sameIdentity(session.checkoutIdentity, checkoutIdentity)
-    );
-  }
-
-  function registerLaunch({
-    sessionId,
-    checkoutIdentity,
-    checkoutPath,
+  async function bind({
     provider,
     launchToken,
+    nativeSessionId,
+    checkoutPath,
   }) {
     const canonical = canonicalProvider(provider);
-    if (
-      !(
-        canonical &&
-        validSessionId(sessionId) &&
-        validText(checkoutPath) &&
-        validLaunchToken(launchToken)
-      )
-    ) {
+    if (!(canonical && validSessionId(nativeSessionId))) {
       return {
         code: 'HOOK_BINDING_INVALID',
         error: 'The hook launch binding is invalid',
         ok: false,
       };
     }
-    const session = sessions.get(sessionId);
-    if (
-      !sessionMatches(session, {
-        checkoutIdentity,
+    const digest = proof(launchToken);
+    if (!digest) {
+      return refused('launch-proof-missing');
+    }
+    let bound;
+    try {
+      bound = await sessions.bindNativeConversation({
         checkoutPath,
+        launchProofDigest: digest,
+        nativeId: nativeSessionId,
         provider: canonical,
-        sessionId,
-      })
-    ) {
-      return {
-        code: 'HOOK_BINDING_UNVERIFIED',
-        error: 'The managed session cannot be bound to hooks',
-        ok: false,
-      };
+      });
+    } catch {
+      return refused('binding-unavailable');
     }
-    launchBindings.set(launchToken, {
-      checkoutIdentity,
+    if (bound.ok) {
+      return { ok: true, sessionId: bound.session.id };
+    }
+    return bound.reason ? refused(bound.reason) : bound;
+  }
+
+  async function resolveHookSession({
+    provider,
+    nativeSessionId,
+    checkoutPath,
+    launchToken,
+  }) {
+    const digest = proof(launchToken);
+    if (!digest) {
+      return { ok: false, reason: 'launch-proof-missing' };
+    }
+    const resolved = await sessions.resolveNativeConversation({
       checkoutPath,
-      provider: canonical,
-      sessionId,
+      launchProofDigest: digest,
+      nativeId: nativeSessionId,
+      provider: canonicalProvider(provider),
     });
-    return { ok: true, sessionId };
+    return resolved.ok
+      ? {
+          checkoutIdentity: resolved.session.checkoutIdentity,
+          ok: true,
+          sessionId: resolved.session.id,
+        }
+      : resolved;
   }
 
-  function bind({ provider, launchToken, nativeSessionId, checkoutPath }) {
-    const canonical = canonicalProvider(provider);
-    const binding = launchBindings.get(launchToken);
-    if (
-      !(
-        canonical &&
-        validSessionId(nativeSessionId) &&
-        binding &&
-        binding.provider === canonical &&
-        binding.checkoutPath === checkoutPath
-      )
-    ) {
-      return {
-        code: 'HOOK_BINDING_UNAUTHORIZED',
-        error: 'The hook cannot prove its launch binding',
-        ok: false,
-      };
-    }
-    const session = sessions.get(binding.sessionId);
-    if (!sessionMatches(session, binding)) {
-      return {
-        code: 'HOOK_BINDING_UNVERIFIED',
-        error: 'The managed session cannot be bound to hooks',
-        ok: false,
-      };
-    }
-    nativeBindings.set(key(canonical, nativeSessionId), {
-      checkoutIdentity: binding.checkoutIdentity,
-      sessionId: binding.sessionId,
-    });
-    launchBindings.delete(launchToken);
-    return { ok: true, sessionId: binding.sessionId };
-  }
-
-  function resolveHookSession({ provider, nativeSessionId, checkoutPath }) {
-    const canonical = canonicalProvider(provider);
-    const binding =
-      canonical && nativeBindings.get(key(canonical, nativeSessionId));
-    if (!(binding && validText(checkoutPath))) {
-      return null;
-    }
-    const session = sessions.get(binding.sessionId);
-    return sessionMatches(session, {
-      ...binding,
-      checkoutPath,
-      provider: canonical,
-    })
-      ? { ...binding }
-      : null;
-  }
-
-  return { bind, registerLaunch, resolveHookSession };
+  return { bind, resolveHookSession };
 }
 
 function unknownAttention(provider, at) {
@@ -288,7 +238,7 @@ export function createTerminalAttention({
     return null;
   };
 
-  async function receive({ provider, payload }) {
+  async function receive({ provider, payload, launchToken }) {
     const at = clock();
     const source = canonicalProvider(provider);
     const initial = attentionEvents(state.read('attention'));
@@ -312,6 +262,7 @@ export function createTerminalAttention({
     try {
       mapping = await resolveHookSession?.({
         checkoutPath: payload?.cwd,
+        launchToken,
         nativeSessionId: normalized.sessionId,
         provider: source,
       });
@@ -321,6 +272,7 @@ export function createTerminalAttention({
     const session = validMapping(mapping)
       ? sessions.get(mapping.sessionId)
       : null;
+    const reason = mapping?.ok === false ? mapping.reason : undefined;
     const verified =
       session &&
       session.ownership === 'owned' &&
@@ -352,7 +304,7 @@ export function createTerminalAttention({
         events: [...prior, event].slice(-maxEvents),
       };
     });
-    return { attention: event, ok: true };
+    return { attention: event, ok: true, ...(reason ? { reason } : {}) };
   }
 
   function list() {

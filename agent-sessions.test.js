@@ -345,3 +345,14 @@ test('an owned harmless coding child can be ended without touching a sibling pro
   expect(sessions.get('session-1')).toMatchObject({ state: 'ended' });
   expect((await observeProcessIdentity(sibling.pid)).state).toBe('alive');
 });
+
+test('a launch proof must be a SHA-256 digest, so a raw capability is refused rather than stored', async () => {
+  const f = fixture();
+  await expect(
+    f.sessions.register({
+      ...launch,
+      launchProofDigest: 'raw_token_1234567890123',
+    })
+  ).resolves.toMatchObject({ code: 'SESSION_INVALID', ok: false });
+  expect(fs.existsSync(f.agentSessionsPath)).toBe(false);
+});

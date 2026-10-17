@@ -12,7 +12,12 @@ import {
   buildAgentSessionLaunch,
   parseSessionRegistration,
 } from './agent-session-launcher.js';
-import { createAgentSessions } from './agent-sessions.js';
+import {
+  createAgentSessions,
+  launchProofDigest,
+  publicSessionResult,
+  publicSession as safeSession,
+} from './agent-sessions.js';
 import { createHeadlessRun } from './headless-run.js';
 import {
   buildGhosttyScriptLaunch,
@@ -88,14 +93,6 @@ function normalTool(tool) {
     return 'codex';
   }
   return null;
-}
-
-function safeSession(session) {
-  if (!session) {
-    return null;
-  }
-  const { managedLease, ...visible } = session;
-  return visible;
 }
 
 function safeRun(run) {
@@ -293,6 +290,8 @@ export function createManagedAgentServices({
   const sessions = createAgentSessions({
     findChildren,
     now,
+    observeCheckout: async ({ repo, name }) =>
+      (await target({ name, repo }))?.checkoutIdentity,
     observeProcess,
     signal,
     state,
@@ -678,6 +677,9 @@ export function createManagedAgentServices({
         'A safe session identity could not be created'
       );
     }
+    // Only Claude has trusted hooks, so only its launch capability is retained.
+    const proofDigest =
+      provider === 'claude-code' ? launchProofDigest(launchToken) : undefined;
     const operationId = `session-${sessionId}`;
     const outcomeSource = validSource(source) ? source : serviceSource;
     let admitted;
@@ -968,6 +970,7 @@ export function createManagedAgentServices({
             checkoutIdentity: resolved.checkoutIdentity,
             checkoutPath: resolved.wtDir,
             id: sessionId,
+            launchProofDigest: proofDigest,
             name,
             repo,
             tool: provider,
@@ -1053,23 +1056,6 @@ export function createManagedAgentServices({
             files,
             hasRecord: true,
           });
-        }
-        if (provider === 'claude-code') {
-          const registrationBinding = ingress.registerLaunch({
-            checkoutIdentity: resolved.checkoutIdentity,
-            checkoutPath: resolved.wtDir,
-            launchToken,
-            provider,
-            sessionId,
-          });
-          if (!registrationBinding.ok) {
-            return prelaunchFailure({
-              code: registrationBinding.code,
-              error: registrationBinding.error,
-              files,
-              hasRecord: true,
-            });
-          }
         }
         return null;
       }
@@ -1303,7 +1289,7 @@ export function createManagedAgentServices({
         );
       }
       return {
-        ...result,
+        ...publicSessionResult(result),
         operationId,
         ...(recording && !recording.ok ? { recording } : {}),
       };
@@ -1327,7 +1313,7 @@ export function createManagedAgentServices({
         provider: canonical,
       });
     }
-    return attention.receive({ payload, provider: canonical });
+    return attention.receive({ launchToken, payload, provider: canonical });
   }
 
   async function attentionEvent(item, only) {
