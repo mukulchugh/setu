@@ -1155,3 +1155,27 @@ test('reports an explicit prelaunch refusal despite failed outcome persistence a
     'starting'
   );
 });
+
+test('waits for hook children to drain before settling a clean exit', async () => {
+  const { state } = fixture();
+  const { child, exit } = deferredChild(4250);
+  let groupChecks = 0;
+  const runner = createHeadlessRun({
+    admit: async () => ({ lease: { id: 'lease' }, ok: true }),
+    launch: () => child,
+    observeGroup: async () => (++groupChecks < 3 ? 'alive' : 'absent'),
+    observeProcess: async (pid) => ({
+      processId: pid,
+      processStartIdentity: `start-${pid}`,
+      state: 'alive',
+    }),
+    state,
+  });
+  await runner.start({ ...target, id: 'run-drain', prompt: 'drain' });
+  const completion = runner.wait('run-drain');
+  exit();
+  await completion;
+  expect(state.read('headlessRuns').runs['run-drain'].state).not.toBe(
+    'unknown'
+  );
+});

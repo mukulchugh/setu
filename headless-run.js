@@ -176,6 +176,9 @@ export function createHeadlessRun({
       },
     };
   },
+  // Hooks/plugins can outlive the claude process by a moment on exit; poll the
+  // group this long before calling a finished run ambiguous.
+  exitGraceMs = 5000,
   now = () => Date.now(),
   observeGroup,
   observeProcess = observeProcessIdentity,
@@ -462,6 +465,14 @@ export function createHeadlessRun({
         let descendants = 'unknown';
         try {
           descendants = record.ownedGroup ? await groupState(record) : 'absent';
+          for (
+            let waited = 0;
+            descendants === 'alive' && waited < exitGraceMs;
+            waited += 100
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            descendants = await groupState(record);
+          }
         } catch {
           descendants = 'unknown';
         }
