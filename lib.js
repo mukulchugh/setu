@@ -32,6 +32,36 @@ import {
 import { validateRemovalRecords } from './worktree-removal.js';
 import { discoverWriterWorktrees } from './writer-claims.js';
 
+const tunnelIdPattern = /^[0-9a-f-]{36}$/i;
+const environmentAssignmentPattern =
+  /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*?)\s*$/;
+const triggerVersionPrefixPattern = /^[\^~]/;
+const listenerPortPattern = /:(\d+)$/;
+const sidecarNamePattern = /^[a-zA-Z0-9_-]+$/;
+const gitDirectoryPattern = /^gitdir:\s*(.+)\s*$/m;
+const worktreePathPattern = /^worktree (.+)$/m;
+const worktreeBranchPattern = /^branch refs\/heads\/(.+)$/m;
+const originPrefixPattern = /^origin\//;
+const mergeConflictPattern = /^(UU|AA|DD|AU|UA|UD|DU)/;
+const environmentFilePattern = /^\.env/;
+const remoteUrlSchemePattern = /^\w+:\/\/[^/]+\//;
+const remoteUrlSshPattern = /^[^@\s]+@[^:]+:/;
+const remoteUrlGitSuffixPattern = /\.git$/;
+const trailingWhitespacePattern = /\s*$/;
+const lineBreakPattern = /\r?\n/;
+const githubSlugPattern = /github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/;
+const unsafeWorktreeTextPattern = /[\\:]/;
+const whitespacePattern = /\s+/;
+
+function hasAsciiControlCharacter(value) {
+  for (const character of value) {
+    if (character.codePointAt(0) <= 0x20) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Keep the established library API while lifecycle owns the implementation.
 export const effectiveContainerLimits = lifecycleContainerLimits;
 export const parseMemToMb = lifecycleParseMemory;
@@ -118,7 +148,7 @@ export function installedStateValue(result) {
 
 export function tunnelCredentials(directory, name, tunnels) {
   const matches = tunnels.filter((t) => t.name === name);
-  if (matches.length !== 1 || !/^[0-9a-f-]{36}$/i.test(matches[0].id)) {
+  if (matches.length !== 1 || !tunnelIdPattern.test(matches[0].id)) {
     throw new Error(`Could not identify tunnel ${name}`);
   }
   const path = join(directory, `${matches[0].id}.json`);
@@ -182,7 +212,8 @@ export function validateWorktreeNames(repo, name) {
   const safe = (value) =>
     typeof value === 'string' &&
     value.length > 0 &&
-    !/[\\\x00-\x20:]/.test(value) &&
+    !unsafeWorktreeTextPattern.test(value) &&
+    !hasAsciiControlCharacter(value) &&
     value
       .split('/')
       .every(
@@ -258,7 +289,7 @@ export function parseEnvFile(path) {
     if (!line.trim() || line.trim().startsWith('#')) {
       continue;
     }
-    const m = line.match(/^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*?)\s*$/);
+    const m = line.match(environmentAssignmentPattern);
     if (m) {
       out[m[1]] = m[2].replace(/^['"]|['"]$/g, '');
     }
@@ -310,7 +341,7 @@ export function pinnedTriggerVersion(wtDir) {
     const v =
       pkg.dependencies?.['@trigger.dev/sdk'] ??
       pkg.devDependencies?.['@trigger.dev/sdk'];
-    return v ? v.replace(/^[\^~]/, '') : 'latest';
+    return v ? v.replace(triggerVersionPrefixPattern, '') : 'latest';
   } catch {
     return 'latest';
   }
@@ -426,6 +457,7 @@ export function reloadCaddy(
   });
 }
 
+// biome-ignore lint/suspicious/useAwait: Routing callers require any synchronous state failure to reject from this Promise-returning portal boundary.
 export async function reloadCaddyAsync(
   workspace,
   {
@@ -532,7 +564,7 @@ export function getPort(workspace, repo, name) {
 
 export function activePid(port) {
   try {
-    return execFileSync('lsof', ['-iTCP:' + port, '-sTCP:LISTEN', '-t'], {
+    return execFileSync('lsof', [`-iTCP:${port}`, '-sTCP:LISTEN', '-t'], {
       stdio: ['ignore', 'pipe', 'ignore'],
     })
       .toString()
@@ -547,8 +579,9 @@ export function activePid(port) {
 // stalling every other in-flight request (same class of bug fetchPR hit,
 // see its own comment). cli.js keeps calling the sync version: a one-shot
 // foreground process has no concurrent requests to starve.
+// biome-ignore lint/suspicious/useAwait: Public async callers must receive rejected Promises for argument coercion or spawn setup failures.
 export async function activePidAsync(port) {
-  return spawnText(['lsof', '-iTCP:' + port, '-sTCP:LISTEN', '-t']);
+  return spawnText(['lsof', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']);
 }
 
 // Covers app dev-server ports (3000-3999) and inngest sidecar ports (appPort+5288,
@@ -580,7 +613,7 @@ export function listActivePorts() {
     } else if (line.startsWith('c')) {
       cur.cmd = line.slice(1);
     } else if (line.startsWith('n')) {
-      const m = line.match(/:(\d+)$/);
+      const m = line.match(listenerPortPattern);
       if (!m) {
         continue;
       }
@@ -686,6 +719,7 @@ export function detectAgentClis(workspace) {
   return [...builtins, ...custom];
 }
 
+// biome-ignore lint/suspicious/useAwait: Registry validation may throw synchronously; callers use this as a Promise-returning allocation boundary.
 export async function assignPort(
   workspace,
   repo,
@@ -803,6 +837,7 @@ async function allocationListeners() {
       )
     );
   } catch {
+    // biome-ignore lint/style/useErrorCause: Listener probing intentionally maps all raw command failures to this sanitized state error.
     throw new StateError('STATE_UNREADABLE', 'ports', 'listener-observation');
   }
 }
@@ -859,7 +894,7 @@ export function loadAllSidecars(workspace, repo) {
 export function saveSidecars(workspace, repo, sidecars) {
   const normalized = sidecars.map((sidecar) => {
     const name = typeof sidecar.name === 'string' ? sidecar.name.trim() : '';
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    if (!sidecarNamePattern.test(name)) {
       throw Object.assign(
         new Error(
           'Sidecar name must use only letters, numbers, underscores, or hyphens'
@@ -1027,6 +1062,20 @@ function kebabSlug(s) {
     .replace(/^-+|-+$/g, '');
 }
 
+function uniqueSlugId(used, suppliedId, label, fallback) {
+  if (suppliedId && !used.has(suppliedId)) {
+    return suppliedId;
+  }
+  const base = kebabSlug(label) || fallback;
+  let id = base;
+  let suffix = 2;
+  while (used.has(id)) {
+    id = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
+
 export function loadCustomAgents(workspace) {
   return workspaceState(workspace).read('customAgents');
 }
@@ -1040,10 +1089,10 @@ export function loadCustomAgents(workspace) {
 // collision with a built-in would silently hijack that tool's entry.
 export function saveCustomAgents(workspace, agents) {
   const used = new Set(Object.keys(AGENT_CLIS));
-  const out = agents.map((a) => {
-    let id = a.id;
+  const out = agents.map(({ command, id: suppliedId, label }) => {
+    let id = suppliedId;
     if (!id || used.has(id)) {
-      const base = kebabSlug(a.label) || 'agent';
+      const base = kebabSlug(label) || 'agent';
       id = base;
       let n = 2;
       while (used.has(id)) {
@@ -1052,7 +1101,7 @@ export function saveCustomAgents(workspace, agents) {
       }
     }
     used.add(id);
-    return { command: a.command, id, label: a.label };
+    return { command, id, label };
   });
   return workspaceState(workspace).replace('customAgents', out);
 }
@@ -1065,6 +1114,43 @@ export function loadMcpServers(workspace) {
   return workspaceState(workspace).read('mcpServers');
 }
 
+function copyMcpServer(input, used) {
+  const {
+    args,
+    command,
+    env,
+    headers,
+    httpAuthMode,
+    id: suppliedId,
+    name,
+    transport,
+    url,
+  } = input;
+  const id = uniqueSlugId(used, suppliedId, name, 'mcp-server');
+  used.add(id);
+  const server = { id, name, transport };
+  if (transport === 'stdio') {
+    server.command = command;
+    if (args?.length) {
+      server.args = args;
+    }
+    if (env && Object.keys(env).length) {
+      server.env = env;
+    }
+  } else if (transport === 'http') {
+    server.url = url;
+    server.httpAuthMode = httpAuthMode === 'oauth' ? 'oauth' : 'headers';
+    if (
+      server.httpAuthMode === 'headers' &&
+      headers &&
+      Object.keys(headers).length
+    ) {
+      server.headers = headers;
+    }
+  }
+  return server;
+}
+
 // id is kept as-is when already unique (so editing a server's name doesn't
 // change its routing id), otherwise derived as a kebab slug of the name and
 // deduped against every other configured server's id. This id is load-bearing
@@ -1074,40 +1160,7 @@ export function loadMcpServers(workspace) {
 // spec-level redirect_uri_mismatch. Renaming a server only ever touches name.
 export function saveMcpServers(workspace, servers) {
   const used = new Set();
-  const out = servers.map((s) => {
-    let id = s.id;
-    if (!id || used.has(id)) {
-      const base = kebabSlug(s.name) || 'mcp-server';
-      id = base;
-      let n = 2;
-      while (used.has(id)) {
-        id = `${base}-${n}`;
-        n += 1;
-      }
-    }
-    used.add(id);
-    const server = { id, name: s.name, transport: s.transport };
-    if (s.transport === 'stdio') {
-      server.command = s.command;
-      if (s.args?.length) {
-        server.args = s.args;
-      }
-      if (s.env && Object.keys(s.env).length) {
-        server.env = s.env;
-      }
-    } else if (s.transport === 'http') {
-      server.url = s.url;
-      server.httpAuthMode = s.httpAuthMode === 'oauth' ? 'oauth' : 'headers';
-      if (
-        server.httpAuthMode === 'headers' &&
-        s.headers &&
-        Object.keys(s.headers).length
-      ) {
-        server.headers = s.headers;
-      }
-    }
-    return server;
-  });
+  const out = servers.map((server) => copyMcpServer(server, used));
   return workspaceState(workspace).replace('mcpServers', out);
 }
 
@@ -1198,7 +1251,7 @@ export function ensureSetuExcludes(repoDir) {
     }
     mkdirSync(dirname(exclude), { recursive: true });
   }
-  const existing = new Set(current.split(/\r?\n/));
+  const existing = new Set(current.split(lineBreakPattern));
   const missing = generated.filter((entry) => !existing.has(entry));
   if (missing.length) {
     writeFileSync(
@@ -1326,10 +1379,10 @@ export function engineCapacity() {
   if (res.status !== 0 || !res.stdout?.trim()) {
     return { cpus: null, memMb: null };
   }
-  const [cpus, memBytes] = res.stdout.trim().split('|');
+  const [engineCpus, engineMemBytes] = res.stdout.trim().split('|');
   return {
-    cpus: Number.parseInt(cpus, 10) || null,
-    memMb: memBytes ? Math.floor(+memBytes / 1024 / 1024) : null,
+    cpus: Number.parseInt(engineCpus, 10) || null,
+    memMb: engineMemBytes ? Math.floor(+engineMemBytes / 1024 / 1024) : null,
   };
 }
 
@@ -1480,7 +1533,7 @@ export function agentComposePath(wtDir) {
 function agentGitMounts(wtDir, registeredBareRepoDir) {
   const gitFile = join(wtDir, '.git');
   const gitPointer = readFileSync(gitFile, 'utf8').match(
-    /^gitdir:\s*(.+)\s*$/m
+    gitDirectoryPattern
   )?.[1];
   if (!gitPointer) {
     throw new Error(`Could not identify the Git admin directory for ${wtDir}`);
@@ -1696,10 +1749,10 @@ export function git(repoDir, args, opts = {}) {
 export async function gitFetchAsync(
   dir,
   args,
-  { spawn = (args, options) => Bun.spawn(args, options) } = {}
+  { spawn = (command, options) => Bun.spawn(command, options) } = {}
 ) {
-  const run = createCommandRunner((args, options) =>
-    spawn(args, { ...options, killSignal: 'SIGKILL' })
+  const run = createCommandRunner((command, options) =>
+    spawn(command, { ...options, killSignal: 'SIGKILL' })
   );
   const result = await run(['git', '-C', dir, ...args], { timeoutMs: 120_000 });
   if (result.code !== 0 || result.timedOut || result.truncated) {
@@ -1726,8 +1779,8 @@ export function branchExists(repoDir, name) {
 export function worktreeForBranch(repoDir, name) {
   const porcelain = git(repoDir, ['worktree', 'list', '--porcelain']);
   for (const entry of porcelain.trim().split('\n\n')) {
-    const path = entry.match(/^worktree (.+)$/m)?.[1];
-    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
+    const path = entry.match(worktreePathPattern)?.[1];
+    const branch = entry.match(worktreeBranchPattern)?.[1];
     if (branch === name) {
       return path;
     }
@@ -1747,8 +1800,8 @@ export function worktreeBranchMap(
 ) {
   const map = new Map();
   for (const entry of porcelain.trim().split('\n\n')) {
-    const path = entry.match(/^worktree (.+)$/m)?.[1];
-    const branch = entry.match(/^branch refs\/heads\/(.+)$/m)?.[1];
+    const path = entry.match(worktreePathPattern)?.[1];
+    const branch = entry.match(worktreeBranchPattern)?.[1];
     if (path && branch) {
       map.set(resolve(path), branch);
     }
@@ -1786,6 +1839,7 @@ async function runLocalGit(repoDir, args) {
 export async function baseBranchRefAsync(repoDir, { run = runLocalGit } = {}) {
   for (const ref of ['refs/heads/staging', 'refs/remotes/origin/staging']) {
     try {
+      // biome-ignore lint/performance/noAwaitInLoops: The staging probe must fall through from local to remote before resolving the HEAD fallback.
       await run(repoDir, ['show-ref', '--verify', '--quiet', ref]);
       return 'origin/staging';
     } catch {
@@ -1814,7 +1868,7 @@ export async function syncWithBase(
   } = {}
 ) {
   const base = await resolveBase(repoDir);
-  const branchName = base.replace(/^origin\//, '');
+  const branchName = base.replace(originPrefixPattern, '');
   // A detached worktree has no branch name; it cannot be the base branch.
   const checkedOut = (
     await runGit(wtDir, ['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(
@@ -1855,7 +1909,7 @@ export async function syncWithBase(
     const status = await runGit(wtDir, ['status', '--porcelain']);
     const conflicts = status
       .split('\n')
-      .filter((l) => /^(UU|AA|DD|AU|UA|UD|DU)/.test(l))
+      .filter((l) => mergeConflictPattern.test(l))
       .map((l) => l.slice(3).trim());
     // Only a real conflict leaves MERGE_HEAD behind — `merge --abort` itself
     // throws ("no merge to abort") if the failure was something else (e.g.
@@ -1897,10 +1951,11 @@ export async function syncWithBase(
 // ahead/behind are 0 if the repo has no reachable base (rare, but
 // for-each-ref degrades to blank fields rather than erroring per-branch).
 export function branchMetadata(repoDir, raw) {
-  if (raw === undefined) {
+  let metadata = raw;
+  if (metadata === undefined) {
     const base = baseBranchRef(repoDir);
     try {
-      raw = git(repoDir, [
+      metadata = git(repoDir, [
         'for-each-ref',
         `--format=%(refname:short)\t%(committerdate:unix)\t%(ahead-behind:${base})`,
         'refs/heads/',
@@ -1910,14 +1965,14 @@ export function branchMetadata(repoDir, raw) {
     }
   }
   const map = new Map();
-  for (const line of raw.trim().split('\n')) {
+  for (const line of metadata.trim().split('\n')) {
     if (!line) {
       continue;
     }
     const [branch, at, ab] = line.split('\t');
     const [ahead, behind] = (ab ?? '')
       .trim()
-      .split(/\s+/)
+      .split(whitespacePattern)
       .map((n) => Number.parseInt(n, 10) || 0);
     map.set(branch, {
       ahead: ahead ?? 0,
@@ -1985,6 +2040,7 @@ export function syncIncludedFiles(mainDir, wtDir, globs) {
 
 // Creates worktree + port + envrc + caddy + env symlink + hosts. Dependency
 // install is the caller's job (CLI runs it inline, portal in the background).
+// biome-ignore lint/suspicious/useAwait: Target-lock validation may throw synchronously; callers require this exported creation API to reject instead.
 export async function createWorktree(
   c,
   repo,
@@ -2122,7 +2178,7 @@ export async function assertRemovableWorktree(
     .split('\0')
     .filter((entry) => entry.startsWith('!! '))
     .map((entry) => entry.slice(3))
-    .filter((path) => /^\.env/.test(path.split('/').at(-1)))
+    .filter((path) => environmentFilePattern.test(path.split('/').at(-1)))
     .filter((path) => !path.split('/').includes('node_modules'))
     .filter((path) => {
       try {
@@ -2163,6 +2219,7 @@ export async function assertRemovableWorktree(
   }
 }
 
+// biome-ignore lint/suspicious/useAwait: This legacy exported boundary must reject with PORTAL_REQUIRED, not throw synchronously.
 export async function removeWorktree() {
   throw Object.assign(
     new Error(
@@ -2226,9 +2283,9 @@ function deriveSweepName(remoteUrl, dirName) {
   }
   const slug = remoteUrl
     .trim()
-    .replace(/^\w+:\/\/[^/]+\//, '')
-    .replace(/^[^@\s]+@[^:]+:/, '')
-    .replace(/\.git$/, '');
+    .replace(remoteUrlSchemePattern, '')
+    .replace(remoteUrlSshPattern, '')
+    .replace(remoteUrlGitSuffixPattern, '');
   return slug.split('/').pop() || dirName;
 }
 
@@ -2310,7 +2367,7 @@ function readDirty(dir) {
 // CLI path: execFileSync, synchronous throughout. Blocking is fine here —
 // this only runs when someone explicitly types `setu sweep`.
 export function discoverRepos(homeDir) {
-  const workspace = loadConfig().workspace;
+  const { workspace } = loadConfig();
   const projects = workspace ? loadProjects(workspace) : {};
   const registeredRemotes = new Set(
     Object.keys(projects)
@@ -2365,6 +2422,7 @@ export function discoverRepos(homeDir) {
 async function batchMap(items, size, fn) {
   const out = [];
   for (let i = 0; i < items.length; i += size) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each bounded concurrent chunk must finish before launching the next to enforce the process cap.
     out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
   }
   return out;
@@ -2425,7 +2483,7 @@ async function readDirtyAsync(dir) {
 // parallel — a dozens-of-candidates home directory can otherwise spawn 100+
 // processes at once.
 export async function discoverReposAsync(homeDir) {
-  const workspace = loadConfig().workspace;
+  const { workspace } = loadConfig();
   const projects = workspace ? loadProjects(workspace) : {};
   const registeredRemotes = new Set(
     (
@@ -2552,7 +2610,7 @@ export async function writeSetuAgentMarkers(
     ? readFileSync(agentsPath, 'utf8')
     : '';
   if (!existing.includes(SETU_AGENTS_SECTION_MARKER)) {
-    const trimmed = existing.replace(/\s*$/, '');
+    const trimmed = existing.replace(trailingWhitespacePattern, '');
     writeFileSync(
       agentsPath,
       (trimmed ? `${trimmed}\n\n` : '') + setuAgentsSection(repo)
@@ -2575,6 +2633,7 @@ export async function writeSetuAgentMarkers(
 // createWorktree needs it — same convention createWorktree/removeWorktree
 // above already use. Never touches whatever directory the caller discovered
 // remoteUrl from: this always clones fresh into workspace/<name>.git.
+// biome-ignore lint/suspicious/useAwait: Target-lock validation may throw synchronously; callers require this exported import API to reject instead.
 export async function importRepo(
   c,
   { name, remoteUrl, label = '' },
@@ -2594,9 +2653,7 @@ export async function importRepo(
       }
       const repoDir = join(c.workspace, `${name}.git`);
       await assertStorageHeadroom(c.workspace, readStorage);
-      const ghSlug =
-        remoteUrl?.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ??
-        '';
+      const ghSlug = remoteUrl?.match(githubSlugPattern)?.[1] ?? '';
 
       if (!existsSync(repoDir)) {
         if (!remoteUrl) {

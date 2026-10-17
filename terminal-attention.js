@@ -2,6 +2,8 @@
 
 const DEFAULT_LIMIT = 100;
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
+const launchTokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
+const unsafeTextPattern = /[\0\r\n]/;
 
 export const attentionHookEvents = {
   'claude-code': [
@@ -21,7 +23,7 @@ export const terminalFocusRequirements = {
 };
 
 function validLaunchToken(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(value);
+  return typeof value === 'string' && launchTokenPattern.test(value);
 }
 
 function validSessionId(value) {
@@ -30,7 +32,9 @@ function validSessionId(value) {
 
 function validText(value) {
   return (
-    typeof value === 'string' && value.length > 0 && !/[\0\r\n]/.test(value)
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !unsafeTextPattern.test(value)
   );
 }
 
@@ -100,7 +104,7 @@ function attentionEvents(document) {
   if (!Object.hasOwn(document ?? {}, 'events')) {
     return { ok: true, value: [] };
   }
-  const events = document.events;
+  const { events } = document;
   return Array.isArray(events) && events.every(validEvent)
     ? { ok: true, value: events }
     : { ok: false };
@@ -274,12 +278,15 @@ export function createTerminalAttention({
   const maxEvents =
     Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_LIMIT;
   const expiry = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
-  const parse = (provider, payload) =>
-    provider === 'claude-code'
-      ? parseClaudeCodeAttentionHook(payload)
-      : provider === 'codex'
-        ? parseCodexAttentionHook(payload)
-        : null;
+  const parse = (provider, payload) => {
+    if (provider === 'claude-code') {
+      return parseClaudeCodeAttentionHook(payload);
+    }
+    if (provider === 'codex') {
+      return parseCodexAttentionHook(payload);
+    }
+    return null;
+  };
 
   async function receive({ provider, payload }) {
     const at = clock();

@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
 import { observeProcessIdentity } from './process-observation.js';
 
+const processStartPattern = /\d{2}:\d{2}:\d{2} \d{4}$/;
+
 test('process observation distinguishes proven absence, unknown access and a stable start identity without signalling', async () => {
   const calls = [];
   const options = {
@@ -17,7 +19,9 @@ test('process observation distinguishes proven absence, unknown access and a sta
     await observeProcessIdentity(321, {
       ...options,
       signal: () => {
-        throw Object.assign(new Error(), { code: 'ESRCH' });
+        throw Object.assign(new Error('fixture signal refused'), {
+          code: 'ESRCH',
+        });
       },
     })
   ).toEqual({ state: 'absent' });
@@ -25,7 +29,9 @@ test('process observation distinguishes proven absence, unknown access and a sta
     await observeProcessIdentity(321, {
       ...options,
       signal: () => {
-        throw Object.assign(new Error(), { code: 'EPERM' });
+        throw Object.assign(new Error('fixture signal refused'), {
+          code: 'EPERM',
+        });
       },
     })
   ).toEqual({ state: 'unknown' });
@@ -40,5 +46,5 @@ test('process observation distinguishes proven absence, unknown access and a sta
 test('the native observation adapter reads only the current isolated test process', async () => {
   const result = await observeProcessIdentity(process.pid);
   expect(result).toMatchObject({ processId: process.pid, state: 'alive' });
-  expect(result.processStartIdentity).toMatch(/\d{2}:\d{2}:\d{2} \d{4}$/);
+  expect(result.processStartIdentity).toMatch(processStartPattern);
 });

@@ -9,13 +9,19 @@ export const DEFAULT_LOW_STORAGE_FLOOR_BYTES = 20 * 1024 ** 3;
 const ADMISSION_DOCUMENT = 'resourceAdmission';
 const KINDS = new Set(['install', 'session', 'headless-run']);
 const MANAGED_SESSION_KINDS = new Set(['session', 'headless-run']);
+const safeIdPattern = /^[a-zA-Z0-9_-]{1,128}$/;
+const unsafePartPattern = /[/\\:\s]/;
 const plainObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const safeId = (value) =>
-  typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
+  typeof value === 'string' && safeIdPattern.test(value);
+const hasAsciiControlCharacter = (value) =>
+  [...value].some((character) => character.codePointAt(0) <= 0x20);
 const safePart = (value) =>
   typeof value === 'string' &&
-  /^[^/\\\s:\x00-\x20]+$/.test(value) &&
+  value.length > 0 &&
+  !unsafePartPattern.test(value) &&
+  !hasAsciiControlCharacter(value) &&
   !['.', '..'].includes(value) &&
   !value.startsWith('-');
 
@@ -185,7 +191,9 @@ export function createResourceAdmission({
         observed.processStartIdentity
         ? { pid: process.pid, processStart: observed.processStartIdentity }
         : undefined;
-    } catch {}
+    } catch {
+      // An unconfirmed owner identity must not admit managed work.
+    }
   }
 
   async function freshStorage() {
@@ -219,6 +227,59 @@ export function createResourceAdmission({
       );
     }
     return { ok: true };
+  }
+
+  async function existingAdmission(existing, candidate, callerOwner) {
+    if (
+      existing.kind !== candidate.kind ||
+      !sameTarget(existing.target, candidate.target)
+    ) {
+      return refusal(
+        'OPERATION_ID_CONFLICT',
+        'This operation id already owns a different admission lease.'
+      );
+    }
+    const existingLease = await view(existing, observeProcess);
+    if (sameOwner(existing.owner, callerOwner)) {
+      return Object.freeze({ existing: true, lease: existingLease, ok: true });
+    }
+    return existingLease.ownership === 'uncertain'
+      ? refusal(
+          'LEASE_UNCERTAIN',
+          'This operation lease has an unconfirmed owner and needs recovery.',
+          { lease: existingLease }
+        )
+      : refusal(
+          'LEASE_OWNED_BY_ANOTHER',
+          'This operation id is owned by another managed operation.',
+          { lease: existingLease }
+        );
+  }
+
+  function capacityRefusal(candidate, leases) {
+    const active = Object.values(leases);
+    if (
+      candidate.kind === 'install' &&
+      active.some((activeLease) => activeLease.kind === 'install')
+    ) {
+      return refusal(
+        'INSTALL_IN_PROGRESS',
+        'Another managed dependency installation holds the shared install lane.'
+      );
+    }
+    if (
+      MANAGED_SESSION_KINDS.has(candidate.kind) &&
+      active.filter((activeLease) =>
+        MANAGED_SESSION_KINDS.has(activeLease.kind)
+      ).length >= configured.maxManagedSessions
+    ) {
+      return refusal(
+        'SESSION_CAPACITY_REACHED',
+        'The managed session limit has been reached.',
+        { reason: 'session-capacity' }
+      );
+    }
+    return null;
   }
 
   async function admit(request) {
@@ -259,59 +320,12 @@ export function createResourceAdmission({
         }
         const existing = leases[candidate.operationId];
         if (existing) {
-          if (
-            existing.kind === candidate.kind &&
-            sameTarget(existing.target, candidate.target)
-          ) {
-            const existingLease = await view(existing, observeProcess);
-            if (sameOwner(existing.owner, callerOwner)) {
-              result = Object.freeze({
-                existing: true,
-                lease: existingLease,
-                ok: true,
-              });
-            } else if (existingLease.ownership === 'uncertain') {
-              result = refusal(
-                'LEASE_UNCERTAIN',
-                'This operation lease has an unconfirmed owner and needs recovery.',
-                { lease: existingLease }
-              );
-            } else {
-              result = refusal(
-                'LEASE_OWNED_BY_ANOTHER',
-                'This operation id is owned by another managed operation.',
-                { lease: existingLease }
-              );
-            }
-          } else {
-            result = refusal(
-              'OPERATION_ID_CONFLICT',
-              'This operation id already owns a different admission lease.'
-            );
-          }
+          result = await existingAdmission(existing, candidate, callerOwner);
           return document;
         }
-        const active = Object.values(leases);
-        if (
-          candidate.kind === 'install' &&
-          active.some((lease) => lease.kind === 'install')
-        ) {
-          result = refusal(
-            'INSTALL_IN_PROGRESS',
-            'Another managed dependency installation holds the shared install lane.'
-          );
-          return document;
-        }
-        if (
-          MANAGED_SESSION_KINDS.has(candidate.kind) &&
-          active.filter((lease) => MANAGED_SESSION_KINDS.has(lease.kind))
-            .length >= configured.maxManagedSessions
-        ) {
-          result = refusal(
-            'SESSION_CAPACITY_REACHED',
-            'The managed session limit has been reached.',
-            { reason: 'session-capacity' }
-          );
+        const capacity = capacityRefusal(candidate, leases);
+        if (capacity) {
+          result = capacity;
           return document;
         }
         const acquiredAt = now();

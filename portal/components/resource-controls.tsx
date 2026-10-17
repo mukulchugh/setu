@@ -1,5 +1,6 @@
 // Worktree-scoped operational controls. Reads begin only after a user opens the
 // relevant disclosure; mutations stay separate from their review state.
+import type { ComponentChildren } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import { post } from '../api';
 import { formatStorageBytes } from '../host-storage';
@@ -123,7 +124,10 @@ export function createReviewGeneration() {
   return {
     begin: () => value,
     current: () => value,
-    invalidate: () => ++value,
+    invalidate: () => {
+      value += 1;
+      return value;
+    },
     isCurrent: (candidate: number) => candidate === value,
   };
 }
@@ -188,6 +192,45 @@ function stateTone(value: unknown): Tone {
   return state === 'unknown' || state === 'partial' || state === 'queued'
     ? 'amber'
     : 'zinc';
+}
+
+function sessionEndState(session: Record<string, unknown>) {
+  if (session.ownership !== 'owned') {
+    return 'ownership unknown';
+  }
+  if (session.state !== 'running') {
+    return 'not running';
+  }
+  return 'cannot end';
+}
+
+function cleanupExecuteLabel(
+  busy: 'prepare' | 'execute' | null,
+  retry: unknown
+) {
+  if (busy === 'execute') {
+    return 'Executing…';
+  }
+  if (retry) {
+    return 'Confirm retry';
+  }
+  return 'Execute approved cleanup';
+}
+
+function workflowDispatchLabel(
+  busy: 'review' | 'dispatch' | null,
+  confirmation: string | null
+) {
+  if (busy === 'review') {
+    return 'Reviewing…';
+  }
+  if (busy === 'dispatch') {
+    return 'Dispatching…';
+  }
+  if (confirmation) {
+    return 'Confirm dispatch';
+  }
+  return 'Review dispatch';
 }
 
 function ResultState({ value }: { value: ResourceResult | undefined }) {
@@ -518,11 +561,11 @@ function DependencyControls({ repo, name, toast }: TargetProps) {
   );
 }
 
-type TargetProps = {
-  repo: string;
+interface TargetProps {
   name: string;
+  repo: string;
   toast: (message: string, tone?: Tone) => void;
-};
+}
 
 function OperationsControls({ repo, name }: TargetProps) {
   const operations = useVisiblePoll(
@@ -586,7 +629,7 @@ function OperationsControls({ repo, name }: TargetProps) {
               </p>
             </div>
           )}
-          {leases.length ? (
+          {leases.length > 0 && (
             <ul class="space-y-2 text-xs">
               {leases.map((lease) => (
                 <li key={text(lease.operationId, text(lease.id))}>
@@ -600,9 +643,10 @@ function OperationsControls({ repo, name }: TargetProps) {
                 </li>
               ))}
             </ul>
-          ) : admission.data?.ok ? (
+          )}
+          {leases.length === 0 && admission.data?.ok && (
             <p class="text-xs text-zinc-500">No active admission leases.</p>
-          ) : null}
+          )}
         </div>
       </div>
     </Section>
@@ -617,8 +661,8 @@ function SessionControls({ repo, name, toast }: TargetProps) {
   const [endReview, setEndReview] = useState<string | null>(null);
   const sessions = read.data?.ok ? array(read.data.sessions) : [];
   async function end(session: Record<string, unknown>) {
-    const id = text(session.id, '');
-    const checkoutIdentity = session.checkoutIdentity;
+    const { checkoutIdentity, id: sessionId } = session;
+    const id = text(sessionId, '');
     if (!(id && checkoutIdentity) || ending) {
       return;
     }
@@ -652,6 +696,46 @@ function SessionControls({ repo, name, toast }: TargetProps) {
               session.ownership === 'owned' &&
               session.state === 'running' &&
               !!session.checkoutIdentity;
+            let sessionAction: ComponentChildren;
+            if (canEnd) {
+              if (endReview === id) {
+                sessionAction = (
+                  <span class="flex items-center gap-2">
+                    <Badge tone="amber">End this session?</Badge>
+                    <Button
+                      compact
+                      disabled={ending !== null}
+                      onClick={() => end(session)}
+                    >
+                      {ending === id ? 'Ending…' : 'Confirm end'}
+                    </Button>
+                    <Button
+                      compact
+                      disabled={ending !== null}
+                      onClick={() => setEndReview(null)}
+                      variant="secondary"
+                    >
+                      Cancel
+                    </Button>
+                  </span>
+                );
+              } else {
+                sessionAction = (
+                  <Button
+                    compact
+                    disabled={ending !== null}
+                    onClick={() => setEndReview(id)}
+                    variant="secondary"
+                  >
+                    End
+                  </Button>
+                );
+              }
+            } else {
+              sessionAction = (
+                <Badge tone="amber">{sessionEndState(session)}</Badge>
+              );
+            }
             return (
               <li
                 class="flex flex-wrap items-center justify-between gap-2 py-2"
@@ -661,45 +745,7 @@ function SessionControls({ repo, name, toast }: TargetProps) {
                   <span class="font-mono">{text(session.tool)}</span> ·{' '}
                   {text(session.state)} · {id}
                 </span>
-                {canEnd ? (
-                  endReview === id ? (
-                    <span class="flex items-center gap-2">
-                      <Badge tone="amber">End this session?</Badge>
-                      <Button
-                        compact
-                        disabled={ending !== null}
-                        onClick={() => end(session)}
-                      >
-                        {ending === id ? 'Ending…' : 'Confirm end'}
-                      </Button>
-                      <Button
-                        compact
-                        disabled={ending !== null}
-                        onClick={() => setEndReview(null)}
-                        variant="secondary"
-                      >
-                        Cancel
-                      </Button>
-                    </span>
-                  ) : (
-                    <Button
-                      compact
-                      disabled={ending !== null}
-                      onClick={() => setEndReview(id)}
-                      variant="secondary"
-                    >
-                      End
-                    </Button>
-                  )
-                ) : (
-                  <Badge tone="amber">
-                    {session.ownership === 'owned'
-                      ? session.state === 'running'
-                        ? 'cannot end'
-                        : 'not running'
-                      : 'ownership unknown'}
-                  </Badge>
-                )}
+                {sessionAction}
               </li>
             );
           })}
@@ -823,11 +869,7 @@ function CleanupControls({ repo, name, toast }: TargetProps) {
               </Button>
             ) : (
               <Button compact disabled={busy !== null} onClick={execute}>
-                {busy === 'execute'
-                  ? 'Executing…'
-                  : retry
-                    ? 'Confirm retry'
-                    : 'Execute approved cleanup'}
+                {cleanupExecuteLabel(busy, retry)}
               </Button>
             )}
             <Button
@@ -872,8 +914,7 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
   const records = setup.data?.ok ? array(setup.data.records) : [];
   const events = attention.data?.ok ? array(attention.data.events) : [];
   async function retry(entry: Record<string, unknown>) {
-    const attemptId = entry.attemptId;
-    const checkoutIdentity = entry.checkoutIdentity;
+    const { attemptId, checkoutIdentity } = entry;
     if (!(typeof attemptId === 'string' && checkoutIdentity) || busy) {
       return;
     }
@@ -1305,29 +1346,27 @@ function McpActionsControls({ toast }: { toast: TargetProps['toast'] }) {
 
 export function WorktreeResourceControls(props: TargetProps) {
   return (
-    <>
-      <DeferredDetails label="Storage, sessions & operations">
-        {(open) =>
-          open ? (
-            <div key={`${props.repo}/${props.name}`}>
-              <StorageControls {...props} />
-              <DependencyControls {...props} />
-              <OperationsControls {...props} />
-              <SessionControls {...props} />
-              <CleanupControls {...props} />
-              <SetupAttentionControls {...props} />
-              <HeadlessControls {...props} />
-              <McpActionsControls toast={props.toast} />
-            </div>
-          ) : (
-            <p class="text-xs text-zinc-500">
-              Open to load worktree resource status. No storage scan runs until
-              you choose Inspect.
-            </p>
-          )
-        }
-      </DeferredDetails>
-    </>
+    <DeferredDetails label="Storage, sessions & operations">
+      {(open) =>
+        open ? (
+          <div key={`${props.repo}/${props.name}`}>
+            <StorageControls {...props} />
+            <DependencyControls {...props} />
+            <OperationsControls {...props} />
+            <SessionControls {...props} />
+            <CleanupControls {...props} />
+            <SetupAttentionControls {...props} />
+            <HeadlessControls {...props} />
+            <McpActionsControls toast={props.toast} />
+          </div>
+        ) : (
+          <p class="text-xs text-zinc-500">
+            Open to load worktree resource status. No storage scan runs until
+            you choose Inspect.
+          </p>
+        )
+      }
+    </DeferredDetails>
   );
 }
 
@@ -1413,7 +1452,10 @@ function PrReviewHandoffContents({
     (signal) =>
       readResource(resourceReadUrl('/api/agent-sessions', repo, name), signal)
   );
-  const [artifactSkill, setArtifactSkill] = useState(artifacts[0]?.skill ?? '');
+  const [artifactSkill, setArtifactSkill] = useState(
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: PrReviewSection's artifact flatMap may legitimately supply an empty API-derived list.
+    artifacts[0]?.skill ?? ''
+  );
   const [sessionId, setSessionId] = useState('');
   const [findings, setFindings] = useState('');
   const [review, setReview] = useState<string | null>(null);
@@ -1713,13 +1755,7 @@ function GithubWorkflowContents({ repo, name, toast }: TargetProps) {
           onClick={dispatch}
           variant={confirmation ? 'primary' : 'secondary'}
         >
-          {busy === 'review'
-            ? 'Reviewing…'
-            : busy === 'dispatch'
-              ? 'Dispatching…'
-              : confirmation
-                ? 'Confirm dispatch'
-                : 'Review dispatch'}
+          {workflowDispatchLabel(busy, confirmation)}
         </Button>
       </div>
       {recent.length ? (

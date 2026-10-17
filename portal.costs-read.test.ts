@@ -1,16 +1,17 @@
 import { expect, test } from 'bun:test';
 import { parseCostsSummary } from './portal/costs-read';
+
 const summary = () => ({
   anthropic: {
-    provider: 'anthropic',
+    byModel: [],
     configured: true,
+    provider: 'anthropic',
     totalCostUsd: 0,
     windowDays: 30,
-    byModel: [],
   },
-  openai: { provider: 'openai', configured: false, reason: 'Not configured' },
-  gemini: { provider: 'gemini', configured: false, reason: 'Detection only' },
   budgets: null,
+  gemini: { configured: false, provider: 'gemini', reason: 'Detection only' },
+  openai: { configured: false, provider: 'openai', reason: 'Not configured' },
 });
 
 test('zero reported spend is distinct from unconfigured or unavailable provider totals', () => {
@@ -28,17 +29,17 @@ test('malformed refresh cannot replace the previous provider summary', () => {
     {
       ...summary(),
       anthropic: {
-        provider: 'anthropic',
         configured: true,
+        provider: 'anthropic',
         totalCostUsd: '12',
       },
     },
     {
       ...summary(),
       anthropic: {
-        provider: 'anthropic',
+        byModel: [{ costUsd: null, model: 'model' }],
         configured: true,
-        byModel: [{ model: 'model', costUsd: null }],
+        provider: 'anthropic',
       },
     },
     {
@@ -50,7 +51,7 @@ test('malformed refresh cannot replace the previous provider summary', () => {
     {
       ...summary(),
       budgets: {
-        daily: { limit: 20, spent: 1, status: 'ok', incomplete: 'false' },
+        daily: { incomplete: 'false', limit: 20, spent: 1, status: 'ok' },
       },
     },
   ]) {
@@ -61,13 +62,13 @@ test('malformed refresh cannot replace the previous provider summary', () => {
 test('partial provider errors and incomplete budgets stay visible, without inventing zero totals', () => {
   const value = {
     ...summary(),
+    budgets: {
+      daily: { incomplete: true, limit: 20, spent: 2, status: 'incomplete' },
+    },
     openai: {
-      provider: 'openai',
       configured: true,
       error: 'Provider unavailable',
-    },
-    budgets: {
-      daily: { limit: 20, spent: 2, status: 'incomplete', incomplete: true },
+      provider: 'openai',
     },
   };
   expect(parseCostsSummary(value)).toBe(value);

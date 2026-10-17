@@ -25,10 +25,18 @@ test('duplicate log subscription does not leak a timer or subscriber count', asy
       clearInterval: () => {
         cleared += 1;
       },
-      setInterval: () => ++timers,
+      setInterval: () => {
+        timers += 1;
+        return timers;
+      },
     },
   });
-  const ws = { data: new Set(), send() {}, subscribe() {}, unsubscribe() {} };
+  const ws = {
+    data: new Set(),
+    send: () => undefined,
+    subscribe: () => undefined,
+    unsubscribe: () => undefined,
+  };
   portal.wsSubscribeLog(ws, 'logs:r/a/dev');
   portal.wsSubscribeLog(ws, 'logs:r/a/dev');
   expect(timers).toBe(1);
@@ -66,6 +74,7 @@ test('GitHub cache misses share work and never exceed four concurrent requests',
   expect(gates).toHaveLength(4);
   for (let index = 0; index < 6; index += 1) {
     gates[index].resolve('{"number":1,"state":"OPEN"}');
+    // biome-ignore lint/performance/noAwaitInLoops: Resolve and drain each request gate before advancing the next queued request.
     await Promise.resolve();
     await Promise.resolve();
   }
@@ -96,6 +105,7 @@ test('concurrent worktree reads share one computation and clear after completion
 test('metadata refresh deduplicates asynchronous Git reads and reuses the shared parsers', async () => {
   let calls = 0;
   const portal = await runtime({
+    // biome-ignore lint/suspicious/useAwait: Git probe fixtures preserve rejected assertion failures at the subprocess promise boundary.
     spawnText: async (args) => {
       calls += 1;
       if (args.includes('symbolic-ref')) {
@@ -171,6 +181,7 @@ test('real detached process and child both exit on Stop without a listening port
     const reader = proc.stdout.getReader();
     let output = '';
     while (output.trim().split('\n').length < 2) {
+      // biome-ignore lint/performance/noAwaitInLoops: Read successive stream chunks until both child process identities have arrived.
       const { value, done } = await reader.read();
       if (done) {
         break;
@@ -187,6 +198,8 @@ test('real detached process and child both exit on Stop without a listening port
       if (alive(-proc.pid)) {
         process.kill(-proc.pid, 'SIGKILL');
       }
-    } catch {}
+    } catch {
+      // Cleanup is best-effort after a failed assertion or shutdown.
+    }
   }
 }, 10_000);

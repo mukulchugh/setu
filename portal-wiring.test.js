@@ -33,9 +33,13 @@ function fixture(overrides = {}) {
     },
     events: {
       list: () => ({ events, ok: true }),
-      record: async (event) => {
-        events.push(event);
-        return { event, ok: true };
+      record: (event) => {
+        try {
+          events.push(event);
+          return Promise.resolve({ event, ok: true });
+        } catch (error) {
+          return Promise.reject(error);
+        }
       },
     },
     github: {
@@ -140,9 +144,9 @@ test('portal wiring GET helpers remain reads and do not inspect storage', async 
   let inspected = 0;
   const { wiring } = fixture({
     storage: {
-      inspect: async () => {
+      inspect: () => {
         inspected += 1;
-        return [];
+        return Promise.resolve([]);
       },
       readAll: () => [],
       roots: () => [],
@@ -160,9 +164,7 @@ test('operation recorder failure does not mask a known target result', async () 
   const { wiring } = fixture({
     events: {
       list: () => ({ events: [], ok: true }),
-      record: async () => {
-        throw new Error('state unavailable');
-      },
+      record: () => Promise.reject(new Error('state unavailable')),
     },
   });
   await expect(
@@ -206,7 +208,7 @@ test('a selected worktree filters the durable event query before its result limi
           target: { name, repo: 'r' },
         })),
       }),
-      update: async () => {},
+      update: () => Promise.resolve(),
     },
   });
   const { wiring } = fixture({ events });

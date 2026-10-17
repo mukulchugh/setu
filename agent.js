@@ -93,7 +93,7 @@ export const AGENT_ADAPTERS = {
   },
 };
 
-async function sandcastle() {
+function sandcastle() {
   return import('@ai-hero/sandcastle');
 }
 
@@ -570,7 +570,9 @@ export async function runAgent({
     try {
       const timeoutResult = new Promise((_, reject) => {
         timeoutId = setTimeout(() => {
-          void Promise.resolve(stopContainer()).catch(() => {});
+          Promise.resolve(stopContainer()).catch(() => {
+            // The timeout result remains authoritative if best-effort cleanup fails.
+          });
           reject(
             new Error(`Agent run exceeded ${RUN_TIMEOUT_MS}ms wall-clock limit`)
           );

@@ -100,8 +100,8 @@ export function createPortalUpdateControl({
     }
     owner = {
       lifecycleToken: result.token,
-      reopening: false,
       ownerProcessId: body?.ownerProcessId,
+      reopening: false,
       stopping: false,
       token,
     };
@@ -154,6 +154,7 @@ export function createPortalUpdateControl({
         "Only this portal instance's cutover owner may stop it"
       );
     }
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: A prior request can set the mutable closure's stopping flag before this same owner retries prepareStop.
     if (owner.stopping) {
       return envelope({ ok: true });
     }

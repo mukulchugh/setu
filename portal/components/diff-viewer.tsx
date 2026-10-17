@@ -2,6 +2,7 @@
 // computeDiff/parseUnifiedDiff for the backend half) and renders it. Manual
 // refresh and visibility resume, no interval poll: unlike LiveLog above, this isn't a stream
 // to watch, it's a "let me look at what changed" snapshot.
+import type { ComponentChildren } from 'preact';
 import { useEffect, useId, useState } from 'preact/hooks';
 import { Badge } from '../ui/badge';
 import { IconButton } from '../ui/button';
@@ -124,6 +125,58 @@ function HunkBlock({ hunk }: { hunk: DiffHunk }) {
 // index first, not everything unrolled); 1-2 files is the whole point of
 // opening this view, so they start open.
 const AUTO_EXPAND_MAX_FILES = 2;
+const ORIGIN_PREFIX_PATTERN = /^origin\//;
+
+function DiffHeaderText({
+  data,
+  loading,
+}: {
+  data: DiffResponse | undefined;
+  loading: boolean;
+}) {
+  if (data) {
+    if (data.baseResolved) {
+      return (
+        <>
+          {data.committed.totalFiles + data.uncommitted.totalFiles} file
+          {data.committed.totalFiles + data.uncommitted.totalFiles === 1
+            ? ''
+            : 's'}{' '}
+          changed ·{' '}
+          <span class="text-signal-green">
+            +{data.committed.additions + data.uncommitted.additions}
+          </span>{' '}
+          <span class="text-signal-red">
+            -{data.committed.deletions + data.uncommitted.deletions}
+          </span>
+        </>
+      );
+    }
+    return (
+      <>
+        {data.uncommitted.totalFiles} uncommitted file
+        {data.uncommitted.totalFiles === 1 ? '' : 's'} changed ·{' '}
+        <span class="text-signal-green">+{data.uncommitted.additions}</span>{' '}
+        <span class="text-signal-red">-{data.uncommitted.deletions}</span> (base
+        unresolved, committed diff unavailable)
+      </>
+    );
+  }
+  if (loading) {
+    return 'Loading…';
+  }
+  return ' ';
+}
+
+function untrackedFootnoteText(untracked: string[], dirty?: number | null) {
+  if (untracked.length > 0) {
+    const remaining = untracked.length - 10;
+    return `Untracked: ${untracked.slice(0, 10).join(', ')}${remaining > 0 ? ` and ${remaining} more` : ''}`;
+  }
+  if (dirty === null) {
+    return 'Working tree status is unknown.';
+  }
+}
 
 function FileRow({
   f,
@@ -136,6 +189,23 @@ function FileRow({
 }) {
   const collapsible = !(f.binary || f.tooLarge) && f.hunks.length > 0;
   const panelId = useId();
+  let fileSummary: ComponentChildren;
+  if (f.binary) {
+    fileSummary = <Badge tone="zinc">binary</Badge>;
+  } else if (f.tooLarge) {
+    fileSummary = (
+      <Badge tip="Hunk content skipped past the size guard" tone="amber">
+        {f.additions + f.deletions} lines
+      </Badge>
+    );
+  } else {
+    fileSummary = (
+      <>
+        <Badge tone="emerald">+{f.additions}</Badge>
+        <Badge tone="red">-{f.deletions}</Badge>
+      </>
+    );
+  }
   return (
     <div class="border-zinc-100 border-b last:border-0 dark:border-zinc-800">
       <button
@@ -154,18 +224,7 @@ function FileRow({
         <span class="min-w-0 flex-1 break-words font-mono text-zinc-700 dark:text-zinc-300">
           {f.file}
         </span>
-        {f.binary ? (
-          <Badge tone="zinc">binary</Badge>
-        ) : f.tooLarge ? (
-          <Badge tip="Hunk content skipped past the size guard" tone="amber">
-            {f.additions + f.deletions} lines
-          </Badge>
-        ) : (
-          <>
-            <Badge tone="emerald">+{f.additions}</Badge>
-            <Badge tone="red">-{f.deletions}</Badge>
-          </>
-        )}
+        {fileSummary}
       </button>
       {f.binary && (
         <div class="-mt-1 px-3 pb-2 text-xs text-zinc-400">
@@ -210,6 +269,36 @@ function DiffGroupSection({
   onToggleOpen: () => void;
 }) {
   const panelId = useId();
+  let groupBody: ComponentChildren;
+  if (open) {
+    if (warning) {
+      groupBody = <p class="pl-5 text-signal-red text-xs">{warning}</p>;
+    } else if (group.files.length === 0) {
+      groupBody = <p class="pl-5 text-xs text-zinc-400">{emptyText}</p>;
+    } else {
+      groupBody = (
+        <div class="rounded-none border border-zinc-200 dark:border-zinc-800">
+          {group.files.map((f, i) => (
+            // Index, not f.file: a rename plus an unrelated file sharing
+            // that same new path elsewhere in the group would otherwise
+            // collide (parser sets `file` from the "+++ b/" side).
+            <FileRow
+              expanded={!!expanded[`${groupKey}:${f.file}`]}
+              f={f}
+              key={i}
+              onToggle={() => onToggleFile(`${groupKey}:${f.file}`)}
+            />
+          ))}
+          {group.truncatedFileCount > 0 && (
+            <p class="px-3 py-2 text-xs text-zinc-400">
+              +{group.truncatedFileCount} more file
+              {group.truncatedFileCount === 1 ? '' : 's'} not shown
+            </p>
+          )}
+        </div>
+      );
+    }
+  }
   return (
     <div class="mb-4 last:mb-0">
       <h3>
@@ -236,31 +325,7 @@ function DiffGroupSection({
       <div hidden={!open} id={panelId}>
         {open && (
           <>
-            {warning ? (
-              <p class="pl-5 text-signal-red text-xs">{warning}</p>
-            ) : group.files.length === 0 ? (
-              <p class="pl-5 text-xs text-zinc-400">{emptyText}</p>
-            ) : (
-              <div class="rounded-none border border-zinc-200 dark:border-zinc-800">
-                {group.files.map((f, i) => (
-                  // Index, not f.file: a rename plus an unrelated file sharing
-                  // that same new path elsewhere in the group would otherwise
-                  // collide (parser sets `file` from the "+++ b/" side).
-                  <FileRow
-                    expanded={!!expanded[`${groupKey}:${f.file}`]}
-                    f={f}
-                    key={i}
-                    onToggle={() => onToggleFile(`${groupKey}:${f.file}`)}
-                  />
-                ))}
-                {group.truncatedFileCount > 0 && (
-                  <p class="px-3 py-2 text-xs text-zinc-400">
-                    +{group.truncatedFileCount} more file
-                    {group.truncatedFileCount === 1 ? '' : 's'} not shown
-                  </p>
-                )}
-              </div>
-            )}
+            {groupBody}
             {footnote && (
               <p class="mt-1 pl-5 text-xs text-zinc-400">{footnote}</p>
             )}
@@ -349,37 +414,7 @@ export function DiffViewer({
   const header = (
     <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
       <div class="text-xs text-zinc-400">
-        {data ? (
-          data.baseResolved ? (
-            <>
-              {data.committed.totalFiles + data.uncommitted.totalFiles} file
-              {data.committed.totalFiles + data.uncommitted.totalFiles === 1
-                ? ''
-                : 's'}{' '}
-              changed ·{' '}
-              <span class="text-signal-green">
-                +{data.committed.additions + data.uncommitted.additions}
-              </span>{' '}
-              <span class="text-signal-red">
-                -{data.committed.deletions + data.uncommitted.deletions}
-              </span>
-            </>
-          ) : (
-            <>
-              {data.uncommitted.totalFiles} uncommitted file
-              {data.uncommitted.totalFiles === 1 ? '' : 's'} changed ·{' '}
-              <span class="text-signal-green">
-                +{data.uncommitted.additions}
-              </span>{' '}
-              <span class="text-signal-red">-{data.uncommitted.deletions}</span>{' '}
-              (base unresolved, committed diff unavailable)
-            </>
-          )
-        ) : loading ? (
-          'Loading…'
-        ) : (
-          ' '
-        )}
+        <DiffHeaderText data={data} loading={loading} />
       </div>
       <IconButton
         disabled={loading}
@@ -419,14 +454,9 @@ export function DiffViewer({
     );
   }
 
-  const cleanBase = data.base.replace(/^origin\//, '');
+  const cleanBase = data.base.replace(ORIGIN_PREFIX_PATTERN, '');
   const untracked = data.uncommitted.untracked ?? [];
-  const untrackedFootnote =
-    untracked.length > 0
-      ? `Untracked: ${untracked.slice(0, 10).join(', ')}${untracked.length > 10 ? ` and ${untracked.length - 10} more` : ''}`
-      : dirty === null
-        ? 'Working tree status is unknown.'
-        : undefined;
+  const untrackedFootnote = untrackedFootnoteText(untracked, dirty);
 
   if (
     data.baseResolved &&

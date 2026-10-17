@@ -541,6 +541,17 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/setup-progress` | `repo?`,`name?`; list durable setup records. | H W C M |
 | `POST` | `/api/setup-progress/retry` | T plus `attemptId`,`checkoutIdentity`; retry exact recorded attempt. | H W C M |
 | `GET` | `/api/shared-caches` | List shared-cache catalog records. | H W C M |
+| `GET` | `/api/spans/runs` | `afterRunId?`,`limit?`,`phase?`,`query?`; bounded retained run summaries. | H W C M |
+| `GET` | `/api/spans/workflows` | none; offline workflow catalog, no archive write. | H W C M |
+| `POST` | `/api/spans/workflows/preview` | workflow inputs; redacted preview and digest, no archive write. | H W C M |
+| `POST` | `/api/spans/workflows/create` | original workflow inputs plus preview digest; save a Planned draft only. | H W C M |
+| `POST` | `/api/spans/drafts/create` | explicit run, goal, owner and spans; save a Planned draft only. | H W C M |
+| `POST` | `/api/spans/plans/revise` | runId, goal, spans, expectedRevision, expectedGeneration; reject stale plans and action history. | H W C M |
+| `GET` | `/api/spans/search` | `query`,`runId?`,`limit?`,`afterSequence?`,`throughSequence?`,`expectedGeneration?`; bounded historical matches, stale generation returns 409. | H W C M |
+| `GET` | `/api/spans/search/status` | none; index generation and coverage, without indexing. | H W C M |
+| `GET` | `/api/spans/run` | `runId`; full retained run view. | H W C M |
+| `GET` | `/api/spans/events` | `runId`,`afterSequence?`,`limit?`; bounded append-only history. | H W C M |
+| `GET` | `/api/spans/artifact` | `runId`,`artifactId`; inert redacted artifact referenced by that run. | H W C M |
 | `POST` | `/api/sidecar-approvals/approve` | `repo`,`name`,`command`,`args`; must match reviewed sidecar. | H W |
 | `GET` | `/api/sidecars` | `repo`; list project sidecars. | H W M |
 | `POST` | `/api/sidecars` | `repo`,`sidecars`; replace project sidecars. | H W |

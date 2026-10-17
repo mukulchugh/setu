@@ -49,19 +49,17 @@ function transaction(
   const deps = {
     git: async (args) => git(repo.checkout, args),
     inProgress: async () => false,
-    rebaseInProgress: async () =>
-      fs.existsSync(join(repo.checkout, '.git', 'rebase-merge')) ||
-      fs.existsSync(join(repo.checkout, '.git', 'rebase-apply')),
     inspectPortal: async () =>
       portal === 'ready'
         ? { instanceId: 'portal', protocol: 1, state: 'ready' }
         : { state: 'absent' },
+    // biome-ignore lint/suspicious/useAwait: The install fixture must reject injected installation failures.
     install: async () => {
       if (failInstall) {
         throw new Error('install failed');
       }
     },
-    link: async () => {},
+    link: () => Promise.resolve(),
     operationId: () => 'real-fixture',
     quiesce: async () => ({
       instanceId: 'portal',
@@ -69,10 +67,15 @@ function transaction(
       protocol: 1,
       token: 'owner',
     }),
+    rebaseInProgress: async () =>
+      fs.existsSync(join(repo.checkout, '.git', 'rebase-merge')) ||
+      fs.existsSync(join(repo.checkout, '.git', 'rebase-apply')),
+    // biome-ignore lint/suspicious/useAwait: The reopen fixture preserves the asynchronous portal control contract.
     reopen: async () => {
       reopened += 1;
       return { ok: true };
     },
+    // biome-ignore lint/suspicious/useAwait: The restart fixture must reject unconfirmed replacement failures.
     restart: async () => {
       if (failRestart) {
         throw new Error('replacement portal was not confirmed');

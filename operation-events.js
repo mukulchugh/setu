@@ -89,7 +89,7 @@ function history(value) {
 
 export function createOperationEvents({
   state,
-  now = Date.now,
+  now: _now = Date.now,
   limit = 200,
 } = {}) {
   if (

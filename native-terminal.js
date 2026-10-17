@@ -1,9 +1,14 @@
 const ghosttyId =
   /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
+const ghosttyLaunchResponsePattern = /^SETU:LAUNCHED:(.+)$/;
+const safeLaunchTokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
+const unsafeTextPattern = /[\0\r\n]/;
 
 function validText(value) {
   return (
-    typeof value === 'string' && value.length > 0 && !/[\0\r\n]/.test(value)
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !unsafeTextPattern.test(value)
   );
 }
 
@@ -98,7 +103,7 @@ export function buildGhosttyScriptLaunch({
       validText(launcherPath) &&
       validText(checkoutPath) &&
       typeof launchToken === 'string' &&
-      /^[A-Za-z0-9_-]{16,128}$/.test(launchToken)
+      safeLaunchTokenPattern.test(launchToken)
     )
   ) {
     throw new TypeError(
@@ -124,7 +129,7 @@ end run
 
 export function parseGhosttyLaunchResponse(text) {
   const match =
-    typeof text === 'string' && text.trim().match(/^SETU:LAUNCHED:(.+)$/);
+    typeof text === 'string' && text.trim().match(ghosttyLaunchResponsePattern);
   return match && validTerminalId(match[1]) ? match[1] : null;
 }
 

@@ -11,9 +11,10 @@ test('repository cloning refuses critically low space before its first command',
       null,
       {
         readStorage: async () => ({
-          state: 'ready',
           availableBytes: 116 * 1024 ** 2,
+          state: 'ready',
         }),
+        // biome-ignore lint/suspicious/useAwait: The injected command runner must preserve its promise result contract.
         run: async (args) => {
           commands.push(args);
           return { code: 0, stderr: '', stdout: '' };
@@ -29,9 +30,9 @@ test('health distinguishes the 20 GiB warning from the 10 GiB admission minimum'
     observe: async () => ({ availableBytes: 15 * 1024 ** 3 }),
   });
   expect(await read()).toMatchObject({
+    critical: false,
     low: true,
     lowThresholdBytes: 20 * 1024 ** 3,
-    critical: false,
     minimumAvailableBytes: 10 * 1024 ** 3,
   });
 });
@@ -40,6 +41,7 @@ test('admission refreshes a cached healthy observation and rejects unknown or in
   let availableBytes = 30 * 1024 ** 3,
     reads = 0;
   const read = createHostHealth('/isolated/workspace', {
+    // biome-ignore lint/suspicious/useAwait: The observer fixture models asynchronous health reads while counting invocation order.
     observe: async () => {
       reads += 1;
       return { availableBytes };
@@ -51,21 +53,24 @@ test('admission refreshes a cached healthy observation and rejects unknown or in
     assertStorageHeadroom('/isolated/workspace', read)
   ).rejects.toMatchObject({ code: 'STORAGE_LOW' });
   expect(reads).toBe(2);
-  for (const health of [
-    { state: 'unknown' },
-    ...[NaN, Infinity, -1, undefined, '999999999999'].map((value) => ({
-      state: 'ready',
-      availableBytes: value,
-    })),
-  ]) {
-    await expect(
-      assertStorageHeadroom('/isolated/workspace', async () => health)
-    ).rejects.toMatchObject({ code: 'STORAGE_UNKNOWN' });
-  }
   availableBytes = 10 * 1024 ** 3;
   expect(
     (await assertStorageHeadroom('/isolated/workspace', read)).critical
   ).toBe(false);
+});
+
+test.each([
+  { state: 'unknown' },
+  ...[Number.NaN, Number.POSITIVE_INFINITY, -1, undefined, '999999999999'].map(
+    (value) => ({
+      availableBytes: value,
+      state: 'ready',
+    })
+  ),
+])('invalid storage observation is refused: %#', async (health) => {
+  await expect(
+    assertStorageHeadroom('/isolated/workspace', async () => health)
+  ).rejects.toMatchObject({ code: 'STORAGE_UNKNOWN' });
 });
 
 test('filesystem status shares pending reads and caches without a background timer', async () => {
@@ -112,9 +117,7 @@ test('filesystem status shares pending reads and caches without a background tim
 
 test('failure and timeout report unknown, never free/healthy; hung probes do not overlap', async () => {
   const failed = createHostHealth('/owned', {
-    observe: () => {
-      return Promise.reject(new Error('private path'));
-    },
+    observe: () => Promise.reject(new Error('private path')),
   });
   expect(await failed()).toMatchObject({
     code: 'FILESYSTEM_UNAVAILABLE',

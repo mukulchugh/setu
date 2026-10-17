@@ -79,6 +79,7 @@ test('Ghostty focus and paste transports target the UUID and never send Enter', 
 test('Ghostty adapter revalidates the owned session and confirms the exact UUID', async () => {
   const calls = [];
   const adapter = createGhosttyTerminalAdapter({
+    // biome-ignore lint/suspicious/useAwait: Native terminal command fixtures preserve the asynchronous adapter contract.
     runAppleScript: async (request) => {
       calls.push(request);
       return { availability: 'available', stdout: `SETU:OK:${terminalId}` };

@@ -35,7 +35,7 @@ export function reviewWriteAllowed(filePath, reportDir) {
           return false;
         }
       } catch (error) {
-        if (error?.code !== 'ENOENT') {
+        if (error.code !== 'ENOENT') {
           return false;
         }
       }

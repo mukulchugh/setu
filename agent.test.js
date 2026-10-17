@@ -22,6 +22,8 @@ import {
 
 const UNKNOWN_AGENT = /unknown agent/;
 const MINT_CMD = /claude setup-token/;
+const REPLACEMENT_CHARACTER_RE = /�/;
+const FINITE_POSITIVE_RE = /finite positive/;
 
 // Feeds an array of byte-chunks through pumpLines as an async iterable, the
 // same shape Bun.spawn's stdout has.
@@ -113,7 +115,7 @@ await check(
     assert.equal(lines.length, 1);
     assert.ok(Buffer.byteLength(lines[0].line) <= 31);
     assert.equal(lines[0].details.truncated, true);
-    assert.doesNotMatch(lines[0].line, /�/);
+    assert.doesNotMatch(lines[0].line, REPLACEMENT_CHARACTER_RE);
   }
 );
 
@@ -221,7 +223,7 @@ await check(
   async () => {
     await assert.rejects(
       runAgent({ agentId: 'claude', maxBudgetUsd: Number.NaN }),
-      /finite positive/
+      FINITE_POSITIVE_RE
     );
   }
 );
@@ -247,7 +249,9 @@ const fixtureProvider = (command = 'claude --print -p -') => ({
   }),
   captureSessions: true,
   name: 'fixture',
-  parseStreamLine: () => {},
+  parseStreamLine: () => {
+    // The fixture does not consume stream lines.
+  },
   sessionStorage: {},
 });
 

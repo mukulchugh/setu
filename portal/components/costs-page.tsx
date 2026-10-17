@@ -1,8 +1,8 @@
 // Provider-reported cost totals. Credentials are configured outside this UI.
 import {
   type Budgets,
-  parseCostsSummary,
   type ProviderCosts,
+  parseCostsSummary,
 } from '../costs-read';
 import { PageHeader } from '../ui';
 import { Badge } from '../ui/badge';
@@ -31,6 +31,32 @@ const BUDGET_LABEL = {
   weekly: 'Weekly (7d)',
 } as const;
 
+function budgetStatusLabel(status: keyof typeof BUDGET_TONE) {
+  if (status === 'ok') {
+    return 'Within budget';
+  }
+  if (status === 'over') {
+    return 'Over budget';
+  }
+  if (status === 'warning') {
+    return 'Near budget';
+  }
+  return 'Incomplete';
+}
+
+function providerStatus(data: ProviderCosts) {
+  if (data.error) {
+    return { label: 'Read failed', tone: 'red' as const };
+  }
+  if (data.configured) {
+    return { label: 'Connected', tone: 'emerald' as const };
+  }
+  if (data.provider === 'gemini') {
+    return { label: 'Detection only', tone: 'zinc' as const };
+  }
+  return { label: 'Not configured', tone: 'zinc' as const };
+}
+
 function BudgetBar({ budgets }: { budgets: Budgets }) {
   const periods = (['daily', 'weekly', 'monthly'] as const).filter(
     (k) => budgets[k]
@@ -41,17 +67,14 @@ function BudgetBar({ budgets }: { budgets: Budgets }) {
   return (
     <div class="glass-panel mb-5 flex flex-wrap items-center gap-4 px-5 py-4">
       {periods.map((period) => {
-        const p = budgets[period]!;
+        const p = budgets[period];
+        if (!p) {
+          return null;
+        }
         return (
           <div class="flex flex-wrap items-center gap-2 text-sm" key={period}>
             <Badge tone={BUDGET_TONE[p.status]}>
-              {p.status === 'ok'
-                ? 'Within budget'
-                : p.status === 'over'
-                  ? 'Over budget'
-                  : p.status === 'warning'
-                    ? 'Near budget'
-                    : 'Incomplete'}
+              {budgetStatusLabel(p.status)}
             </Badge>
             <span class="text-zinc-500 dark:text-zinc-400">
               {BUDGET_LABEL[period]}
@@ -74,21 +97,14 @@ function BudgetBar({ budgets }: { budgets: Budgets }) {
 
 function ProviderCard({ data }: { data: ProviderCosts }) {
   const label = PROVIDER_LABEL[data.provider] ?? data.provider;
+  const status = providerStatus(data);
   return (
     <div class="glass-panel min-w-0 p-5">
       <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h3 class="font-semibold text-sm text-zinc-900 dark:text-zinc-100">
           {label}
         </h3>
-        <Badge tone={data.error ? 'red' : data.configured ? 'emerald' : 'zinc'}>
-          {data.error
-            ? 'Read failed'
-            : data.configured
-              ? 'Connected'
-              : data.provider === 'gemini'
-                ? 'Detection only'
-                : 'Not configured'}
-        </Badge>
+        <Badge tone={status.tone}>{status.label}</Badge>
       </div>
 
       {!data.configured && (
@@ -146,6 +162,23 @@ export function CostsPage({ onBack }: { onBack: () => void }) {
       parseCostsSummary(await readJson<unknown>('/api/costs', signal))
   );
   const loaded = data !== undefined;
+  let costsContent = !failed && (
+    <p class="empty-state">Loading provider costs…</p>
+  );
+  if (loaded) {
+    costsContent = data ? (
+      <>
+        {data.budgets && <BudgetBar budgets={data.budgets} />}
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <ProviderCard data={data.anthropic} />
+          <ProviderCard data={data.openai} />
+          <ProviderCard data={data.gemini} />
+        </div>
+      </>
+    ) : (
+      <p class="py-12 text-center text-zinc-400">Couldn't reach the portal.</p>
+    );
+  }
 
   return (
     <div class="portal-page mx-auto max-w-5xl px-4 py-6 sm:px-6">
@@ -182,24 +215,7 @@ export function CostsPage({ onBack }: { onBack: () => void }) {
           totals can arrive later than usage.
         </p>
       )}
-      {loaded ? (
-        data ? (
-          <>
-            {data.budgets && <BudgetBar budgets={data.budgets} />}
-            <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-              <ProviderCard data={data.anthropic} />
-              <ProviderCard data={data.openai} />
-              <ProviderCard data={data.gemini} />
-            </div>
-          </>
-        ) : (
-          <p class="py-12 text-center text-zinc-400">
-            Couldn't reach the portal.
-          </p>
-        )
-      ) : (
-        !failed && <p class="empty-state">Loading provider costs…</p>
-      )}
+      {costsContent}
 
       <p class="mt-6 max-w-2xl text-sm text-zinc-600 leading-relaxed dark:text-zinc-300">
         Configure via <code class="font-mono">~/.setu-costs.json</code>.

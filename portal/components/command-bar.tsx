@@ -30,6 +30,22 @@ export function CommandBar({
   );
   const optionId = (w: Worktree) => `${listId}-${encodeURIComponent(w.key)}`;
   const activeId = selected ? optionId(selected) : undefined;
+  const finalFocus = () => {
+    if (selectedNavigation.current) {
+      return false;
+    }
+    const target = returnFocus?.current;
+    return target?.isConnected
+      ? target
+      : (document.getElementById('jump-to-worktree') ?? true);
+  };
+  const statusTone = (worktree: Worktree) => {
+    const state = worktreeState(worktree);
+    if (state === 'running') {
+      return 'emerald';
+    }
+    return state === 'stopped' ? 'zinc' : 'amber';
+  };
   useLayoutEffect(() => {
     if (activeId) {
       document.getElementById(activeId)?.scrollIntoView({ block: 'nearest' });
@@ -77,13 +93,7 @@ export function CommandBar({
       <DialogContent
         aria-label="Jump to a worktree"
         class="command-palette p-0 sm:max-w-md"
-        finalFocus={() =>
-          selectedNavigation.current
-            ? false
-            : returnFocus?.current?.isConnected
-              ? returnFocus.current
-              : (document.getElementById('jump-to-worktree') ?? true)
-        }
+        finalFocus={finalFocus}
         initialFocus={inputRef}
       >
         <div class="flex items-center gap-3 border-zinc-200 border-b px-4 py-3 dark:border-zinc-700">
@@ -161,15 +171,7 @@ export function CommandBar({
               tabIndex={-1}
             >
               <span aria-hidden="true">
-                <StatusDot
-                  tone={
-                    worktreeState(w) === 'running'
-                      ? 'emerald'
-                      : worktreeState(w) === 'stopped'
-                        ? 'zinc'
-                        : 'amber'
-                  }
-                />
+                <StatusDot tone={statusTone(w)} />
               </span>
               <span class="min-w-0 flex-1 break-words text-sm text-zinc-900 dark:text-zinc-100">
                 {w.name}

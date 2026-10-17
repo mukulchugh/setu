@@ -107,6 +107,51 @@ export function createUpdateCommand({
       ? { ...result, state: 'ready' }
       : { state: 'unknown' };
   }
+  async function originalPortalStopped(owner) {
+    const status = await inspectPortal();
+    if (status.state === 'ready' && status.instanceId !== owner.instanceId) {
+      throw new Error('Portal identity changed before confirmed stop');
+    }
+    const observed = await observeProcess(owner.processId).catch(() => ({
+      state: 'unknown',
+    }));
+    const originalGone =
+      observed.state === 'absent' ||
+      (observed.state === 'alive' &&
+        observed.processId === owner.processId &&
+        typeof observed.processStartIdentity === 'string' &&
+        observed.processStartIdentity &&
+        observed.processStartIdentity !== owner.processStartIdentity);
+    return status.state === 'absent' && originalGone;
+  }
+
+  async function waitForOriginalPortalStop(owner) {
+    const deadline = now() + 10_000;
+    while (now() < deadline) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each stop poll must observe the prior portal and process identities before the next retry.
+      if (await originalPortalStopped(owner)) {
+        return;
+      }
+      await sleep(100);
+    }
+    throw new Error(
+      'Original portal process exit was not confirmed; no replacement was started'
+    );
+  }
+
+  async function waitForReplacementPortal(owner) {
+    const readyDeadline = now() + 10_000;
+    while (now() < readyDeadline) {
+      // biome-ignore lint/performance/noAwaitInLoops: Readiness must be observed after the prior launch/poll before retrying.
+      const status = await inspectPortal();
+      if (status.state === 'ready' && status.instanceId !== owner.instanceId) {
+        return;
+      }
+      await sleep(100);
+    }
+    throw new Error('New portal readiness could not be confirmed');
+  }
+
   async function restart(owner) {
     const stopped = await request('/api/update/stop', {
       instanceId: owner.instanceId,
@@ -115,44 +160,9 @@ export function createUpdateCommand({
     if (!stopped.ok || stopped.instanceId !== owner.instanceId) {
       throw new Error('Owner-held portal stop was not confirmed');
     }
-    const deadline = now() + 10_000;
-    let exited = false;
-    while (now() < deadline) {
-      const status = await inspectPortal();
-      if (status.state === 'ready' && status.instanceId !== owner.instanceId) {
-        throw new Error('Portal identity changed before confirmed stop');
-      }
-      const observed = await observeProcess(owner.processId).catch(() => ({
-        state: 'unknown',
-      }));
-      const originalGone =
-        observed.state === 'absent' ||
-        (observed.state === 'alive' &&
-          observed.processId === owner.processId &&
-          typeof observed.processStartIdentity === 'string' &&
-          observed.processStartIdentity &&
-          observed.processStartIdentity !== owner.processStartIdentity);
-      if (status.state === 'absent' && originalGone) {
-        exited = true;
-        break;
-      }
-      await sleep(100);
-    }
-    if (!exited) {
-      throw new Error(
-        'Original portal process exit was not confirmed; no replacement was started'
-      );
-    }
+    await waitForOriginalPortalStop(owner);
     await startPortal(repoDir);
-    const readyDeadline = now() + 10_000;
-    while (now() < readyDeadline) {
-      const status = await inspectPortal();
-      if (status.state === 'ready' && status.instanceId !== owner.instanceId) {
-        return;
-      }
-      await sleep(100);
-    }
-    throw new Error('New portal readiness could not be confirmed');
+    await waitForReplacementPortal(owner);
   }
   async function update(options) {
     if (
@@ -204,9 +214,9 @@ export function createUpdateCommand({
               'rebase-apply',
               'BISECT_LOG',
             ]) {
-              const path = (
-                await git(['rev-parse', '--git-path', name])
-              ).trim();
+              const path =
+                // biome-ignore lint/performance/noAwaitInLoops: Git-path probes preserve the recovery-marker priority and stop at the first present marker.
+                (await git(['rev-parse', '--git-path', name])).trim();
               if (
                 fs.existsSync(isAbsolute(path) ? path : join(directory, path))
               ) {
@@ -234,9 +244,9 @@ export function createUpdateCommand({
           }),
           rebaseInProgress: async () => {
             for (const name of ['rebase-merge', 'rebase-apply']) {
-              const path = (
-                await git(['rev-parse', '--git-path', name])
-              ).trim();
+              const path =
+                // biome-ignore lint/performance/noAwaitInLoops: Rebase-marker probes preserve the established priority before deciding recovery state.
+                (await git(['rev-parse', '--git-path', name])).trim();
               if (
                 fs.existsSync(isAbsolute(path) ? path : join(directory, path))
               ) {

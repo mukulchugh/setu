@@ -32,7 +32,10 @@ const writeAgentCompose = (c, repo, name, opts) =>
   writeProductionAgentCompose(c, repo, name, opts, engineCapacity());
 
 const CPUS_LINE_RE = /cpus: "([^"]+)"/;
+const GIT_ADMIN_DIRECTORY_RE = /Git admin directory|gitdir/i;
+const GIT_DIRECTORY_POINTER_RE = /^gitdir:\s*(.+)\s*$/m;
 const MEM_LIMIT_LINE_RE = /mem_limit: "([^"]+)"/;
+const NODE_MODULES_VOLUME_RE = /^volumes:\n {2}node_modules:/m;
 
 const failures = [];
 async function check(what, fn) {
@@ -123,7 +126,7 @@ function realWorktree() {
   git(wtDir, ['add', 'commit.txt']);
   git(wtDir, ['commit', '-m', 'commit after packed refs']);
   const adminDir = readFileSync(join(wtDir, '.git'), 'utf8').match(
-    /^gitdir:\s*(.+)\s*$/m
+    GIT_DIRECTORY_POINTER_RE
   )?.[1];
   assert.ok(adminDir, 'linked worktree must have a gitdir pointer');
   return {
@@ -196,7 +199,7 @@ await check(
       `node_modules volume missing — host node_modules is exposed:\n${yaml}`
     );
     // A named volume is only valid if it is also declared at the top level.
-    assert.match(yaml, /^volumes:\n {2}node_modules:/m, yaml);
+    assert.match(yaml, NODE_MODULES_VOLUME_RE, yaml);
     rmSync(workspace, { force: true, recursive: true });
   }
 );
@@ -258,15 +261,15 @@ await check(
       ),
       `common Git metadata must be read-only:\n${yaml}`
     );
-    for (const path of [
+    for (const mountPath of [
       adminDir,
       `${realpathSync(bareRepoDir)}/objects`,
       `${realpathSync(bareRepoDir)}/refs`,
       `${realpathSync(bareRepoDir)}/logs`,
     ]) {
       assert.ok(
-        yaml.includes(`- ${path}:${path}`),
-        `missing writable ${path}:\n${yaml}`
+        yaml.includes(`- ${mountPath}:${mountPath}`),
+        `missing writable ${mountPath}:\n${yaml}`
       );
     }
     assert.ok(
@@ -289,7 +292,7 @@ await check(
       writeFileSync(join(wtDir, '.git'), `gitdir: ${forged}\n`);
       await assert.rejects(
         writeAgentCompose(c, repo, name, {}),
-        /Git admin directory|gitdir/i
+        GIT_ADMIN_DIRECTORY_RE
       );
       assert.ok(!existsSync(agentComposePath(wtDir)));
     } finally {
@@ -407,32 +410,16 @@ await check(
     );
     const cpus = yaml.match(CPUS_LINE_RE)?.[1];
     const mem = yaml.match(MEM_LIMIT_LINE_RE)?.[1];
-    if (cap.cpus) {
-      assert.equal(
-        Number(cpus),
-        cap.cpus,
-        'cpu limit should be clamped to engine capacity'
-      );
-    } else {
-      assert.equal(
-        Number(cpus),
-        9999,
-        'no engine reachable — configured value should pass through'
-      );
-    }
-    if (cap.memMb) {
-      assert.equal(
-        mem,
-        `${cap.memMb}m`,
-        'mem limit should be clamped to engine capacity'
-      );
-    } else {
-      assert.equal(
-        mem,
-        '9999g',
-        'no engine reachable — configured value should pass through'
-      );
-    }
+    assert.equal(
+      Number(cpus),
+      cap.cpus,
+      'cpu limit should be clamped to engine capacity'
+    );
+    assert.equal(
+      mem,
+      `${cap.memMb}m`,
+      'mem limit should be clamped to engine capacity'
+    );
     rmSync(workspace, { force: true, recursive: true });
   }
 );

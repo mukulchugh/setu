@@ -1,7 +1,11 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import * as fs from 'node:fs/promises';
+import {
+  readFile as readFileAsync,
+  realpath as realpathAsync,
+  stat as statAsync,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
@@ -45,6 +49,7 @@ function adoptionFixture(overrides = {}) {
   const records = {};
   let port = null;
   const adoption = createWorktreeAdoption({
+    // biome-ignore lint/suspicious/useAwait: Port allocation preserves the asynchronous adoption collaborator contract.
     assignPort: async (...args) => {
       calls.push(['assignPort', ...args]);
       port = 3201;
@@ -55,6 +60,7 @@ function adoptionFixture(overrides = {}) {
       checkoutPath: '/workspace/r/topic',
       known: true,
     }),
+    // biome-ignore lint/suspicious/useAwait: Checkout lookup preserves the asynchronous adoption collaborator contract.
     isLinkedWorktree: async (...args) => {
       calls.push(['isLinkedWorktree', ...args]);
       return true;
@@ -70,12 +76,14 @@ function adoptionFixture(overrides = {}) {
     }),
     withRecords: (task) => task(),
     withTarget: (_target, task) => task(),
+    // biome-ignore lint/suspicious/useAwait: Record mutation and clone failures must reject through the persistence contract.
     writeRecords: async (next) => {
       for (const key of Object.keys(records)) {
         delete records[key];
       }
       Object.assign(records, structuredClone(next));
     },
+    // biome-ignore lint/suspicious/useAwait: Routing writes preserve the asynchronous adoption collaborator contract.
     writeRouting: async (...args) => {
       calls.push(['writeRouting', ...args]);
       return { ok: true };
@@ -165,6 +173,7 @@ test('adoption retains exact identity for hosts and Caddy recovery without reall
     { ok: true },
   ];
   const { adoption, calls, records } = adoptionFixture({
+    // biome-ignore lint/suspicious/useAwait: Routing retries preserve the asynchronous collaborator contract.
     writeRouting: async (...args) => {
       calls.push(['writeRouting', ...args]);
       return results.shift();
@@ -193,6 +202,7 @@ test('adoption retains exact identity for hosts and Caddy recovery without reall
 test('adoption rejects a replacement checkout before publishing or retrying a registration', async () => {
   let observations = 0;
   const { adoption, calls } = adoptionFixture({
+    // biome-ignore lint/suspicious/useAwait: Checkout observations preserve the asynchronous identity collaborator contract.
     inspectIdentity: async () => {
       observations += 1;
       return {
@@ -241,7 +251,14 @@ test('adoption requires a real linked Git checkout with matching administration 
 
     const { adoption } = adoptionFixture({
       inspectIdentity: (_repo, _name, wtDir) =>
-        inspectCheckoutIdentity({ repoDir: bare, wtDir }, fs),
+        inspectCheckoutIdentity(
+          { repoDir: bare, wtDir },
+          {
+            readFile: readFileAsync,
+            realpath: realpathAsync,
+            stat: statAsync,
+          }
+        ),
       isLinkedWorktree: async (_repo, path) =>
         parseLinkedWorktrees(
           execFileSync(
@@ -256,7 +273,7 @@ test('adoption requires a real linked Git checkout with matching administration 
       await adoption.adopt({ name: 'topic', path: checkout, repo: 'r' })
     ).toMatchObject({
       ok: true,
-      path: await fs.realpath(checkout),
+      path: await realpathAsync(checkout),
       port: 3201,
     });
   } finally {
@@ -604,7 +621,9 @@ test('portal GET route uses inventory; other routes and methods do not trigger i
 test('portal activity adapter retains unknown listeners, queued work, timestamps, and nested sidecars', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'setu-inventory-runtime-'));
   const lifecycle = {
-    dispose() {},
+    dispose() {
+      // This lifecycle fixture has no resources to release.
+    },
     operationStatus: () => null,
     queueSnapshot: () => [{ key: 'r/main' }],
     refreshCapacity: async () => ({}),

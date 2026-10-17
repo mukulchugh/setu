@@ -8,6 +8,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createMcpActions } from './mcp-actions.js';
 import { createWorkspaceState } from './workspace-state.js';
 
+function asPromise(callback) {
+  try {
+    return Promise.resolve(callback());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 async function fixture(overrides = {}) {
   const inputSchema = {
     additionalProperties: false,
@@ -42,19 +50,22 @@ async function fixture(overrides = {}) {
   const events = [];
   let listedTools = [{ inputSchema, name: 'echo' }];
   const actions = createMcpActions({
-    callTool: async (serverId, tool, input) => ({
-      ok: true,
-      result: await client.callTool({ arguments: input, name: tool }),
-    }),
+    callTool: (_serverId, tool, input) =>
+      client
+        .callTool({ arguments: input, name: tool })
+        .then((result) => ({ ok: true, result })),
     eventRecorder: {
-      record: async (event) => {
+      record: (event) => {
         events.push(event);
-        return { ok: true };
+        return Promise.resolve({ ok: true });
       },
     },
     id: (() => {
       let n = 0;
-      return () => `id-${++n}`;
+      return () => {
+        n += 1;
+        return `id-${n}`;
+      };
     })(),
     maxResultBytes: 80,
     now: () => 10,
@@ -162,18 +173,19 @@ test('MCP action persistence whitelists mappings and treats a thrown call outcom
   const root = mkdtempSync(join(tmpdir(), 'setu-mcp-actions-'));
   const events = [];
   const actions = createMcpActions({
-    callTool: async () => {
-      throw new Error('lost transport');
-    },
+    callTool: () => Promise.reject(new Error('lost transport')),
     eventRecorder: {
-      record: async (event) => {
+      record: (event) => {
         events.push(event);
-        return { ok: true };
+        return Promise.resolve({ ok: true });
       },
     },
     id: (() => {
       let n = 0;
-      return () => `event-${++n}`;
+      return () => {
+        n += 1;
+        return `event-${n}`;
+      };
     })(),
     state: createWorkspaceState({
       configPath: join(root, 'config.json'),
@@ -205,14 +217,17 @@ test('a recorder refusal prevents an MCP action call', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setu-mcp-actions-'));
   let calls = 0;
   const actions = createMcpActions({
-    callTool: async () => {
+    callTool: () => {
       calls += 1;
-      return { ok: true, result: {} };
+      return Promise.resolve({ ok: true, result: {} });
     },
     eventRecorder: { record: async () => ({ ok: false }) },
     id: (() => {
       let n = 0;
-      return () => `event-${++n}`;
+      return () => {
+        n += 1;
+        return `event-${n}`;
+      };
     })(),
     state: createWorkspaceState({
       configPath: join(root, 'config.json'),
@@ -241,18 +256,22 @@ async function boundedInvocation(maxResultBytes, result) {
   const inputSchema = { type: 'object' };
   let document = {};
   const actions = createMcpActions({
-    callTool: async () => ({ ok: true, result }),
-    eventRecorder: { record: async () => ({ ok: true }) },
+    callTool: () => Promise.resolve({ ok: true, result }),
+    eventRecorder: { record: () => Promise.resolve({ ok: true }) },
     id: (() => {
       let n = 0;
-      return () => `bounded-${++n}`;
+      return () => {
+        n += 1;
+        return `bounded-${n}`;
+      };
     })(),
     maxResultBytes,
     state: {
       read: () => document,
-      update: async (_name, update) => {
-        document = update(document);
-      },
+      update: (_name, update) =>
+        asPromise(() => {
+          document = update(document);
+        }),
     },
     tools: () => [{ inputSchema, name: 'echo' }],
   });
@@ -268,13 +287,22 @@ async function boundedInvocation(maxResultBytes, result) {
   return actions.invoke(saved.action.id, {}, confirmation);
 }
 
-test('MCP result bounds terminate at UTF-8 boundaries for small and large emoji output', async () => {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  const emojiPayload = { text: '😀'.repeat(32) };
-  // The serialized source has nine ASCII bytes before its first four-byte emoji.
-  for (const ceiling of [20, 21, 22, 23, 24]) {
-    const response = await boundedInvocation(ceiling, emojiPayload);
+test.each([
+  { ceiling: 20, size: 32 },
+  { ceiling: 21, size: 32 },
+  { ceiling: 22, size: 32 },
+  { ceiling: 23, size: 32 },
+  { ceiling: 24, size: 32 },
+  { ceiling: 64 * 1024, size: 40_000 },
+])(
+  'MCP emoji output terminates at a UTF-8 boundary: %#',
+  async ({ ceiling, size }) => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    // The serialized source has nine ASCII bytes before its first four-byte emoji.
+    const response = await boundedInvocation(ceiling, {
+      text: '😀'.repeat(size),
+    });
     expect(response).toMatchObject({ ok: true, truncated: true });
     expect(
       encoder.encode(JSON.stringify(response.result)).byteLength
@@ -283,38 +311,31 @@ test('MCP result bounds terminate at UTF-8 boundaries for small and large emoji 
       decoder.decode(encoder.encode(response.result.text))
     ).not.toThrow();
   }
-  const response = await boundedInvocation(64 * 1024, {
-    text: '😀'.repeat(40_000),
-  });
-  expect(response).toMatchObject({ ok: true, truncated: true });
-  expect(
-    encoder.encode(JSON.stringify(response.result)).byteLength
-  ).toBeLessThanOrEqual(64 * 1024);
-  expect(() =>
-    decoder.decode(encoder.encode(response.result.text))
-  ).not.toThrow();
-});
+);
 
-test('missing acknowledgments prevent invocation or preserve its known outcome', async () => {
-  for (const outcome of ['not-started', 'completed', 'failed', 'unknown']) {
+test.each(['not-started', 'completed', 'failed', 'unknown'])(
+  'missing acknowledgments prevent invocation or preserve its known outcome: %s',
+  async (outcome) => {
     let writes = 0,
       calls = 0;
     const fx = await fixture({
-      callTool: async () => {
+      callTool: () => {
         calls += 1;
         if (outcome === 'unknown') {
-          throw new Error('lost response');
+          return Promise.reject(new Error('lost response'));
         }
-        return outcome === 'failed'
-          ? { code: 'TOOL_REFUSED', ok: false }
-          : { ok: true, result: {} };
+        return Promise.resolve(
+          outcome === 'failed'
+            ? { code: 'TOOL_REFUSED', ok: false }
+            : { ok: true, result: {} }
+        );
       },
       eventRecorder: {
-        record: async () => {
+        record: () => {
           writes += 1;
-          return outcome !== 'not-started' && writes === 1
-            ? { ok: true }
-            : undefined;
+          return Promise.resolve(
+            outcome !== 'not-started' && writes === 1 ? { ok: true } : undefined
+          );
         },
       },
     });
@@ -357,7 +378,7 @@ test('missing acknowledgments prevent invocation or preserve its known outcome',
       await fx.server.close();
     }
   }
-});
+);
 
 test('save rechecks a journal changed under its update lock and leaves it unchanged', async () => {
   const corrupt = { actions: null, unrelated: true };
@@ -366,11 +387,12 @@ test('save rechecks a journal changed under its update lock and leaves it unchan
   const fx = await fixture({
     state: {
       read: () => document,
-      update: async (_name, update) => {
-        attempted += 1;
-        document = corrupt;
-        document = update(document);
-      },
+      update: (_name, update) =>
+        asPromise(() => {
+          attempted += 1;
+          document = corrupt;
+          document = update(document);
+        }),
     },
   });
   try {

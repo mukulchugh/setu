@@ -1,7 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   createAndInstallWorktree,
   installWorktreeDependencies,
@@ -9,6 +11,10 @@ import {
 import { createWorkspaceState } from './workspace-state.js';
 
 const roots = [];
+const ansiColorPattern = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-9;]*m`,
+  'g'
+);
 afterEach(() => {
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { force: true, recursive: true });
@@ -20,6 +26,7 @@ function fixture() {
   let time = 0;
   const state = createWorkspaceState({
     now: () => time,
+    // biome-ignore lint/suspicious/useAwait: The injected clock must preserve its asynchronous sleep contract.
     sleep: async (ms) => {
       time += ms;
     },
@@ -27,6 +34,54 @@ function fixture() {
   });
   return { root, state, target: { name: 'topic', repo: 'repo' } };
 }
+
+test('setup retries with its supplied arguments after installing Homebrew', () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'setu-setup-retry-'));
+  roots.push(root);
+  const bin = join(root, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(join(bin, 'curl'), '#!/bin/sh\nprintf ":\\n"\n');
+  fs.chmodSync(join(bin, 'curl'), 0o755);
+
+  const workspace = join(root, "workspace with 'quotes'");
+  const setupArgs = [
+    'setup',
+    '--name',
+    'lane',
+    '--workspace',
+    workspace,
+    '--zone',
+    'example.test',
+    '--engine',
+    'skip',
+    '--yes',
+  ];
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('./cli.js', import.meta.url)), ...setupArgs],
+    {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: root, PATH: `${bin}:/usr/bin:/bin` },
+    }
+  );
+
+  expect(result.status).toBe(0);
+  const retry = result.stdout
+    .replace(ansiColorPattern, '')
+    .split('\n')
+    .find((line) => line.trim().startsWith('setu setup '))
+    .trim();
+  const parsed = spawnSync(
+    '/bin/sh',
+    ['-c', `set -- ${retry}; printf '%s\\0' "$@"`],
+    { encoding: 'utf8' }
+  );
+  expect(parsed.status).toBe(0);
+  expect(parsed.stdout.split('\0').slice(0, -1)).toEqual([
+    'setu',
+    ...setupArgs,
+  ]);
+});
 
 test('CLI installation retains the checkout lease until completion and only then permits removal admission', async () => {
   const f = fixture();
@@ -60,7 +115,9 @@ test('CLI installation retains the checkout lease until completion and only then
 
 test('dependency installation reports failed and unconfirmed completion instead of allowing a subsequent Start', async () => {
   const options = {
-    assertStorage: async () => {},
+    assertStorage: async () => {
+      // Storage is available for this fixture.
+    },
     exists: (path) => path.endsWith('package.json'),
     run: () => ({ pid: 321, status: 2 }),
   };
@@ -116,12 +173,14 @@ test('CLI tunnel setup prepares local routing and enables only after installatio
   const setup = createAndInstallWorktree({
     ...f,
     ...f.target,
+    // biome-ignore lint/suspicious/useAwait: The create fixture preserves the asynchronous workspace-creation contract.
     create: async (options) => {
       createOptions = options;
       effects.push('create');
       return localResult;
     },
     enableTunnel: async () => {
+      // biome-ignore lint/suspicious/useAwait: The target-lock callback retains its rejected-error promise boundary.
       await f.state.withTargets([f.target], async () => {
         effects.push('enable');
       });
@@ -150,8 +209,9 @@ test('CLI tunnel setup prepares local routing and enables only after installatio
   expect(localResult.pubDom).toBeNull();
 });
 
-test('failed installation or unconfirmed tunnel activation never reports a public domain', async () => {
-  for (const failureAt of ['install', 'enable']) {
+test.each(['install', 'enable'])(
+  'failed installation or unconfirmed tunnel activation never reports a public domain: %s',
+  async (failureAt) => {
     const f = fixture(),
       effects = [],
       localResult = { pubDom: null, wtDir: f.root };
@@ -160,10 +220,12 @@ test('failed installation or unconfirmed tunnel activation never reports a publi
         ...f,
         ...f.target,
         create: async () => localResult,
+        // biome-ignore lint/suspicious/useAwait: Tunnel activation failure must be a rejected promise.
         enableTunnel: async () => {
           effects.push('enable');
           throw new Error('activation unconfirmed');
         },
+        // biome-ignore lint/suspicious/useAwait: Installation failure must be a rejected promise.
         install: async () => {
           if (failureAt === 'install') {
             throw new Error('install failed');
@@ -177,4 +239,4 @@ test('failed installation or unconfirmed tunnel activation never reports a publi
     expect(effects).toEqual(failureAt === 'install' ? [] : ['enable']);
     expect(localResult.pubDom).toBeNull();
   }
-});
+);

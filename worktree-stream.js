@@ -54,7 +54,7 @@ export function createWorktreeStream({
   return {
     close(ws) {
       const entry = current;
-      if (!(entry && entry.clients.delete(ws))) {
+      if (!entry?.clients.delete(ws)) {
         return;
       }
       if (!entry.clients.size) {
@@ -74,7 +74,7 @@ export function createWorktreeStream({
         };
         current = entry;
         entry.timer = schedule(() => {
-          void tick(entry);
+          tick(entry);
         }, 3000);
       }
       if (entry.clients.has(ws)) {

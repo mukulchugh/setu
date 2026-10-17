@@ -48,6 +48,17 @@ function toolJson(response) {
 }
 
 const TOOL_NAMES = [
+  'list_spans_runs',
+  'get_spans_run',
+  'get_spans_events',
+  'get_spans_artifact',
+  'search_spans',
+  'list_spans_workflows',
+  'preview_spans_workflow',
+  'create_spans_workflow',
+  'create_spans_draft',
+  'revise_spans_plan',
+  'get_spans_search_status',
   'adopt_worktree',
   'cancel_headless_run',
   'claim_worktree',
@@ -205,6 +216,7 @@ test('MCP runtime tools forward portal operations and preserve mutation recovery
     'start_convex',
     'stop_convex',
   ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: MCP calls share the server singleton and the test asserts their recorded forwarding order.
     const response = await callTool(name, { name: 'topic', repo: 'r' });
     expect(response.result.structuredContent).toEqual(accepted);
   }
@@ -649,7 +661,7 @@ test('MCP diff caps verbose text at 200 KiB with an explicit marker', async () =
     repo: 'r',
     verbose: true,
   });
-  const text = response.result.content[0].text;
+  const { text } = response.result.content[0];
   expect(Buffer.byteLength(text)).toBeLessThanOrEqual(200 * 1024);
   expect(JSON.parse(text)).toMatchObject({
     truncation: 'Output truncated at 200 KB.',

@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process';
 
+const PROCESS_START =
+  /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+
 const readStart = (processId) =>
   new Promise((resolve, reject) => {
     execFile(
@@ -39,11 +42,7 @@ export async function observeProcessIdentity(
     const processStartIdentity = (await run(processId))
       .trim()
       .replace(/\s+/g, ' ');
-    if (
-      !/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(
-        processStartIdentity
-      )
-    ) {
+    if (!PROCESS_START.test(processStartIdentity)) {
       return { state: 'unknown' };
     }
     const after = presence();

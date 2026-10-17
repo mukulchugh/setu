@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 
 const failure = (code, error) => ({ code, error, ok: false });
+const inputNamePattern = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
+const workflowPathPattern = /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/;
 
 function commandError(result, code, error) {
-  if (!result || result.code !== 0 || result.timedOut || result.truncated) {
+  if (result?.code !== 0 || result?.timedOut || result?.truncated) {
     return failure(code, error);
   }
   return null;
@@ -35,8 +37,7 @@ function validInputs(inputs) {
     typeof inputs === 'object' &&
     !Array.isArray(inputs) &&
     Object.entries(inputs).every(
-      ([key, value]) =>
-        /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/.test(key) && typeof value === 'string'
+      ([key, value]) => inputNamePattern.test(key) && typeof value === 'string'
     )
   );
 }
@@ -102,6 +103,55 @@ export function createGithubActions({ target, branch, run, readWorkflow }) {
     return { checkout, ref };
   }
 
+  async function dispatchableWorkflow(context, workflow) {
+    if (workflow?.path?.startsWith('dynamic/')) {
+      return { kind: 'skip' };
+    }
+    if (
+      workflow?.state !== 'active' ||
+      !(typeof workflow.id === 'number' || typeof workflow.id === 'string')
+    ) {
+      return { kind: 'skip' };
+    }
+    if (
+      !(
+        typeof workflow.name === 'string' &&
+        typeof workflow.path === 'string' &&
+        workflowPathPattern.test(workflow.path)
+      )
+    ) {
+      return {
+        kind: 'failure',
+        value: failure(
+          'GITHUB_WORKFLOWS_UNAVAILABLE',
+          'GitHub returned an invalid workflow record'
+        ),
+      };
+    }
+    let yaml;
+    try {
+      yaml = await workflowYaml(context.checkout, workflow.path, context.ref);
+    } catch {
+      return {
+        kind: 'failure',
+        value: failure(
+          'GITHUB_WORKFLOW_UNVERIFIED',
+          `Could not read workflow ${workflow.name} at ${context.ref}`
+        ),
+      };
+    }
+    return dispatchable(yaml)
+      ? {
+          kind: 'workflow',
+          value: {
+            id: workflow.id,
+            name: workflow.name,
+            path: workflow.path,
+          },
+        }
+      : { kind: 'skip' };
+  }
+
   async function listWorkflows(request) {
     const context = await worktree(request);
     if (context.ok === false) {
@@ -125,44 +175,13 @@ export function createGithubActions({ target, branch, run, readWorkflow }) {
     }
     const workflows = [];
     for (const workflow of listed) {
-      if (
-        workflow?.state !== 'active' ||
-        !(typeof workflow.id === 'number' || typeof workflow.id === 'string')
-      ) {
-        continue;
+      // biome-ignore lint/performance/noAwaitInLoops: Workflow source checks retain CLI list order and stop at the first unverifiable workflow.
+      const resolved = await dispatchableWorkflow(context, workflow);
+      if (resolved.kind === 'failure') {
+        return resolved.value;
       }
-      // GitHub-managed workflows (e.g. dynamic/dependabot/...) have no YAML in
-      // the repo and can't be dispatched; skip them rather than fail the list.
-      if (workflow.path?.startsWith('dynamic/')) {
-        continue;
-      }
-      if (
-        !(
-          typeof workflow.name === 'string' &&
-          typeof workflow.path === 'string' &&
-          /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(workflow.path)
-        )
-      ) {
-        return failure(
-          'GITHUB_WORKFLOWS_UNAVAILABLE',
-          'GitHub returned an invalid workflow record'
-        );
-      }
-      let yaml;
-      try {
-        yaml = await workflowYaml(context.checkout, workflow.path, context.ref);
-      } catch {
-        return failure(
-          'GITHUB_WORKFLOW_UNVERIFIED',
-          `Could not read workflow ${workflow.name} at ${context.ref}`
-        );
-      }
-      if (dispatchable(yaml)) {
-        workflows.push({
-          id: workflow.id,
-          name: workflow.name,
-          path: workflow.path,
-        });
+      if (resolved.kind === 'workflow') {
+        workflows.push(resolved.value);
       }
     }
     return { ok: true, workflows };

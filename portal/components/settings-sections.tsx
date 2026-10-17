@@ -1,5 +1,6 @@
 // Three self-contained Settings sections — each owns its own state/fetch loop,
 // documented as intentionally independent of SettingsPage's own state.
+import type { ComponentChildren } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import { post, postOrToast } from '../api';
 import { createMcpConfigWriter } from '../mcp-config';
@@ -17,6 +18,9 @@ interface SweepCandidate {
   remoteUrl: string | null;
   status: 'importable' | 'no-remote' | 'conflict';
 }
+
+const HTTP_URL_PATTERN = /^https?:\/\//i;
+const WHITESPACE_PATTERN = /\s+/;
 
 // Raycast dev-mode control — status, start/stop, and a live log tail. Fully
 // self-contained (owns its own polling loop) the same way LiveLog/PortsPage
@@ -48,7 +52,9 @@ export function RaycastSection({
   const { lines, preRef } = logRead;
 
   async function start() {
-    if (busy) return;
+    if (busy) {
+      return;
+    }
     setBusy(true);
     await postOrToast('/api/raycast/start', {}, toast, 'start failed');
     setBusy(false);
@@ -56,11 +62,62 @@ export function RaycastSection({
   }
 
   async function stop() {
-    if (busy) return;
+    if (busy) {
+      return;
+    }
     setBusy(true);
     await postOrToast('/api/raycast/stop', {}, toast, 'stop failed');
     setBusy(false);
     loadStatus();
+  }
+
+  let statusContent: ComponentChildren = !failed && (
+    <p class="text-sm text-zinc-400">Loading…</p>
+  );
+  if (status) {
+    if (!status.dirExists) {
+      statusContent = (
+        <p class="text-sm text-zinc-400">raycast/ not found in the Setu repo</p>
+      );
+    } else if (status.running) {
+      statusContent = (
+        <div class="flex flex-col gap-3">
+          <div class="flex items-center gap-2">
+            <StatusDot tone="emerald" />
+            <span class="text-sm">Dev mode running</span>
+            <Button disabled={busy} onClick={stop} variant="secondary">
+              {busy ? 'Stopping…' : 'Stop'}
+            </Button>
+          </div>
+          <LogReadStatus read={logRead} />
+          <section
+            aria-label="Raycast development log output"
+            class="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-zinc-600 leading-relaxed dark:text-zinc-400"
+            onScroll={logRead.onScroll}
+            ref={preRef}
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: The bounded log region needs keyboard scrolling.
+            tabIndex={0}
+          >
+            <pre class="m-0 whitespace-pre-wrap break-all font-mono">
+              {lines?.join('\n') ?? ''}
+            </pre>
+          </section>
+        </div>
+      );
+    } else {
+      statusContent = (
+        <div class="flex flex-col items-start gap-2">
+          <Button disabled={busy} onClick={start}>
+            {busy ? 'Starting…' : 'Start dev mode'}
+          </Button>
+          <p class="text-xs text-zinc-600 dark:text-zinc-300">
+            Runs <span class="font-mono">bun install</span> when dependencies
+            are missing, then <span class="font-mono">bunx ray develop</span> in
+            the background to load Setu in Raycast.
+          </p>
+        </div>
+      );
+    }
   }
 
   return (
@@ -84,52 +141,7 @@ export function RaycastSection({
           </button>
         </p>
       )}
-      {status ? (
-        status.dirExists ? (
-          status.running ? (
-            <div class="flex flex-col gap-3">
-              <div class="flex items-center gap-2">
-                <StatusDot tone="emerald" />
-                <span class="text-sm">Dev mode running</span>
-                <Button disabled={busy} onClick={stop} variant="secondary">
-                  {busy ? 'Stopping…' : 'Stop'}
-                </Button>
-              </div>
-              <LogReadStatus read={logRead} />
-              <section
-                aria-label="Raycast development log output"
-                class="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-zinc-600 leading-relaxed dark:text-zinc-400"
-                onScroll={logRead.onScroll}
-                ref={preRef}
-                // biome-ignore lint/a11y/noNoninteractiveTabindex: The bounded log region needs keyboard scrolling.
-                tabIndex={0}
-              >
-                <pre class="m-0 whitespace-pre-wrap break-all font-mono">
-                  {lines?.join('\n') ?? ''}
-                </pre>
-              </section>
-            </div>
-          ) : (
-            <div class="flex flex-col items-start gap-2">
-              <Button disabled={busy} onClick={start}>
-                {busy ? 'Starting…' : 'Start dev mode'}
-              </Button>
-              <p class="text-xs text-zinc-600 dark:text-zinc-300">
-                Runs <span class="font-mono">bun install</span> when
-                dependencies are missing, then{' '}
-                <span class="font-mono">bunx ray develop</span> in the
-                background to load Setu in Raycast.
-              </p>
-            </div>
-          )
-        ) : (
-          <p class="text-sm text-zinc-400">
-            raycast/ not found in the Setu repo
-          </p>
-        )
-      ) : (
-        !failed && <p class="text-sm text-zinc-400">Loading…</p>
-      )}
+      {statusContent}
     </Section>
   );
 }
@@ -158,7 +170,9 @@ export function DiscoverProjectsSection({
   const importing = importingPath !== null;
 
   async function scan() {
-    if (scanning || importing) return;
+    if (scanning || importing) {
+      return;
+    }
     setScanning(true);
     setScanError(null);
     setResults({});
@@ -244,12 +258,13 @@ export function DiscoverProjectsSection({
           {scanError}
         </p>
       )}
-      {candidates === null ? (
+      {candidates === null && (
         <p class="text-sm text-zinc-400">
           Finds git repos on this Mac that aren't registered with Setu yet. A
           full home directory scan, so it can take a few seconds.
         </p>
-      ) : candidates.length ? (
+      )}
+      {candidates !== null && candidates.length > 0 && (
         <div class="flex flex-col gap-2">
           <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
             {candidates.map((c) => {
@@ -331,7 +346,8 @@ export function DiscoverProjectsSection({
             untouched either way.
           </p>
         </div>
-      ) : (
+      )}
+      {candidates !== null && candidates.length === 0 && (
         <p class="text-sm text-zinc-400">No unregistered repos found.</p>
       )}
     </Section>
@@ -440,6 +456,7 @@ export function McpSection({
         }),
     });
   }
+  const configWriter = writer.current;
   const [form, setForm] = useState({
     args: '',
     command: '',
@@ -462,16 +479,20 @@ export function McpSection({
     savePending.current = true;
     setSaving(true);
     try {
-      const result = await writer.current!.save(
+      const result = await configWriter.save(
         failed ? undefined : serversData,
         change
       );
       const okay = result.ok && result.reconciled !== false;
-      const error = okay
-        ? null
-        : result.networkUncertain || result.committed
-          ? 'Outcome not confirmed. Refresh saved values before trying again.'
-          : result.error || 'Could not save MCP configuration.';
+      let error: string | null;
+      if (okay) {
+        error = null;
+      } else if (result.networkUncertain || result.committed) {
+        error =
+          'Outcome not confirmed. Refresh saved values before trying again.';
+      } else {
+        error = result.error || 'Could not save MCP configuration.';
+      }
       setSaveError(error);
       if (error) {
         toast(`✗ ${error}`, 'red');
@@ -489,7 +510,7 @@ export function McpSection({
       !form.name.trim() ||
       (form.transport === 'stdio'
         ? !form.command.trim()
-        : !/^https?:\/\//i.test(form.url.trim()))
+        : !HTTP_URL_PATTERN.test(form.url.trim()))
     ) {
       setSaveError(
         'Enter a server name and a command, or a complete HTTP(S) URL.'
@@ -501,7 +522,9 @@ export function McpSection({
       form.transport === 'stdio'
         ? {
             ...base,
-            args: form.args.trim() ? form.args.trim().split(/\s+/) : undefined,
+            args: form.args.trim()
+              ? form.args.trim().split(WHITESPACE_PATTERN)
+              : undefined,
             command: form.command.trim(),
           }
         : {
@@ -539,7 +562,9 @@ export function McpSection({
   }
 
   async function connect(id: string) {
-    if (serverBusy.has(id)) return;
+    if (serverBusy.has(id)) {
+      return;
+    }
     setServerBusy((busy) => new Set(busy).add(id));
     try {
       await postOrToast('/api/mcp/connect', { id }, toast, 'connect failed');
@@ -553,7 +578,9 @@ export function McpSection({
     }
   }
   async function disconnect(id: string, preserveBusy = false) {
-    if (serverBusy.has(id) && !preserveBusy) return { ok: false };
+    if (serverBusy.has(id) && !preserveBusy) {
+      return { ok: false };
+    }
     if (!preserveBusy) {
       setServerBusy((busy) => new Set(busy).add(id));
     }
@@ -579,6 +606,7 @@ export function McpSection({
   async function remove(s: McpServer) {
     if (
       serverBusy.has(s.id) ||
+      // biome-ignore lint/suspicious/noAlert: This confirmation gates deletion of the saved MCP configuration below.
       !confirm(
         `Remove MCP server "${s.name}"? Its saved configuration, including any static header, will be removed.`
       )
@@ -772,104 +800,101 @@ export function McpSection({
             </button>
           </p>
         )}
-        {loaded ? (
-          servers.length ? (
-            <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
-              {servers.map((s) => (
-                <div class="flex flex-col gap-1.5 py-2.5" key={s.id}>
-                  <div class="flex min-w-0 flex-wrap items-center gap-2">
-                    <StatusDot
-                      pulse={
-                        s.status === 'connecting' ||
-                        s.status === 'awaiting-auth'
-                      }
-                      tone={MCP_TONE[s.status]}
-                    />
-                    <span class="min-w-0 break-words font-medium text-sm text-zinc-900 dark:text-zinc-100">
-                      {s.name}
-                    </span>
-                    <Badge tone="zinc">{s.transport}</Badge>
-                    <span class="flex-1 text-xs text-zinc-400">
-                      {MCP_LABEL[s.status]}
-                    </span>
-                    {s.status === 'disconnected' || s.status === 'error' ? (
-                      <Button
-                        compact
-                        disabled={serverBusy.has(s.id)}
-                        onClick={() => connect(s.id)}
-                        variant="secondary"
-                      >
-                        Connect
-                      </Button>
-                    ) : (
-                      <Button
-                        compact
-                        disabled={serverBusy.has(s.id)}
-                        onClick={() => disconnect(s.id)}
-                        variant="secondary"
-                      >
-                        Disconnect
-                      </Button>
-                    )}
-                    <IconButton
-                      disabled={saving || failed || serverBusy.has(s.id)}
-                      label={`Remove MCP server ${s.name}`}
-                      onClick={() => remove(s)}
-                      tip="Remove server"
-                      tone="red"
+        {loaded && servers.length > 0 && (
+          <div class="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
+            {servers.map((s) => (
+              <div class="flex flex-col gap-1.5 py-2.5" key={s.id}>
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <StatusDot
+                    pulse={
+                      s.status === 'connecting' || s.status === 'awaiting-auth'
+                    }
+                    tone={MCP_TONE[s.status]}
+                  />
+                  <span class="min-w-0 break-words font-medium text-sm text-zinc-900 dark:text-zinc-100">
+                    {s.name}
+                  </span>
+                  <Badge tone="zinc">{s.transport}</Badge>
+                  <span class="flex-1 text-xs text-zinc-400">
+                    {MCP_LABEL[s.status]}
+                  </span>
+                  {s.status === 'disconnected' || s.status === 'error' ? (
+                    <Button
+                      compact
+                      disabled={serverBusy.has(s.id)}
+                      onClick={() => connect(s.id)}
+                      variant="secondary"
                     >
-                      <CloseIcon class="h-3.5 w-3.5" />
-                    </IconButton>
-                  </div>
-                  {s.error && <p class="text-signal-red text-xs">{s.error}</p>}
-                  {s.status === 'error' && s.stderrTail?.length > 0 && (
-                    <pre class="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-zinc-50 p-2 text-[11px] text-zinc-400 dark:bg-black/20">
-                      {s.stderrTail.join('\n')}
-                    </pre>
+                      Connect
+                    </Button>
+                  ) : (
+                    <Button
+                      compact
+                      disabled={serverBusy.has(s.id)}
+                      onClick={() => disconnect(s.id)}
+                      variant="secondary"
+                    >
+                      Disconnect
+                    </Button>
                   )}
-                  {s.status === 'connected' && s.tools.length > 0 && (
-                    <div>
-                      <button
-                        aria-controls={`mcp-tools-${s.id}`}
-                        aria-expanded={expanded.has(s.id)}
-                        class="text-xs text-zinc-400 underline underline-offset-2"
-                        onClick={() => toggleExpanded(s.id)}
-                        type="button"
-                      >
-                        {expanded.has(s.id) ? 'Hide' : 'Show'} {s.tools.length}{' '}
-                        tool{s.tools.length === 1 ? '' : 's'}
-                      </button>
-                      {expanded.has(s.id) && (
-                        <ul
-                          class="mt-1.5 flex flex-col gap-1"
-                          id={`mcp-tools-${s.id}`}
-                        >
-                          {s.tools.map((t) => (
-                            <li class="text-xs" key={t.name}>
-                              <span class="font-mono text-zinc-700 dark:text-zinc-300">
-                                {t.name}
-                              </span>
-                              {t.description && (
-                                <span class="text-zinc-400">
-                                  {' '}
-                                  — {t.description}
-                                </span>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
+                  <IconButton
+                    disabled={saving || failed || serverBusy.has(s.id)}
+                    label={`Remove MCP server ${s.name}`}
+                    onClick={() => remove(s)}
+                    tip="Remove server"
+                    tone="red"
+                  >
+                    <CloseIcon class="h-3.5 w-3.5" />
+                  </IconButton>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <p class="text-sm text-zinc-400">No MCP servers configured.</p>
-          )
-        ) : (
-          !failed && <p class="text-sm text-zinc-400">Loading…</p>
+                {s.error && <p class="text-signal-red text-xs">{s.error}</p>}
+                {s.status === 'error' && s.stderrTail?.length > 0 && (
+                  <pre class="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-zinc-50 p-2 text-[11px] text-zinc-400 dark:bg-black/20">
+                    {s.stderrTail.join('\n')}
+                  </pre>
+                )}
+                {s.status === 'connected' && s.tools.length > 0 && (
+                  <div>
+                    <button
+                      aria-controls={`mcp-tools-${s.id}`}
+                      aria-expanded={expanded.has(s.id)}
+                      class="text-xs text-zinc-400 underline underline-offset-2"
+                      onClick={() => toggleExpanded(s.id)}
+                      type="button"
+                    >
+                      {expanded.has(s.id) ? 'Hide' : 'Show'} {s.tools.length}{' '}
+                      tool{s.tools.length === 1 ? '' : 's'}
+                    </button>
+                    {expanded.has(s.id) && (
+                      <ul
+                        class="mt-1.5 flex flex-col gap-1"
+                        id={`mcp-tools-${s.id}`}
+                      >
+                        {s.tools.map((t) => (
+                          <li class="text-xs" key={t.name}>
+                            <span class="font-mono text-zinc-700 dark:text-zinc-300">
+                              {t.name}
+                            </span>
+                            {t.description && (
+                              <span class="text-zinc-400">
+                                {' '}
+                                — {t.description}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         )}
+        {loaded && servers.length === 0 && (
+          <p class="text-sm text-zinc-400">No MCP servers configured.</p>
+        )}
+        {!(loaded || failed) && <p class="text-sm text-zinc-400">Loading…</p>}
       </div>
     </Section>
   );

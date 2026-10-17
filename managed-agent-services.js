@@ -28,8 +28,10 @@ import {
 } from './terminal-attention.js';
 
 const tokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
+const sessionIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
+const authorizationErrorPattern = /not authorized|not permitted/i;
 const safeId = (value) =>
-  typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+  typeof value === 'string' && sessionIdPattern.test(value);
 const same = (a, b) => {
   if (a === b) {
     return true;
@@ -55,12 +57,37 @@ const same = (a, b) => {
 const shellQuote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
 const failure = (code, error) => ({ code, error, ok: false });
 
+function headlessRunState(outcome) {
+  if (outcome.ok) {
+    return 'running';
+  }
+  return outcome.state === 'unknown' || outcome.code === 'RUN_PROCESS_UNKNOWN'
+    ? 'unknown'
+    : 'failed';
+}
+
+function completedHeadlessRunState(run) {
+  if (run.state === 'completed') {
+    return 'completed';
+  }
+  if (
+    run.state === 'failed' ||
+    run.state === 'cancelled' ||
+    run.state === 'timed out'
+  ) {
+    return 'failed';
+  }
+  return 'unknown';
+}
+
 function normalTool(tool) {
-  return tool === 'claude' || tool === 'claude-code'
-    ? 'claude-code'
-    : tool === 'codex'
-      ? 'codex'
-      : null;
+  if (tool === 'claude' || tool === 'claude-code') {
+    return 'claude-code';
+  }
+  if (tool === 'codex') {
+    return 'codex';
+  }
+  return null;
 }
 
 function safeSession(session) {
@@ -156,6 +183,7 @@ async function defaultPrivateFiles({ id, runtimeDir = tmpdir() }) {
   };
   return {
     ...files,
+    // biome-ignore lint/suspicious/useAwait: Injected readFile implementations may throw synchronously; this private-files API must reject instead.
     async read(path) {
       return readFile(path, 'utf8');
     },
@@ -185,7 +213,7 @@ async function defaultAppleScript(command) {
       return { availability: 'available', stdout: stdout.trim() };
     }
     return {
-      availability: /not authorized|not permitted/i.test(stderr)
+      availability: authorizationErrorPattern.test(stderr)
         ? 'disabled'
         : 'unknown',
       stdout: stdout.trim(),
@@ -347,16 +375,21 @@ export function createManagedAgentServices({
     lease.target &&
     typeof lease.target.repo === 'string' &&
     typeof lease.target.name === 'string';
-  const leaseEntry = (value) =>
-    validLease(value)
-      ? { lease: value, source: serviceSource }
-      : value &&
-          validLease(value.lease) &&
-          validSource(value.source) &&
-          (value.pendingOutcome === undefined ||
-            validPendingOutcome(value.pendingOutcome))
-        ? value
-        : null;
+  const leaseEntry = (value) => {
+    if (validLease(value)) {
+      return { lease: value, source: serviceSource };
+    }
+    if (
+      value &&
+      validLease(value.lease) &&
+      validSource(value.source) &&
+      (value.pendingOutcome === undefined ||
+        validPendingOutcome(value.pendingOutcome))
+    ) {
+      return value;
+    }
+    return null;
+  };
   const leaseEntries = (document) => {
     if (document?.managedLeases === undefined) {
       return {};
@@ -428,7 +461,7 @@ export function createManagedAgentServices({
     id: eventId,
     kind,
     state: eventState,
-    target,
+    target: eventTarget,
     code,
     source = serviceSource,
   }) => {
@@ -440,7 +473,7 @@ export function createManagedAgentServices({
         kind,
         source,
         state: eventState,
-        target: { name: target.name, repo: target.repo },
+        target: { name: eventTarget.name, repo: eventTarget.repo },
       });
       return recorded?.ok
         ? { ok: true }
@@ -485,18 +518,52 @@ export function createManagedAgentServices({
     for (let attempt = 0; attempt < registrationAttempts; attempt += 1) {
       try {
         const parsed = parseSessionRegistration(
+          // biome-ignore lint/performance/noAwaitInLoops: Each read determines whether the next registration retry and delay are necessary.
           await files.read(files.registrationPath),
           { launchToken, sessionId }
         );
         if (parsed) {
           return parsed;
         }
-      } catch {}
+      } catch {
+        // Registration can appear after a short retry delay.
+      }
       if (attempt + 1 < registrationAttempts) {
         await sleep(registrationDelayMs);
       }
     }
     return null;
+  };
+  const releaseEndedSession = async (session, entry, retain) => {
+    if (!locallyReleasedLeases.has(session.id)) {
+      let released;
+      try {
+        released = await admission.release(entry.lease);
+      } catch {
+        released = null;
+      }
+      if (!released?.ok) {
+        return;
+      }
+      locallyReleasedLeases.add(session.id);
+    }
+    // An outcome recorder outage cannot hold a proven-ended process slot.
+    // Keep its attribution for retry after releasing only the exact lease.
+    if (retain.has(session.id) || entry.pendingOutcome) {
+      return;
+    }
+    try {
+      await forgetLease(session.id);
+    } catch {
+      return;
+    }
+    const runtime = runtimes.get(session.id);
+    if (runtime?.files?.remove) {
+      await runtime.files.remove().catch(() => {
+        // Private launch artifacts are best-effort cleanup after a proved exit.
+      });
+    }
+    runtimes.delete(session.id);
   };
   const releaseEndedSessions = async ({ retain = new Set() } = {}) => {
     const leases = leaseDocument();
@@ -505,33 +572,8 @@ export function createManagedAgentServices({
         continue;
       }
       const entry = leaseEntry(leases[session.id]);
-      if (!locallyReleasedLeases.has(session.id)) {
-        let released;
-        try {
-          released = await admission.release(entry.lease);
-        } catch {
-          released = null;
-        }
-        if (!released?.ok) {
-          continue;
-        }
-        locallyReleasedLeases.add(session.id);
-      }
-      // An outcome recorder outage cannot hold a proven-ended process slot.
-      // Keep its attribution for retry after releasing only the exact lease.
-      if (retain.has(session.id) || entry.pendingOutcome) {
-        continue;
-      }
-      try {
-        await forgetLease(session.id);
-      } catch {
-        continue;
-      }
-      const runtime = runtimes.get(session.id);
-      if (runtime?.files?.remove) {
-        await runtime.files.remove().catch(() => {});
-      }
-      runtimes.delete(session.id);
+      // biome-ignore lint/performance/noAwaitInLoops: Each release result updates this exact lease before its journal can be removed.
+      await releaseEndedSession(session, entry, retain);
     }
   };
   const withTargetResult = async (selected, work) => {
@@ -554,7 +596,9 @@ export function createManagedAgentServices({
   const ensureMonitor = () => {
     if (!monitor) {
       monitor = scheduleInterval(() => {
-        void reconcileSessions().catch(() => {});
+        reconcileSessions().catch(() => {
+          // The next monitor tick retries reconciliation.
+        });
       }, monitorMs);
     }
   };
@@ -586,21 +630,14 @@ export function createManagedAgentServices({
         };
   };
   const trackRun = (runId, resolved, source) => {
-    void headless
+    headless
       .wait(runId)
       .then(async () => {
         const run = headless.get(runId);
         if (!resultTarget(run, resolved)) {
           return;
         }
-        const stateName =
-          run.state === 'completed'
-            ? 'completed'
-            : run.state === 'failed' ||
-                run.state === 'cancelled' ||
-                run.state === 'timed out'
-              ? 'failed'
-              : 'unknown';
+        const stateName = completedHeadlessRunState(run);
         await event({
           id: `headless-${runId}`,
           kind: 'headless-run',
@@ -609,7 +646,9 @@ export function createManagedAgentServices({
           target: resolved,
         });
       })
-      .catch(() => {});
+      .catch(() => {
+        // Background observation failures must not become unhandled rejections.
+      });
   };
 
   async function open({ repo, name, tool = 'claude-code', source } = {}) {
@@ -678,32 +717,22 @@ export function createManagedAgentServices({
         return null;
       }
     };
-    const prelaunchFailure = async ({
-      code,
-      error,
-      files,
-      hasRecord = false,
-    }) => {
-      const cleanup = {};
-      if (hasRecord) {
-        try {
-          if (
-            !(
-              await sessions.fail(sessionId, {
-                checkoutIdentity: reviewed.checkoutIdentity,
-              })
-            ).ok
-          ) {
-            cleanup.sessionState = 'unavailable';
-          }
-        } catch {
+    async function failStartingRecord(cleanup) {
+      try {
+        if (
+          !(
+            await sessions.fail(sessionId, {
+              checkoutIdentity: reviewed.checkoutIdentity,
+            })
+          ).ok
+        ) {
           cleanup.sessionState = 'unavailable';
         }
+      } catch {
+        cleanup.sessionState = 'unavailable';
       }
-      const released = await releaseOnce();
-      if (!released?.ok) {
-        cleanup.release = released?.code ?? 'ADMISSION_RELEASE_UNAVAILABLE';
-      }
+    }
+    async function cleanPrelaunchFiles(cleanup, released, failureFiles) {
       if (remembered && released?.ok) {
         try {
           await forgetLease(sessionId);
@@ -712,13 +741,29 @@ export function createManagedAgentServices({
           cleanup.forgetLease = 'unavailable';
         }
       }
-      if (files?.remove) {
+      if (failureFiles?.remove) {
         try {
-          await files.remove();
+          await failureFiles.remove();
         } catch {
           cleanup.files = 'unavailable';
         }
       }
+    }
+    const prelaunchFailure = async ({
+      code,
+      error,
+      files: failureFiles,
+      hasRecord: failureHasRecord = false,
+    }) => {
+      const cleanup = {};
+      if (failureHasRecord) {
+        await failStartingRecord(cleanup);
+      }
+      const released = await releaseOnce();
+      if (!released?.ok) {
+        cleanup.release = released?.code ?? 'ADMISSION_RELEASE_UNAVAILABLE';
+      }
+      await cleanPrelaunchFiles(cleanup, released, failureFiles);
       runtimes.delete(sessionId);
       const recording = await event({
         code,
@@ -737,7 +782,9 @@ export function createManagedAgentServices({
       };
     };
     const unknownAfterLaunch = async (code, error) => {
-      await sessions.reconcile().catch(() => {});
+      await sessions.reconcile().catch(() => {
+        // The monitor retains ownership after an uncertain launch.
+      });
       ensureMonitor();
       const recording = await event({
         code,
@@ -754,180 +801,35 @@ export function createManagedAgentServices({
         ...(recording.ok ? {} : { recording }),
       };
     };
-    const launchLocked = async () => {
-      // Admission is deliberately outside this lock. The registry is re-read
-      // while locked, so no pre-admission target observation reaches launch.
-      resolved = await target({ name, repo });
-      if (
-        !resolved ||
-        resolved.wtDir !== reviewed.wtDir ||
-        !same(resolved.checkoutIdentity, reviewed.checkoutIdentity)
-      ) {
+    function failedLaunchLock() {
+      if (!nativeStarted) {
+        if (lockResult) {
+          return {
+            ...lockResult,
+            cleanup: {
+              ...lockResult.cleanup,
+              targetLockRelease: 'unavailable',
+            },
+          };
+        }
         return prelaunchFailure({
-          code: 'TARGET_CHANGED',
-          error: 'The selected worktree changed before launch',
-        });
-      }
-      const acceptedRecording = await event({
-        id: operationId,
-        kind: 'interactive-session',
-        source: outcomeSource,
-        state: 'accepted',
-        target: resolved,
-      });
-      try {
-        files = await filesFor(sessionId);
-      } catch {
-        return prelaunchFailure({
-          code: 'SESSION_FILES_FAILED',
-          error: 'Private launch files could not be created',
-        });
-      }
-      let initial;
-      hasRecord = true;
-      try {
-        initial = await sessions.register({
-          checkoutIdentity: resolved.checkoutIdentity,
-          checkoutPath: resolved.wtDir,
-          id: sessionId,
-          name,
-          repo,
-          tool: provider,
-        });
-      } catch {
-        return prelaunchFailure({
-          code: 'SESSION_START_WRITE_FAILED',
-          error: 'The starting session record could not be saved',
+          code: 'TARGET_LOCK_FAILED',
+          error: 'The target could not be locked before launch',
           files,
           hasRecord,
         });
       }
-      if (!initial.ok) {
-        return prelaunchFailure({
-          code: initial.code ?? 'SESSION_START_WRITE_FAILED',
-          error:
-            initial.error ?? 'The starting session record could not be saved',
-          files,
-        });
-      }
-      // A state write can report failure after an atomic rename. Treat the
-      // association as possibly durable until its explicit removal succeeds.
-      remembered = true;
-      try {
-        await rememberLease(sessionId, admitted.lease, outcomeSource);
-      } catch {
-        return prelaunchFailure({
-          code: 'SESSION_LEASE_WRITE_FAILED',
-          error: 'The session lease could not be saved',
-          files,
-          hasRecord: true,
-        });
-      }
-      runtimes.set(sessionId, {
-        files,
-        lease: admitted.lease,
-        source: outcomeSource,
-      });
-      const settings =
-        provider === 'claude-code'
-          ? claudeSettings({ hookPath: files.hookPath })
-          : null;
-      const command =
-        provider === 'claude-code'
-          ? `claude --settings "$(cat -- ${shellQuote(files.settingsPath)})"`
-          : 'codex';
-      const launch = buildAgentSessionLaunch({
-        checkoutPath: resolved.wtDir,
-        command,
-        launcherPath: files.launcherPath,
-        launchToken,
-        registrationPath: files.registrationPath,
-        sessionId,
-      });
-      try {
-        if (provider === 'claude-code') {
-          await files.write(
-            files.hookPath,
-            claudeHookProgram(ingressUrl),
-            0o700
-          );
-          await files.write(files.settingsPath, settings, 0o600);
-        }
-        // `open -na` has no documented per-launch environment option. Keep the
-        // token only in this 0700 launcher so its registration can still be bound.
-        await files.write(
-          files.launcherPath,
-          `export SETU_SESSION_TOKEN=${shellQuote(launchToken)}\n${launch.script}`,
-          0o700
-        );
-        await files.write(files.registrationPath, '', 0o600);
-      } catch {
-        return prelaunchFailure({
-          code: 'SESSION_FILES_FAILED',
-          error: 'Private launch files could not be written',
-          files,
-          hasRecord: true,
-        });
-      }
-      if (provider === 'claude-code') {
-        const registrationBinding = ingress.registerLaunch({
-          checkoutIdentity: resolved.checkoutIdentity,
-          checkoutPath: resolved.wtDir,
-          launchToken,
-          provider,
-          sessionId,
-        });
-        if (!registrationBinding.ok) {
-          return prelaunchFailure({
-            code: registrationBinding.code,
-            error: registrationBinding.error,
-            files,
-            hasRecord: true,
-          });
-        }
-      }
-      const scripted = buildGhosttyScriptLaunch({
-        checkoutPath: resolved.wtDir,
-        launcherPath: files.launcherPath,
-        launchToken,
-      });
-      let native;
-      nativeStarted = true;
-      try {
-        native = await (launchNative ?? runAppleScript)(scripted);
-      } catch {
-        native = { availability: 'unknown' };
-      }
-      const terminalId =
-        native?.availability === 'available'
-          ? parseGhosttyLaunchResponse(native.stdout)
-          : null;
+      return unknownAfterLaunch(
+        'SESSION_LAUNCH_UNKNOWN',
+        'The launch outcome could not be confirmed'
+      );
+    }
+    async function registerLaunchedSession(
+      terminalId,
+      initial,
+      acceptedRecording
+    ) {
       const exactTerminal = Boolean(terminalId);
-      if (
-        !terminalId &&
-        (native?.availability === 'unavailable' ||
-          native?.availability === 'disabled' ||
-          native?.stdout?.trim() === 'SETU:SCRIPTING_DISABLED')
-      ) {
-        try {
-          const fallback = await (launchOpen ?? defaultOpen)(launch);
-          if (!fallback?.ok) {
-            throw new Error('open failed');
-          }
-        } catch {
-          return unknownAfterLaunch(
-            'TERMINAL_LAUNCH_UNKNOWN',
-            'Ghostty launch could not be confirmed'
-          );
-        }
-      } else if (!terminalId) {
-        return unknownAfterLaunch(
-          native?.availability === 'disabled'
-            ? 'GHOSTTY_AUTOMATION_DISABLED'
-            : 'TERMINAL_LAUNCH_UNKNOWN',
-          'Ghostty launch could not be confirmed'
-        );
-      }
       const registration = await readRegistration(
         files,
         sessionId,
@@ -958,17 +860,229 @@ export function createManagedAgentServices({
         target: resolved,
       });
       ensureMonitor();
+      let failedRecording = null;
+      if (!acceptedRecording.ok) {
+        failedRecording = acceptedRecording;
+      } else if (!runningRecording.ok) {
+        failedRecording = runningRecording;
+      }
       return {
         capability: { exactTerminal, trustedHooks: provider === 'claude-code' },
         ok: true,
         operationId,
         session: safeSession(registered.session),
-        ...(acceptedRecording.ok
-          ? runningRecording.ok
-            ? {}
-            : { recording: runningRecording }
-          : { recording: acceptedRecording }),
+        ...(failedRecording ? { recording: failedRecording } : {}),
       };
+    }
+    function nativeFallbackAvailable(native) {
+      return (
+        native?.availability === 'unavailable' ||
+        native?.availability === 'disabled' ||
+        native?.stdout?.trim() === 'SETU:SCRIPTING_DISABLED'
+      );
+    }
+    async function launchFallback(launch) {
+      try {
+        const fallback = await (launchOpen ?? defaultOpen)(launch);
+        if (!fallback?.ok) {
+          throw new Error('open failed');
+        }
+      } catch {
+        return unknownAfterLaunch(
+          'TERMINAL_LAUNCH_UNKNOWN',
+          'Ghostty launch could not be confirmed'
+        );
+      }
+      return null;
+    }
+    function nativeTerminalId(native) {
+      return native?.availability === 'available'
+        ? parseGhosttyLaunchResponse(native.stdout)
+        : null;
+    }
+    async function launchTerminal(launch) {
+      const scripted = buildGhosttyScriptLaunch({
+        checkoutPath: resolved.wtDir,
+        launcherPath: files.launcherPath,
+        launchToken,
+      });
+      let native;
+      nativeStarted = true;
+      try {
+        native = await (launchNative ?? runAppleScript)(scripted);
+      } catch {
+        native = { availability: 'unknown' };
+      }
+      const terminalId = nativeTerminalId(native);
+      if (!terminalId && nativeFallbackAvailable(native)) {
+        const fallbackFailure = await launchFallback(launch);
+        if (fallbackFailure) {
+          return { failure: fallbackFailure };
+        }
+      } else if (!terminalId) {
+        return {
+          failure: await unknownAfterLaunch(
+            native?.availability === 'disabled'
+              ? 'GHOSTTY_AUTOMATION_DISABLED'
+              : 'TERMINAL_LAUNCH_UNKNOWN',
+            'Ghostty launch could not be confirmed'
+          ),
+        };
+      }
+      return { terminalId };
+    }
+    const launchLocked = async () => {
+      // Admission is deliberately outside this lock. The registry is re-read
+      // while locked, so no pre-admission target observation reaches launch.
+      resolved = await target({ name, repo });
+      if (
+        !resolved ||
+        resolved.wtDir !== reviewed.wtDir ||
+        !same(resolved.checkoutIdentity, reviewed.checkoutIdentity)
+      ) {
+        return prelaunchFailure({
+          code: 'TARGET_CHANGED',
+          error: 'The selected worktree changed before launch',
+        });
+      }
+      const acceptedRecording = await event({
+        id: operationId,
+        kind: 'interactive-session',
+        source: outcomeSource,
+        state: 'accepted',
+        target: resolved,
+      });
+      let initial;
+      async function prepareLaunchRecord() {
+        try {
+          files = await filesFor(sessionId);
+        } catch {
+          return prelaunchFailure({
+            code: 'SESSION_FILES_FAILED',
+            error: 'Private launch files could not be created',
+          });
+        }
+        hasRecord = true;
+        try {
+          initial = await sessions.register({
+            checkoutIdentity: resolved.checkoutIdentity,
+            checkoutPath: resolved.wtDir,
+            id: sessionId,
+            name,
+            repo,
+            tool: provider,
+          });
+        } catch {
+          return prelaunchFailure({
+            code: 'SESSION_START_WRITE_FAILED',
+            error: 'The starting session record could not be saved',
+            files,
+            hasRecord,
+          });
+        }
+        if (!initial.ok) {
+          return prelaunchFailure({
+            code: initial.code ?? 'SESSION_START_WRITE_FAILED',
+            error:
+              initial.error ?? 'The starting session record could not be saved',
+            files,
+          });
+        }
+        // A state write can report failure after an atomic rename. Treat the
+        // association as possibly durable until its explicit removal succeeds.
+        remembered = true;
+        try {
+          await rememberLease(sessionId, admitted.lease, outcomeSource);
+        } catch {
+          return prelaunchFailure({
+            code: 'SESSION_LEASE_WRITE_FAILED',
+            error: 'The session lease could not be saved',
+            files,
+            hasRecord: true,
+          });
+        }
+        runtimes.set(sessionId, {
+          files,
+          lease: admitted.lease,
+          source: outcomeSource,
+        });
+        return null;
+      }
+      const preparationFailure = await prepareLaunchRecord();
+      if (preparationFailure) {
+        return preparationFailure;
+      }
+      const settings =
+        provider === 'claude-code'
+          ? claudeSettings({ hookPath: files.hookPath })
+          : null;
+      const command =
+        provider === 'claude-code'
+          ? `claude --settings "$(cat -- ${shellQuote(files.settingsPath)})"`
+          : 'codex';
+      const launch = buildAgentSessionLaunch({
+        checkoutPath: resolved.wtDir,
+        command,
+        launcherPath: files.launcherPath,
+        launchToken,
+        registrationPath: files.registrationPath,
+        sessionId,
+      });
+      async function publishLaunchFiles() {
+        try {
+          if (provider === 'claude-code') {
+            await files.write(
+              files.hookPath,
+              claudeHookProgram(ingressUrl),
+              0o700
+            );
+            await files.write(files.settingsPath, settings, 0o600);
+          }
+          // `open -na` has no documented per-launch environment option. Keep the
+          // token only in this 0700 launcher so its registration can still be bound.
+          await files.write(
+            files.launcherPath,
+            `export SETU_SESSION_TOKEN=${shellQuote(launchToken)}\n${launch.script}`,
+            0o700
+          );
+          await files.write(files.registrationPath, '', 0o600);
+        } catch {
+          return prelaunchFailure({
+            code: 'SESSION_FILES_FAILED',
+            error: 'Private launch files could not be written',
+            files,
+            hasRecord: true,
+          });
+        }
+        if (provider === 'claude-code') {
+          const registrationBinding = ingress.registerLaunch({
+            checkoutIdentity: resolved.checkoutIdentity,
+            checkoutPath: resolved.wtDir,
+            launchToken,
+            provider,
+            sessionId,
+          });
+          if (!registrationBinding.ok) {
+            return prelaunchFailure({
+              code: registrationBinding.code,
+              error: registrationBinding.error,
+              files,
+              hasRecord: true,
+            });
+          }
+        }
+        return null;
+      }
+      const publicationFailure = await publishLaunchFiles();
+      if (publicationFailure) {
+        return publicationFailure;
+      }
+      const terminalResult = await launchTerminal(launch);
+      if ('failure' in terminalResult) {
+        return terminalResult.failure;
+      }
+      const { terminalId } = terminalResult;
+      return registerLaunchedSession(terminalId, initial, acceptedRecording);
     };
     try {
       return await state.withTargets([{ name, repo }], async () => {
@@ -976,27 +1090,83 @@ export function createManagedAgentServices({
         return lockResult;
       });
     } catch {
-      if (!nativeStarted) {
-        if (lockResult) {
-          return {
-            ...lockResult,
-            cleanup: {
-              ...lockResult.cleanup,
-              targetLockRelease: 'unavailable',
-            },
+      return failedLaunchLock();
+    }
+  }
+
+  async function recordReconciledSession(
+    session,
+    entry,
+    pending,
+    retain,
+    recording
+  ) {
+    const outcome =
+      pending && !(session.state === 'ended' && pending.state === 'unknown')
+        ? pending
+        : {
+            state: session.state === 'ended' ? 'completed' : 'unknown',
+            ...(session.state === 'unknown'
+              ? { code: 'SESSION_OWNERSHIP_UNKNOWN' }
+              : {}),
+            source:
+              runtimes.get(session.id)?.source ??
+              entry?.source ??
+              serviceSource,
           };
-        }
-        return prelaunchFailure({
-          code: 'TARGET_LOCK_FAILED',
-          error: 'The target could not be locked before launch',
-          files,
-          hasRecord,
-        });
-      }
-      return unknownAfterLaunch(
-        'SESSION_LAUNCH_UNKNOWN',
-        'The launch outcome could not be confirmed'
+    try {
+      await setPendingOutcome(session.id, outcome);
+    } catch {
+      retain.add(session.id);
+      recording.push(
+        failure(
+          'OPERATION_EVENT_PENDING_UNAVAILABLE',
+          'The session outcome could not be retained'
+        )
       );
+      return;
+    }
+    const recorded = await event({
+      code: outcome.code,
+      id: `session-${session.id}`,
+      kind: 'interactive-session',
+      source: outcome.source,
+      state: outcome.state,
+      target: session,
+    });
+    recording.push(recorded);
+    if (!recorded.ok) {
+      retain.add(session.id);
+      return;
+    }
+    try {
+      await clearPendingOutcome(session.id);
+    } catch {
+      retain.add(session.id);
+    }
+  }
+
+  async function recordSessionChanges(rows, before, leases, retain, recording) {
+    for (const session of rows) {
+      const entry = leaseEntry(leases[session.id]);
+      const pending = entry?.pendingOutcome;
+      if (
+        before.get(session.id) === session.state &&
+        ['ended', 'unknown'].includes(session.state) &&
+        !pending
+      ) {
+        continue;
+      }
+      if (session.state === 'ended' || session.state === 'unknown') {
+        // biome-ignore lint/performance/noAwaitInLoops: Persist each session's outcome before recording or releasing that exact lease.
+        await recordReconciledSession(
+          session,
+          entry,
+          pending,
+          retain,
+          recording
+        );
+      }
     }
   }
 
@@ -1014,63 +1184,13 @@ export function createManagedAgentServices({
     const recording = [];
     const retain = new Set();
     if (result.ok) {
-      for (const session of result.sessions) {
-        const entry = leaseEntry(leases[session.id]);
-        const pending = entry?.pendingOutcome;
-        if (
-          before.get(session.id) === session.state &&
-          ['ended', 'unknown'].includes(session.state) &&
-          !pending
-        ) {
-          continue;
-        }
-        if (session.state === 'ended' || session.state === 'unknown') {
-          const outcome =
-            pending &&
-            !(session.state === 'ended' && pending.state === 'unknown')
-              ? pending
-              : {
-                  state: session.state === 'ended' ? 'completed' : 'unknown',
-                  ...(session.state === 'unknown'
-                    ? { code: 'SESSION_OWNERSHIP_UNKNOWN' }
-                    : {}),
-                  source:
-                    runtimes.get(session.id)?.source ??
-                    entry?.source ??
-                    serviceSource,
-                };
-          try {
-            await setPendingOutcome(session.id, outcome);
-          } catch {
-            retain.add(session.id);
-            recording.push(
-              failure(
-                'OPERATION_EVENT_PENDING_UNAVAILABLE',
-                'The session outcome could not be retained'
-              )
-            );
-            continue;
-          }
-          const recorded = await event({
-            code: outcome.code,
-            id: `session-${session.id}`,
-            kind: 'interactive-session',
-            source: outcome.source,
-            state: outcome.state,
-            target: session,
-          });
-          recording.push(recorded);
-          if (!recorded.ok) {
-            retain.add(session.id);
-            continue;
-          }
-          try {
-            await clearPendingOutcome(session.id);
-          } catch {
-            retain.add(session.id);
-          }
-        }
-      }
+      await recordSessionChanges(
+        result.sessions,
+        before,
+        leases,
+        retain,
+        recording
+      );
       try {
         await releaseEndedSessions({ retain });
       } catch {
@@ -1095,6 +1215,52 @@ export function createManagedAgentServices({
       : result;
   }
 
+  const sessionLeaseEntry = (sessionId) => {
+    try {
+      return leaseEntry(leaseDocument()[sessionId]);
+    } catch {
+      return null;
+    }
+  };
+  const recordEndedSession = async ({ resolved, sessionId, source }) => {
+    const entry = sessionLeaseEntry(sessionId);
+    const outcome = {
+      source: entry?.source ?? (validSource(source) ? source : serviceSource),
+      state: 'completed',
+    };
+    try {
+      await setPendingOutcome(sessionId, outcome);
+      const recording = await event({
+        id: `session-${sessionId}`,
+        kind: 'interactive-session',
+        source: outcome.source,
+        state: outcome.state,
+        target: resolved,
+      });
+      if (recording.ok) {
+        await clearPendingOutcome(sessionId);
+      }
+      return recording;
+    } catch {
+      return failure(
+        'OPERATION_EVENT_PENDING_UNAVAILABLE',
+        'The session outcome could not be retained'
+      );
+    }
+  };
+  const recordUnknownSession = (result, resolved, sessionId, source) => {
+    const entry = sessionLeaseEntry(sessionId);
+    return event({
+      code: result.code,
+      id: `session-${sessionId}`,
+      kind: 'interactive-session',
+      source: entry?.source ?? (validSource(source) ? source : serviceSource),
+      state: 'unknown',
+      target: resolved,
+    });
+  };
+
+  // biome-ignore lint/suspicious/useAwait: withTargetResult and its injected collaborators may throw synchronously; this public API must reject instead.
   async function endSession({
     repo,
     name,
@@ -1109,65 +1275,32 @@ export function createManagedAgentServices({
         repo,
         sessionId,
       });
-      if (selected.error) {
+      if (Object.hasOwn(selected, 'error')) {
         return selected.error;
       }
       const result = await sessions.end(sessionId, { checkoutIdentity });
       const operationId = `session-${sessionId}`;
       let recording;
       if (result.session?.state === 'ended') {
-        const entry = (() => {
-          try {
-            return leaseEntry(leaseDocument()[sessionId]);
-          } catch {
-            return null;
-          }
-        })();
         // A lifecycle completion belongs to the front door that launched this
         // owned process; a later portal recovery/end request must not rewrite it.
-        const outcome = {
-          source:
-            entry?.source ?? (validSource(source) ? source : serviceSource),
-          state: 'completed',
-        };
-        try {
-          await setPendingOutcome(sessionId, outcome);
-          recording = await event({
-            id: operationId,
-            kind: 'interactive-session',
-            source: outcome.source,
-            state: outcome.state,
-            target: selected.resolved,
-          });
-          if (recording.ok) {
-            await clearPendingOutcome(sessionId);
-          }
-        } catch {
-          recording = failure(
-            'OPERATION_EVENT_PENDING_UNAVAILABLE',
-            'The session outcome could not be retained'
-          );
-        }
+        recording = await recordEndedSession({
+          resolved: selected.resolved,
+          sessionId,
+          source,
+        });
         await releaseEndedSessions({
           retain: recording?.ok ? new Set() : new Set([sessionId]),
-        }).catch(() => {});
-      } else if (!result.ok && result.session?.state === 'unknown') {
-        const entry = (() => {
-          try {
-            return leaseEntry(leaseDocument()[sessionId]);
-          } catch {
-            return null;
-          }
-        })();
-        recording = await event({
-          code: result.code,
-          id: operationId,
-          kind: 'interactive-session',
-          source:
-            entry?.source ?? (validSource(source) ? source : serviceSource),
-          state: 'unknown',
-          target: selected.resolved,
+        }).catch(() => {
+          // A later reconciliation retries lease cleanup after a proven end.
         });
+      } else if (!result.ok && result.session?.state === 'unknown') {
+        recording = await recordUnknownSession(
+          result,
+          selected.resolved,
+          sessionId,
+          source
+        );
       }
       return {
         ...result,
@@ -1177,6 +1310,7 @@ export function createManagedAgentServices({
     });
   }
 
+  // biome-ignore lint/suspicious/useAwait: Hook ingress adapters may throw synchronously; portal callers receive this boundary as a Promise.
   async function receiveHook({ provider, payload, launchToken } = {}) {
     const canonical = normalTool(provider);
     if (!canonical) {
@@ -1196,6 +1330,25 @@ export function createManagedAgentServices({
     return attention.receive({ payload, provider: canonical });
   }
 
+  async function attentionEvent(item, only) {
+    const session = item.sessionId ? sessions.get(item.sessionId) : null;
+    const resolved =
+      session && session.ownership === 'owned' && session.state === 'running'
+        ? await target({ name: session.name, repo: session.repo })
+        : null;
+    const valid =
+      resolved &&
+      resultTarget(session, resolved) &&
+      (!only || (only.repo === resolved.repo && only.name === resolved.name));
+    return !only || valid
+      ? {
+          ...item,
+          session: valid ? safeSession(session) : null,
+          target: valid ? { name: resolved.name, repo: resolved.repo } : null,
+        }
+      : null;
+  }
+
   async function listAttention({ repo, name } = {}) {
     const listed = attention.list();
     if (!listed.ok) {
@@ -1213,21 +1366,10 @@ export function createManagedAgentServices({
     }
     const events = [];
     for (const item of listed.events) {
-      const session = item.sessionId ? sessions.get(item.sessionId) : null;
-      const resolved =
-        session && session.ownership === 'owned' && session.state === 'running'
-          ? await target({ name: session.name, repo: session.repo })
-          : null;
-      const valid =
-        resolved &&
-        resultTarget(session, resolved) &&
-        (!only || (only.repo === resolved.repo && only.name === resolved.name));
-      if (!only || valid) {
-        events.push({
-          ...item,
-          session: valid ? safeSession(session) : null,
-          target: valid ? { name: resolved.name, repo: resolved.repo } : null,
-        });
+      // biome-ignore lint/performance/noAwaitInLoops: Each live-session lookup preserves the attention list's observed ordering and mutable target view.
+      const attentionItem = await attentionEvent(item, only);
+      if (attentionItem) {
+        events.push(attentionItem);
       }
     }
     return { events, ok: true };
@@ -1250,7 +1392,7 @@ export function createManagedAgentServices({
           repo,
           sessionId,
         });
-        if (selected.error) {
+        if (Object.hasOwn(selected, 'error')) {
           const recording = await event({
             code: selected.error.code,
             id: operationId,
@@ -1339,7 +1481,7 @@ export function createManagedAgentServices({
           repo,
           sessionId,
         });
-        if (selected.error) {
+        if (Object.hasOwn(selected, 'error')) {
           const recording = await event({
             code: selected.error.code,
             id: operationId,
@@ -1438,11 +1580,7 @@ export function createManagedAgentServices({
       id: operationId,
       kind: 'headless-run',
       source,
-      state: outcome.ok
-        ? 'running'
-        : outcome.state === 'unknown' || outcome.code === 'RUN_PROCESS_UNKNOWN'
-          ? 'unknown'
-          : 'failed',
+      state: headlessRunState(outcome),
       target: resolved,
     });
     if (outcome.id && (outcome.ok || outcome.state === 'unknown')) {
@@ -1451,6 +1589,7 @@ export function createManagedAgentServices({
     return { ...outcome, operationId, ...(recording.ok ? {} : { recording }) };
   }
 
+  // biome-ignore lint/suspicious/useAwait: withTargetResult may synchronously reject an invalid target; callers expect a rejected Promise.
   async function cancelRun({
     repo,
     name,
@@ -1517,20 +1656,22 @@ export function createManagedAgentServices({
       id: operationId,
       kind: 'headless-run',
       source,
-      state: outcome.ok
-        ? 'running'
-        : outcome.state === 'unknown' || outcome.code === 'RUN_PROCESS_UNKNOWN'
-          ? 'unknown'
-          : 'failed',
+      state: headlessRunState(outcome),
       target: resolved,
     });
     if (outcome.id && (outcome.ok || outcome.state === 'unknown')) {
       trackRun(outcome.id, resolved, source);
     }
+    if (recording.ok) {
+      return {
+        ...outcome,
+        operationId,
+      };
+    }
     return {
       ...outcome,
       operationId,
-      ...(recording && !recording.ok ? { recording } : {}),
+      recording,
     };
   }
 
@@ -1539,7 +1680,7 @@ export function createManagedAgentServices({
     if (!listed.ok) {
       return listed;
     }
-    const runs = listed.runs;
+    const { runs } = listed;
     const only =
       repo === undefined && name === undefined
         ? null
@@ -1590,6 +1731,7 @@ export function createManagedAgentServices({
 
   return Object.freeze({
     cancelRun,
+    // biome-ignore lint/suspicious/useAwait: clearMonitor is injectable and may throw synchronously; dispose remains an async public cleanup API.
     dispose: async () => {
       if (monitor) {
         clearMonitor(monitor);

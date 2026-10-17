@@ -41,9 +41,7 @@ test('unavailable identity evidence is unknown, without a weaker path-only ident
     await inspectCheckoutIdentity(
       { repoDir: '/absent', wtDir: '/absent' },
       {
-        realpath: () => {
-          return Promise.reject(new Error('unreadable'));
-        },
+        realpath: () => Promise.reject(new Error('unreadable')),
       }
     )
   ).toMatchObject({ known: false });

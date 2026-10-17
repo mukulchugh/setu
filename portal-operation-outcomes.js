@@ -17,12 +17,12 @@ export function createPortalOperationOutcomes({
       return { outcomeRecorded: false };
     }
   };
-  const stateFor = (result) =>
-    result?.state === 'unknown' || result?.code?.includes('UNKNOWN')
-      ? 'unknown'
-      : result?.ok === false
-        ? 'failed'
-        : 'completed';
+  const stateFor = (result) => {
+    if (result?.state === 'unknown' || result?.code?.includes('UNKNOWN')) {
+      return 'unknown';
+    }
+    return result?.ok === false ? 'failed' : 'completed';
+  };
   return {
     async accept({
       kind,

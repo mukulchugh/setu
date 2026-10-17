@@ -10,6 +10,10 @@ const roots = [];
 const start = 'Mon Oct 5 12:00:00 2026';
 const uuid = 'A1B2C3D4-E5F6-4A1B-8C2D-1234567890AB';
 
+function permissionMode(mode) {
+  return mode % 0o1000;
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { force: true, recursive: true });
@@ -87,36 +91,51 @@ function fixture({
       leases.set(operationId, lease);
       return { lease, ok: true };
     },
-    release: async (lease) => {
-      releases.push(lease.operationId);
-      leases.delete(lease.operationId);
-      return { ok: true };
+    release: (lease) => {
+      try {
+        releases.push(lease.operationId);
+        leases.delete(lease.operationId);
+        return Promise.resolve({ ok: true });
+      } catch (error) {
+        return Promise.reject(error);
+      }
     },
   };
   const service = createManagedAgentServices({
     admission: admissionOverride
       ? { ...admission, ...admissionOverride }
       : admission,
-    clearInterval() {},
+    clearInterval() {
+      /* fixture timer cleanup */
+    },
     findChildren:
       findChildren ?? (async () => ({ children: [], state: 'owned' })),
     headless: {
-      clearTimeout() {},
+      clearTimeout() {
+        /* fixture timer cleanup */
+      },
       id: () => 'run-1',
       launch: () => ({
         exited: runDone.promise,
         ownedGroup: false,
         pid: 333,
         signalCode: null,
-        writeInput() {},
+        writeInput() {
+          /* fixture child has no input channel */
+        },
       }),
       now: () => 1,
       setTimeout: () => 1,
     },
     id: (() => {
       let n = 0;
-      return () => (n++ ? `run-${n}` : 'session-1');
+      return () => {
+        const current = n;
+        n += 1;
+        return current ? `run-${n}` : 'session-1';
+      };
     })(),
+    // biome-ignore lint/suspicious/useAwait: Launcher failures must reject through the asynchronous service contract.
     launchNative: async (command) => {
       native.push(command);
       if (nativeAvailability) {
@@ -139,6 +158,7 @@ function fixture({
       }
       return { availability: 'available', stdout: `SETU:LAUNCHED:${uuid}` };
     },
+    // biome-ignore lint/suspicious/useAwait: Registration write failures must reject through the asynchronous launcher contract.
     launchOpen: async (launch) => {
       if (fallback && register) {
         writeFileSync(
@@ -155,18 +175,30 @@ function fixture({
     },
     observeProcess:
       observeProcess ??
-      (async (pid) =>
-        pid === 222 && active
-          ? { processId: 222, processStartIdentity: start, state: 'alive' }
-          : pid === 333
-            ? { processId: 333, processStartIdentity: start, state: 'alive' }
-            : { state: 'absent' }),
+      ((pid) => {
+        if (pid === 222 && active) {
+          return Promise.resolve({
+            processId: 222,
+            processStartIdentity: start,
+            state: 'alive',
+          });
+        }
+        if (pid === 333) {
+          return Promise.resolve({
+            processId: 333,
+            processStartIdentity: start,
+            state: 'alive',
+          });
+        }
+        return Promise.resolve({ state: 'absent' });
+      }),
     operationEvents:
       events ?? createOperationEvents({ now: () => 1, state: serviceState }),
     privateFiles,
     registrationAttempts: 1,
     resolveTarget: async ({ repo, name }) =>
       repo === target.repo && name === target.name ? { ...target } : null,
+    // biome-ignore lint/suspicious/useAwait: The fixture preserves the native runner promise boundary.
     runAppleScript: async (command) => {
       scripts.push(command);
       return { availability: 'available', stdout: `SETU:OK:${uuid}` };
@@ -177,8 +209,9 @@ function fixture({
       tick = callback;
       return monitorCalls;
     },
-    signal: async () => {
+    signal: () => {
       active = false;
+      return Promise.resolve();
     },
     state: serviceState,
     token: () => 'token_1234567890123456',
@@ -221,11 +254,11 @@ test('composes a token-bound Ghostty launch, trusted Claude hook and exact exist
     .find((name) => name.startsWith('setu-agent-session-1-'));
   const hook = fs.readFileSync(join(f.root, runtime, 'claude-hook.js'), 'utf8');
   expect(hook).toContain('AbortSignal.timeout(1000)');
-  expect(fs.statSync(join(f.root, runtime, 'launch.zsh')).mode & 0o777).toBe(
-    0o700
-  );
   expect(
-    fs.statSync(join(f.root, runtime, 'registration.json')).mode & 0o777
+    permissionMode(fs.statSync(join(f.root, runtime, 'launch.zsh')).mode)
+  ).toBe(0o700);
+  expect(
+    permissionMode(fs.statSync(join(f.root, runtime, 'registration.json')).mode)
   ).toBe(0o600);
 
   await expect(
@@ -477,9 +510,7 @@ test('a refused event write is surfaced without masking a valid MCP headless sta
 test('definitely prelaunch file and starting-record failures have a terminal result, operation id, and one release attempt', async () => {
   const createFailure = fixture({
     privateFiles: {
-      create: async () => {
-        throw new Error('no private directory');
-      },
+      create: () => Promise.reject(new Error('no private directory')),
     },
   });
   const files = await createFailure.service.open({
@@ -503,9 +534,14 @@ test('definitely prelaunch file and starting-record failures have a terminal res
 
   let updates = 0;
   const registerFailure = fixture({
+    // biome-ignore lint/suspicious/useAwait: Injected persistence failures must reject rather than throw synchronously.
     stateUpdate: async ({ document, state, work }) => {
-      if (document === 'agentSessions' && updates++ === 0) {
-        throw new Error('disk refused');
+      if (document === 'agentSessions') {
+        const currentUpdate = updates;
+        updates += 1;
+        if (currentUpdate === 0) {
+          throw new Error('disk refused');
+        }
       }
       return state.update(document, work);
     },
@@ -526,9 +562,13 @@ test('definitely prelaunch file and starting-record failures have a terminal res
 test('lease persistence and release failures preserve the original prelaunch classification without duplicate release', async () => {
   let agentUpdates = 0;
   const leaseFailure = fixture({
+    // biome-ignore lint/suspicious/useAwait: Injected persistence failures must reject rather than throw synchronously.
     stateUpdate: async ({ document, state, work }) => {
-      if (document === 'agentSessions' && ++agentUpdates === 2) {
-        throw new Error('lease write refused');
+      if (document === 'agentSessions') {
+        agentUpdates += 1;
+        if (agentUpdates === 2) {
+          throw new Error('lease write refused');
+        }
       }
       return state.update(document, work);
     },
@@ -548,9 +588,7 @@ test('lease persistence and release failures preserve the original prelaunch cla
       release: async (lease) => ({ code: 'RELEASE_REFUSED', lease, ok: false }),
     },
     privateFiles: {
-      create: async () => {
-        throw new Error('no files');
-      },
+      create: () => Promise.reject(new Error('no files')),
     },
   });
   await expect(
@@ -589,6 +627,7 @@ test('post-launch unknown outcomes retain ownership, have an operation id, and r
 
 test('pre-admission target replacement is refused inside the target lock without native launch', async () => {
   const f = fixture({
+    // biome-ignore lint/suspicious/useAwait: The admission hook preserves its promise boundary around target mutation.
     beforeAdmit: async ({ target }) => {
       target.checkoutIdentity = { head: 'changed', tree: 'clean' };
     },
@@ -638,6 +677,7 @@ test('end surfaces an event-write failure without changing its observed completi
   const f = fixture({
     events: {
       record: async (event) =>
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes this captured flag between service calls.
         unavailable
           ? {
               code: 'OPERATION_EVENT_UNAVAILABLE',
@@ -697,9 +737,7 @@ test('malformed session journals return structured failures without normalizing 
 
 test('a target-lock acquisition failure has a terminal failed operation and releases exactly once before launch', async () => {
   const f = fixture({
-    withTargets: async () => {
-      throw new Error('lock unavailable');
-    },
+    withTargets: () => Promise.reject(new Error('lock unavailable')),
   });
   await expect(
     f.service.open({ name: 'topic', repo: 'repo' })
@@ -739,18 +777,20 @@ test('a failed lease-forget keeps recovery evidence without masking a known file
       hookPath: 'hook',
       launcherPath: 'launcher',
       registrationPath: 'registration',
-      async remove() {},
+      remove: () => Promise.resolve(),
       settingsPath: 'settings',
-      async write() {
-        throw new Error('write refused');
-      },
+      write: () => Promise.reject(new Error('write refused')),
     }),
   };
   const f = fixture({
     privateFiles,
+    // biome-ignore lint/suspicious/useAwait: Injected persistence failures must reject rather than throw synchronously.
     stateUpdate: async ({ document, state, work }) => {
-      if (document === 'agentSessions' && ++updates === 4) {
-        throw new Error('forget refused');
+      if (document === 'agentSessions') {
+        updates += 1;
+        if (updates === 4) {
+          throw new Error('forget refused');
+        }
       }
       return state.update(document, work);
     },
@@ -849,9 +889,11 @@ test('an unknown session later records proven completion with its original sourc
   const f = fixture({
     events: {
       record: async (event) =>
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes this captured flag between reconciliations.
         unavailable ? { ok: false } : recorder.record(event),
     },
     findChildren: async () =>
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes this captured flag between reconciliations.
       childrenUnknown ? { state: 'unknown' } : { children: [], state: 'owned' },
   });
   recorder = createOperationEvents({ now: () => 1, state: f.state });
@@ -881,9 +923,7 @@ test('lock cleanup cannot mask an already-known prelaunch refusal or terminal de
     });
   const refused = fixture({
     privateFiles: {
-      create: async () => {
-        throw new Error('no files');
-      },
+      create: () => Promise.reject(new Error('no files')),
     },
     withTargets: unlockFailure,
   });
@@ -898,6 +938,7 @@ test('lock cleanup cannot mask an already-known prelaunch refusal or terminal de
   let failUnlock = false;
   const f = fixture({
     withTargets: async (input) =>
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: The test enables this captured failure after opening the session.
       failUnlock
         ? unlockFailure(input)
         : input.state.withTargets(input.targets, input.work),
@@ -927,7 +968,9 @@ test('target replacement inside the shared lock refuses focus, handoff, end and 
   let replaceInside = false;
   const f = fixture({
     withTargets: async ({ state, target, targets, work }) =>
+      // biome-ignore lint/suspicious/useAwait: Work failures must reject through the target-lock callback contract.
       state.withTargets(targets, async () => {
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: The test enables replacement after the initial open and run.
         if (replaceInside) {
           target.checkoutIdentity = { head: 'replaced', tree: 'clean' };
         }

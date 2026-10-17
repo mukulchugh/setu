@@ -77,9 +77,7 @@ test('portal shutdown disposes recurring work and waits for response drain befor
         /* No side effect is needed in this fixture. */
       },
       exit: () => calls.push('exit'),
-      stopServer: () => {
-        return Promise.reject(new Error('drain unconfirmed'));
-      },
+      stopServer: () => Promise.reject(new Error('drain unconfirmed')),
     })
   ).rejects.toThrow('drain unconfirmed');
   expect(calls).toEqual([]);
@@ -177,7 +175,7 @@ test('already-admitted lifecycle work blocks cutover and new direct backend work
   expect((await f.control.reopen({ ...owner, coherent: true })).ok).toBe(false);
 });
 
-test('a dead quiesce owner is reopened before a new owner is admitted', async () => {
+test('a dead quiesce owner is reopened before a new owner is admitted', () => {
   const lifecycle = createWorktreeLifecycle({
     capacity: {},
     clock: { clearTimeout, now: () => 0, setTimeout },
@@ -190,7 +188,10 @@ test('a dead quiesce owner is reopened before a new owner is admitted', async ()
     lifecycle,
     ownerProcessAlive: (pid) => pid !== 123,
     processIdentity: identity,
-    randomId: () => `owner-${++sequence}`,
+    randomId: () => {
+      sequence += 1;
+      return `owner-${sequence}`;
+    },
   });
   const first = control.quiesce({
     ...control.capabilities(),

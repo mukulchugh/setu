@@ -7,7 +7,8 @@ export function createCommandRunner(spawn) {
     let bytes = new Uint8Array(),
       truncated = false;
     try {
-      while (true) {
+      for (;;) {
+        // biome-ignore lint/performance/noAwaitInLoops: A readable stream yields one ordered chunk at a time and each retained tail depends on the prior bytes.
         const { value, done } = await reader.read();
         if (done) {
           break;
@@ -46,11 +47,11 @@ export function createCommandRunner(spawn) {
     const exited = Promise.resolve()
       .then(() => proc.exited)
       .then(
-        (code) => {
-          if (!Number.isInteger(code) || code < 0) {
+        (exitCode) => {
+          if (!Number.isInteger(exitCode) || exitCode < 0) {
             throw unknown();
           }
-          return code;
+          return exitCode;
         },
         () => {
           throw unknown();
@@ -159,13 +160,28 @@ export function createDevRuntime({
       return 'unknown';
     }
   }
+  async function discoverState(target) {
+    // Sidecar entries are observed without a target; nothing to rediscover.
+    return target ? (await discover(target)).state : 'unknown';
+  }
+  async function containerProcessState(handle, wrapper) {
+    let state;
+    try {
+      state = await containerState(handle.container);
+    } catch {
+      state = 'unknown';
+    }
+    if (state === 'alive') {
+      return 'alive';
+    }
+    return wrapper === 'dead' && state === 'dead' ? 'dead' : 'unknown';
+  }
   async function observe(_target, handle) {
     if (
       !handle ||
       (!(handle.pid || handle.container) && handle.observedState === 'unknown')
     ) {
-      // Sidecar entries are observed without a target; nothing to rediscover.
-      return _target ? (await discover(_target)).state : 'unknown';
+      return discoverState(_target);
     }
     const wrapper = processState(handle);
     if (
@@ -181,16 +197,39 @@ export function createDevRuntime({
     if (!handle.container) {
       return wrapper;
     }
-    let state;
+    return containerProcessState(handle, wrapper);
+  }
+  async function signalProcessPhase(handle, pid, name, timeout) {
+    const state = processState(handle);
+    if (state === 'dead') {
+      return true;
+    }
+    if (state === 'unknown') {
+      throw new Error(
+        'Process ownership/liveness is unknown; Stop did not signal it.'
+      );
+    }
+    if (!(handle.ownedGroup || (await verifyHandle(handle)))) {
+      throw new Error(
+        'Adopted process identity changed; Stop did not signal it.'
+      );
+    }
     try {
-      state = await containerState(handle.container);
-    } catch {
-      state = 'unknown';
+      signal(pid, name);
+    } catch (error) {
+      if (error.code !== 'ESRCH') {
+        throw error;
+      }
     }
-    if (state === 'alive') {
-      return 'alive';
+    const deadline = clock.now() + timeout;
+    // A terminated child can briefly be an unreaped zombie whose group probe
+    // returns EPERM. Give the existing grace period a chance to establish
+    // absence; an unknown result never authorizes the next signal.
+    while (processState(handle) !== 'dead' && clock.now() < deadline) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each polling delay must observe the prior liveness result before another probe.
+      await clock.sleep(50);
     }
-    return wrapper === 'dead' && state === 'dead' ? 'dead' : 'unknown';
+    return false;
   }
   async function stopProcess(handle) {
     if (!handle?.pid) {
@@ -201,33 +240,9 @@ export function createDevRuntime({
       ['SIGTERM', 5000],
       ['SIGKILL', 2000],
     ]) {
-      const state = processState(handle);
-      if (state === 'dead') {
+      // biome-ignore lint/performance/noAwaitInLoops: SIGKILL is permitted only after the prior signal phase's current ownership proof.
+      if (await signalProcessPhase(handle, pid, name, timeout)) {
         return;
-      }
-      if (state === 'unknown') {
-        throw new Error(
-          'Process ownership/liveness is unknown; Stop did not signal it.'
-        );
-      }
-      if (!(handle.ownedGroup || (await verifyHandle(handle)))) {
-        throw new Error(
-          'Adopted process identity changed; Stop did not signal it.'
-        );
-      }
-      try {
-        signal(pid, name);
-      } catch (error) {
-        if (error.code !== 'ESRCH') {
-          throw error;
-        }
-      }
-      const deadline = clock.now() + timeout;
-      // A terminated child can briefly be an unreaped zombie whose group probe
-      // returns EPERM. Give the existing grace period a chance to establish
-      // absence; an unknown result never authorizes the next signal.
-      while (processState(handle) !== 'dead' && clock.now() < deadline) {
-        await clock.sleep(50);
       }
     }
     if (processState(handle) !== 'dead') {

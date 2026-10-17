@@ -38,7 +38,7 @@ const TONE_TEXT: Record<Tone, string> = {
 // per-component ring would double up, not add anything.
 // ---------------------------------------------------------------------------
 const buttonVariants = cva(
-  'inline-flex items-center justify-center gap-2 whitespace-normal text-center rounded-none font-semibold text-sm transition-colors duration-150 ease-out disabled:pointer-events-none disabled:opacity-50',
+  'inline-flex items-center justify-center gap-2 whitespace-normal rounded-none text-center font-semibold text-sm transition-colors duration-150 ease-out disabled:pointer-events-none disabled:opacity-50',
   {
     defaultVariants: { compact: false, variant: 'primary' },
     variants: {
@@ -83,6 +83,7 @@ export interface ButtonProps extends VariantProps<typeof buttonVariants> {
   class?: string;
   disabled?: boolean;
   onClick?: () => void;
+  type?: 'button' | 'submit' | 'reset';
 }
 
 export function Button({

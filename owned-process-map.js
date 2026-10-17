@@ -21,6 +21,7 @@ export function watchOwnedProcessExit(map, key, entry, exited, observe) {
 export async function pruneDeadEntries(map, observe) {
   const deleted = [];
   for (const [key, entry] of map) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each observation is applied to the same mutable ownership map before the next entry is considered.
     if ((await observe(entry)) === 'dead' && map.get(key) === entry) {
       map.delete(key);
       deleted.push(key);

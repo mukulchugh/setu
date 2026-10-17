@@ -39,6 +39,7 @@ test('attention focus uses the verified session joined to an actual hook event',
     sessions: { get: () => session },
     state: {
       read: () => document,
+      // biome-ignore lint/suspicious/useAwait: State mutation failures must reject through the asynchronous store contract.
       update: async (_name: string, change: (value: object) => object) => {
         document = change(document);
       },
@@ -99,6 +100,7 @@ test('resource mutations are attributed to the UI and preserve backend recovery 
   const original = globalThis.fetch;
   try {
     let request: RequestInit | undefined;
+    // biome-ignore lint/suspicious/useAwait: The fetch fixture preserves rejected response-construction failures.
     globalThis.fetch = (async (_input, init) => {
       request = init;
       return Response.json({
@@ -178,6 +180,7 @@ test('GitHub review takes the module-issued refusal token and dispatches only af
   const actions = createGithubActions({
     branch: async () => 'feature/ui',
     readWorkflow: async () => 'on: workflow_dispatch\n',
+    // biome-ignore lint/suspicious/useAwait: The workflow command fixture preserves the asynchronous runner contract.
     run: async (argv: string[]) => {
       calls.push(argv);
       if (argv.slice(1, 3).join(' ') === 'workflow list') {
@@ -200,12 +203,16 @@ test('GitHub review takes the module-issued refusal token and dispatches only af
     },
     target: () => ({ wtDir: '/fixture' }),
   });
+  const workflow = workflowValue(42);
+  if (!workflow) {
+    throw new Error('Expected workflow value');
+  }
   const request = {
     inputs: { channel: 'stable' },
     name: 'feature/ui',
     ref: 'feature/ui',
     repo: 'app',
-    workflow: workflowValue(42)!,
+    workflow,
   };
   const review = await actions.dispatch(request);
   expect(review).toMatchObject({
@@ -213,10 +220,12 @@ test('GitHub review takes the module-issued refusal token and dispatches only af
     ok: false,
   });
   const token = confirmationToken(review);
-  expect(token).toBeTruthy();
+  if (!token) {
+    throw new Error('Expected confirmation token');
+  }
   expect(calls).toHaveLength(0);
   await expect(
-    actions.dispatch({ ...request, confirmation: token! })
+    actions.dispatch({ ...request, confirmation: token })
   ).resolves.toMatchObject({ dispatched: true, ok: true });
   expect(calls.at(-1)).toContain('42');
 });
@@ -226,6 +235,7 @@ test('MCP preflight returns an object but invocation receives only its productio
   const invocations: unknown[] = [];
   const schema = { additionalProperties: false, type: 'object' };
   const actions = createMcpActions({
+    // biome-ignore lint/suspicious/useAwait: Tool invocation fixtures preserve the asynchronous MCP transport contract.
     callTool: async (_server: string, _tool: string, input: unknown) => {
       invocations.push(input);
       return { ok: true, result: { delivered: true } };
@@ -234,6 +244,7 @@ test('MCP preflight returns an object but invocation receives only its productio
     id: () => 'event-1',
     state: {
       read: () => document,
+      // biome-ignore lint/suspicious/useAwait: State mutation failures must reject through the asynchronous store contract.
       update: async (
         _name: string,
         change: (value: Record<string, unknown>) => Record<string, unknown>
@@ -253,9 +264,11 @@ test('MCP preflight returns an object but invocation receives only its productio
   const review = actions.preflight(saved.action.id, {});
   const token = confirmationToken(review);
   expect(review).toMatchObject({ ok: true });
-  expect(token).toBeTruthy();
+  if (!token) {
+    throw new Error('Expected confirmation token');
+  }
   await expect(
-    actions.invoke(saved.action.id, {}, token!)
+    actions.invoke(saved.action.id, {}, token)
   ).resolves.toMatchObject({ ok: true });
   expect(invocations).toEqual([{}]);
 });
@@ -296,6 +309,7 @@ test('handoff accepts selected finding records and refuses unavailable delivery 
     state: 'running',
   };
   const handoff = createReviewHandoff({
+    // biome-ignore lint/suspicious/useAwait: Delivery fixtures preserve the asynchronous session handoff contract.
     deliver: async () => {
       delivered += 1;
       return {

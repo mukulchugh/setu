@@ -157,14 +157,14 @@ export function createPortalResourceServices({
       })),
     update: async (id, mutate) =>
       state.update('cacheManifests', (document) => {
-        const entries = manifestMap(document);
-        const current = entries[id];
+        const manifestEntries = manifestMap(document);
+        const current = manifestEntries[id];
         if (!current) {
           throw new Error('cleanup manifest disappeared');
         }
         return {
           ...document,
-          manifests: { ...entries, [id]: mutate(current) },
+          manifests: { ...manifestEntries, [id]: mutate(current) },
         };
       }),
   };
@@ -300,7 +300,7 @@ export function createPortalResourceServices({
     return { state: 'clear' };
   }
 
-  async function runtime(target) {
+  function lifecycleRuntime(target) {
     const life = lifecycle?.snapshot?.(target.key);
     if (life?.phase === 'unknown') {
       return { state: 'unknown' };
@@ -321,18 +321,15 @@ export function createPortalResourceServices({
     ) {
       return { state: 'active' };
     }
-    if (life?.reserved) {
-      return life.phase === 'queued'
-        ? { queued: true, state: 'stopped' }
-        : { state: 'active' };
+    if (!life?.reserved) {
+      return null;
     }
-    const native = await nativeRuntime(target);
-    if (native === 'unknown') {
-      return { state: 'unknown' };
-    }
-    if (native === 'alive') {
-      return { state: 'active' };
-    }
+    return life.phase === 'queued'
+      ? { queued: true, state: 'stopped' }
+      : { state: 'active' };
+  }
+
+  function persistedRuntime(target) {
     let sessions;
     let runs;
     try {
@@ -359,6 +356,21 @@ export function createPortalResourceServices({
     return sessions.state === 'active' || runs.state === 'active'
       ? { state: 'active' }
       : { queued: false, state: 'stopped' };
+  }
+
+  async function runtime(target) {
+    const lifecycleState = lifecycleRuntime(target);
+    if (lifecycleState) {
+      return lifecycleState;
+    }
+    const native = await nativeRuntime(target);
+    if (native === 'unknown') {
+      return { state: 'unknown' };
+    }
+    if (native === 'alive') {
+      return { state: 'active' };
+    }
+    return persistedRuntime(target);
   }
 
   const cache = createWorktreeCache({
@@ -493,6 +505,7 @@ export function createPortalResourceServices({
         if ((repo && row.repo !== repo) || (name && row.name !== name)) {
           continue;
         }
+        // biome-ignore lint/performance/noAwaitInLoops: Views retain registry order and stop at the first unresolved target or failed inspection.
         const target = await resolveTarget(row.repo, row.name);
         if (!target?.checkoutIdentity) {
           return failure(
@@ -536,6 +549,207 @@ export function createPortalResourceServices({
   return Object.freeze({ ...services, admission, events, storage });
 }
 
+// Search answers carry a status so clients can tell "restart pagination" (409)
+// from malformed input (400) and a missing index (503). Other Spans reads keep
+// their historical 200 envelope.
+const SPANS_SEARCH_ROUTES = Object.freeze({
+  '/api/spans/search': 'spansSearch',
+  '/api/spans/search/status': 'spansSearchStatus',
+});
+const SPANS_SEARCH_HTTP_STATUS = Object.freeze({
+  SPANS_SERVICE_BUSY: 503,
+  SPANS_SERVICE_CORRUPT: 500,
+  SPANS_SERVICE_INVALID: 400,
+  SPANS_SERVICE_STALE: 409,
+  SPANS_SERVICE_UNAVAILABLE: 503,
+});
+const SPANS_SEARCH_FAILURE_MESSAGES = Object.freeze({
+  SPANS_SERVICE_BUSY: 'Spans history is busy; try again.',
+  SPANS_SERVICE_CORRUPT: 'Spans history failed an integrity check.',
+  SPANS_SERVICE_INVALID: 'Invalid spans request.',
+  SPANS_SERVICE_STALE:
+    'Spans search results changed; restart from the first page.',
+  SPANS_SERVICE_UNAVAILABLE: 'Spans history is unavailable.',
+});
+const SPANS_SEARCH_COUNT_KEYS = new Set([
+  'afterSequence',
+  'expectedGeneration',
+  'limit',
+  'throughSequence',
+]);
+const SPANS_SEARCH_TEXT_KEYS = new Set(['query', 'runId']);
+// At most 15 digits keeps every accepted count an exact safe integer.
+const SPANS_SEARCH_COUNT_RE = /^(?:0|[1-9]\d{0,14})$/;
+
+const spansSearchFailure = (code, error) => ({ code, error, ok: false });
+
+// Returns the service input, or null for anything malformed: repeated or
+// unknown keys, non-canonical counts, an empty query, or a continuation page
+// without the generation it must be fenced to.
+function spansSearchInput(url) {
+  const input = {};
+  for (const key of new Set(url.searchParams.keys())) {
+    const values = url.searchParams.getAll(key);
+    if (values.length !== 1) {
+      return null;
+    }
+    if (SPANS_SEARCH_COUNT_KEYS.has(key)) {
+      if (!SPANS_SEARCH_COUNT_RE.test(values[0])) {
+        return null;
+      }
+      input[key] = Number(values[0]);
+    } else if (SPANS_SEARCH_TEXT_KEYS.has(key)) {
+      input[key] = values[0];
+    } else {
+      return null;
+    }
+  }
+  if (!input.query) {
+    return null;
+  }
+  if (
+    input.query.length > 512 ||
+    (input.limit !== undefined && input.limit > 100)
+  ) {
+    return null;
+  }
+  if (input.afterSequence > 0 && input.expectedGeneration === undefined) {
+    return null;
+  }
+  return input;
+}
+
+async function dispatchSpansSearch(services, action, url, response) {
+  const input = action === 'spansSearch' ? spansSearchInput(url) : {};
+  // The status read takes no parameters at all.
+  if (input === null || (action === 'spansSearchStatus' && url.search !== '')) {
+    return response(
+      spansSearchFailure('SPANS_SERVICE_INVALID', 'Invalid spans request.'),
+      400
+    );
+  }
+  if (typeof services[action] !== 'function') {
+    return response(
+      spansSearchFailure(
+        'SPANS_SERVICE_UNAVAILABLE',
+        SPANS_SEARCH_FAILURE_MESSAGES.SPANS_SERVICE_UNAVAILABLE
+      ),
+      503
+    );
+  }
+  let result;
+  try {
+    result = await services[action](input);
+  } catch {
+    // The adapter's message is never forwarded.
+    return response(
+      spansSearchFailure(
+        'SPANS_SERVICE_UNAVAILABLE',
+        'Spans history is unavailable.'
+      ),
+      503
+    );
+  }
+  if (result?.ok === true) {
+    return response(result, 200);
+  }
+  if (result?.ok === false) {
+    const knownCode = Object.hasOwn(SPANS_SEARCH_HTTP_STATUS, result.code);
+    const code = knownCode ? result.code : 'SPANS_SERVICE_CORRUPT';
+    return response(
+      spansSearchFailure(code, SPANS_SEARCH_FAILURE_MESSAGES[code]),
+      SPANS_SEARCH_HTTP_STATUS[code]
+    );
+  }
+  return response(
+    spansSearchFailure(
+      'SPANS_SERVICE_CORRUPT',
+      'Spans history failed an integrity check.'
+    ),
+    500
+  );
+}
+
+const SPANS_PLANNING_POST_ROUTES = Object.freeze({
+  '/api/spans/drafts/create': 'spansDraftCreate',
+  '/api/spans/plans/revise': 'spansPlanRevise',
+  '/api/spans/workflows/create': 'spansWorkflowCreate',
+  '/api/spans/workflows/preview': 'spansWorkflowPreview',
+});
+const SPANS_PLANNING_BODY_BYTES = 1024 * 1024;
+
+async function planningBody(request) {
+  if (!request.body) {
+    return null;
+  }
+  const reader = request.body.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    for (;;) {
+      // biome-ignore lint/performance/noAwaitInLoops: Read the bounded request stream in order.
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      length += value.byteLength;
+      if (length > SPANS_PLANNING_BODY_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks, length).toString('utf8'));
+  } catch {
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function dispatchSpansPlanning(services, request, url, response) {
+  const action =
+    request.method === 'GET' && url.pathname === '/api/spans/workflows'
+      ? 'spansWorkflows'
+      : request.method === 'POST' && SPANS_PLANNING_POST_ROUTES[url.pathname];
+  if (!action) {
+    return null;
+  }
+  const body = request.method === 'POST' ? await planningBody(request) : {};
+  if (url.search || !body || typeof body !== 'object' || Array.isArray(body)) {
+    return response(
+      {
+        code: 'SPANS_DRAFT_INVALID',
+        error: 'Invalid Spans planning request.',
+        ok: false,
+      },
+      400
+    );
+  }
+  if (typeof services[action] !== 'function') {
+    return response(
+      {
+        code: 'SPANS_SERVICE_UNAVAILABLE',
+        error: 'Spans planning is unavailable.',
+        ok: false,
+      },
+      503
+    );
+  }
+  try {
+    return response(await services[action](body));
+  } catch {
+    return response(
+      {
+        code: 'SPANS_SERVICE_UNAVAILABLE',
+        error: 'Spans planning is unavailable.',
+        ok: false,
+      },
+      503
+    );
+  }
+}
+
 export async function dispatchPortalResourceRoute(services, request) {
   const url = new URL(request.url);
   const query = Object.fromEntries(url.searchParams);
@@ -544,51 +758,72 @@ export async function dispatchPortalResourceRoute(services, request) {
   )
     ? request.headers.get('x-setu-source')
     : 'portal';
-  const response = (value) =>
+  const response = (value, status = 200) =>
     new Response(JSON.stringify(value), {
       headers: { 'content-type': 'application/json; charset=utf-8' },
+      status,
     });
-  const read = async (action, input = query) =>
-    response(await services[action](input));
-  if (request.method === 'GET') {
-    if (url.pathname === '/api/workspace-storage') {
-      return read('workspaceStorage', {});
-    }
-    if (url.pathname === '/api/operations') {
-      return read('operations', {
+  const read = async (serviceAction, input = query) =>
+    response(await services[serviceAction](input));
+  const planning = await dispatchSpansPlanning(
+    services,
+    request,
+    url,
+    response
+  );
+  if (planning) {
+    return planning;
+  }
+  const getRoutes = {
+    '/api/agent-sessions': { action: 'agentSessions', optional: true },
+    '/api/attention': { action: 'attention', optional: true },
+    '/api/dependency-sharing': { action: 'dependencyViews' },
+    '/api/github/runs': { action: 'githubRuns' },
+    '/api/github/workflows': { action: 'githubWorkflows' },
+    '/api/headless-runs': { action: 'headlessRuns', optional: true },
+    '/api/mcp-actions': { action: 'mcpActions', input: {} },
+    '/api/operations': {
+      action: 'operations',
+      input: {
         ...query,
         limit: query.limit ? Number(query.limit) : undefined,
         since: query.since || undefined,
-      });
+      },
+    },
+    '/api/resource-admission': { action: 'admissionStatus', input: {} },
+    '/api/shared-caches': { action: 'sharedCaches', input: {} },
+    '/api/spans/artifact': { action: 'spansArtifact', optional: true },
+    '/api/spans/events': {
+      action: 'spansEvents',
+      input: {
+        ...query,
+        ...(query.limit === undefined ? {} : { limit: Number(query.limit) }),
+        ...(query.afterSequence === undefined
+          ? {}
+          : { afterSequence: Number(query.afterSequence) }),
+      },
+      optional: true,
+    },
+    '/api/spans/run': { action: 'spansRun', optional: true },
+    '/api/spans/runs': {
+      action: 'spansRuns',
+      input: {
+        ...query,
+        ...(query.limit === undefined ? {} : { limit: Number(query.limit) }),
+      },
+      optional: true,
+    },
+    '/api/workspace-storage': { action: 'workspaceStorage', input: {} },
+  };
+  if (request.method === 'GET') {
+    const searchAction = SPANS_SEARCH_ROUTES[url.pathname];
+    if (searchAction) {
+      return dispatchSpansSearch(services, searchAction, url, response);
     }
-    if (url.pathname === '/api/resource-admission') {
-      return read('admissionStatus', {});
-    }
-    if (url.pathname === '/api/dependency-sharing') {
-      return read('dependencyViews');
-    }
-    if (url.pathname === '/api/shared-caches') {
-      return read('sharedCaches', {});
-    }
-    if (url.pathname === '/api/mcp-actions') {
-      return read('mcpActions', {});
-    }
-    if (url.pathname === '/api/github/workflows') {
-      return read('githubWorkflows');
-    }
-    if (url.pathname === '/api/github/runs') {
-      return read('githubRuns');
-    }
-    if (url.pathname === '/api/agent-sessions' && services.agentSessions) {
-      return read('agentSessions');
-    }
-    if (url.pathname === '/api/attention' && services.attention) {
-      return read('attention');
-    }
-    if (url.pathname === '/api/headless-runs' && services.headlessRuns) {
-      return read('headlessRuns');
-    }
-    return null;
+    const route = getRoutes[url.pathname];
+    return route && (!route.optional || services[route.action])
+      ? read(route.action, route.input)
+      : null;
   }
   if (request.method !== 'POST') {
     return null;

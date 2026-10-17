@@ -35,6 +35,10 @@ import {
 
 const STDERR_TAIL_MAX = 20;
 
+function errorText(error) {
+  return String(error?.message ?? error);
+}
+
 // serverId -> {status, tools, stderrTail, error}
 // status: 'disconnected' | 'connecting' | 'awaiting-auth' | 'connected' | 'error'
 const serverStatus = new Map();
@@ -87,15 +91,25 @@ export async function callConnectedMcpTool(serverId, name, args) {
     };
   }
   try {
+    const result = await active.client.callTool({ arguments: args, name });
+    if (result.isError === true) {
+      return {
+        code: 'MCP_TOOL_ERROR',
+        error: 'The connected MCP tool reported an error',
+        ok: false,
+        result,
+      };
+    }
     return {
       ok: true,
-      result: await active.client.callTool({ arguments: args, name }),
+      result,
     };
   } catch {
     return {
-      code: 'MCP_TOOL_CALL_FAILED',
-      error: 'The connected MCP server did not complete the tool call',
+      code: 'MCP_TOOL_CALL_UNKNOWN',
+      error: 'The connected MCP tool outcome is unknown after dispatch',
       ok: false,
+      state: 'unknown',
     };
   }
 }
@@ -242,8 +256,10 @@ async function connectStdioServer(server) {
     ownedStdio.delete(transport);
     try {
       await transport?.close?.();
-    } catch {}
-    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
+    } catch {
+      // Preserve the primary connection error when cleanup cannot close transport.
+    }
+    setStatus(server.id, { error: errorText(e), status: 'error' });
   }
 }
 
@@ -295,8 +311,10 @@ async function connectHttpServer(server, workspace) {
     }
     try {
       await transport?.close?.();
-    } catch {}
-    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
+    } catch {
+      // Preserve the primary connection error when cleanup cannot close transport.
+    }
+    setStatus(server.id, { error: errorText(e), status: 'error' });
   }
 }
 
@@ -357,8 +375,10 @@ async function attemptOAuthConnect(server, provider) {
     }
     try {
       await transport.close?.();
-    } catch {}
-    setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
+    } catch {
+      // Preserve the primary connection error when cleanup cannot close transport.
+    }
+    setStatus(server.id, { error: errorText(e), status: 'error' });
   }
 }
 
@@ -399,8 +419,8 @@ export async function finishMcpAuth(server, code, state) {
       await pending.transport.finishAuth(code);
     } catch (e) {
       pendingAuth.delete(server.id);
-      setStatus(server.id, { error: String(e?.message ?? e), status: 'error' });
-      return { error: String(e?.message ?? e), ok: false };
+      setStatus(server.id, { error: errorText(e), status: 'error' });
+      return { error: errorText(e), ok: false };
     }
     // Reconnect on a fresh transport instance, reusing the same provider (its
     // saved tokens now satisfy the connection) -- attemptOAuthConnect clears

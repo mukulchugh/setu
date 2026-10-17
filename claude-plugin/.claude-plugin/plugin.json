@@ -1,15 +1,10 @@
 {
   "name": "setu",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Drive the Setu portal (worktree lifecycle, dev servers, diffs, logs, PR review) as MCP tools. Requires the Setu portal running locally (localhost:2999) — no built-in retry if it's down when a session starts.",
   "author": {
     "name": "Mukul Chugh"
   },
   "license": "MIT",
-  "keywords": [
-    "setu",
-    "worktrees",
-    "dev-servers",
-    "mcp"
-  ]
+  "keywords": ["setu", "worktrees", "dev-servers", "mcp"]
 }

@@ -2,15 +2,16 @@ import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { PORTAL_API_ROUTES } from './portal-routes.js';
 
+const portalRouteTablePattern =
+  /<!-- PORTAL_API_ROUTES_START -->([\s\S]*?)<!-- PORTAL_API_ROUTES_END -->/;
+
 const routes = (rows) =>
   rows.flatMap(({ methods, path }) =>
     methods.map((method) => `${method} ${path}`)
   );
 
 function documentedRoutes(markdown) {
-  const match = markdown.match(
-    /<!-- PORTAL_API_ROUTES_START -->([\s\S]*?)<!-- PORTAL_API_ROUTES_END -->/
-  );
+  const match = markdown.match(portalRouteTablePattern);
   if (!match) {
     throw new Error('AGENTS.md has no marked portal route table');
   }

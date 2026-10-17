@@ -1,6 +1,15 @@
 import { afterEach, expect, mock, test } from 'bun:test';
 
 let toast: { style?: string; title?: string; message?: string };
+
+function asPromise<Value>(callback: () => Value): Promise<Value> {
+  try {
+    return Promise.resolve(callback());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 mock.module('@raycast/api', () => ({
   Action: {},
   ActionPanel: {},
@@ -11,10 +20,11 @@ mock.module('@raycast/api', () => ({
   Icon: {},
   Keyboard: {},
   List: {},
-  showToast: async (initial: typeof toast) => {
-    toast = { ...initial };
-    return toast;
-  },
+  showToast: (initial: typeof toast) =>
+    asPromise(() => {
+      toast = { ...initial };
+      return toast;
+    }),
   Toast: {
     Style: { Animated: 'animated', Failure: 'failure', Success: 'success' },
   },
@@ -50,10 +60,11 @@ test('Raycast sends exact cleanup ID and preserves the complete partial result',
     pendingSteps: ['routing'],
     removed: true,
   };
-  globalThis.fetch = (async (_url, init) => {
-    requests.push(JSON.parse(String(init?.body)));
-    return Response.json(result, { status: 500 });
-  }) as typeof fetch;
+  globalThis.fetch = ((_url, init) =>
+    asPromise(() => {
+      requests.push(JSON.parse(String(init?.body)));
+      return Response.json(result, { status: 500 });
+    })) as typeof fetch;
   expect(await removeWorktree('r', 'topic', 'op-42')).toEqual(result);
   expect(requests).toEqual([
     { name: 'topic', operationId: 'op-42', repo: 'r' },
@@ -77,6 +88,7 @@ test('Raycast rejects missing success fields and contradictory HTTP failures', a
   ] as const) {
     globalThis.fetch = (async () =>
       Response.json(body, { status })) as typeof fetch;
+    // biome-ignore lint/performance/noAwaitInLoops: Each removal result must settle before replacing the global fetch response.
     expect(await removeWorktree('r', 'topic')).toMatchObject({
       networkUncertain: true,
       ok: false,
@@ -87,10 +99,11 @@ test('Raycast rejects missing success fields and contradictory HTTP failures', a
 
 test('Raycast does not replay an uncertain mutation', async () => {
   let calls = 0;
-  globalThis.fetch = (async () => {
-    calls += 1;
-    throw new Error('connection reset after dispatch');
-  }) as typeof fetch;
+  globalThis.fetch = (() =>
+    asPromise(() => {
+      calls += 1;
+      throw new Error('connection reset after dispatch');
+    })) as typeof fetch;
   expect(await removeWorktree('r', 'topic', 'op-42')).toMatchObject({
     networkUncertain: true,
     ok: false,
@@ -107,20 +120,21 @@ test('Raycast callback refreshes worktrees and independent cleanup status after 
     removed: true,
     repo: 'r',
   };
-  globalThis.fetch = (async (url, init) => {
-    const path = new URL(String(url)).pathname;
-    requests.push(path);
-    if (init?.method === 'POST') {
-      return Response.json({
-        ...pending,
-        error: 'Routing cleanup is pending',
-        ok: false,
-      });
-    }
-    return Response.json(
-      path === '/api/status' ? { pendingRemovals: [pending] } : []
-    );
-  }) as typeof fetch;
+  globalThis.fetch = ((url, init) =>
+    asPromise(() => {
+      const path = new URL(String(url)).pathname;
+      requests.push(path);
+      if (init?.method === 'POST') {
+        return Response.json({
+          ...pending,
+          error: 'Routing cleanup is pending',
+          ok: false,
+        });
+      }
+      return Response.json(
+        path === '/api/status' ? { pendingRemovals: [pending] } : []
+      );
+    })) as typeof fetch;
   let rows: unknown, status: unknown;
   await runAction(
     'Remove',
@@ -140,10 +154,11 @@ test('Raycast callback refreshes worktrees and independent cleanup status after 
 test('Raycast callback reports uncertainty and refreshes once without replay', async () => {
   let calls = 0,
     refreshes = 0;
-  globalThis.fetch = (async () => {
-    calls += 1;
-    throw new Error('timeout');
-  }) as typeof fetch;
+  globalThis.fetch = (() =>
+    asPromise(() => {
+      calls += 1;
+      throw new Error('timeout');
+    })) as typeof fetch;
   await runAction(
     'Cleanup',
     () => removeWorktree('r', 'topic', 'old-id'),
@@ -157,15 +172,16 @@ test('Raycast callback reports uncertainty and refreshes once without replay', a
 
 test('Raycast preserves an unknown exact ID failure without starting fresh removal', async () => {
   const bodies: unknown[] = [];
-  globalThis.fetch = (async (_url, init) => {
-    bodies.push(JSON.parse(String(init?.body)));
-    return Response.json({
-      code: 'REMOVAL_NOT_FOUND',
-      error: 'Unknown operation',
-      ok: false,
-      removed: false,
-    });
-  }) as typeof fetch;
+  globalThis.fetch = ((_url, init) =>
+    asPromise(() => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({
+        code: 'REMOVAL_NOT_FOUND',
+        error: 'Unknown operation',
+        ok: false,
+        removed: false,
+      });
+    })) as typeof fetch;
   await runAction(
     'Cleanup',
     () => removeWorktree('r', 'topic', 'expired-id'),

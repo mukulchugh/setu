@@ -782,7 +782,9 @@ test('Python and manifest-free setup bypass even an invalid sharing policy', asy
     const context = { ready: false, res: { wtDir: '/absent' } };
     const pending = await startWorktreeSetupInstall(context, {
       assertStorage: () => Promise.resolve(),
-      closeLog: () => {},
+      closeLog: () => {
+        // The fixture log descriptor does not own an open file.
+      },
       exists: (path) => !!manifest && path.endsWith(`/${manifest}`),
       openLog: () => 3,
       sharing: { enabled: true },
@@ -790,7 +792,9 @@ test('Python and manifest-free setup bypass even an invalid sharing policy', asy
         spawned.push(args.slice(4));
         return { exited: Promise.resolve(0), pid: 100 };
       },
-      stopProcess: async () => {},
+      stopProcess: async () => {
+        // The fixture child has already exited.
+      },
     });
     await pending.completion;
     expect(spawned).toEqual(manifest ? [['uv', 'sync']] : []);

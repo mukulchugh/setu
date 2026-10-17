@@ -5,10 +5,12 @@ test('adding before a successful configuration read cannot replace existing serv
   let reads = 0,
     writes = 0;
   const writer = createMcpConfigWriter<string>({
+    // biome-ignore lint/suspicious/useAwait: Config reads preserve the asynchronous writer collaborator contract.
     read: async () => {
       reads += 1;
       return ['existing'];
     },
+    // biome-ignore lint/suspicious/useAwait: Config writes preserve the asynchronous writer collaborator contract.
     write: async () => {
       writes += 1;
       return { ok: true };
@@ -40,7 +42,10 @@ test('explicit writes use a fresh list, serialize, and never replay an uncertain
     await writer.save(['existing'], (rows) => rows.slice(1))
   ).toMatchObject({ code: 'SAVE_PENDING', ok: false });
   expect(writes).toEqual([['existing', 'another-tab', 'new']]);
-  finish!({ networkUncertain: true, ok: false });
+  if (!finish) {
+    throw new Error('Expected pending write resolver');
+  }
+  finish({ networkUncertain: true, ok: false });
   expect(await first).toMatchObject({ networkUncertain: true, ok: false });
   expect(writes).toHaveLength(1);
 });
@@ -48,7 +53,8 @@ test('explicit writes use a fresh list, serialize, and never replay an uncertain
 test('a failed fresh read preserves the saved configuration without a write', async () => {
   let writes = 0;
   const writer = createMcpConfigWriter<string>({
-    read: () => { return Promise.reject(new Error('offline')); },
+    read: () => Promise.reject(new Error('offline')),
+    // biome-ignore lint/suspicious/useAwait: Config writes preserve the asynchronous writer collaborator contract.
     write: async () => {
       writes += 1;
       return { ok: true };
@@ -64,13 +70,16 @@ test('unconfirmed disconnect cannot remove a saved server', async () => {
   let writes = 0;
   const writer = createMcpConfigWriter<string>({
     read: () => Promise.resolve(['existing']),
+    // biome-ignore lint/suspicious/useAwait: Config writes preserve the asynchronous writer collaborator contract.
     write: async () => {
       writes += 1;
       return { ok: true };
     },
   });
   expect(
-    await writer.save(['existing'], () => { return Promise.reject(new Error('Disconnect outcome not confirmed')); })
+    await writer.save(['existing'], () =>
+      Promise.reject(new Error('Disconnect outcome not confirmed'))
+    )
   ).toMatchObject({ error: 'Disconnect outcome not confirmed', ok: false });
   expect(writes).toBe(0);
 });

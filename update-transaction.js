@@ -1,4 +1,6 @@
 // Update decisions are import-safe; command/runtime effects are explicit adapters.
+const oidPattern = /^[a-f0-9]{40,64}$/;
+
 export async function runUpdateTransaction(
   deps,
   { includeUntracked = false, restartAuthorized = false } = {}
@@ -15,7 +17,7 @@ export async function runUpdateTransaction(
   const fail = (code, message) => {
     throw Object.assign(new Error(message), { code });
   };
-  const validOid = (value) => /^[a-f0-9]{40,64}$/.test(value);
+  const validOid = (value) => oidPattern.test(value);
   async function findOwnStash() {
     const entries = (
       await deps.git(['stash', 'list', '--format=%H%x00%gs'])
@@ -23,16 +25,18 @@ export async function runUpdateTransaction(
     const matches = entries
       .map((line) => line.split('\0'))
       .filter(
-        ([oid, subject]) => validOid(oid) && subject?.endsWith(`: ${marker}`)
+        ([candidateOid, subject]) =>
+          validOid(candidateOid) && subject?.endsWith(`: ${marker}`)
       );
     if (matches.length !== 1) {
       return;
     }
-    const oid = matches[0][0];
+    const [[oid]] = matches;
     await deps.git(['cat-file', '-e', `${oid}^{commit}`]);
     return oid;
   }
-  try {
+
+  async function preflight() {
     before = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
     if (!validOid(before)) {
       fail('UPDATE_REVISION_UNKNOWN', 'Cannot establish the original revision');
@@ -66,7 +70,10 @@ export async function runUpdateTransaction(
         'Untracked files require review; use --include-untracked only after checking what will enter the recovery stash'
       );
     }
-    const dirty = (await deps.git(['status', '--porcelain', '-z'])).length > 0;
+    return (await deps.git(['status', '--porcelain', '-z'])).length > 0;
+  }
+
+  async function quiescePortal() {
     stage = 'portal';
     const portal = await deps.inspectPortal();
     if (
@@ -107,6 +114,9 @@ export async function runUpdateTransaction(
         );
       }
     }
+  }
+
+  async function applyUpdate(dirty) {
     stage = 'fetch';
     await deps.checkStorage?.();
     await deps.git(['fetch', 'origin', '--quiet']);
@@ -166,23 +176,76 @@ export async function runUpdateTransaction(
       await deps.restart(owner, { after, before });
       admissionClosed = false;
     }
-    return {
-      admissionClosed,
-      after,
-      before,
-      dependenciesChanged,
-      ok: true,
-      sourceChanged,
-      stage: 'complete',
-      stashId,
-      ...(saved.warning ? { warning: saved.warning } : {}),
-    };
-  } catch (error) {
-    const recovery = {
-      revisionRestored: false,
-      stashApplied: false,
-      warnings: [],
-    };
+    return saved;
+  }
+
+  async function restoreSource(recovery) {
+    try {
+      if (await deps.rebaseInProgress?.()) {
+        await deps.git(['rebase', '--abort']);
+        recovery.rebaseAborted = true;
+      }
+    } catch {
+      recovery.warnings.push('The in-progress rebase could not be aborted.');
+    }
+    try {
+      let head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
+      // A verified recovery stash preserves the original working tree while
+      // reset returns source files installed by a completed rebase to before.
+      if (head !== before && (!marker || stashId)) {
+        await deps.git(['reset', '--hard', before]);
+        head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
+      }
+      recovery.revisionRestored = head === before;
+      if (!recovery.revisionRestored) {
+        recovery.warnings.push(
+          'HEAD could not be restored to the recorded original revision.'
+        );
+      }
+    } catch {
+      recovery.warnings.push(
+        'The original revision could not be confirmed after recovery.'
+      );
+    }
+    if (stashId) {
+      try {
+        const clean =
+          (await deps.git(['status', '--porcelain', '-z'])).length === 0;
+        if (clean) {
+          await deps.git(['stash', 'apply', '--index', stashId]);
+          recovery.stashApplied = true;
+        } else {
+          recovery.warnings.push(
+            'Recovery stash was retained because the working tree is not clean.'
+          );
+        }
+      } catch {
+        recovery.warnings.push(
+          'Recovery stash was retained but could not be reapplied cleanly.'
+        );
+      }
+    }
+  }
+
+  async function reopenAdmission(checkoutRestored) {
+    if (!(owner && checkoutRestored && stage !== 'restart')) {
+      return;
+    }
+    try {
+      const result = await deps.reopen(owner, { coherent: true });
+      if (result?.ok === true) {
+        admissionClosed = false;
+      } else if (result?.ok === false) {
+        admissionClosed = true;
+      } else {
+        admissionClosed = null;
+      }
+    } catch {
+      admissionClosed = null;
+    }
+  }
+
+  async function recoverSource(recovery) {
     if (stage === 'stash-create' && marker && !stashId) {
       try {
         stashId = await findOwnStash();
@@ -199,64 +262,22 @@ export async function runUpdateTransaction(
       );
     }
     if (rollBack) {
-      try {
-        if (await deps.rebaseInProgress?.()) {
-          await deps.git(['rebase', '--abort']);
-          recovery.rebaseAborted = true;
-        }
-      } catch {
-        recovery.warnings.push('The in-progress rebase could not be aborted.');
-      }
-      try {
-        let head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
-        // A verified recovery stash preserves the original working tree while
-        // reset returns source files installed by a completed rebase to before.
-        if (head !== before && (!marker || stashId)) {
-          await deps.git(['reset', '--hard', before]);
-          head = (await deps.git(['rev-parse', '--verify', 'HEAD'])).trim();
-        }
-        recovery.revisionRestored = head === before;
-        if (!recovery.revisionRestored) {
-          recovery.warnings.push(
-            'HEAD could not be restored to the recorded original revision.'
-          );
-        }
-      } catch {
-        recovery.warnings.push(
-          'The original revision could not be confirmed after recovery.'
-        );
-      }
-      if (stashId) {
-        try {
-          const clean =
-            (await deps.git(['status', '--porcelain', '-z'])).length === 0;
-          if (clean) {
-            await deps.git(['stash', 'apply', '--index', stashId]);
-            recovery.stashApplied = true;
-          } else {
-            recovery.warnings.push(
-              'Recovery stash was retained because the working tree is not clean.'
-            );
-          }
-        } catch {
-          recovery.warnings.push(
-            'Recovery stash was retained but could not be reapplied cleanly.'
-          );
-        }
-      }
+      await restoreSource(recovery);
     }
     const checkoutRestored = rollBack
       ? recovery.revisionRestored
       : !(sourceChanged || dependenciesChanged);
-    if (owner && checkoutRestored && stage !== 'restart') {
-      try {
-        const result = await deps.reopen(owner, { coherent: true });
-        admissionClosed =
-          result?.ok === true ? false : result?.ok === false ? true : null;
-      } catch {
-        admissionClosed = null;
-      }
-    }
+    return checkoutRestored;
+  }
+
+  async function recover(error) {
+    const recovery = {
+      revisionRestored: false,
+      stashApplied: false,
+      warnings: [],
+    };
+    const checkoutRestored = await recoverSource(recovery);
+    await reopenAdmission(checkoutRestored);
     if (dependenciesChanged && checkoutRestored) {
       recovery.warnings.push(
         'Dependencies may have changed; reinstall them before relying on this checkout.'
@@ -279,5 +300,24 @@ export async function runUpdateTransaction(
       stashId,
       ...(sourceChanged ? { recovery } : {}),
     };
+  }
+
+  try {
+    const dirty = await preflight();
+    await quiescePortal();
+    const saved = await applyUpdate(dirty);
+    return {
+      admissionClosed,
+      after,
+      before,
+      dependenciesChanged,
+      ok: true,
+      sourceChanged,
+      stage: 'complete',
+      stashId,
+      ...(saved.warning ? { warning: saved.warning } : {}),
+    };
+  } catch (error) {
+    return recover(error);
   }
 }

@@ -69,6 +69,7 @@ function fixture({
     manifests: {
       get: async (id) => records.get(id),
       save: async (record) => records.set(record.id, record),
+      // biome-ignore lint/suspicious/useAwait: Manifest persistence failures must reject through the asynchronous state contract.
       update: async (id, change) => {
         const current = records.get(id);
         const next = change(current);
@@ -86,6 +87,7 @@ function fixture({
     randomId: () => 'retry-fixture-id',
     runtime: async () => runtime,
     state,
+    // biome-ignore lint/suspicious/useAwait: Git command failures must reject through the tracked-path collaborator contract.
     trackedPaths: async (value, paths) => {
       const stdout = execFileSync(
         'git',
@@ -151,9 +153,9 @@ function resign(manifest) {
   return { ...manifest, id, immutableHash: id };
 }
 
-function generated(fixture, files = { 'a.cache': 'a', 'b.cache': 'b' }) {
+function generated(context, files = { 'a.cache': 'a', 'b.cache': 'b' }) {
   for (const [name, content] of Object.entries(files)) {
-    const path = join(fixture.output, name);
+    const path = join(context.output, name);
     fs.mkdirSync(join(path, '..'), { recursive: true });
     fs.writeFileSync(path, content);
   }
@@ -221,13 +223,13 @@ test('execute holds on an active writer rather than clearing its generated outpu
   expect(fs.existsSync(join(f.output, 'a.cache'))).toBe(true);
 });
 
-test('prepare refuses active, unknown, and queued ownership without persisting a manifest', async () => {
-  const cases = [
-    { code: 'ACTIVE_WRITER', ownership: { state: 'active' } },
-    { code: 'UNKNOWN_WRITER', ownership: { state: 'unknown' } },
-    { code: 'TARGET_QUEUED', runtime: { queued: true, state: 'stopped' } },
-  ];
-  for (const scenario of cases) {
+test.each([
+  { code: 'ACTIVE_WRITER', ownership: { state: 'active' } },
+  { code: 'UNKNOWN_WRITER', ownership: { state: 'unknown' } },
+  { code: 'TARGET_QUEUED', runtime: { queued: true, state: 'stopped' } },
+])(
+  'prepare refuses unsafe ownership without persisting a manifest: %#',
+  async (scenario) => {
     const f = fixture();
     generated(f, { 'entry.cache': 'generated' });
     if (scenario.ownership) {
@@ -243,7 +245,7 @@ test('prepare refuses active, unknown, and queued ownership without persisting a
     });
     expect(f.records.size).toBe(0);
   }
-});
+);
 
 test('a completed manifest cannot execute a second time', async () => {
   const f = fixture();
@@ -270,6 +272,7 @@ test('a completed manifest cannot execute a second time', async () => {
 test('a deletion failure records only completed paths and a retry identity', async () => {
   let failed = false;
   const f = fixture({
+    // biome-ignore lint/suspicious/useAwait: Injected removal failures must reject through the filesystem promise contract.
     remove: async (entry, fsOps) => {
       if (!failed && entry.path.endsWith('/b.cache')) {
         failed = true;
@@ -393,6 +396,7 @@ test('a malformed but re-signed entry path is refused before deletion', async ()
 test('retry accepts an already-removed first generated root after failure in the second', async () => {
   let failed = false;
   const f = fixture({
+    // biome-ignore lint/suspicious/useAwait: Injected removal failures must reject through the filesystem promise contract.
     remove: async (entry, fsOps) => {
       if (!failed && entry.path.endsWith('/turbopack/b.cache')) {
         failed = true;
@@ -456,7 +460,13 @@ test('an entry-count bound produces no executable manifest', async () => {
 
 test('a time bound produces no executable manifest', async () => {
   let tick = 0;
-  const f = fixture({ maxScanMs: 1, now: () => ++tick * 10 });
+  const f = fixture({
+    maxScanMs: 1,
+    now: () => {
+      tick += 1;
+      return tick * 10;
+    },
+  });
   generated(f, { 'entry.cache': 'generated' });
 
   await expect(f.cache.prepare(f.target)).resolves.toMatchObject({
@@ -471,7 +481,14 @@ test('a verification time bound refuses execution before deleting a prepared pat
   let tick = 0;
   const f = fixture({
     maxScanMs: 1,
-    now: () => (verifying ? ++tick * 10 : 0),
+    now: () => {
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: The test enables the captured verifying flag after preparing the manifest.
+      if (!verifying) {
+        return 0;
+      }
+      tick += 1;
+      return tick * 10;
+    },
   });
   generated(f, { 'entry.cache': 'generated' });
   const prepared = await f.cache.prepare(f.target);

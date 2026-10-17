@@ -3,6 +3,7 @@ import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv
 import { callConnectedMcpTool, mcpStatus } from './mcp.js';
 
 const failure = (code, error) => ({ code, error, ok: false });
+const revisionPattern = /^[a-f0-9]{64}$/;
 
 function safeText(value, limit = 160) {
   return typeof value === 'string' && value.length > 0 && value.length <= limit;
@@ -68,7 +69,7 @@ function validAction(action) {
     safeText(action.title, 160) &&
     typeof action.mutates === 'boolean' &&
     typeof action.revision === 'string' &&
-    /^[a-f0-9]{64}$/.test(action.revision) &&
+    revisionPattern.test(action.revision) &&
     validator(action.inputSchema) !== null &&
     action.revision === revision(action)
   );
@@ -94,14 +95,14 @@ function boundResult(result, limit) {
   const boundaries = [0];
   for (let index = 0; index < bytes.length; ) {
     const first = bytes[index];
-    const width =
-      first < 0x80
-        ? 1
-        : (first & 0xe0) === 0xc0
-          ? 2
-          : (first & 0xf0) === 0xe0
-            ? 3
-            : 4;
+    let width = 4;
+    if (first < 0x80) {
+      width = 1;
+    } else if (first >= 0xc0 && first <= 0xdf) {
+      width = 2;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      width = 3;
+    }
     index += width;
     boundaries.push(index);
   }
@@ -261,7 +262,7 @@ export function createMcpActions({
   async function invoke(
     actionId,
     input,
-    confirmation,
+    confirmationToken,
     { source = 'portal' } = {}
   ) {
     const checkedAction = checked(actionId, input);
@@ -269,7 +270,7 @@ export function createMcpActions({
       return checkedAction;
     }
     const { action } = checkedAction;
-    if (confirmation !== checkedAction.confirmation.token) {
+    if (confirmationToken !== checkedAction.confirmation.token) {
       return {
         ...failure(
           'MCP_ACTION_CONFIRMATION_REQUIRED',
@@ -301,14 +302,14 @@ export function createMcpActions({
         outcomeRecorded: false,
       };
     }
-    const finish = async (state, result) => {
+    const finish = async (outcomeState, result) => {
       let recorded = false;
       try {
         recorded =
           (
             await record?.({
               ...event,
-              state,
+              state: outcomeState,
               ...(result.code ? { code: result.code } : {}),
             })
           )?.ok === true;
@@ -334,16 +335,17 @@ export function createMcpActions({
       });
     }
     if (!called?.ok) {
-      const state =
+      const outcomeState =
         called?.state === 'unknown' || called?.code?.includes('UNKNOWN')
           ? 'unknown'
           : 'failed';
-      return finish(state, {
+      return finish(outcomeState, {
         ...failure(
           called?.code ?? 'MCP_TOOL_CALL_FAILED',
           called?.error ?? 'The connected MCP tool did not complete'
         ),
-        state,
+        ...boundResult(called?.result, maxResultBytes),
+        state: outcomeState,
       });
     }
     return finish('completed', {

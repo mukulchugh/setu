@@ -10,14 +10,16 @@ test('offline removal refuses without deleting locally or starting a portal', as
     {
       ensurePortal: () => effects.push('started'),
       portalAvailable: () => false,
-      removeLocal: async () => {
+      removeLocal: () => {
         effects.push('deleted');
+        return Promise.resolve();
       },
-      request: async () => {
-        throw Object.assign(new Error('Connection refused'), {
-          code: 'ECONNREFUSED',
-        });
-      },
+      request: () =>
+        Promise.reject(
+          Object.assign(new Error('Connection refused'), {
+            code: 'ECONNREFUSED',
+          })
+        ),
       stderr: (text) => errors.push(text),
       stdout: (text) => output.push(text),
     }
@@ -41,9 +43,9 @@ test('confirmed online removal sends the explicit force once and prints success'
       portalAvailable: () => {
         throw new Error('PID markers must not decide reachability');
       },
-      request: async (body) => {
+      request: (body) => {
         sent.push(body);
-        return { ok: true };
+        return Promise.resolve({ ok: true });
       },
       stderr: (text) => errors.push(text),
       stdout: (text) => output.push(text),
@@ -57,17 +59,20 @@ test('confirmed online removal sends the explicit force once and prints success'
   });
 });
 
-test('timeout or disconnect after possible acceptance never retries or claims no deletion', async () => {
-  for (const code of ['TimeoutError', 'ECONNRESET']) {
+test.each(['TimeoutError', 'ECONNRESET'])(
+  'timeout or disconnect after possible acceptance never retries or claims no deletion: %s',
+  async (code) => {
     let attempts = 0;
     const output = [],
       errors = [];
     const outcome = await runRemoveCommand(
       { name: 'topic', repo: 'r' },
       {
-        request: async () => {
+        request: () => {
           attempts += 1;
-          throw Object.assign(new Error('Interrupted'), { code });
+          return Promise.reject(
+            Object.assign(new Error('Interrupted'), { code })
+          );
         },
         stderr: (text) => errors.push(text),
         stdout: (text) => output.push(text),
@@ -81,7 +86,7 @@ test('timeout or disconnect after possible acceptance never retries or claims no
     expect({ attempts, output }).toEqual({ attempts: 1, output: [] });
     expect(errors[0]).not.toContain('No files were removed');
   }
-});
+);
 
 test('invalid force refuses before a request', async () => {
   const outcome = await runRemoveCommand(
@@ -105,14 +110,16 @@ test('body read failure after response headers is uncertain even with a connecti
     {
       request: (body) =>
         requestRemoval(body, {
-          fetch: async () => ({
-            json: async () => {
-              throw Object.assign(new Error('body lost'), {
-                code: 'ECONNREFUSED',
-              });
-            },
-            ok: true,
-          }),
+          fetch: () =>
+            Promise.resolve({
+              json: () =>
+                Promise.reject(
+                  Object.assign(new Error('body lost'), {
+                    code: 'ECONNREFUSED',
+                  })
+                ),
+              ok: true,
+            }),
           url: 'http://127.0.0.1:2999/api/remove',
         }),
       stderr: () => {
@@ -142,6 +149,7 @@ test('the removal transport preserves structured HTTP refusal instead of throwin
   const received = await requestRemoval(
     { force: true, name: 'topic', repo: 'r' },
     {
+      // biome-ignore lint/suspicious/useAwait: The fetch fixture preserves rejected request parsing and response construction errors.
       fetch: async (url, options) => {
         sent.push({
           body: JSON.parse(options.body),
@@ -172,9 +180,9 @@ test('a malformed reply after possible acceptance reports uncertainty without re
   const outcome = await runRemoveCommand(
     { name: 'topic', repo: 'r' },
     {
-      request: async () => {
+      request: () => {
         requests += 1;
-        return { message: 'proxy unavailable' };
+        return Promise.resolve({ message: 'proxy unavailable' });
       },
       stderr: (text) => errors.push(text),
       stdout: (text) => output.push(text),
@@ -202,9 +210,9 @@ test('online rejection retains the server outcome and never prints removal succe
   const outcome = await runRemoveCommand(
     { force: false, name: 'topic', repo: 'r' },
     {
-      request: async (body) => {
+      request: (body) => {
         requests.push(body);
-        return result;
+        return Promise.resolve(result);
       },
       stderr: (text) => errors.push(text),
       stdout: (text) => output.push(text),
@@ -232,9 +240,9 @@ test('exact cleanup retry and JSON output preserve the complete partial result',
   const outcome = await runRemoveCommand(
     { json: true, name: 'topic', operationId: 'op-42', repo: 'r' },
     {
-      request: async (body) => {
+      request: (body) => {
         sent.push(body);
-        return result;
+        return Promise.resolve(result);
       },
       stderr: (text) => errors.push(text),
       stdout: (text) => output.push(text),
@@ -260,9 +268,9 @@ test('unknown exact cleanup ID exits nonzero with JSON and never starts a new re
   const outcome = await runRemoveCommand(
     { json: true, name: 'topic', operationId: 'expired-id', repo: 'r' },
     {
-      request: async (body) => {
+      request: (body) => {
         requests.push(body);
-        return result;
+        return Promise.resolve(result);
       },
       stderr: () => {
         /* No side effect is needed in this fixture. */
@@ -283,8 +291,9 @@ test('invalid exact retry ID refuses before dispatch and still emits JSON', asyn
   const outcome = await runRemoveCommand(
     { json: true, name: 'topic', operationId: true, repo: 'r' },
     {
-      request: async () => {
+      request: () => {
         calls += 1;
+        return Promise.resolve();
       },
       stderr: () => {
         /* No side effect is needed in this fixture. */

@@ -56,6 +56,7 @@ test('a failed output stream does not release command ownership before known exi
     return error;
   });
   for (let i = 0; i < 10; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each turn lets another pending microtask run before checking that completion remains blocked.
     await Promise.resolve();
   }
   expect(returned).toBe(false);
@@ -81,6 +82,7 @@ function platform(overrides = {}) {
   const deps = {
     clock: {
       now: () => time,
+      // biome-ignore lint/suspicious/useAwait: The fixture clock preserves the asynchronous sleep contract.
       sleep: async (ms) => {
         time += ms;
       },
@@ -176,9 +178,7 @@ test('adopted listeners signal only the exact PID and every sidecar stop settles
   let completed = false;
   const f = platform({
     sidecarStops: [
-      () => {
-        return Promise.reject(new Error('sidecar exit unknown'));
-      },
+      () => Promise.reject(new Error('sidecar exit unknown')),
       async () => {
         await pending;
         completed = true;
@@ -243,6 +243,7 @@ test('Stop waits through transient post-signal unknown until the owned group is 
   const runtime = createDevRuntime({
     clock: {
       now: () => now,
+      // biome-ignore lint/suspicious/useAwait: The fixture clock changes observed process state at the sleep promise boundary.
       sleep: async (ms) => {
         now += ms;
         state = 'dead';
@@ -250,7 +251,7 @@ test('Stop waits through transient post-signal unknown until the owned group is 
     },
     signal(pid, value) {
       if (state !== 'alive') {
-        throw Object.assign(new Error(), {
+        throw Object.assign(new Error('fixture process signal refused'), {
           code: state === 'dead' ? 'ESRCH' : 'EPERM',
         });
       }
@@ -265,21 +266,25 @@ test('Stop waits through transient post-signal unknown until the owned group is 
   expect(now).toBe(50);
 });
 
-test('initial unknown receives no signal and persistent post-TERM unknown never escalates', async () => {
-  for (const initial of ['unknown', 'alive']) {
+test.each(['unknown', 'alive'])(
+  'initial unknown receives no signal and persistent post-TERM unknown never escalates: %s',
+  async (initial) => {
     let state = initial,
       now = 0;
     const signals = [];
     const runtime = createDevRuntime({
       clock: {
         now: () => now,
+        // biome-ignore lint/suspicious/useAwait: The fixture clock preserves the asynchronous sleep contract.
         sleep: async (ms) => {
           now += ms;
         },
       },
       signal(pid, value) {
         if (state === 'unknown') {
-          throw Object.assign(new Error(), { code: 'EPERM' });
+          throw Object.assign(new Error('fixture process signal refused'), {
+            code: 'EPERM',
+          });
         }
         if (value !== 0) {
           signals.push([pid, value]);
@@ -293,7 +298,7 @@ test('initial unknown receives no signal and persistent post-TERM unknown never 
     expect(signals).toEqual(initial === 'unknown' ? [] : [[-123, 'SIGTERM']]);
     expect(now).toBe(initial === 'unknown' ? 0 : 5000);
   }
-});
+);
 
 test('a delayed command leaves unrelated reads responsive and preserves bounded failure diagnostics', async () => {
   let finish;

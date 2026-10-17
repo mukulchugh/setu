@@ -9,6 +9,15 @@ import { createWorkspaceState } from './workspace-state.js';
 
 const roots = [];
 const processes = [];
+
+function asPromise(callback) {
+  try {
+    return Promise.resolve(callback());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) {
     fs.rmSync(root, { force: true, recursive: true });
@@ -143,7 +152,9 @@ test('a registered actual coding process survives a launcher-wrapper exit and pe
   const recovered = createAgentSessions({
     now: () => '2026-10-05T12:01:00.000Z',
     observeProcess: async (pid) => f.identities.get(pid),
-    signal: () => {},
+    signal: () => {
+      // No signal is needed for this recovery fixture.
+    },
     state: f.state,
   });
   await recovered.reconcile();
@@ -256,16 +267,17 @@ test('end rechecks root identity after child signals and refuses a changed root'
       state: 'owned',
     }),
     now: () => '2026-10-05T12:00:00.000Z',
-    observeProcess: async (pid) => {
-      if (pid === 322) {
-        return identity(322, childStart);
-      }
-      rootChecks += 1;
-      return identity(
-        321,
-        rootChecks <= 2 ? start : 'Mon Sep 21 10:11:00 2026'
-      );
-    },
+    observeProcess: (pid) =>
+      asPromise(() => {
+        if (pid === 322) {
+          return identity(322, childStart);
+        }
+        rootChecks += 1;
+        return identity(
+          321,
+          rootChecks <= 2 ? start : 'Mon Sep 21 10:11:00 2026'
+        );
+      }),
     signal: (pid, value) => f.signals.push([pid, value]),
     state: f.state,
   });
@@ -291,7 +303,9 @@ test('reconcile leaves a root-ended session unknown when a proven descendant sur
     }),
     now: () => '2026-10-05T12:00:00.000Z',
     observeProcess: async (pid) => identities.get(pid) ?? { state: 'absent' },
-    signal: () => {},
+    signal: () => {
+      // The fixture only verifies session persistence.
+    },
     state: f.state,
   });
   await f.sessions.register({ ...launch, pid: 321, processStart: start });

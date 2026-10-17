@@ -15,10 +15,10 @@ import {
   DialogTitle,
   dialogReturnTarget,
 } from '../ui/dialog';
+import { stripAnsiSgr } from '../ui-helpers';
 import { readJson, useVisiblePoll } from '../use-visible-poll';
 import { getWs } from '../ws';
 import { tablerCopy } from './icons';
-import { stripAnsiSgr } from '../ui-helpers';
 
 export const LOG_TABS = [
   'dev',
@@ -119,7 +119,7 @@ function FollowNotice({ holding }: { holding: boolean }) {
 export function useLogPoll(url: string | null, intervalMs: number) {
   const buffer = useLogBuffer(url);
   const { data, failed, refresh } = useVisiblePoll(url, intervalMs, (signal) =>
-    readJson<LogSnapshot>(url!, signal)
+    readJson<LogSnapshot>(url as string, signal)
   );
   useEffect(() => {
     if (data) {
@@ -147,6 +147,36 @@ export function useLogStream(repo: string, name: string, type: string) {
   return { ...buffer, retry: () => getWs().refresh() };
 }
 
+function logReadText(read: LogRead) {
+  if (read.state === 'read-error') {
+    const successfulRead =
+      read.successfulAt === undefined
+        ? ''
+        : ` Showing the last successful read at ${new Date(read.successfulAt).toLocaleTimeString()}.`;
+    return `Could not read this log.${successfulRead}`;
+  }
+  if (read.state === 'loading') {
+    return 'Loading log…';
+  }
+  if (read.state === 'missing') {
+    return 'No log file yet. Run the matching service or action to create one.';
+  }
+  return 'The log is empty.';
+}
+
+function logTabLabel(type: string) {
+  if (type === 'dev') {
+    return 'Dev server';
+  }
+  if (type === 'pr-review') {
+    return 'PR review';
+  }
+  if (type.startsWith('sidecar-')) {
+    return type.slice(8);
+  }
+  return type[0].toUpperCase() + type.slice(1);
+}
+
 export function LogReadStatus({
   read,
 }: {
@@ -155,14 +185,7 @@ export function LogReadStatus({
   if (read.state === 'ready') {
     return null;
   }
-  const text =
-    read.state === 'read-error'
-      ? `Could not read this log.${read.successfulAt === undefined ? '' : ` Showing the last successful read at ${new Date(read.successfulAt).toLocaleTimeString()}.`}`
-      : read.state === 'loading'
-        ? 'Loading log…'
-        : read.state === 'missing'
-          ? 'No log file yet. Run the matching service or action to create one.'
-          : 'The log is empty.';
+  const text = logReadText(read);
   return (
     <p
       class={`px-1 py-2 text-xs ${read.state === 'read-error' ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-300'}`}
@@ -257,13 +280,7 @@ export function LogModal({
                 }}
                 type="button"
               >
-                {t === 'dev'
-                  ? 'Dev server'
-                  : t === 'pr-review'
-                    ? 'PR review'
-                    : t.startsWith('sidecar-')
-                      ? t.slice(8)
-                      : t[0].toUpperCase() + t.slice(1)}
+                {logTabLabel(t)}
               </button>
             ))}
           </fieldset>
@@ -332,9 +349,7 @@ export function LogModal({
           // biome-ignore lint/a11y/noNoninteractiveTabindex: The scrollable log region needs keyboard scrolling inside the dialog.
           tabIndex={0}
         >
-          <pre class="m-0 whitespace-pre-wrap break-all font-mono">
-            {text}
-          </pre>
+          <pre class="m-0 whitespace-pre-wrap break-all font-mono">{text}</pre>
         </section>
       </DialogContent>
     </Dialog>

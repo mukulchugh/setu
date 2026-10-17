@@ -98,23 +98,56 @@ export function useSavedDraft<T>(
     reconcileFirst.current = false;
     abort.current?.abort();
     abort.current = null;
-    void reload(true);
+    reload(true);
     return () => {
       generation.current += 1;
       abort.current?.abort();
       abort.current = null;
     };
   }, [key]);
+  async function refreshBeforeSaveRetry() {
+    await reload();
+    setMessage(
+      'Saved values refreshed. Review your draft before saving again.'
+    );
+    return false;
+  }
+  function rejectSave(result: Awaited<ReturnType<typeof post>>) {
+    reconcileFirst.current = !!(result.networkUncertain || result.committed);
+    setError(
+      reconcileFirst.current
+        ? 'Outcome not confirmed. Refresh saved values before trying again.'
+        : result.error || 'Could not save. Your draft is kept.'
+    );
+    return false;
+  }
+  async function confirmSaved(
+    submitted: T,
+    version: number,
+    result: Awaited<ReturnType<typeof post>>
+  ) {
+    saved.current = submitted;
+    // A failed readback cannot erase the confirmed saved draft.
+    const refreshed = await reload(editing.current === version);
+    if (!refreshed) {
+      reconcileFirst.current = true;
+    }
+    let savedMessage = 'Saved; refresh is still needed.';
+    if (refreshed) {
+      savedMessage = 'Saved';
+    }
+    if (result.warning) {
+      savedMessage = 'Saved; durability could not be confirmed.';
+    }
+    setMessage(savedMessage);
+    return !isDirty();
+  }
   async function save() {
     if (inFlight.current || !loaded) {
       return false;
     }
     if (reconcileFirst.current) {
-      await reload();
-      setMessage(
-        'Saved values refreshed. Review your draft before saving again.'
-      );
-      return false;
+      return await refreshBeforeSaveRetry();
     }
     const invalid = validator.current?.(current.current);
     if (invalid) {
@@ -136,30 +169,9 @@ export function useSavedDraft<T>(
         return false;
       }
       if (!result.ok || result.reconciled === false) {
-        reconcileFirst.current = !!(
-          result.networkUncertain || result.committed
-        );
-        setError(
-          reconcileFirst.current
-            ? 'Outcome not confirmed. Refresh saved values before trying again.'
-            : result.error || 'Could not save. Your draft is kept.'
-        );
-        return false;
+        return rejectSave(result);
       }
-      saved.current = submitted;
-      // A failed readback cannot erase the confirmed saved draft.
-      const refreshed = await reload(editing.current === version);
-      if (!refreshed) {
-        reconcileFirst.current = true;
-      }
-      setMessage(
-        result.warning
-          ? 'Saved; durability could not be confirmed.'
-          : refreshed
-            ? 'Saved'
-            : 'Saved; refresh is still needed.'
-      );
-      return !isDirty();
+      return await confirmSaved(submitted, version, result);
     } finally {
       if (generation.current === own) {
         inFlight.current = false;

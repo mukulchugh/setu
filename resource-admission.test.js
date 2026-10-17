@@ -19,6 +19,7 @@ function fixture({ availableBytes = 30 * GiB } = {}) {
     workspaceRoot: root,
   });
   const reads = [];
+  // biome-ignore lint/suspicious/useAwait: The health observer fixture preserves its asynchronous result contract.
   const hostHealth = async (options) => {
     reads.push(options);
     return { availableBytes, state: 'ready' };
@@ -46,7 +47,7 @@ function fixture({ availableBytes = 30 * GiB } = {}) {
   };
 }
 
-afterEach(async () => {
+afterEach(() => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null) {
       child.kill();

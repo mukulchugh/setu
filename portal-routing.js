@@ -11,6 +11,7 @@ export function createPortalRouting({
   state,
   writeCaddy,
 }) {
+  // biome-ignore lint/suspicious/useAwait: Routing callers require synchronous state/read failures to reject from this async portal boundary.
   async function syncHosts() {
     return state.withRouting(async () => {
       const raw = await readFile(hostsPath, 'utf8');

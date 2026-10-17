@@ -22,8 +22,8 @@ import {
   createWorktree,
   ensureSetuExcludes,
   envLocalPath,
-  localDomain,
   linkWorktreeEnv,
+  localDomain,
   PACKAGE_VERSION,
   portalRequestError,
   reloadCaddyAsync,
@@ -176,6 +176,7 @@ test('async direnv allow leaves the event loop available while the child runs', 
 
 test('async base branch resolution preserves the staging fallback', async () => {
   const calls = [];
+  // biome-ignore lint/suspicious/useAwait: A missing Git ref must reject through the asynchronous runner contract.
   const run = async (_repoDir, args) => {
     calls.push(args);
     if (args[0] === 'show-ref') {
@@ -198,6 +199,7 @@ test('async caddy reload retains the sync helper success result', async () => {
   const state = { withRouting: (task) => task() };
   await expect(
     reloadCaddyAsync('/workspace', {
+      // biome-ignore lint/suspicious/useAwait: The reload command fixture preserves its asynchronous command result.
       run: async (args, options) => {
         calls.push({ args, options });
         return 0;

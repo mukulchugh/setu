@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import { post } from '../api';
 import { inputCls, PageHeader } from '../ui';
@@ -33,16 +34,20 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
   );
 
   async function stop(port: PortInfo) {
-    if (pending.current.has(port.port)) return;
+    if (pending.current.has(port.port)) {
+      return;
+    }
     const owner = port.worktree
       ? `Setu worktree ${port.worktree}`
       : `${port.cmd}, PID ${port.pid}`;
     if (
+      // biome-ignore lint/suspicious/noAlert: Existing confirmation gates the only /api/ports/kill mutation after its owner warning.
       !confirm(
         `Stop ${owner} on port ${port.port}? Setu will resolve the current listener before stopping it. An unregistered process may belong to another application.`
       )
-    )
+    ) {
       return;
+    }
     pending.current.add(port.port);
     setBusy(new Set(pending.current));
     try {
@@ -61,6 +66,52 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
       pending.current.delete(port.port);
       setBusy(new Set(pending.current));
     }
+  }
+
+  let portContent: ComponentChildren;
+  if (loaded) {
+    if (matches.length) {
+      portContent = matches.map((p) => (
+        <div
+          class="flex min-w-0 flex-wrap items-center gap-4 border-zinc-200/60 border-b px-4 py-4 last:border-0 dark:border-white/10"
+          key={`${p.port}:${p.pid}`}
+        >
+          <span class="min-w-16 font-mono font-semibold text-lg tabular-nums">
+            {p.port}
+          </span>
+          <div class="min-w-0 flex-1 basis-40">
+            <p class="break-words font-medium">{p.cmd}</p>
+            <p class="mt-1 break-all text-xs text-zinc-600 dark:text-zinc-300">
+              PID {p.pid}
+              {p.worktree ? ` · ${p.worktree}` : ''}
+            </p>
+          </div>
+          <Badge tone={p.worktree ? 'emerald' : 'amber'}>
+            {p.worktree ? 'Setu worktree' : 'Unregistered'}
+          </Badge>
+          <Button
+            aria-label={`Stop listener on port ${p.port}`}
+            class="text-red-700 dark:text-red-300"
+            compact
+            disabled={busy.has(p.port)}
+            onClick={() => stop(p)}
+            variant="secondary"
+          >
+            {busy.has(p.port) ? 'Stopping…' : 'Stop'}
+          </Button>
+        </div>
+      ));
+    } else {
+      portContent = (
+        <p class="empty-state">
+          {search
+            ? 'No listeners match this search.'
+            : 'No listeners on ports 3000–3999.'}
+        </p>
+      );
+    }
+  } else if (!failed) {
+    portContent = <p class="empty-state">Loading active ports…</p>;
   }
 
   return (
@@ -111,50 +162,7 @@ export function PortsPage({ onBack }: { onBack: () => void }) {
           {actionError}
         </p>
       )}
-      <div class="glass-panel text-sm">
-        {loaded ? (
-          matches.length ? (
-            matches.map((p) => (
-              <div
-                class="flex min-w-0 flex-wrap items-center gap-4 border-zinc-200/60 border-b px-4 py-4 last:border-0 dark:border-white/10"
-                key={`${p.port}:${p.pid}`}
-              >
-                <span class="min-w-16 font-mono font-semibold text-lg tabular-nums">
-                  {p.port}
-                </span>
-                <div class="min-w-0 flex-1 basis-40">
-                  <p class="break-words font-medium">{p.cmd}</p>
-                  <p class="mt-1 break-all text-xs text-zinc-600 dark:text-zinc-300">
-                    PID {p.pid}
-                    {p.worktree ? ` · ${p.worktree}` : ''}
-                  </p>
-                </div>
-                <Badge tone={p.worktree ? 'emerald' : 'amber'}>
-                  {p.worktree ? 'Setu worktree' : 'Unregistered'}
-                </Badge>
-                <Button
-                  aria-label={`Stop listener on port ${p.port}`}
-                  class="text-red-700 dark:text-red-300"
-                  compact
-                  disabled={busy.has(p.port)}
-                  onClick={() => stop(p)}
-                  variant="secondary"
-                >
-                  {busy.has(p.port) ? 'Stopping…' : 'Stop'}
-                </Button>
-              </div>
-            ))
-          ) : (
-            <p class="empty-state">
-              {search
-                ? 'No listeners match this search.'
-                : 'No listeners on ports 3000–3999.'}
-            </p>
-          )
-        ) : (
-          !failed && <p class="empty-state">Loading active ports…</p>
-        )}
-      </div>
+      <div class="glass-panel text-sm">{portContent}</div>
     </div>
   );
 }

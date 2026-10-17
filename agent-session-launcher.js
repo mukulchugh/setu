@@ -2,6 +2,8 @@ import { API_KEY_VARS } from './cli-helpers.js';
 
 const startIdentity =
   /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+const launchTokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
+const unsafeStringCharacter = /[\0\r\n]/;
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -9,12 +11,14 @@ function shellQuote(value) {
 
 function requiredString(value) {
   return (
-    typeof value === 'string' && value.length > 0 && !/[\0\r\n]/.test(value)
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !unsafeStringCharacter.test(value)
   );
 }
 
 function validLaunchToken(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(value);
+  return typeof value === 'string' && launchTokenPattern.test(value);
 }
 
 // This module builds data only. The portal writes the script with restrictive
@@ -79,12 +83,12 @@ exec zsh -l
 }
 
 export function parseSessionRegistration(text, expected) {
-  const expectation =
-    typeof expected === 'string'
-      ? { sessionId: expected }
-      : expected && typeof expected === 'object'
-        ? expected
-        : null;
+  let expectation = null;
+  if (typeof expected === 'string') {
+    expectation = { sessionId: expected };
+  } else if (expected && typeof expected === 'object') {
+    expectation = expected;
+  }
   if (!(typeof text === 'string' && requiredString(expectation?.sessionId))) {
     return null;
   }

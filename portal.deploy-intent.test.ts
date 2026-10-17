@@ -9,6 +9,7 @@ import {
 
 const tick = async () => {
   for (let i = 0; i < 10; i += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Successive microtasks must drain the controller promise chain before assertions.
     await Promise.resolve();
   }
 };
@@ -71,8 +72,9 @@ function fixture() {
     writes,
   };
 }
-test('all three production providers require an explicit confirmation and submit once', async () => {
-  for (const provider of ['vercel', 'netlify', 'convex'] as const) {
+test.each(['vercel', 'netlify', 'convex'] as const)(
+  'all three production providers require an explicit confirmation and submit once: %s',
+  async (provider) => {
     const f = fixture();
     f.controller.begin(intent(provider));
     const expected = f.resolve(0);
@@ -88,7 +90,7 @@ test('all three production providers require an explicit confirmation and submit
     await tick();
     expect(f.controller.getState().phase).toBe('idle');
   }
-});
+);
 test('cancel and stale preflight responses dispatch nothing', async () => {
   const f = fixture();
   f.controller.begin(intent());

@@ -10,10 +10,10 @@ function root() {
   roots.push(path);
   return path;
 }
-function reader(roots, options = {}) {
+function reader(storageRoots, options = {}) {
   return createWorkspaceStorage({
     entryLimit: 25_000,
-    roots,
+    roots: storageRoots,
     timeoutMs: 5000,
     ...options,
   });
@@ -116,6 +116,7 @@ test('reports unreadable roots as unknown and unreadable descendants as partial'
   fs.writeFileSync(join(blocked, 'private'), 'nope');
   fs.chmodSync(blocked, 0o000);
   const storage = reader([{ category: 'source', id: 'source', path }], {
+    // biome-ignore lint/suspicious/useAwait: A denied directory fixture must reject through the filesystem promise contract.
     readdirPath: async (target, options) => {
       if (target === blocked) {
         throw Object.assign(new Error('denied'), { code: 'EACCES' });
@@ -229,14 +230,14 @@ test('refreshes all roots together so mixed warm and cold observations deduplica
   fs.mkdirSync(b);
   fs.writeFileSync(join(a, 'payload'), 'shared');
   fs.linkSync(join(a, 'payload'), join(b, 'payload'));
-  const roots = [
+  const storageRoots = [
     { category: 'source', id: 'a', path: a },
     { category: 'generated', id: 'b', path: b },
   ];
-  const warm = reader(roots);
+  const warm = reader(storageRoots);
   await warm.observe('a');
   const mixed = await warm.observeAll();
-  const cold = await reader(roots).observeAll();
+  const cold = await reader(storageRoots).observeAll();
 
   expect(mixed.map((item) => item.logicalBytes)).toEqual(
     cold.map((item) => item.logicalBytes)

@@ -17,6 +17,7 @@ function scenario({
     stashMade = false,
     marker = '';
   const deps = {
+    // biome-ignore lint/suspicious/useAwait: Git command failures must reject through the transaction's async adapter.
     git: async (args) => {
       calls.push(args.join(' '));
       if (args[0] === 'rev-parse') {
@@ -73,18 +74,27 @@ function scenario({
       throw new Error(`Unexpected command ${args.join(' ')}`);
     },
     inProgress: () => Promise.resolve(false),
-    inspectPortal: async () =>
-      portal === 'absent'
-        ? { state: 'absent' }
-        : portal === 'legacy'
-          ? { state: 'unknown' }
-          : { instanceId: 'old', protocol: 1, state: 'ready' },
+    inspectPortal: () => {
+      if (portal === 'absent') {
+        return Promise.resolve({ state: 'absent' });
+      }
+      if (portal === 'legacy') {
+        return Promise.resolve({ state: 'unknown' });
+      }
+      return Promise.resolve({
+        instanceId: 'old',
+        protocol: 1,
+        state: 'ready',
+      });
+    },
+    // biome-ignore lint/suspicious/useAwait: The injected install failure must remain a rejected promise.
     install: async () => {
       calls.push('install');
       if (failAt === 'install') {
         throw new Error('failed');
       }
     },
+    // biome-ignore lint/suspicious/useAwait: The injected link failure must remain a rejected promise.
     link: async () => {
       calls.push('link');
       if (failAt === 'link') {
@@ -92,35 +102,36 @@ function scenario({
       }
     },
     operationId: () => 'fixture-operation',
-    quiesce: async () => {
+    quiesce: () => {
       calls.push('quiesce');
-      return {
+      return Promise.resolve({
         code: busy ? 'OWNED_WORK_ACTIVE' : undefined,
         instanceId: 'old',
         ok: !busy,
         protocol: 1,
         token: 'owner',
-      };
+      });
     },
-    reopen: async () => {
+    reopen: () => {
       calls.push('reopen');
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     },
+    // biome-ignore lint/suspicious/useAwait: The injected restart failure must remain a rejected promise.
     restart: async () => {
       calls.push('restart');
       if (failAt === 'restart') {
         throw new Error('failed');
       }
     },
-    writeCheck: async () => {
+    writeCheck: () => {
       calls.push('settings');
-      return {
+      return Promise.resolve({
         committed: true,
         reconciled: true,
         ...(failAt === 'warning'
           ? { warning: { code: 'STATE_DURABILITY_UNCONFIRMED' } }
           : {}),
-      };
+      });
     },
   };
   return { calls, deps, older, original, stash };
@@ -153,6 +164,7 @@ test('restore conflict preserves exact recovery identity and stops before instal
 
 test('low storage after rebase never prevents restoring the exact recovery stash', async () => {
   const s = scenario({ dirty: true, portal: 'ready' });
+  // biome-ignore lint/suspicious/useAwait: Storage refusal must reject at the transaction's awaited preflight boundary.
   s.deps.checkStorage = async () => {
     if (s.calls.includes('rebase origin/main')) {
       throw Object.assign(new Error('Storage ran low'), {
@@ -179,8 +191,9 @@ test('low storage after rebase never prevents restoring the exact recovery stash
 test('update installation explicitly requires the frozen lockfile', async () => {
   const s = scenario();
   let installOptions;
-  s.deps.install = async (options) => {
+  s.deps.install = (options) => {
     installOptions = options;
+    return Promise.resolve();
   };
   await expect(runUpdateTransaction(s.deps)).resolves.toMatchObject({
     ok: true,
@@ -242,8 +255,9 @@ test.each(['fetch', 'stash', 'rebase', 'install', 'link'])(
   }
 );
 
-test('unknown legacy portal and missing restart approval refuse before loaded source changes', async () => {
-  for (const portal of ['legacy', 'ready']) {
+test.each(['legacy', 'ready'])(
+  'portal %s refuses before loaded source changes without compatible restart approval',
+  async (portal) => {
     const s = scenario({ portal });
     const result = await runUpdateTransaction(s.deps);
     expect(result.ok).toBe(false);
@@ -254,7 +268,7 @@ test('unknown legacy portal and missing restart approval refuse before loaded so
       )
     ).toBe(false);
   }
-});
+);
 
 test('busy quiescence reopens only unchanged source and does no update work', async () => {
   const s = scenario({ busy: true, portal: 'ready' });

@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
+const memoryPattern = /^(\d+(?:\.\d+)?)\s*(g|m)$/i;
+
 export function parseMemToMb(value) {
-  const match = String(value)
-    .trim()
-    .match(/^(\d+(?:\.\d+)?)\s*(g|m)$/i);
+  const match = String(value).trim().match(memoryPattern);
   return match
     ? Number(match[1]) * (match[2].toLowerCase() === 'g' ? 1024 : 1)
     : null;
@@ -151,6 +151,7 @@ export function createWorktreeLifecycle({
   function canAdmit(spec, excluding = null) {
     return admissionReason(spec, excluding) === null;
   }
+  // biome-ignore lint/suspicious/useAwait: Cached capacity is an object; this helper intentionally normalizes every branch to the Promise contract awaited by start, restart, and refreshCapacity.
   async function readCapacity(force = false) {
     if (capacityInFlight) {
       return capacityInFlight;
@@ -351,6 +352,43 @@ export function createWorktreeLifecycle({
         });
     });
   }
+  async function observedRuntimeState(record, handle) {
+    try {
+      return await runtime.observe(record.target, handle);
+    } catch {
+      return 'unknown';
+    }
+  }
+  function observationStillCurrent(record, key, expectedGeneration) {
+    return (
+      records.get(key) === record &&
+      record.generation === expectedGeneration &&
+      !record.operation &&
+      !record.stopPromise
+    );
+  }
+  function applyObservation(record, state) {
+    if (!record.reserved) {
+      if (record.phase === 'unknown' && state === 'dead') {
+        record.phase = 'stopped';
+        record.lastError = null;
+        publish();
+      }
+      return { state };
+    }
+    if (state !== 'dead') {
+      record.deadObservations = 0;
+      record.phase = state === 'alive' ? 'running' : 'unknown';
+      publish();
+      return { state };
+    }
+    record.deadObservations = (record.deadObservations ?? 0) + 1;
+    if (record.spec.container && record.deadObservations < 2) {
+      return { retained: true, state: 'dead' };
+    }
+    return stop(record.target);
+  }
+  // biome-ignore lint/suspicious/useAwait: Early observation outcomes are values while an in-flight observation is a Promise; callers (watchExit, portal reconciliation, and lifecycle tests) rely on one Promise boundary.
   async function reconcile(key, expectedGeneration) {
     const record = records.get(key);
     if (
@@ -368,44 +406,17 @@ export function createWorktreeLifecycle({
     }
     const capturedHandle = record.handle;
     record.observing = (async () => {
-      let state;
-      try {
-        state = await runtime.observe(record.target, capturedHandle);
-      } catch {
-        state = 'unknown';
-      }
-      if (
-        records.get(key) !== record ||
-        record.generation !== expectedGeneration ||
-        record.operation ||
-        record.stopPromise
-      ) {
+      const state = await observedRuntimeState(record, capturedHandle);
+      if (!observationStillCurrent(record, key, expectedGeneration)) {
         return { state: 'unchanged' };
       }
-      if (!record.reserved) {
-        if (record.phase === 'unknown' && state === 'dead') {
-          record.phase = 'stopped';
-          record.lastError = null;
-          publish();
-        }
-        return { state };
-      }
-      if (state !== 'dead') {
-        record.deadObservations = 0;
-        record.phase = state === 'alive' ? 'running' : 'unknown';
-        publish();
-        return { state };
-      }
-      record.deadObservations = (record.deadObservations ?? 0) + 1;
-      if (record.spec.container && record.deadObservations < 2) {
-        return { retained: true, state: 'dead' };
-      }
-      return stop(record.target);
+      return applyObservation(record, state);
     })().finally(() => {
       record.observing = null;
     });
     return record.observing;
   }
+  // biome-ignore lint/suspicious/useAwait: Draining exposes one Promise completion boundary to start, stop, capacity refresh, and the queue timer while sharing the in-flight drain.
   async function drain() {
     if (draining) {
       return draining;
@@ -428,10 +439,11 @@ export function createWorktreeLifecycle({
         if (index === -1) {
           break;
         }
-        const record = queued.splice(index, 1)[0];
+        const [record] = queued.splice(index, 1);
         record.spec = launchSpec(record, record.spec.container);
         record.reserved = true;
         record.phase = 'admitting';
+        // biome-ignore lint/performance/noAwaitInLoops: Queue admission is result-dependent: each completed launch changes the capacity available to the next FIFO candidate.
         await operate(record, async () => {
           try {
             await validateTarget(record.target, { kind: 'start' });
@@ -452,6 +464,62 @@ export function createWorktreeLifecycle({
       armQueueTimer();
     });
     return draining;
+  }
+  async function prepareStart(record, container) {
+    await validateTarget(record.target, { kind: 'start' });
+    if (record.reserved) {
+      const observed = await runtime
+        .observe(record.target, record.handle)
+        .catch(() => 'unknown');
+      if (observed !== 'dead') {
+        return failure(
+          observed === 'unknown' ? 'RUNTIME_UNKNOWN' : 'ALREADY_RUNNING',
+          'Runtime is already running or its liveness is unknown'
+        );
+      }
+      await runtime.stop(record.target, record.handle);
+      record.handle = null;
+      record.reserved = false;
+    }
+    if (container) {
+      await readCapacity();
+      if (!capacityValue.available) {
+        throw new Error(
+          'Docker capacity is unavailable; start the engine or choose bare mode.'
+        );
+      }
+    }
+    record.spec = launchSpec(record, container);
+    if (record.stopIntent) {
+      record.phase = 'stopped';
+      return { ok: true, stopped: true };
+    }
+    const reason = admissionReason(record.spec);
+    if (reason) {
+      record.phase = 'queued';
+      record.queueReason = reason;
+      queued.push(record);
+      armQueueTimer();
+      publish();
+      return {
+        container,
+        ok: true,
+        position: queued.length,
+        queued: true,
+        reason,
+      };
+    }
+    return launch(record);
+  }
+  async function startRecord(record, container) {
+    try {
+      return await prepareStart(record, container);
+    } catch (error) {
+      record.lastError = failure('START_FAILED', error);
+      record.phase = record.handle ? 'unknown' : 'stopped';
+      record.reserved = !!record.handle;
+      return record.lastError;
+    }
   }
   async function start(target, container = true) {
     if (closedBy || disposed) {
@@ -484,64 +552,13 @@ export function createWorktreeLifecycle({
     }
     const record = current?.reserved ? current : makeRecord(target);
     record.stopIntent = false;
-    const result = await operate(record, async () => {
-      try {
-        await validateTarget(record.target, { kind: 'start' });
-        if (record.reserved) {
-          const observed = await runtime
-            .observe(record.target, record.handle)
-            .catch(() => 'unknown');
-          if (observed !== 'dead') {
-            return failure(
-              observed === 'unknown' ? 'RUNTIME_UNKNOWN' : 'ALREADY_RUNNING',
-              'Runtime is already running or its liveness is unknown'
-            );
-          }
-          await runtime.stop(record.target, record.handle);
-          record.handle = null;
-          record.reserved = false;
-        }
-        if (container) {
-          await readCapacity();
-          if (!capacityValue.available) {
-            throw new Error(
-              'Docker capacity is unavailable; start the engine or choose bare mode.'
-            );
-          }
-        }
-        record.spec = launchSpec(record, container);
-        if (record.stopIntent) {
-          record.phase = 'stopped';
-          return { ok: true, stopped: true };
-        }
-        const reason = admissionReason(record.spec);
-        if (reason) {
-          record.phase = 'queued';
-          record.queueReason = reason;
-          queued.push(record);
-          armQueueTimer();
-          publish();
-          return {
-            container,
-            ok: true,
-            position: queued.length,
-            queued: true,
-            reason,
-          };
-        }
-        return await launch(record);
-      } catch (error) {
-        record.lastError = failure('START_FAILED', error);
-        record.phase = record.handle ? 'unknown' : 'stopped';
-        record.reserved = !!record.handle;
-        return record.lastError;
-      }
-    });
+    const result = await operate(record, () => startRecord(record, container));
     if (!record.reserved && record.phase !== 'queued' && !record.stopPromise) {
       await drain();
     }
     return result;
   }
+  // biome-ignore lint/suspicious/useAwait: Stop is the lifecycle's public Promise API; early state setup must reject rather than synchronously throw for portal and removal callers.
   async function stop(target, { drain: shouldDrain = true } = {}) {
     let record = records.get(target.key);
     if (!record) {
@@ -588,6 +605,65 @@ export function createWorktreeLifecycle({
     record.stopPromise = promise;
     return promise;
   }
+  async function prepareRestart(record, priorPhase, change) {
+    await validateTarget(record.target, { kind: 'restart' });
+    if (record.spec.container) {
+      await readCapacity(true);
+    }
+    const replacement =
+      record.spec.container && !record.spec.limits
+        ? launchSpec(record, true)
+        : record.spec;
+    if (!canAdmit(replacement, record)) {
+      record.phase = priorPhase;
+      return {
+        result: failure(
+          'RESTART_CAPACITY_UNAVAILABLE',
+          'Current capacity cannot admit this restart; the existing runtime was left unchanged.'
+        ),
+      };
+    }
+    try {
+      await assertStorage(record.target);
+    } catch (error) {
+      record.phase = priorPhase;
+      record.lastError = failure('RESTART_FAILED', error);
+      return { result: record.lastError };
+    }
+    await change();
+    return { replacement };
+  }
+  async function restartRecord(record, priorPhase, priorHandle, change) {
+    let tornDown = false;
+    try {
+      const prepared = await prepareRestart(record, priorPhase, change);
+      if ('result' in prepared) {
+        return prepared.result;
+      }
+      if (record.stopIntent) {
+        return { ok: true, stopped: true };
+      }
+      // Once teardown is attempted its outcome decides the phase, not the
+      // state before it.
+      tornDown = true;
+      await runtime.stop(record.target, record.handle, { sidecars: false });
+      record.handle = null;
+      record.spec = prepared.replacement;
+      return record.stopIntent
+        ? { ok: true, stopped: true }
+        : await launch(record, { sidecars: false });
+    } catch (error) {
+      record.lastError = failure('RESTART_FAILED', error);
+      if (!tornDown && record.handle === priorHandle) {
+        record.phase = priorPhase;
+        record.reserved = true;
+      } else {
+        record.phase = record.handle ? 'unknown' : 'stopped';
+        record.reserved = !!record.handle;
+      }
+      return record.lastError;
+    }
+  }
   async function restart(target, change = () => Promise.resolve()) {
     if (closedBy || disposed) {
       return failure('ADMISSION_CLOSED', 'Lifecycle admission is closed');
@@ -607,59 +683,11 @@ export function createWorktreeLifecycle({
     }
     const priorPhase = record.phase;
     const priorHandle = record.handle;
-    let tornDown = false;
     record.phase = 'restarting';
     record.stopIntent = false;
-    const result = await operate(record, async () => {
-      try {
-        await validateTarget(record.target, { kind: 'restart' });
-        if (record.spec.container) {
-          await readCapacity(true);
-        }
-        const replacement =
-          record.spec.container && !record.spec.limits
-            ? launchSpec(record, true)
-            : record.spec;
-        if (!canAdmit(replacement, record)) {
-          record.phase = priorPhase;
-          return failure(
-            'RESTART_CAPACITY_UNAVAILABLE',
-            'Current capacity cannot admit this restart; the existing runtime was left unchanged.'
-          );
-        }
-        try {
-          await assertStorage(record.target);
-        } catch (error) {
-          record.phase = priorPhase;
-          record.lastError = failure('RESTART_FAILED', error);
-          return record.lastError;
-        }
-        await change();
-        if (record.stopIntent) {
-          return { ok: true, stopped: true };
-        }
-        // Once teardown is attempted its outcome decides the phase, not the
-        // state before it.
-        tornDown = true;
-        await runtime.stop(record.target, record.handle, { sidecars: false });
-        record.handle = null;
-        record.spec = replacement;
-        if (record.stopIntent) {
-          return { ok: true, stopped: true };
-        }
-        return await launch(record, { sidecars: false });
-      } catch (error) {
-        record.lastError = failure('RESTART_FAILED', error);
-        if (!tornDown && record.handle === priorHandle) {
-          record.phase = priorPhase;
-          record.reserved = true;
-        } else {
-          record.phase = record.handle ? 'unknown' : 'stopped';
-          record.reserved = !!record.handle;
-        }
-        return record.lastError;
-      }
-    });
+    const result = await operate(record, () =>
+      restartRecord(record, priorPhase, priorHandle, change)
+    );
     if (!record.reserved) {
       await drain();
     }
@@ -675,6 +703,7 @@ export function createWorktreeLifecycle({
     await drain();
     return value;
   }
+  // biome-ignore lint/suspicious/useAwait: Busy and closed failures are values, while task execution is deferred; callers uniformly await this public operation boundary.
   async function runOperation(target, kind, task) {
     if (closedBy || disposed) {
       return failure('ADMISSION_CLOSED', 'Lifecycle admission is closed');

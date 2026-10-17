@@ -9,6 +9,7 @@ test('failed or malformed list reads cannot become a confirmed empty configurati
       Response.json({ error: 'unavailable' }),
     ]) {
       globalThis.fetch = (async () => response) as typeof fetch;
+      // biome-ignore lint/performance/noAwaitInLoops: Each read must settle before replacing the shared global fetch response.
       await expect(
         readArray('/controlled-list', new AbortController().signal)
       ).rejects.toThrow();

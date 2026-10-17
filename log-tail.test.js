@@ -32,7 +32,7 @@ test('large log tails remain byte bounded for every requested line count and clo
   ]) {
     const h = reader(`${'a'.repeat(400_000)}\nmarker\n`);
     const result = readLogTail('/owned/log', n, h);
-    expect(h.reads.every((n) => n <= 262_144)).toBe(true);
+    expect(h.reads.every((readSize) => readSize <= 262_144)).toBe(true);
     expect(h.closed).toEqual([3]);
     expect(result.lines).toEqual(['marker']);
     expect(result.truncated).toBe(true);
@@ -78,7 +78,9 @@ test('missing, empty and read errors are distinct; failed reads retain only prio
   });
   const missing = {
     openSync() {
-      throw Object.assign(new Error(), { code: 'ENOENT' });
+      throw Object.assign(new Error('fixture file is missing'), {
+        code: 'ENOENT',
+      });
     },
   };
   expect(
@@ -90,13 +92,15 @@ test('signature errors cannot suppress a retry and open descriptors close after 
   expect(
     logSignature('/owned/log', {
       statSync() {
-        throw Object.assign(new Error(), { code: 'EACCES' });
+        throw Object.assign(new Error('fixture stat denied'), {
+          code: 'EACCES',
+        });
       },
     })
   ).toBeNull();
   const h = reader('hello');
   h.files.readSync = () => {
-    throw Object.assign(new Error(), { code: 'EIO' });
+    throw Object.assign(new Error('fixture read failed'), { code: 'EIO' });
   };
   expect(readLogTail('/owned/log', 150, h).state).toBe('read-error');
   expect(h.closed).toEqual([3]);
@@ -116,7 +120,9 @@ test('real file growth, truncation and transient failures use one bounded snapsh
     ...files,
     readSync(...args) {
       if (denied) {
-        throw Object.assign(new Error(), { code: 'EACCES' });
+        throw Object.assign(new Error('fixture read denied'), {
+          code: 'EACCES',
+        });
       }
       const n = files.readSync(...args);
       bytes += n;

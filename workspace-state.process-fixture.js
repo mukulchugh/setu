@@ -53,6 +53,7 @@ try {
         throw new Error('incomplete publication');
       }
       count += 1;
+      // biome-ignore lint/performance/noAwaitInLoops: The fixture must observe each atomic publication in order before declaring completion.
       await new Promise((resolve) => setTimeout(resolve, 0));
       if (newSeen) {
         process.stdout.write(

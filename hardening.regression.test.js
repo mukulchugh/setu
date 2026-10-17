@@ -250,7 +250,9 @@ test('PR routes use the checked-out feature branch and resolve the base before p
     withTargets: async (_targets, task) => task(),
   };
   const lifecycle = {
-    dispose() {},
+    dispose() {
+      /* The fixture has no lifecycle resources to release. */
+    },
     operationStatus: () => null,
     queueSnapshot: () => [],
     refreshCapacity: async () => ({}),
@@ -281,20 +283,25 @@ test('PR routes use the checked-out feature branch and resolve the base before p
     mkdirSync(join(workspace, 'r', 'topic'), { recursive: true });
     writeFileSync(join(workspace, '.ports'), 'r/topic:3001\n');
     writeFileSync(join(workspace, '.projects'), 'r:3000:o/r:Fixture\n');
-    const command = async (args, options = {}) => {
+    const command = (args, options = {}) => {
       commands.push(args);
-      const stdout = args.includes('rev-list')
-        ? '2\n'
-        : args[0] === 'gh' && args[2] === 'list'
-          ? '[]'
-          : args[0] === 'gh' && args[2] === 'create'
-            ? 'https://example.test/pr/1'
-            : args.includes('symbolic-ref')
-              ? options.cwd?.endsWith('.git')
-                ? 'staging'
-                : 'feature/actual'
-              : '';
-      return { code: 0, stderr: '', stdout, timedOut: false, truncated: false };
+      let stdout = '';
+      if (args.includes('rev-list')) {
+        stdout = '2\n';
+      } else if (args[0] === 'gh' && args[2] === 'list') {
+        stdout = '[]';
+      } else if (args[0] === 'gh' && args[2] === 'create') {
+        stdout = 'https://example.test/pr/1';
+      } else if (args.includes('symbolic-ref')) {
+        stdout = options.cwd?.endsWith('.git') ? 'staging' : 'feature/actual';
+      }
+      return Promise.resolve({
+        code: 0,
+        stderr: '',
+        stdout,
+        timedOut: false,
+        truncated: false,
+      });
     };
     const portal = await createPortalRuntime({
       command,
@@ -346,7 +353,9 @@ test('dirty badges return immediately, observe a four-command cap, and recover a
   let peak = 0;
   let completed = 0;
   const lifecycle = {
-    dispose() {},
+    dispose() {
+      /* The fixture has no lifecycle resources to release. */
+    },
     operationStatus: () => null,
     queueSnapshot: () => [],
     refreshCapacity: async () => ({}),
@@ -356,10 +365,10 @@ test('dirty badges return immediately, observe a four-command cap, and recover a
   try {
     writeFileSync(
       join(workspace, '.ports'),
-      Array.from(
+      `${Array.from(
         { length: 20 },
         (_, index) => `r/${index}:${3000 + index}`
-      ).join('\n') + '\n'
+      ).join('\n')}\n`
     );
     const portal = await createPortalRuntime({
       command: async () => {
@@ -386,6 +395,7 @@ test('dirty badges return immediately, observe a four-command cap, and recover a
     );
     expect(first.every((value) => value === null)).toBe(true);
     for (let index = 0; index < 100 && completed < 20; index += 1) {
+      // biome-ignore lint/performance/noAwaitInLoops: The bounded poll yields between observations until queued dirty reads finish.
       await Bun.sleep(5);
     }
     expect(peak).toBe(4);
@@ -425,11 +435,11 @@ test('actual POST dispatch records a failed action response in the isolated work
     const portal = await createPortalRuntime({
       config: { tunnel: 'fixture', workspace },
       removals: {
-        cancel: async (id) => {
+        cancel: (id) => {
           if (id === 'crash') {
-            throw new Error('route crash');
+            return Promise.reject(new Error('route crash'));
           }
-          return { error: 'refused', ok: false };
+          return Promise.resolve({ error: 'refused', ok: false });
         },
       },
     });
@@ -438,7 +448,12 @@ test('actual POST dispatch records a failed action response in the isolated work
         body: JSON.stringify({ operationId: 'remove-1' }),
         method: 'POST',
       }),
-      { requestIP: () => ({ address: '127.0.0.1' }), timeout() {} }
+      {
+        requestIP: () => ({ address: '127.0.0.1' }),
+        timeout() {
+          /* The test server has no timeout side effect. */
+        },
+      }
     );
     expect(response.status).toBe(200);
     const entry = JSON.parse(
@@ -451,12 +466,15 @@ test('actual POST dispatch records a failed action response in the isolated work
     });
     const server = {
       requestIP: () => ({ address: '127.0.0.1' }),
-      timeout() {},
+      timeout() {
+        /* The test server has no timeout side effect. */
+      },
     };
     for (const [path, operationId, status] of [
       ['/api/remove/cancel', 'crash', 500],
       ['/api/unknown', '', 404],
     ]) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each route writes the same action log and must finish before checking its last entry.
       const failed = await portal.handle(
         new Request(`http://localhost:2999${path}`, {
           body: JSON.stringify({ operationId }),
@@ -491,7 +509,12 @@ test('kill-port signals only the confirmed listener when Stop fails and the cont
       timedOut: false,
     }),
     config: { tunnel: 'fixture', workspace },
-    lifecycle: { dispose() {}, stop: async () => stopped },
+    lifecycle: {
+      dispose() {
+        /* The fixture has no lifecycle resources to release. */
+      },
+      stop: async () => stopped,
+    },
     signalProcess: (...args) => signals.push(args),
   });
   try {
@@ -500,6 +523,7 @@ test('kill-port signals only the confirmed listener when Stop fails and the cont
     stopped = { code: 'STOP_FAILED', error: 'unidentified', ok: false };
     for (const state of ['alive', 'unknown', 'dead']) {
       container = state;
+      // biome-ignore lint/performance/noAwaitInLoops: Each kill observation must finish before mutating the shared container state for the next case.
       await expect(
         kill(3005, state === 'dead' ? undefined : 701)
       ).resolves.toEqual(stopped);
@@ -524,18 +548,28 @@ test('settings GET reconciles an uncertain committed config before reopening dep
   const portal = await createPortalRuntime({
     config: installed,
     lifecycle: {
-      dispose() {},
+      dispose() {
+        /* The fixture has no lifecycle resources to release. */
+      },
       refreshCapacity: async () => ({}),
       status: () => ({ max: installed.maxConcurrentDevServers }),
       updateSettings: async (settings) => applied.push(settings),
     },
     state: {
       read: () => installed,
-      withTargets: (_targets, task) => task(),
-      update: async (_document, update) => {
-        installed = update(installed);
-        return { committed: true, reconciled: false, status: 'uncertain' };
+      update: (_document, update) => {
+        try {
+          installed = update(installed);
+          return Promise.resolve({
+            committed: true,
+            reconciled: false,
+            status: 'uncertain',
+          });
+        } catch (error) {
+          return Promise.reject(error);
+        }
       },
+      withTargets: (_targets, task) => task(),
     },
   });
   try {

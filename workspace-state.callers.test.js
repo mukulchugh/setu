@@ -210,7 +210,7 @@ test('actual OAuth Promise saves preserve another issuer and both fields of one 
   expect(first.clientInformation()).toEqual({ client_id: 'fixture-client' });
   expect(first.tokens()).toEqual({ access_token: 'fixture-first' });
   expect(second.tokens()).toEqual({ access_token: 'fixture-second' });
-  expect(statSync(join(root, 'mcp-tokens.json')).mode & 0o777).toBe(0o600);
+  expect(statSync(join(root, 'mcp-tokens.json')).mode % 0o1000).toBe(0o600);
   writeFileSync(join(root, 'mcp-tokens.json'), '{broken');
   await expect(
     first.saveTokens({ access_token: 'replacement' })
