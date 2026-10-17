@@ -734,6 +734,20 @@ async function cmdSetup() {
       )
     );
   });
+  // `brew services` runs caddy with BREW_PREFIX/etc/Caddyfile; without it the
+  // service crash-loops and `caddy reload` has no admin API to talk to.
+  const brewCaddyfile = join(BREW_PREFIX, 'etc', 'Caddyfile');
+  const brewImport = `import ${caddyfile}\n`;
+  const brewCaddyText = existsSync(brewCaddyfile)
+    ? readFileSync(brewCaddyfile, 'utf8')
+    : '';
+  if (!brewCaddyText.includes(brewImport.trim())) {
+    if (brewCaddyText.trim()) {
+      fail(`${brewCaddyfile} exists — add this line to it: ${brewImport}`);
+    } else {
+      writeFileSync(brewCaddyfile, brewImport);
+    }
+  }
   done();
 
   spin('caddy service');
