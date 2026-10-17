@@ -3634,6 +3634,7 @@ export async function createPortalRuntime(options = {}) {
     options.managedAgents ??
     createManagedAgentServices({
       admission: portalB205.admission,
+      ingressUrl: `http://127.0.0.1:${PORT}/api/attention/hook`,
       operationEvents: portalB205.events,
       resolveTarget: async ({ repo, name }) => b205Target(repo, name),
       runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
