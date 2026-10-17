@@ -697,6 +697,11 @@ async function cmdSetup() {
   if (!dnsText.includes(`address=/.${lz}/127.0.0.1`)) {
     appendFileSync(dnsConf, `\naddress=/.${lz}/127.0.0.1\n`);
   }
+  // Loopback only: a wildcard bind collides with other local resolvers on :53
+  // (Cloudflare WARP, VPN clients) and dnsmasq exits at startup.
+  if (!/^listen-address=/m.test(dnsText)) {
+    appendFileSync(dnsConf, 'listen-address=127.0.0.1\nbind-interfaces\n');
+  }
   // port 53 needs root — a user-level dnsmasq service silently fails to bind
   try {
     execFileSync('sudo', ['brew', 'services', 'restart', 'dnsmasq'], {
