@@ -491,9 +491,12 @@ export function syncHosts(
       ''
     );
     const { ports } = await state.snapshot(['ports']);
-    const entries = ports.map(
-      ({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`
-    );
+    // Portal host too: /etc/hosts still resolves when a VPN/WARP bypasses
+    // /etc/resolver, so dnsmasq is never the only path to the portal.
+    const entries = [
+      `127.0.0.1\t${localZone()}`,
+      ...ports.map(({ repo, name }) => `127.0.0.1\t${localDomain(repo, name)}`),
+    ];
     const next =
       cleaned.trimEnd() +
       `\n${HOSTS_START}\n` +

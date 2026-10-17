@@ -197,6 +197,7 @@ export async function createPortalRuntime(options = {}) {
       hostsEnd: HOSTS_END,
       hostsStart: HOSTS_START,
       localDomain,
+      portalHost: localZone(),
       readFile: identityFs.readFile,
       reloadCaddy: () => reloadCaddyAsync(WORKSPACE),
       run: (args, options) => Bun.spawn(args, options),
