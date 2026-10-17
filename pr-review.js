@@ -24,7 +24,7 @@ import { claudeSubscriptionEnv } from './cli-helpers.js';
 import { HOME } from './lib.js';
 
 const RUN_TIMEOUT_MS = 20 * 60 * 1000; // wall-clock cap on a single run
-const MAX_BUDGET_USD = 2.0; // real money on the user's account per click
+const MAX_BUDGET_USD = 2.0; // API-price-equivalent cap; runs on the subscription login
 
 // ── plugin detection ────────────────────────────────────────────────────────
 
@@ -267,6 +267,9 @@ export function buildDeepReviewArgs(skill, slug, prNumber) {
     },
   });
   return [
+    // No user MCP servers: they add hundreds of tool schemas per turn and
+    // blew the budget cap on the first message in testing.
+    '--strict-mcp-config',
     '-p',
     `/${skill} ${slug}#${prNumber}\nFor git diff or git show, include both --no-ext-diff and --no-textconv.`,
     '--permission-mode',

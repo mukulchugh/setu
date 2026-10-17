@@ -106,6 +106,8 @@ const validRun = (run, key) => {
 function providerArgs({ maxBudgetUsd, model, permissionMode, resumeSession }) {
   const args = [
     'claude',
+    // No user MCP servers: they add hundreds of tool schemas per turn.
+    '--strict-mcp-config',
     '-p',
     '-',
     '--output-format',

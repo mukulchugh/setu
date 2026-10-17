@@ -162,7 +162,9 @@ test('deep review arguments fail closed for write-shaped Bash commands', async (
   expect(args[args.indexOf('--settings') + 1]).toContain(
     '/reviews/owner/repo/pr-42'
   );
-  expect(args[1]).toContain('--no-ext-diff and --no-textconv');
+  expect(args[args.indexOf('-p') + 1]).toContain(
+    '--no-ext-diff and --no-textconv'
+  );
   for (const command of [
     'gh pr merge 42',
     'gh pr close 42',
