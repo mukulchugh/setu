@@ -35,6 +35,7 @@ import {
   sudoRuleCovers,
   withSetuBlock,
 } from './cli-helpers.js';
+import { isConnectionRefused } from './connection-refused.js';
 import { dependencySharingForTarget } from './dependency-sharing.js';
 import { createHostHealth } from './host-health.js';
 import {
@@ -218,6 +219,7 @@ export const commandHandlers = {
   headless: cmdHeadless,
   help: cmdHelp,
   init: cmdInit,
+  links: cmdLinks,
   logs: cmdLogs,
   ls: cmdLs,
   mcp: cmdMcp,
@@ -2414,6 +2416,128 @@ async function cmdSessions() {
   );
 }
 
+const LINKS_USAGE =
+  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] [--json]';
+
+// Links needs the running portal and never starts anything itself. An unreachable portal is a refusal;
+// a send the portal or engine may or may not have recorded is unknown, and says how to repeat it safely.
+async function linksResult(call, { sendKey } = {}) {
+  const unknownSend = () => ({
+    code: 'LINKS_OUTCOME_UNKNOWN',
+    error: `The Links engine did not confirm this send. Check the inbox, or repeat it with --idempotency-key ${sendKey}.`,
+    ok: false,
+  });
+  let result;
+  try {
+    result = await call();
+  } catch (error) {
+    if (isConnectionRefused(error)) {
+      return apiResult(() => ({
+        code: 'PORTAL_REQUIRED',
+        error: 'PORTAL_REQUIRED: Portal must be running to use Setu Links.',
+        ok: false,
+      }));
+    }
+    return apiResult(() =>
+      sendKey
+        ? unknownSend()
+        : {
+            code: 'PORTAL_UNAVAILABLE',
+            error: 'The portal request failed.',
+            ok: false,
+          }
+    );
+  }
+  return apiResult(() =>
+    sendKey && result?.code === 'LINKS_OUTCOME_UNKNOWN' ? unknownSend() : result
+  );
+}
+
+// Arguments after the action and the flags each Links action accepts. Only redeliver takes a
+// confirmation: it is the reviewed token the user passes back, never something a command infers.
+const LINKS_ACTIONS = new Map([
+  ['ack', { argCount: 3, flags: ['message', 'session'] }],
+  ['cancel', { argCount: 2, flags: [] }],
+  ['inbox', { argCount: 3, flags: ['session', 'state'] }],
+  [
+    'redeliver',
+    { argCount: 3, flags: ['attempt', 'confirmation', 'message', 'session'] },
+  ],
+  [
+    'send',
+    {
+      argCount: 3,
+      flags: ['body-file', 'idempotency-key', 'reply-to', 'session'],
+    },
+  ],
+  ['show', { argCount: 2, flags: [] }],
+  ['status', { argCount: 2, flags: [] }],
+]);
+
+// biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
+async function cmdLinks() {
+  const [action, first, name] = args;
+  const accepted = LINKS_ACTIONS.get(action);
+  if (!accepted) {
+    die(`Usage: ${LINKS_USAGE}`);
+  }
+  validateCommand({
+    allowedFlags: accepted.flags,
+    argCounts: [accepted.argCount],
+    usage: LINKS_USAGE,
+  });
+  if (accepted.argCount === 2) {
+    if (action === 'cancel') {
+      return linksResult(() =>
+        cliApi.post('/api/links/cancel', { messageId: first })
+      );
+    }
+    const path = action === 'show' ? '/api/links/message' : '/api/links/status';
+    return linksResult(() => cliApi.get(path, { messageId: first }));
+  }
+  const recipient = { name, repo: first, sessionId: requireFlag('session') };
+  if (action === 'inbox') {
+    return linksResult(() =>
+      cliApi.get('/api/links/inbox', {
+        ...recipient,
+        state: optionalFlag('state'),
+      })
+    );
+  }
+  if (action === 'send') {
+    const body = textInput('body-file');
+    const idempotencyKey =
+      optionalFlag('idempotency-key') ?? crypto.randomUUID();
+    const replyTo = optionalFlag('reply-to');
+    return linksResult(
+      () =>
+        cliApi.post('/api/links/send', {
+          body,
+          idempotencyKey,
+          ...recipient,
+          ...(replyTo === undefined ? {} : { replyTo }),
+        }),
+      { sendKey: idempotencyKey }
+    );
+  }
+  const messageId = requireFlag('message');
+  if (action === 'ack') {
+    return linksResult(() =>
+      cliApi.post('/api/links/ack', { ...recipient, messageId })
+    );
+  }
+  const attemptId = requireFlag('attempt');
+  const confirmation = optionalFlag('confirmation');
+  return linksResult(() =>
+    cliApi.post('/api/links/redeliver', {
+      ...recipient,
+      attemptId,
+      ...(confirmation === undefined ? {} : { confirmation }),
+      messageId,
+    })
+  );
+}
+
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdCaches() {
   validateCommand({
@@ -3505,6 +3629,13 @@ function cmdHelp() {
     setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
                                       Offline: indexes an existing archive in bounded pages; rerun to resume
     setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] [--json]
+    setu links inbox <repo> <branch> --session <id> [--state <state>] [--json]
+    setu links show|status|cancel <message> [--json]
+    setu links ack <repo> <branch> --session <id> --message <message> [--json]
+    setu links redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--json]
+                                      Needs the running portal. A message is addressed to one verified
+                                      native conversation; handoff-unknown is never retried automatically
     setu caches prepare <repo> <branch> [--json]
     setu caches execute <repo> <branch> --manifest <id> --confirmation <token> [--json]
     setu caches execute <repo> <branch> --retry <file|-> [--json]
@@ -3566,6 +3697,7 @@ export {
   cmdHeadless,
   cmdHelp,
   cmdInit,
+  cmdLinks,
   cmdLogs,
   cmdLs,
   cmdMcp,

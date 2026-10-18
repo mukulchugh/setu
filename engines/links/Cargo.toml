@@ -1,0 +1,31 @@
+[package]
+name = "setu-links"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Setu Links engine: the single durable mailbox store behind `setu links`"
+publish = false
+
+[lib]
+name = "setu_links"
+path = "src/lib.rs"
+
+[[bin]]
+name = "setu-links"
+path = "src/main.rs"
+
+[features]
+# Deterministic kill points and a settable clock for contract tests. Never part of a shipped build.
+test-hooks = []
+
+[dependencies]
+getrandom = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

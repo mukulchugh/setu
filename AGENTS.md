@@ -429,6 +429,12 @@ carry JSON must contain JSON.
 | `storage [inspect <repo> <branch>]` | `--store <id>` | Read cached storage, or explicitly inspect one server-known target/store. |
 | `operations [repo branch]` | `--since`, `--limit` | Read durable operation outcomes. |
 | `sessions [list [repo branch]]` | `end <repo> <branch> --session <id> --checkout <file\|->` | List or end an exact owned session. Identity is mandatory for end. |
+| `links send <repo> <branch>` | `--session <id> --body-file <file\|-> [--idempotency-key <key> --reply-to <message>]` | Queue a message for one exact session's verified native conversation. Needs the running portal (`PORTAL_REQUIRED` otherwise). A refused send stores nothing. After an uncertain result, repeat with the same key. |
+| `links inbox <repo> <branch>` | `--session <id> [--state <state>]` | List that session's messages and their honest states. |
+| `links show <message>`, `links status <message>` | none | Read one message with its body, or its state and attempt count without the body. |
+| `links cancel <message>` | none | Retract a message that has not been handed off. |
+| `links ack <repo> <branch>` | `--session <id> --message <message>` | The addressed conversation's user acknowledges a handed-off message. |
+| `links redeliver <repo> <branch>` | `--session <id> --message <message> --attempt <attempt>` | Accept a possible duplicate for a `handoff-unknown` message; the next claim is a new, counted attempt. |
 | `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
 | `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
 | `admission` | none | Read resource-admission leases and limits. |
@@ -503,6 +509,13 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/headless-runs/start` | T plus `prompt`, optional bounded model/limits. | H W C M |
 | `POST` | `/api/inngest/start` | T; start Inngest runtime. | H W M |
 | `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
+| `POST` | `/api/links/ack` | T plus `sessionId`,`messageId`; the addressed conversation's user acknowledges a handed-off message. Not task completion. | H C |
+| `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
+| `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
+| `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
+| `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
+| `POST` | `/api/links/send` | T plus `sessionId`,`idempotencyKey`,`body`,`replyTo?`; refused unless the session is running with a verified native conversation. | H C |
+| `GET` | `/api/links/status` | `messageId`; delivery state, reason and attempt count, without the body. `observed` and `storedState` as for inbox. | H C |
 | `GET` | `/api/logs` | T query plus `type?`,`n?`; bounded log tail. | H W C M |
 | `GET` | `/api/mcp-servers` | Read connected MCP-server configuration/status. | H W |
 | `POST` | `/api/mcp-servers` | Save reviewed MCP-server configuration. | H W |
@@ -678,6 +691,53 @@ Vercel's reviewed adapter is 58.9.1 with exact project/team linkage; Netlify
 preview requires the exact linked site. Convex requires the source-verified
 installed CLI/deployment-key binding. An unavailable or unbound adapter is a
 refusal, never a fallback or an accepted deployment.
+
+### Setu Links (local inbox)
+
+`setu links` sends messages to one exact managed session's native conversation. The Setu-owned engine
+in `engines/links` (Rust, `setu-links`, protocol `setu-links/1`) is the only holder of mailbox state;
+JavaScript is a client of it (`links-client.js`, composed in `links-service.js`/`links-runtime.js`) and
+never opens its database. Engine state lives in `~/.local/share/setu/links` (directory 0700, database
+0600). See `engines/links/README.md` for the operations, states, limits and build.
+
+- A send needs a running, owned session in its original checkout with a verified native conversation
+  (`nativeConversation.state === 'bound'`) on a provider with verified delivery (Claude only). Otherwise it
+  is refused with a stable code (`LINKS_SESSION_NOT_FOUND`, `LINKS_SESSION_ENDED`,
+  `LINKS_SESSION_NOT_RUNNING`, `LINKS_CHECKOUT_CHANGED`, `LINKS_PROVIDER_UNVERIFIED`,
+  `LINKS_NO_NATIVE_BINDING`) and nothing is stored or held for later. Identity is never inferred from
+  branch, directory or terminal.
+- `queued` is durable but not delivered. A claim moves mail to `handoff-unknown` at once; only the exact
+  attempt's confirming report makes it `handed-off`, and `handed-off` is not read or understood.
+  Nothing is replayed automatically: only a confirmed `redeliver` makes a new attempt.
+- Reads are passive and honest. `inbox`, `status` and `show` never create the store and never write: the
+  service passes the engine a trusted observation (the session's verified conversation, in the checkout as
+  freshly observed, only while the session is verifiably running and owned) and the engine reports the
+  effective state from it. Mail for any other conversation reads as `held` (`conversation-replaced`, or
+  `checkout-changed` when only the checkout differs); held mail for exactly the observed conversation reads
+  as `queued`, never because a different conversation appeared. `storedState` is always what the engine
+  holds, and `observed: false` means there was nothing trustworthy to compare (no verified binding, ended or
+  not-owned session, unreadable target or session list), so `state` is the stored state. Only an explicit
+  send or claim persists the transition (`reconcile`); the live binding transitions come from the
+  authenticated hook work (#10). The managed record is the only identity authority and the engine the only
+  mailbox authority; there is no second registry.
+- `redeliver` can duplicate a message that did arrive, so it is the receiving user's choice. The first
+  request returns `LINKS_CONFIRMATION_REQUIRED` with a token bound to the exact message, its current unknown
+  attempt and its recipient; the user reviews it and passes it back (`--confirmation <token>`). Any caller
+  field about itself (`source`, `confirmed`, ...) is ignored or refused, a token for an earlier attempt or
+  another conversation is void, the review identifies the recipient the way the engine does (provider, native conversation, checkout; never the session locator), the engine is asked to redeliver only after the exact token matches, and no agent tool (MCP) offers redelivery. The portal's loopback routes
+  are a cooperative local-user surface: they do not defend against other software running as the same
+  user.
+- An unconfirmed result is `LINKS_OUTCOME_UNKNOWN` with recovery that fits the operation: a send names its
+  idempotency key to repeat; cancel, acknowledge and confirm say repeating is safe; a claim says anything
+  it claimed is `handoff-unknown` and is only redelivered on explicit request. Nothing is requeued on
+  uncertainty. The client accepts an engine result only if it has exactly the expected shape.
+- `claim` and `confirm` have no HTTP route: they belong to the provider hook, which authenticates a session
+  first. A message or receipt is not Span completion, writer authority, admission, attention approval or
+  spend authorization, and nothing wakes a provider.
+- Build and test: `bun run engine:build`, `bun run engine:test` (set `SETU_LINKS_CARGO` to the pinned
+  toolchain's cargo; a missing toolchain fails the check). `bun run verify` includes the engine tests and
+  the naming check. A development engine is found at `engines/links/target/release/setu-links` or
+  `SETU_LINKS_ENGINE`; shipping the built binary is part of the release-lifecycle work.
 
 ### Runtime and dependency-sharing limits
 

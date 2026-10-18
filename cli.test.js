@@ -57,6 +57,7 @@ test('every command advertised by help has a dispatch handler', () => {
     'storage',
     'operations',
     'sessions',
+    'links',
     'caches',
     'admission',
     'setup-progress',

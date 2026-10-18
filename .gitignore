@@ -3,3 +3,7 @@ node_modules/
 .DS_Store
 .gstack/
 .impeccable/
+
+# Setu Links engine build output
+engines/links/target/
+engines/links/target-*/

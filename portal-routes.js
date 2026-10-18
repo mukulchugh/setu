@@ -1,4 +1,11 @@
 export const PORTAL_API_ROUTES = Object.freeze([
+  { methods: ['POST'], path: '/api/links/ack' },
+  { methods: ['POST'], path: '/api/links/cancel' },
+  { methods: ['GET'], path: '/api/links/inbox' },
+  { methods: ['GET'], path: '/api/links/message' },
+  { methods: ['POST'], path: '/api/links/redeliver' },
+  { methods: ['POST'], path: '/api/links/send' },
+  { methods: ['GET'], path: '/api/links/status' },
   { methods: ['POST'], path: '/api/spans/drafts/create' },
   { methods: ['POST'], path: '/api/spans/plans/revise' },
   { methods: ['GET'], path: '/api/spans/workflows' },

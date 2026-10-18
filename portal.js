@@ -102,6 +102,7 @@ import {
   writeDockerCompose,
   writerClaimPaths,
 } from './lib.js';
+import { createLinksRuntime } from './links-runtime.js';
 import {
   createListenerObservation,
   probeListeningPorts,
@@ -3641,8 +3642,16 @@ export async function createPortalRuntime(options = {}) {
       state: b205State,
     });
   const spans = createSpansRuntime({ root: options.spansRoot });
+  const links = createLinksRuntime({
+    enginePath: options.linksEngine,
+    resolveTarget: ({ repo, name }) =>
+      (options.linksTarget ?? b205Target)(repo, name),
+    root: options.linksRoot,
+    sessions: { list: () => managedAgents.listSessions({}) },
+  });
   const portalB205Composition = Object.freeze({
     ...spans,
+    ...links,
     ...portalB205,
     agentSessions: (input) => managedAgents.listSessions(input),
     attention: (input) => managedAgents.listAttention(input),
