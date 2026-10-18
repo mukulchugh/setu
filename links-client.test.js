@@ -6,11 +6,69 @@ import { ensureEngine, temporaryLinksRoot } from './links-engine-fixture.js';
 // Built before any test runs so a first compile is never charged to a test's own time limit.
 const PLAIN_ENGINE = ensureEngine();
 const HOOKS_ENGINE = ensureEngine({ hooks: true });
+const recipient = {
+  checkout: '{"incarnation":"c1","path":"/work/repo"}',
+  native_id: 'native-a',
+  provider: 'claude-code',
+  session_hint: 'session-1',
+};
 
 const cleanups = [];
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) {
     cleanup();
+  }
+});
+
+const attentionItem = {
+  admitted: true,
+  attention_id: 'att_1',
+  body: 'look',
+  created_at: 5,
+  project: 'repo',
+  recipient,
+  sender: { id: 'sender-session', kind: 'session' },
+};
+const attentionPage = {
+  has_more: false,
+  items: [{ ...attentionItem, group_key: 'g', notifying: true }],
+  next_before: null,
+  notifications: {
+    groups: [{ count: 1, count_complete: true, first_at: 5, group_key: 'g', item_ids: ['att_1'], last_at: 5, latest_attention_id: 'att_1', project: 'repo', recipient_session_hint: 'session-1', sender: { id: 'sender-session', kind: 'session' } }],
+    suppressed: 0,
+  },
+};
+
+test('attention replies are believed only in their exact shapes', async () => {
+  for (const [op, result] of [
+    ['attention_send', { attention_id: 'att_1', replayed: false }],
+    ['attention_list', attentionPage],
+    ['attention_show', attentionItem],
+    ['share_attention', { changed: true, policy: { attention: true, interrupt: false, owner: 'Mukul', receive: true, scope: 'ps_x', version: 1, visibility: true }, project: 'repo' }],
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
+    expect(await answering(result).call(op, {})).toEqual({ ok: true, result });
+  }
+  for (const [op, result] of [
+    ['attention_send', { attention_id: 'att_1' }],
+    ['attention_list', { ...attentionPage, items: [{ attention_id: 'att_1' }] }],
+    ['attention_show', { ...attentionItem, sender: { kind: 'user' } }],
+    ['share_attention', { changed: true, project: 'repo' }],
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
+    expect((await answering(result).call(op, {})).ok).toBe(false);
+  }
+});
+
+test('a lost attention mutation is unknown and reads are unavailable', async () => {
+  const { root, cleanup } = temporaryLinksRoot();
+  cleanups.push(cleanup);
+  const client = createLinksClient({ dataDir: join(root, 'links'), enginePath: join(root, 'absent') });
+  expect((await client.call('attention_send', {})).code).toBe('LINKS_OUTCOME_UNKNOWN');
+  expect((await client.call('share_attention', {})).code).toBe('LINKS_OUTCOME_UNKNOWN');
+  for (const op of ['attention_list', 'attention_show', 'wake']) {
+    // biome-ignore lint/performance/noAwaitInLoops: One missing engine serves every operation.
+    expect((await client.call(op, {})).code).toBe('LINKS_ENGINE_UNAVAILABLE');
   }
 });
 
@@ -27,13 +85,6 @@ function realClient(options = {}) {
     dataDir,
   };
 }
-
-const recipient = {
-  checkout: '{"incarnation":"c1","path":"/work/repo"}',
-  native_id: 'native-a',
-  provider: 'claude-code',
-  session_hint: 'session-1',
-};
 
 test('a send reaches the real engine and its status can be read back', async () => {
   const { client } = realClient();

@@ -14,8 +14,9 @@ pub const POLICY_VERSION: i64 = 1;
 pub const MAX_PROJECT_BYTES: usize = 128;
 pub const MAX_OWNER_CHARS: usize = 64;
 
-/// What a stored policy says. `interrupt` and `attention` are carried so they are recorded as off; this
-/// version grants neither, and a policy that says otherwise is not one it understands.
+/// What a stored policy says. `attention` is its own opt-in (off until the user reviews and enables it).
+/// `interrupt` is carried so it is recorded as off; this version never grants it, and a policy that says
+/// otherwise is not one it understands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
     /// Opaque, minted when sharing is enabled and gone when it is withdrawn. Anything that refers to the
@@ -24,6 +25,7 @@ pub struct Policy {
     pub owner: String,
     pub visibility: bool,
     pub receive: bool,
+    pub attention: bool,
 }
 
 impl Policy {
@@ -35,7 +37,7 @@ impl Policy {
             "visibility": self.visibility,
             "receive": self.receive,
             "interrupt": false,
-            "attention": false,
+            "attention": self.attention,
         })
     }
 
@@ -45,7 +47,7 @@ impl Policy {
         let exact = ["attention", "interrupt", "owner", "receive", "scope", "version", "visibility"];
         let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        if keys != exact || fields["version"] != POLICY_VERSION || fields["interrupt"] != false || fields["attention"] != false {
+        if keys != exact || fields["version"] != POLICY_VERSION || fields["interrupt"] != false {
             return None;
         }
         let owner = fields["owner"].as_str()?;
@@ -56,7 +58,13 @@ impl Policy {
         if !scope_is_valid(scope) {
             return None;
         }
-        Some(Policy { scope: scope.to_string(), owner: owner.to_string(), visibility: fields["visibility"].as_bool()?, receive: fields["receive"].as_bool()? })
+        Some(Policy {
+            scope: scope.to_string(),
+            owner: owner.to_string(),
+            visibility: fields["visibility"].as_bool()?,
+            receive: fields["receive"].as_bool()?,
+            attention: fields["attention"].as_bool()?,
+        })
     }
 }
 
@@ -167,6 +175,8 @@ pub fn enable(store: &mut Store, request: EnableRequest) -> Result<Value, Fail> 
         owner,
         visibility: true,
         receive: true,
+        // Enabling the same share again is not a new decision about attention; a new share starts without it.
+        attention: earlier.as_ref().is_some_and(|p| p.attention),
     };
     let changed = earlier.as_ref() != Some(&policy);
     // Mail a withdrawn policy was holding is queued again, unless it has expired meanwhile.
@@ -180,6 +190,60 @@ pub fn enable(store: &mut Store, request: EnableRequest) -> Result<Value, Fail> 
     }
     commit(tx, "share_enable")?;
     Ok(json!({ "project": project, "changed": changed, "policy": policy.to_json(), "released": released }))
+}
+
+pub struct AttentionRequest {
+    project: String,
+    enabled: bool,
+    /// The scope the user reviewed. Enabling names it; switching off is a revocation and needs none.
+    scope: Option<String>,
+}
+
+impl AttentionRequest {
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+}
+
+pub fn parse_attention(mut args: Args) -> Result<AttentionRequest, Fail> {
+    let project = project_arg(&mut args)?;
+    let enabled = match args.take("enabled") {
+        Some(Value::Bool(enabled)) => enabled,
+        _ => return Err(Fail::new("REQUEST_INVALID", "field `enabled` is missing or invalid")),
+    };
+    let scope = args.optional_string("scope", 64)?;
+    if enabled && scope.is_none() {
+        return Err(Fail::new("REQUEST_INVALID", "field `scope` is missing or invalid"));
+    }
+    args.finish()?;
+    Ok(AttentionRequest { project, enabled, scope })
+}
+
+/// Turns attention on or off for a shared project, keeping its scope, owner and every other permission. The
+/// project must have a readable policy; an unreadable one is never repaired here.
+pub fn set_attention(store: &mut Store, request: AttentionRequest) -> Result<Value, Fail> {
+    let AttentionRequest { project, enabled, scope } = request;
+    let now = util::now_ms();
+    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut policy = match standing(&tx, store.version, &project)? {
+        Standing::Valid(policy, _) => policy,
+        Standing::Invalid(reason) => return Err(invalid_policy(&project, reason)),
+        Standing::Absent => return Err(not_shared(&project)),
+    };
+    // What was reviewed is what is changed: a share withdrawn and made again since the review has a new scope.
+    if enabled && scope.as_deref() != Some(policy.scope.as_str()) {
+        return Err(Fail::new("SCOPE_CHANGED", "the project's sharing changed since it was reviewed; review it again").with(json!({ "project": project })));
+    }
+    let changed = policy.attention != enabled;
+    policy.attention = enabled;
+    if changed {
+        tx.execute(
+            "UPDATE sharing_policies SET policy = ?2, updated_at = ?3 WHERE project = ?1",
+            params![project, policy.to_json().to_string(), now],
+        )?;
+        commit(tx, "share_attention")?;
+    }
+    Ok(json!({ "project": project, "changed": changed, "policy": policy.to_json() }))
 }
 
 fn release_held(db: &rusqlite::Connection, project: &str, now: i64) -> Result<Vec<String>, Fail> {

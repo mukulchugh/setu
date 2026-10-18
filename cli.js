@@ -2507,7 +2507,7 @@ async function cmdSessions() {
 }
 
 const LINKS_USAGE =
-  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] | share enable <repo> [--owner <label>] [--confirmation <token>] | share disable <repo> | share status [<repo>] | directory [<repo>] [--json]';
+  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] | capabilities | send-now <repo> <branch> --session <id> --message <message> | attention open <attention> | share enable <repo> [--owner <label>] [--confirmation <token>] | share attention <repo> on|off [--confirmation <token>] | share disable <repo> | share status [<repo>] | directory [<repo>] [--json]';
 
 // Links needs the running portal and never starts anything itself. An unreachable portal is a refusal;
 // a send the portal or engine may or may not have recorded is unknown, and says how to repeat it safely.
@@ -2560,6 +2560,7 @@ const LINKS_ACTIONS = new Map([
       flags: ['body-file', 'idempotency-key', 'reply-to', 'session'],
     },
   ],
+  ['send-now', { argCount: 3, flags: ['message', 'session'] }],
   ['show', { argCount: 2, flags: [] }],
   ['status', { argCount: 2, flags: [] }],
 ]);
@@ -2567,13 +2568,14 @@ const LINKS_ACTIONS = new Map([
 // Sharing is the user's own decision about a project, and enabling shows the exact public fields first: the
 // first request returns them with a token, and only that token passed back (`--confirmation`) enables.
 const LINKS_SHARE_ACTIONS = new Map([
+  ['attention', { argCounts: [4], flags: ['confirmation'] }],
   ['disable', { argCounts: [3], flags: [] }],
   ['enable', { argCounts: [3], flags: ['confirmation', 'owner'] }],
   ['status', { argCounts: [2, 3], flags: [] }],
 ]);
 
 function cmdLinksShare() {
-  const [, sub, repo] = args;
+  const [, sub, repo, mode] = args;
   const accepted = LINKS_SHARE_ACTIONS.get(sub);
   if (!accepted) {
     die(`Usage: ${LINKS_USAGE}`);
@@ -2591,6 +2593,20 @@ function cmdLinksShare() {
   if (sub === 'disable') {
     return linksResult(() => cliApi.post('/api/links/share/disable', { repo }));
   }
+  if (sub === 'attention') {
+    // Turning attention on is reviewed like sharing itself; turning it off is immediate.
+    if (mode !== 'on' && mode !== 'off') {
+      die(`Usage: ${LINKS_USAGE}`);
+    }
+    const reviewed = optionalFlag('confirmation');
+    return linksResult(() =>
+      cliApi.post('/api/links/share/attention', {
+        enabled: mode === 'on',
+        repo,
+        ...(reviewed === undefined ? {} : { confirmation: reviewed }),
+      })
+    );
+  }
   const owner = optionalFlag('owner');
   const confirmation = optionalFlag('confirmation');
   return linksResult(() =>
@@ -2607,6 +2623,21 @@ async function cmdLinks() {
   const [action, first, name] = args;
   if (action === 'share') {
     return cmdLinksShare();
+  }
+  if (action === 'attention') {
+    // Opening an attention request focuses its exact conversation, or says why it cannot.
+    validateCommand({ allowedFlags: [], argCounts: [3], usage: LINKS_USAGE });
+    if (first !== 'open') {
+      die(`Usage: ${LINKS_USAGE}`);
+    }
+    return linksResult(() =>
+      cliApi.post('/api/links/attention/open', { attentionId: name })
+    );
+  }
+  if (action === 'capabilities') {
+    // What Links can do on this machine now; today that states that Send now is unavailable, and why.
+    validateCommand({ allowedFlags: [], argCounts: [1], usage: LINKS_USAGE });
+    return linksResult(() => cliApi.get('/api/links/capabilities', {}));
   }
   if (action === 'directory') {
     validateCommand({
@@ -2662,6 +2693,12 @@ async function cmdLinks() {
     );
   }
   const messageId = requireFlag('message');
+  if (action === 'send-now') {
+    // Always answered `LINKS_WAKE_UNAVAILABLE` today; the command never types into a terminal.
+    return linksResult(() =>
+      cliApi.post('/api/links/send-now', { ...recipient, messageId })
+    );
+  }
   if (action === 'ack') {
     return linksResult(() =>
       cliApi.post('/api/links/ack', { ...recipient, messageId })
@@ -2768,19 +2805,27 @@ async function cmdSetupProgress() {
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdAttention() {
   validateCommand({
-    allowedFlags: ['checkout', 'session'],
+    allowedFlags: ['before', 'checkout', 'limit', 'session'],
     argCounts: [0, 1, 3],
     usage:
-      'setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]',
+      'setu attention [list [repo branch] [--limit <n> --before <cursor>] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]',
   });
   const [action, repo, name] = args;
   if (!action || action === 'list') {
-    validateFlags([], 'setu attention list [repo branch] [--json]');
+    validateFlags(
+      ['before', 'limit'],
+      'setu attention list [repo branch] [--limit <n> --before <cursor>] [--json]'
+    );
     if ((repo && !name) || (!repo && name)) {
       die('Usage: setu attention list [repo branch] [--json]');
     }
+    // Links requests page by a cursor (`links.next` of the previous page); an older page lists only requests.
+    const before = optionalFlag('before');
+    const limit = positiveNumber('limit', { integer: true, maximum: 100 });
     return apiResult(() =>
       cliApi.get('/api/attention', {
+        before,
+        limit,
         name: action ? name : undefined,
         repo: action ? repo : undefined,
       })
@@ -2791,6 +2836,10 @@ async function cmdAttention() {
       'Usage: setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <identity>] [--json]'
     );
   }
+  validateFlags(
+    ['checkout', 'session'],
+    'setu attention focus <repo> <branch> --session <id> --checkout <file|->'
+  );
   return apiResult(() =>
     cliApi.post('/api/attention/focus', {
       checkoutIdentity: checkoutIdentity(),
@@ -3786,6 +3835,10 @@ function cmdHelp() {
     setu links ack <repo> <branch> --session <id> --message <message> [--json]
     setu links redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--json]
     setu links share enable <repo> [--owner <label>] [--confirmation <token>] [--json]
+    setu links share attention <repo> on|off [--confirmation <token>] [--json]
+    setu links capabilities [--json]
+    setu links send-now <repo> <branch> --session <id> --message <message> [--json]
+    setu links attention open <attention> [--json]
     setu links share disable <repo> | status [<repo>] [--json]
     setu links directory [<repo>] [--json]
                                       Needs the running portal. A message is addressed to one verified
@@ -3796,7 +3849,7 @@ function cmdHelp() {
                                       Retry input contains the returned manifestId and retryId
     setu admission [--json]
     setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id>] [--json]
-    setu attention [list [repo branch] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu attention [list [repo branch] [--limit <n> --before <cursor>] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]
     setu headless list [repo branch] [--json]
     setu headless start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]
     setu headless cancel <repo> <branch> --run <id> --checkout <file|-> [--json]

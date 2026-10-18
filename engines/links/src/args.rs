@@ -122,6 +122,11 @@ impl Args {
         }
     }
 
+    /// A raw value the caller validates itself, or none.
+    pub fn take(&mut self, key: &str) -> Option<Value> {
+        self.0.remove(key)
+    }
+
     pub fn optional_string(&mut self, key: &str, max: usize) -> Result<Option<String>, Fail> {
         match self.0.get(key) {
             None | Some(Value::Null) => {

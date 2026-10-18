@@ -1,4 +1,5 @@
 pub mod args;
+pub mod attention;
 pub mod authz;
 pub mod binding;
 pub mod daemon;

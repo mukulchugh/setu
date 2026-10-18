@@ -335,7 +335,11 @@ test('every Links route has a CLI command and every CLI command has a route', as
     ['share', 'enable', 'repo'],
     ['share', 'disable', 'repo'],
     ['share', 'status', 'repo'],
-    ['directory']
+    ['share', 'attention', 'repo', 'on'],
+    ['directory'],
+    ['capabilities'],
+    ['attention', 'open', 'att_1'],
+    ['send-now', 'repo', 'topic', '--session', 's1', '--message', 'm_1']
   );
   const used = new Set();
   for (const argv of commands) {

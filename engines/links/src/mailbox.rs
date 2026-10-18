@@ -95,7 +95,7 @@ pub enum Principal {
 
 impl Principal {
     /// One column value: `user`, or `session:<id>`. Ids never contain `:`, so it decodes without ambiguity.
-    fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         match self {
             Principal::User => "user".to_string(),
             Principal::Session(id) => format!("session:{id}"),
@@ -106,7 +106,7 @@ impl Principal {
         *self == Principal::User
     }
 
-    fn parse(mut args: Args) -> Result<Self, Fail> {
+    pub(crate) fn parse(mut args: Args) -> Result<Self, Fail> {
         let kind = args.string("kind", 16)?;
         let principal = match kind.as_str() {
             "user" => Principal::User,

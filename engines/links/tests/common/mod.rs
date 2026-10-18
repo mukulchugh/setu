@@ -103,10 +103,13 @@ pub fn session_send_args(key: &str, body: &str, native_id: &str, sender_session:
 impl Engine {
     pub fn new() -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "setu-links-test-{}-{}",
+            "setu-links-test-{}-{}-{}",
             std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
+            NEXT.fetch_add(1, Ordering::SeqCst),
+            setu_links::util::new_id("t")
         ));
+        // Never an old run's directory, whose process id may be reused; its evidence is left alone.
+        assert!(!dir.exists(), "a fresh test root must not exist yet: {dir:?}");
         Engine { dir, owned: true, spawned: std::sync::atomic::AtomicU32::new(0) }
     }
 

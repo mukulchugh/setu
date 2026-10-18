@@ -131,7 +131,13 @@ export function createLinksRuntime({
       publish: absentUnlessMailbox(service.publishBinding),
     }),
     linksAck: service.ack,
+    // Pieces of the attention list and the exact open, composed with the managed-session services in
+    // portal.js. The session tools' ingress (`attentionSendExact`) is deliberately not exported: it trusts
+    // its caller, so it waits for the authenticated tool coordinator and the engine's sender fence.
+    linksAttentionList: service.attentionList,
+    linksAttentionTarget: service.attentionTarget,
     linksCancel: service.cancel,
+    linksCapabilities: service.capabilities,
     linksDirectory: service.directory,
     linksInbox: service.inbox,
     linksPresence: createPresenceLifecycle({
@@ -144,6 +150,8 @@ export function createLinksRuntime({
     }),
     linksRedeliver: service.redeliver,
     linksSend: service.send,
+    linksSendNow: service.sendNow,
+    linksShareAttention: service.shareAttention,
     linksShareDisable: service.shareDisable,
     linksShareEnable: service.shareEnable,
     linksShareStatus: service.shareStatus,

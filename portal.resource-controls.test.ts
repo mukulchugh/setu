@@ -3,11 +3,17 @@ import { createGithubActions } from './github-actions.js';
 import { createMcpActions } from './mcp-actions.js';
 import {
   attentionFocusBody,
+  attentionPlaceholder,
   cleanupExecutionBody,
   confirmationToken,
   createReviewGeneration,
   dependencyRepairPlan,
   handoffFindings,
+  linksOpenBody,
+  linksOpenReason,
+  linksProblem,
+  mergeAttentionEvents,
+  olderRequestsUrl,
   readResource,
   resourceAction,
   resourceReadUrl,
@@ -73,6 +79,127 @@ test('attention focus uses the verified session joined to an actual hook event',
   expect(
     attentionFocusBody({ ...event, state: 'unknown' }, 'app', 'topic')
   ).toBeNull();
+});
+
+test('a Links request is opened by its own id, never focused by session id', () => {
+  const entry = {
+    id: 'att_1',
+    message: 'look',
+    open: { available: true },
+    sender: { id: 'session-s', kind: 'session' },
+    session: null,
+    source: 'links',
+    state: 'links-attention',
+    target: { name: 'topic', repo: 'app' },
+  };
+  // The session-focus body needs a session; a Links entry has none, so that path can never be taken.
+  expect(attentionFocusBody(entry, 'app', 'topic')).toBeNull();
+  expect(linksOpenBody(entry, 'app', 'topic')).toEqual({
+    attentionId: 'att_1',
+  });
+  // Another worktree, an unavailable open, a provider event, or an entry with no id: no body.
+  expect(linksOpenBody(entry, 'app', 'other')).toBeNull();
+  expect(
+    linksOpenBody(
+      { ...entry, open: { available: false, reason: 'The session has ended' } },
+      'app',
+      'topic'
+    )
+  ).toBeNull();
+  expect(
+    linksOpenBody({ ...entry, source: undefined }, 'app', 'topic')
+  ).toBeNull();
+  expect(linksOpenBody({ ...entry, id: 7 }, 'app', 'topic')).toBeNull();
+  expect(
+    linksOpenReason({
+      ...entry,
+      open: { available: false, reason: 'The session has ended' },
+    })
+  ).toBe('The session has ended');
+  expect(linksOpenReason(entry)).toBeNull();
+});
+
+test('older Links requests load by cursor, are listed once, and an empty page that has more says so', () => {
+  const permission = { at: 1, kind: 'permission', state: 'permission' };
+  const request = (id: string) => ({
+    at: 10 + Number(id.slice(4)),
+    id,
+    open: { available: true },
+    source: 'links',
+    target: { name: 'topic', repo: 'app' },
+  });
+  const first = [permission, request('att_3'), request('att_2')];
+  const links = { hasMore: true, next: 'att_2', state: 'ok' };
+
+  // The older-page action names the same worktree and the cursor, and only exists while there is more.
+  expect(olderRequestsUrl('app', 'topic', links)).toBe(
+    '/api/attention?before=att_2&name=topic&repo=app'
+  );
+  expect(olderRequestsUrl('app', 'feat/x', links)).toBe(
+    '/api/attention?before=att_2&name=feat%2Fx&repo=app'
+  );
+  expect(
+    olderRequestsUrl('app', 'topic', { ...links, hasMore: false })
+  ).toBeNull();
+  expect(
+    olderRequestsUrl('app', 'topic', { hasMore: true, state: 'ok' })
+  ).toBeNull();
+  expect(
+    olderRequestsUrl('app', 'topic', {
+      code: 'LINKS_ENGINE_UNAVAILABLE',
+      state: 'unavailable',
+    })
+  ).toBeNull();
+  expect(olderRequestsUrl('app', 'topic', null)).toBeNull();
+
+  // Older entries join the first page without repeating anything, and the provider event stays one.
+  const older = [request('att_1'), request('att_2')];
+  const merged = mergeAttentionEvents(first, older);
+  expect(merged.map((event) => event.id ?? event.kind)).toEqual([
+    'permission',
+    'att_1',
+    'att_2',
+    'att_3',
+  ]);
+  // A refreshed first page keeps what was already loaded below it.
+  const refreshed = [
+    permission,
+    request('att_4'),
+    request('att_3'),
+    request('att_2'),
+  ];
+  expect(
+    mergeAttentionEvents(refreshed, older).map(
+      (event) => event.id ?? event.kind
+    )
+  ).toEqual(['permission', 'att_1', 'att_2', 'att_3', 'att_4']);
+
+  // Nothing shown is "none" only when the store has nothing more; with more it says so, never "none".
+  expect(attentionPlaceholder([], { hasMore: false, state: 'ok' })).toBe(
+    'none'
+  );
+  expect(attentionPlaceholder([], links)).toBe('more');
+  expect(
+    attentionPlaceholder([], { code: 'LINKS_INVALID', state: 'unavailable' })
+  ).toBe('unavailable');
+  expect(attentionPlaceholder(first, links)).toBeNull();
+
+  // When Links cannot be listed (even a worktree view that is too large to name), the list says why and how
+  // to recover, whether or not provider events are shown, and never reads as "none".
+  const tooLarge = {
+    code: 'LINKS_SCOPE_TOO_LARGE',
+    error:
+      'List them without a worktree (setu attention list), where nothing is left out.',
+    state: 'unavailable',
+  };
+  expect(linksProblem(tooLarge)).toContain('setu attention list');
+  expect(
+    linksProblem({ code: 'LINKS_ENGINE_UNAVAILABLE', state: 'unavailable' })
+  ).toContain('unavailable');
+  expect(linksProblem(links)).toBeNull();
+  expect(linksProblem(null)).toBeNull();
+  expect(attentionPlaceholder([], tooLarge)).toBe('unavailable');
+  expect(attentionPlaceholder(first, tooLarge)).toBeNull();
 });
 
 test('resource reads retain their target and reject malformed successful responses', async () => {

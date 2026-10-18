@@ -69,6 +69,96 @@ export function attentionFocusBody(
     : null;
 }
 
+// The action that loads the next older page of this worktree's Links requests: present only while the
+// backend says there are more and gave the cursor to continue from.
+export function olderRequestsUrl(repo: string, name: string, links: unknown) {
+  const state = record(links);
+  return state?.state === 'ok' &&
+    state.hasMore === true &&
+    typeof state.next === 'string' &&
+    state.next
+    ? `/api/attention?${new URLSearchParams({ before: state.next, name, repo })}`
+    : null;
+}
+
+// The first page, then older Links requests below it: each request once, the provider's own events not
+// repeated (older pages carry none), and a refreshed first page keeps what was loaded beneath it.
+export function mergeAttentionEvents(
+  first: Record<string, unknown>[],
+  older: Record<string, unknown>[]
+) {
+  const seen = new Set(
+    first.flatMap((event) => (typeof event.id === 'string' ? [event.id] : []))
+  );
+  const all = [
+    ...first,
+    ...older.filter(
+      (event) => typeof event.id !== 'string' || !seen.has(event.id)
+    ),
+  ];
+  // One timeline, oldest first like the list itself; equal times keep their order.
+  const at = (event: Record<string, unknown>) =>
+    typeof event.at === 'number' ? event.at : 0;
+  return all
+    .map((event, index) => ({ event, index }))
+    .sort((a, b) => at(a.event) - at(b.event) || a.index - b.index)
+    .map(({ event }) => event);
+}
+
+// Why the Links part of the list could not be read, in the backend's words, whatever else is shown.
+export function linksProblem(links: unknown) {
+  const state = record(links);
+  if (state?.state !== 'unavailable') {
+    return null;
+  }
+  return typeof state.error === 'string' && state.error
+    ? state.error
+    : 'Links requests are unavailable right now.';
+}
+
+// What to say when the list has nothing to show. "None" is only true when nothing more is retained.
+export function attentionPlaceholder(
+  events: unknown[],
+  links: unknown
+): 'none' | 'more' | 'unavailable' | null {
+  const state = record(links);
+  if (events.length > 0) {
+    return null;
+  }
+  if (state?.state === 'unavailable') {
+    return 'unavailable';
+  }
+  return state?.hasMore === true ? 'more' : 'none';
+}
+
+// A request Links retains: opened by its own id through the exact-conversation route, never by session id.
+// Only an entry the backend says can be opened, in this worktree, gets a body.
+export function linksOpenBody(
+  event: Record<string, unknown>,
+  repo: string,
+  name: string
+) {
+  const target = isRecord(event.target) ? event.target : null;
+  const open = isRecord(event.open) ? event.open : null;
+  return event.source === 'links' &&
+    typeof event.id === 'string' &&
+    open?.available === true &&
+    target?.repo === repo &&
+    target.name === name
+    ? { attentionId: event.id }
+    : null;
+}
+
+// Why a Links entry cannot be opened, in the backend's own words.
+export function linksOpenReason(event: Record<string, unknown>) {
+  const open = isRecord(event.open) ? event.open : null;
+  return event.source === 'links' &&
+    open?.available === false &&
+    typeof open.reason === 'string'
+    ? open.reason
+    : null;
+}
+
 export function confirmationToken(value: unknown) {
   const confirmation = isRecord(value) ? value.confirmation : null;
   return isRecord(confirmation) && typeof confirmation.token === 'string'
@@ -900,6 +990,34 @@ function CleanupControls({ repo, name, toast }: TargetProps) {
   );
 }
 
+// Who a Links request is from, how many came together, and whether its project still admits them.
+function LinksSender({ event }: { event: Record<string, unknown> }) {
+  if (event.source !== 'links' || !isRecord(event.sender)) {
+    return null;
+  }
+  const group = isRecord(event.group) ? event.group : null;
+  const together =
+    group?.notifying === true &&
+    typeof group.count === 'number' &&
+    group.count > 1
+      ? ` · ${group.count} requests`
+      : '';
+  return (
+    <span class="text-zinc-500">
+      {text(event.sender.id)}
+      {together}
+      {event.admitted === false ? ' · no longer admitted' : ''}
+    </span>
+  );
+}
+
+function LinksOpenReason({ event }: { event: Record<string, unknown> }) {
+  const reason = linksOpenReason(event);
+  return reason ? (
+    <span class="text-xs text-zinc-500">Can’t open: {reason}</span>
+  ) : null;
+}
+
 function SetupAttentionControls({ repo, name, toast }: TargetProps) {
   const setup = useVisiblePoll(`setup:${repo}/${name}`, 5000, (signal) =>
     readResource(resourceReadUrl('/api/setup-progress', repo, name), signal)
@@ -911,8 +1029,38 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
       readResource(resourceReadUrl('/api/attention', repo, name), signal)
   );
   const [busy, setBusy] = useState<string | null>(null);
+  // Older Links requests loaded below the first page, and the cursor to continue from.
+  const [older, setOlder] = useState<{
+    events: Record<string, unknown>[];
+    links: unknown;
+  }>({ events: [], links: null });
   const records = setup.data?.ok ? array(setup.data.records) : [];
-  const events = attention.data?.ok ? array(attention.data.events) : [];
+  const firstEvents = attention.data?.ok ? array(attention.data.events) : [];
+  const events = mergeAttentionEvents(firstEvents, older.events);
+  const links =
+    older.links ?? (attention.data?.ok ? attention.data.links : null);
+  const olderUrl = olderRequestsUrl(repo, name, links);
+  const placeholder = attentionPlaceholder(events, links);
+  async function loadOlder() {
+    if (!olderUrl || busy) {
+      return;
+    }
+    setBusy('older');
+    try {
+      const page = await readResource(olderUrl, new AbortController().signal);
+      if (page.ok) {
+        setOlder((previous) => ({
+          events: mergeAttentionEvents(previous.events, array(page.events)),
+          links: page.links,
+        }));
+      } else {
+        toast(`✗ Could not load older requests: ${text(page.error)}`, 'red');
+      }
+    } catch {
+      toast('✗ Could not load older requests.', 'red');
+    }
+    setBusy(null);
+  }
   async function retry(entry: Record<string, unknown>) {
     const { attemptId, checkoutIdentity } = entry;
     if (!(typeof attemptId === 'string' && checkoutIdentity) || busy) {
@@ -945,6 +1093,20 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
       toast('Requested focus for the existing terminal.', 'emerald');
     } else {
       toast(`✗ Could not focus the terminal: ${text(response.error)}`, 'red');
+    }
+  }
+  async function openRequest(event: Record<string, unknown>) {
+    const body = linksOpenBody(event, repo, name);
+    if (!body || busy) {
+      return;
+    }
+    setBusy(body.attentionId);
+    const response = await resourceAction('/api/links/attention/open', body);
+    setBusy(null);
+    if (response.ok) {
+      toast('Requested focus for the exact conversation.', 'emerald');
+    } else {
+      toast(`✗ Could not open the request: ${text(response.error)}`, 'red');
     }
   }
   return (
@@ -1005,9 +1167,23 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
                   key={text(event.id, String(index))}
                 >
                   <Badge tone={stateTone(event.state)}>
-                    {text(event.kind ?? event.state)}
+                    {event.source === 'links'
+                      ? 'From Links'
+                      : text(event.kind ?? event.state)}
                   </Badge>
+                  <LinksSender event={event} />
                   <span>{text(event.summary ?? event.message, '')}</span>
+                  {linksOpenBody(event, repo, name) && (
+                    <Button
+                      compact
+                      disabled={busy !== null}
+                      onClick={() => openRequest(event)}
+                      variant="secondary"
+                    >
+                      {busy === event.id ? 'Opening…' : 'Open'}
+                    </Button>
+                  )}
+                  <LinksOpenReason event={event} />
                   {attentionFocusBody(event, repo, name) && (
                     <Button
                       compact
@@ -1023,10 +1199,27 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
                 </li>
               ))}
             </ul>
-          ) : (
-            attention.data?.ok && (
-              <p class="text-xs text-zinc-500">No attention events.</p>
-            )
+          ) : null}
+          {placeholder === 'none' && attention.data?.ok && (
+            <p class="text-xs text-zinc-500">No attention events.</p>
+          )}
+          {placeholder === 'more' && (
+            <p class="text-xs text-zinc-500">
+              Nothing on this page, but older requests exist.
+            </p>
+          )}
+          {linksProblem(links) && (
+            <p class="text-xs text-zinc-500">{linksProblem(links)}</p>
+          )}
+          {olderUrl && (
+            <Button
+              compact
+              disabled={busy !== null}
+              onClick={loadOlder}
+              variant="secondary"
+            >
+              {busy === 'older' ? 'Loading…' : 'Load older requests'}
+            </Button>
           )}
         </div>
       </div>

@@ -102,6 +102,7 @@ import {
   writeDockerCompose,
   writerClaimPaths,
 } from './lib.js';
+import { createLinksAttention } from './links-attention.js';
 import { createLinksRuntime } from './links-runtime.js';
 import {
   createListenerObservation,
@@ -3641,6 +3642,8 @@ export async function createPortalRuntime(options = {}) {
   const {
     delivery: linksDelivery,
     lifecycle: linksLifecycle,
+    linksAttentionList,
+    linksAttentionTarget,
     linksPresence,
     linksWithdrawSharing,
     ...links
@@ -3682,6 +3685,17 @@ export async function createPortalRuntime(options = {}) {
       runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
       state: b205State,
     });
+  // The attention list and the exact open: Links' requests beside the provider's events, and the existing
+  // focus action with the conversation attached. The portal's own reader carries the message; the
+  // generic MCP reader (below) does not.
+  const linksAttention = createLinksAttention({
+    focus: (input) => managedAgents.focus(input),
+    links: {
+      attentionList: linksAttentionList,
+      attentionTarget: linksAttentionTarget,
+    },
+    listProvider: (input) => managedAgents.listAttention(input),
+  });
   const spans = createSpansRuntime({ root: options.spansRoot });
   const portalB205Composition = Object.freeze({
     ...spans,
@@ -3689,7 +3703,8 @@ export async function createPortalRuntime(options = {}) {
     ...links,
     ...portalB205,
     agentSessions: (input) => managedAgents.listSessions(input),
-    attention: (input) => managedAgents.listAttention(input),
+    // The portal's own view carries the message; the MCP reader below does not.
+    attention: (input) => linksAttention.list(input, { withMessage: true }),
     attentionFocus: (input) => managedAgents.focus(input),
     attentionHook: (input) => managedAgents.receiveHook(input),
     endAgentSession: (input) => managedAgents.endSession(input),
@@ -3698,6 +3713,7 @@ export async function createPortalRuntime(options = {}) {
     headlessResume: (input) => managedAgents.resumeRun(input),
     headlessRuns: (input) => managedAgents.listRuns(input),
     headlessStart: (input) => managedAgents.startRun(input),
+    linksAttentionOpen: (input) => linksAttention.open(input),
     resumeAgentSession: (input) => managedAgents.resume(input),
   });
 
@@ -5686,7 +5702,8 @@ export async function createPortalRuntime(options = {}) {
       adoptWorktree: (repo, name, path) =>
         adoptWorktree(repo, name, path, 'mcp'),
       agentSessions: (input) => managedAgents.listSessions(input),
-      attention: (input) => managedAgents.listAttention(input),
+      // An agent sees that a request exists, who sent it and when, never its text.
+      attention: (input) => linksAttention.list(input),
       attentionFocus: (input) =>
         managedAgents.focus({ ...input, source: 'mcp' }),
       cacheExecute: (input) => portalB205.cacheExecute(input),
