@@ -3,6 +3,7 @@ import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createLinksClient, MAILBOX_FILE } from './links-client.js';
+import { createLinksHistoryService } from './links-history-service.js';
 import { createLinksService } from './links-service.js';
 import { listWriterClaims } from './writer-claims.js';
 
@@ -78,6 +79,20 @@ function createPresenceLifecycle({ publish, timers }) {
   });
 }
 
+// The same history service for an explicit offline command: no portal, only
+// the engine process and the Spans archive it is pointed at.
+export function createOfflineLinksHistory({
+  enginePath = process.env.SETU_LINKS_ENGINE ?? defaultEngine,
+  linksRoot = join(homedir(), '.local/share/setu/links'),
+  spansRoot = join(homedir(), '.local/share/setu/spans'),
+  timeoutMs,
+} = {}) {
+  return createLinksHistoryService({
+    client: createLinksClient({ dataDir: linksRoot, enginePath, timeoutMs }),
+    spansRoot,
+  });
+}
+
 // Composition only. Nothing starts and nothing is created until an operation runs; the engine process
 // that serves it creates its own private store on the first send. A read, a report or a claim never creates one.
 export function createLinksRuntime({
@@ -87,6 +102,7 @@ export function createLinksRuntime({
   resolveTarget,
   sessions,
   taskLabel = claimTaskLabel,
+  spansRoot = join(homedir(), '.local/share/setu/spans'),
   timeoutMs,
   timers = { clearInterval, setInterval },
 } = {}) {
@@ -118,6 +134,10 @@ export function createLinksRuntime({
     sessions,
     taskLabel,
   });
+  const history = createLinksHistoryService({
+    client: createLinksClient({ dataDir: root, enginePath, timeoutMs }),
+    spansRoot,
+  });
   return Object.freeze({
     // For the authenticated prompt hook only (see portal.js): never a route, tool or command.
     delivery: Object.freeze({
@@ -148,6 +168,14 @@ export function createLinksRuntime({
           : { ok: true, published: 0 },
       timers,
     }),
+    linksAssociationApprove: history.associationApprove,
+    linksAssociationPreview: history.associationPreview,
+    linksAssociationRevoke: history.associationRevoke,
+    linksAssociations: history.associations,
+    linksEvidenceAttach: history.evidenceAttach,
+    linksEvidencePreview: history.evidencePreview,
+    linksProjectionStatus: history.projectionStatus,
+    linksRecovery: history.recovery,
     linksRedeliver: service.redeliver,
     linksSend: service.send,
     linksSendNow: service.sendNow,

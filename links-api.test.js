@@ -225,7 +225,19 @@ test('every registered Links route is served, and the hook-only operations are n
     'GET /api/links/status',
     'POST /api/links/ack',
     'POST /api/links/attention/open',
+    'GET /api/links/associations',
+    'GET /api/links/associations/preview',
+    'GET /api/links/evidence/preview',
+    'GET /api/links/inbox',
+    'GET /api/links/message',
+    'GET /api/links/projection/status',
+    'GET /api/links/recovery',
+    'GET /api/links/status',
+    'POST /api/links/ack',
+    'POST /api/links/associations/approve',
+    'POST /api/links/associations/revoke',
     'POST /api/links/cancel',
+    'POST /api/links/evidence/attach',
     'POST /api/links/redeliver',
     'POST /api/links/send',
     'POST /api/links/send-now',
@@ -238,6 +250,7 @@ test('every registered Links route is served, and the hook-only operations are n
     '/api/links/capabilities',
     '/api/links/directory',
     '/api/links/share/status',
+    '/api/links/recovery',
   ]);
   for (const route of links) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.

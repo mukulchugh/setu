@@ -1,0 +1,49 @@
+# Issue 14 contract: engine `events`, `list` and roster reads as the JS history now uses them
+
+Status: the JavaScript history, projection and association boundaries are implemented and reviewed. The Rust events API and schema 3-to-4 migration remain pending the integrated transport baseline. This contract specifies the required engine behavior; it does not claim that behavior is implemented.
+
+## `events` (passive; wire args)
+`{after>=0, limit 1..=200 (default 100), origin?, run_hint?}`; `run_hint` requires `origin`; unknown fields `FIELD_UNSUPPORTED`; opens an existing store read-only, never creates one.
+Result `{store_id: string|null, head, next, has_more, events:[...]}`; a missing store is `{store_id:null, head:0, next:0, has_more:false, events:[]}`.
+- `store_id`: stable id minted with the database (not the peer key, which can survive a database replacement).
+- `head`: highest seq of the unfiltered log. `next`: seq the scan reached; with `has_more` it is the last returned seq, otherwise at least the observed `head` even when nothing matched (a filtered cursor must not stick).
+- Event (all keys present, nullable ones as null): `seq, first, backfill, at, message_id, state, reason, attempts, redeliveries, attempt_id, expires_at, stage, remote_state, cancel, message`.
+  - `first`: true only on the lowest-seq event of that message in the whole log, never "first on this filtered page".
+  - `backfill`: true on the single synthesized event the migration writes per pre-existing message (its current state). History before it is unknown. `first` is also true for it, so the message row is still produced; `backfill` is what lets the display say earlier history is unknown. False otherwise. (Added because `first` alone cannot express the gap.)
+  - `stage` outbox_state or null; `remote_state` or null; `cancel` none|requested|confirmed|refused (`none` for inbox rows).
+  - one event per persisted user-visible change; none for retry heartbeats or `inbound.state_seq` updates; a `cancel_state` change is an event even if the displayed state did not move.
+  - `message`: `{body, created_at, kind, origin, recipient:{provider, session_hint}, reply_to, run_hint, sender:{kind}, size, span_hint}`. `origin` is exactly `local` or `peer:<key>` (see "Canonical origin" below), computed from the immutable `messages.sender` (`peer:<key>`) / `inbound.peer_id`; no origin column. No checkout or native id on the wire. `kind` is carried, not assumed to be `message`.
+- The client (`links-client.js`) accepts exactly these keys and refuses any other.
+
+## `list` (extended; baseline reply still accepted)
+Args: `session_hint?` plus `run_hint?+origin?`, `has_run_hint?`, `states?[]`, `limit<=200`, `after_id?`; at least one selector; bodies excluded.
+Result: baseline `{messages}` or `{messages:[... + origin], has_more, next_after}`. An engine that predates this answers `REQUEST_INVALID`/`FIELD_UNSUPPORTED`; the service reports `LINKS_ENGINE_UPGRADE_REQUIRED`.
+
+## `peer_list`
+Read loosely by the JS: `{peers:[{peer_id, ...}]}`; the roster's other fields are the transport's. A peer `origin` is accepted for an approval only if listed; an unreadable roster is `LINKS_ORIGIN_UNVERIFIABLE`.
+
+## `show`
+Unchanged. If the engine adds `origin`, the client's exact `show` shape must add it in the same change; until then the service treats a `user` sender as `local` and refuses anything else as `LINKS_ORIGIN_UNVERIFIABLE`.
+
+## Canonical origin (pinned)
+On the engine wire — `events` (`message.origin` and the `origin` filter), `list` (`origin` per message and filter), `show` — and in every archive payload, an origin is **exactly** one of:
+- `local`
+- `peer:` followed by the 64 lowercase hexadecimal characters of the authenticated peer key (`peer:[0-9a-f]{64}`).
+
+Nothing else is valid on the wire: not a bare key, not uppercase, not a label. The JS compares origins by exact string equality (a message's origin must equal the association's, and the `events` filter is exact), so a bare or differently-cased key from the engine would never match an approval. Only a typed *request* from a person (CLI/UI) is tolerated: a bare lowercase 64-hex key is read as that peer and canonicalized to `peer:<key>` before anything is stored or compared; `peer_list` ids are bare keys and are compared after the same canonicalization.
+**Rust assertion PENDING** (schema 3->4 work): the engine must emit and test exactly this spelling for `events`, `list` and `show`, and must refuse to write an event for a message whose sender does not parse to it. The history endpoints are not implemented or verified here. The canonical peer-key spelling is checked by transport peer parsing and used in its authenticated inbound sender.
+
+## Identities and states
+- Origin: see "Canonical origin" above. `local`, or `peer:<key>` where `<key>` is the authenticated transport peer key, as `try_deposit` writes `sender = peer:<key>` from the authenticated peer. The roster lists the bare key; the JS compares `peer:<key>` with it. Transport peer parsing accepts the canonical key spelling; inbound transport constructs the sender from the authenticated peer. The history engine tests must verify the same origin spelling after integration.
+- `rejected` is a delivery state of its own (the sender's outbox could not hand the message over). It is carried as `state: rejected` with `stage` beside it, shown red, never folded into a delivered state. An unknown state is refused by the client.
+- Engine refusal codes reach the service prefixed `LINKS_` (`FIELD_UNSUPPORTED`, `REQUEST_INVALID`, `UNKNOWN_OP` mark an engine too old for the extended `list`); covered by a test through the real client.
+
+## Versioning of projected events
+Event ids hash store, run, message (and seq for status). They do not include a payload version, so a payload for an existing id must never change. A change to what is projected uses a new event type or a version-qualified id and its own cursor key (`parserVersion` is already part of the cursor key). An id seen again with different content is `LINKS_PROJECTION_CONFLICT` (blocked, never skipped). No migration framework is planned.
+
+## Archive side (this branch)
+- `commitImport` takes optional `fence:{runId, generation, associationId}`, checked inside the same transaction; `SPANS_MODEL_FENCE_STALE` writes nothing.
+- `commitFencedEvents({events, fence})`: the same fence, events only, no view write and no revision bump. Used by evidence.
+- `listRuns` tolerates a run whose stored view is not valid JSON (it lists the id; `readRun` of it still refuses).
+- Run view key `linksAssociations[associationId] = {origin, hint, generation, epoch, status}`.
+- Derived lookup `spans_cache` key `links-assoc-index:<sha256(origin,hint)>` -> `{runs:[...], overflow}` (<=16 runs; `overflow` when more approved the pair or a run could not be read). Recovery reports `index-incomplete` when `overflow` is set and no listed run is currently approved. The run view is the authority; the index only lets Recovery name a run, and a missing entry reads as "no approval found".

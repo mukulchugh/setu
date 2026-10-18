@@ -2507,7 +2507,7 @@ async function cmdSessions() {
 }
 
 const LINKS_USAGE =
-  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] | capabilities | send-now <repo> <branch> --session <id> --message <message> | attention open <attention> | share enable <repo> [--owner <label>] [--confirmation <token>] | share attention <repo> on|off [--confirmation <token>] | share disable <repo> | share status [<repo>] | directory [<repo>] [--json]';
+  'setu links associate|dissociate|associations|recovery|evidence|projection|project | send|inbox|show|status|cancel|ack|redeliver|capabilities|send-now|attention open|share enable|attention|disable|status|directory [--json]';
 
 // Links needs the running portal and never starts anything itself. An unreachable portal is a refusal;
 // a send the portal or engine may or may not have recorded is unknown, and says how to repeat it safely.
@@ -2546,6 +2546,16 @@ async function linksResult(call, { sendKey } = {}) {
 // Arguments after the action and the flags each Links action accepts. Only redeliver takes a
 // confirmation: it is the reviewed token the user passes back, never something a command infers.
 const LINKS_ACTIONS = new Map([
+  ['associate', { argCount: 2, flags: ['confirmation', 'hint', 'origin'] }],
+  ['associations', { argCount: 2, flags: [] }],
+  ['dissociate', { argCount: 2, flags: ['hint', 'origin'] }],
+  ['evidence', { argCount: 2, flags: ['confirmation', 'message', 'span'] }],
+  [
+    'project',
+    { argCount: 1, flags: ['links-root', 'max-batches', 'spans-root'] },
+  ],
+  ['projection', { argCount: 2, flags: [] }],
+  ['recovery', { argCount: 1, flags: ['after', 'kind', 'limit', 'run'] }],
   ['ack', { argCount: 3, flags: ['message', 'session'] }],
   ['cancel', { argCount: 2, flags: [] }],
   ['inbox', { argCount: 3, flags: ['session', 'state'] }],
@@ -2618,6 +2628,126 @@ function cmdLinksShare() {
   );
 }
 
+const LINKS_HISTORY_ACTIONS = new Set([
+  'associate',
+  'associations',
+  'dissociate',
+  'evidence',
+  'project',
+  'projection',
+  'recovery',
+]);
+
+// An absolute path with no ".." segment, as the offline Spans commands require.
+function absoluteRootFlag(name) {
+  const root = optionalFlag(name);
+  if (root === undefined) {
+    return;
+  }
+  if (
+    !(
+      isAbsolute(root) &&
+      !root.includes('\0') &&
+      !root.split(PATH_SEPARATOR_RE).includes('..')
+    )
+  ) {
+    die(`--${name} must be an absolute path without ".." segments.`);
+  }
+  return root;
+}
+
+// Run-linked history. Previewing, listing and status are portal reads; an
+// approval, a revocation and an attachment are portal writes that need the
+// reviewed token passed back. Projecting is the one offline, explicit command:
+// it reads the engine and writes the Spans archive, and nothing else does.
+async function cmdLinksHistory(action) {
+  const [, run] = args;
+  if (action === 'project') {
+    const deps = localCommandOverrides;
+    const roots = {
+      linksRoot: absoluteRootFlag('links-root'),
+      spansRoot: absoluteRootFlag('spans-root'),
+    };
+    const maxBatches =
+      positiveNumber('max-batches', { integer: true, maximum: 1000 }) ?? 20;
+    const factory =
+      deps.createLinksHistoryService ??
+      (async (given) =>
+        (await import('./links-runtime.js')).createOfflineLinksHistory(given));
+    let result;
+    try {
+      const service = await factory(
+        Object.fromEntries(
+          Object.entries(roots).filter(([, value]) => value !== undefined)
+        )
+      );
+      result = await service.project({ maxBatches });
+    } catch {
+      result = {
+        code: 'LINKS_PROJECTION_FAILED',
+        error: 'The projection did not complete. Run it again to resume.',
+        ok: false,
+      };
+    }
+    return apiResult(() => result);
+  }
+  if (action === 'recovery') {
+    return linksResult(() =>
+      cliApi.get('/api/links/recovery', {
+        afterId: optionalFlag('after'),
+        kind: optionalFlag('kind'),
+        limit: positiveNumber('limit', { integer: true, maximum: 200 }),
+        runId: optionalFlag('run'),
+      })
+    );
+  }
+  if (action === 'associations') {
+    return linksResult(() =>
+      cliApi.get('/api/links/associations', { runId: run })
+    );
+  }
+  if (action === 'projection') {
+    return linksResult(() =>
+      cliApi.get('/api/links/projection/status', { runId: run })
+    );
+  }
+  if (action === 'evidence') {
+    const evidence = {
+      messageId: requireFlag('message'),
+      runId: run,
+      spanId: optionalFlag('span'),
+    };
+    const confirmation = optionalFlag('confirmation');
+    return linksResult(() =>
+      confirmation === undefined
+        ? cliApi.get('/api/links/evidence/preview', evidence)
+        : cliApi.post('/api/links/evidence/attach', {
+            ...evidence,
+            confirmation,
+          })
+    );
+  }
+  const association = {
+    hint: requireFlag('hint'),
+    origin: requireFlag('origin'),
+    runId: run,
+  };
+  if (action === 'dissociate') {
+    return linksResult(() =>
+      cliApi.post('/api/links/associations/revoke', association)
+    );
+  }
+  const confirmation = optionalFlag('confirmation');
+  return linksResult(() =>
+    confirmation === undefined
+      ? cliApi.get('/api/links/associations/preview', association)
+      : cliApi.post('/api/links/associations/approve', {
+          ...association,
+          confirmation,
+        })
+  );
+}
+
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdLinks() {
   const [action, first, name] = args;
@@ -2658,6 +2788,9 @@ async function cmdLinks() {
     argCounts: [accepted.argCount],
     usage: LINKS_USAGE,
   });
+  if (LINKS_HISTORY_ACTIONS.has(action)) {
+    return cmdLinksHistory(action);
+  }
   if (accepted.argCount === 2) {
     if (action === 'cancel') {
       return linksResult(() =>
@@ -3841,6 +3974,12 @@ function cmdHelp() {
     setu links attention open <attention> [--json]
     setu links share disable <repo> | status [<repo>] [--json]
     setu links directory [<repo>] [--json]
+    setu links associate <run> --origin <local|peer> --hint <hint> [--confirmation <token>] [--json]   preview, then approve with the reviewed token
+    setu links dissociate <run> --origin <origin> --hint <hint> [--json]
+    setu links associations|projection <run> [--json]
+    setu links recovery [--kind delivery|unassociated] [--run <run>] [--limit <n>] [--after <message>] [--json]
+    setu links evidence <run> --message <message> [--span <span>] [--confirmation <token>] [--json]
+    setu links project [--spans-root <dir>] [--links-root <dir>] [--max-batches <n>] [--json]   offline; the only command that writes history
                                       Needs the running portal. A message is addressed to one verified
                                       native conversation; handoff-unknown is never retried automatically
     setu caches prepare <repo> <branch> [--json]

@@ -74,6 +74,7 @@ export function SpansDetail({
   onRefresh,
   conversation,
   evidence,
+  links,
   tab,
   onTabChange,
 }: {
@@ -85,6 +86,7 @@ export function SpansDetail({
   onRefresh: () => void;
   conversation: ComponentChildren;
   evidence: ComponentChildren;
+  links?: ComponentChildren;
   tab?: string;
   onTabChange?: (tab: string) => void;
 }) {
@@ -122,7 +124,12 @@ export function SpansDetail({
       case 'Evidence':
         return evidence ?? <Empty>Evidence is unavailable.</Empty>;
       case 'Recovery':
-        return <SpansRecoveryPanel view={view} />;
+        return (
+          <>
+            <SpansRecoveryPanel view={view} />
+            {links}
+          </>
+        );
       case 'Resources':
         return <SpansResourcesPanel view={view} />;
       case 'Usage':
