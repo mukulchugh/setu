@@ -4,6 +4,9 @@ const sessionStates = new Set(['starting', 'running', 'ended', 'unknown']);
 const ownershipStates = new Set(['owned', 'unknown']);
 
 export const maxReplacedHistory = 8;
+// Off-group descendants one session may retain, and how often a late group proof is tried.
+export const maxEscapedDescendants = 64;
+const maxGroupProofAttempts = 3;
 const digestPattern = /^[0-9a-f]{64}$/;
 
 // Only this digest of a per-launch capability is ever persisted.
@@ -89,6 +92,66 @@ function nextBinding(binding, { nativeId, provider, resumedFrom }, at) {
 }
 
 const canonicalTool = (tool) => (tool === 'claude' ? 'claude-code' : tool);
+
+const validIdentity = (value) =>
+  Number.isSafeInteger(value?.pid) &&
+  value.pid > 0 &&
+  typeof value.processStart === 'string' &&
+  value.processStart.length > 0;
+
+// The proved execution group of a managed process, or null. It is evidence
+// only when it names the registered process as its leader and every field is
+// well formed; anything else counts as no proof at all, never as an empty one.
+// `escaped` holds the descendants observed outside the group while the root was
+// live, `overflow` that more than the bound were seen, and `unverified` that
+// the latest scan failed, so the list may be missing newer descendants.
+function executionGroupOf(record) {
+  const group = record.executionGroup;
+  return group &&
+    typeof group === 'object' &&
+    Number.isSafeInteger(record.pid) &&
+    group.id === record.pid &&
+    validTime(group.provenAt) &&
+    Array.isArray(group.escaped) &&
+    group.escaped.length <= maxEscapedDescendants &&
+    group.escaped.every(validIdentity) &&
+    (group.overflow === undefined || group.overflow === true) &&
+    (group.unverified === undefined || group.unverified === true)
+    ? group
+    : null;
+}
+
+const identityKey = (entry) => `${entry.pid}:${entry.processStart}`;
+
+// Adds observed off-group descendants to what was already retained. Nothing is
+// ever dropped here, and more than the bound sets `overflow` for good.
+function withEscaped(group, found) {
+  const merged = new Map(group.escaped.map((e) => [identityKey(e), e]));
+  let overflow = group.overflow === true;
+  for (const entry of found) {
+    if (!validIdentity(entry)) {
+      overflow = true;
+      continue;
+    }
+    if (
+      merged.size >= maxEscapedDescendants &&
+      !merged.has(identityKey(entry))
+    ) {
+      overflow = true;
+      continue;
+    }
+    merged.set(identityKey(entry), {
+      pid: entry.pid,
+      processStart: entry.processStart,
+    });
+  }
+  const { overflow: _o, ...rest } = group;
+  return {
+    ...rest,
+    escaped: [...merged.values()],
+    ...(overflow ? { overflow } : {}),
+  };
+}
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const validString = (value) => typeof value === 'string' && value.length > 0;
@@ -229,6 +292,11 @@ export function createAgentSessions({
   signal,
   now,
   findChildren = async () => ({ state: 'unknown' }),
+  // Execution-group evidence. Unless all three are supplied a dead root can
+  // never be proven ended: the defaults prove and observe nothing.
+  proveGroup = async () => ({ state: 'unknown' }),
+  findEscaped = async () => ({ state: 'unknown' }),
+  observeGroup = () => 'unknown',
   observeCheckout = async () => null,
 } = {}) {
   if (
@@ -296,30 +364,15 @@ export function createAgentSessions({
       return { state: 'unknown' };
     }
   }
-  async function inspectChildren(record) {
-    let tree;
+  async function observedGroup(group) {
     try {
-      tree = await findChildren({
-        pid: record.pid,
-        processStart: record.processStart,
-      });
+      const observed = await observeGroup(group.id);
+      return observed === 'alive' || observed === 'absent'
+        ? observed
+        : 'unknown';
     } catch {
-      return { state: 'unknown' };
+      return 'unknown';
     }
-    if (tree?.state !== 'owned' || !Array.isArray(tree.children)) {
-      return { state: 'unknown' };
-    }
-    for (const child of tree.children) {
-      // biome-ignore lint/performance/noAwaitInLoops: The first alive or unknown descendant determines this ownership result.
-      const childObservation = await observe(child);
-      if (matches(child, childObservation)) {
-        return { state: 'alive' };
-      }
-      if (childObservation?.state !== 'absent') {
-        return { state: 'unknown' };
-      }
-    }
-    return { state: 'absent', tree };
   }
   async function inspectListedChildren(children) {
     for (const child of children) {
@@ -370,7 +423,13 @@ export function createAgentSessions({
       record.id === session.id ? session : record
     );
   }
-  function registerExistingSession(records, existing, launch, hasProcess) {
+  function registerExistingSession(
+    records,
+    existing,
+    launch,
+    hasProcess,
+    evidence
+  ) {
     if (conflictsWithLaunch(existing, launch)) {
       return failedSession(
         records,
@@ -402,6 +461,7 @@ export function createAgentSessions({
       pid: launch.pid,
       processStart: launch.processStart,
       state: 'running',
+      ...evidence,
       ...(launch.terminal && !existing.terminal
         ? { terminal: clone(launch.terminal) }
         : {}),
@@ -411,7 +471,7 @@ export function createAgentSessions({
       session,
     });
   }
-  function newSession(launch, hasProcess) {
+  function newSession(launch, hasProcess, evidence) {
     return {
       checkoutIdentity: clone(launch.checkoutIdentity),
       checkoutPath: launch.checkoutPath,
@@ -423,6 +483,7 @@ export function createAgentSessions({
       processStart: hasProcess ? launch.processStart : null,
       repo: launch.repo,
       state: hasProcess ? 'running' : 'starting',
+      ...(hasProcess ? evidence : {}),
       ...(launch.terminal ? { terminal: clone(launch.terminal) } : {}),
       tool: launch.tool,
       ...(launch.launchProofDigest
@@ -433,20 +494,145 @@ export function createAgentSessions({
         : {}),
     };
   }
+  // Whether a root already observed absent is also the end of everything it
+  // managed. Only the proved execution group and the off-group descendants
+  // observed while the root was live can say so; a snapshot of children or an
+  // attempted stop proves nothing by itself. A live group or escapee is 'alive'.
+  async function exitProof(record) {
+    const group = executionGroupOf(record);
+    if (!group || group.overflow || group.unverified) {
+      return 'unknown';
+    }
+    const members = await observedGroup(group);
+    if (members !== 'absent') {
+      return members;
+    }
+    const escaped = await inspectListedChildren(group.escaped);
+    return escaped === 'absent' ? 'proved' : escaped;
+  }
+  // The evidence stays as retained, but is no longer complete.
+  function unverifiedEvidence(record) {
+    const group = executionGroupOf(record);
+    return group
+      ? { ...record, executionGroup: { ...group, unverified: true } }
+      : record;
+  }
+  // A live process now holds the root's pid with a different, valid start
+  // identity: the original root is gone, which is not a lapse in observation.
+  const confirmedReplacement = (record, observation) =>
+    observation?.state === 'alive' &&
+    observation.processId === record.pid &&
+    validString(observation.processStartIdentity) &&
+    observation.processStartIdentity !== record.processStart;
+  // What the retained evidence is worth after the root was observed this way:
+  // proven absent or confirmed replaced leaves it as it was; anything else
+  // (unknown, malformed, merely not matching) may have hidden a live root.
+  const evidenceAfter = (record, observation) =>
+    observation?.state === 'absent' || confirmedReplacement(record, observation)
+      ? record
+      : unverifiedEvidence(record);
+  // Retained descendants positively observed absent no longer need a place.
+  // A live, unknown or reused identity stays: only absence is evidence.
+  async function withoutAbsent(group) {
+    const kept = [];
+    for (const entry of group.escaped) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each retained identity is observed in turn; the bound keeps this small.
+      const observed = await observe(entry);
+      if (observed?.state !== 'absent') {
+        kept.push(entry);
+      }
+    }
+    return kept.length === group.escaped.length
+      ? group
+      : { ...group, escaped: kept };
+  }
+  const endReasonOf = (record) =>
+    validTime(record.stopRequestedAt) ? 'ended-by-user' : 'exited';
+  // Group proof taken while the root identity is live (see proveProcessGroupOwnership).
+  async function provenGroup(pid, processStart) {
+    let proof;
+    try {
+      proof = await proveGroup({ groupId: pid, pid, processStart });
+    } catch {
+      return null;
+    }
+    return proof?.state === 'owned' && Array.isArray(proof.escaped)
+      ? withEscaped({ escaped: [], id: pid, provenAt: now() }, proof.escaped)
+      : null;
+  }
+  // Re-observes the off-group descendants of a live, owned root. A failed or
+  // incomplete scan keeps everything already retained and marks the evidence
+  // unverified, which only a later successful scan, made while the root
+  // identity is live, can clear.
+  async function refreshedGroup(record) {
+    const group = executionGroupOf(record);
+    if (!group) {
+      return record;
+    }
+    let scan;
+    try {
+      scan = await findEscaped({
+        groupId: group.id,
+        pid: record.pid,
+        processStart: record.processStart,
+      });
+    } catch {
+      scan = { state: 'unknown' };
+    }
+    if (scan?.state !== 'owned' || !Array.isArray(scan.escaped)) {
+      return unverifiedEvidence(record);
+    }
+    const { unverified: _stale, ...scanned } = withEscaped(
+      await withoutAbsent(group),
+      scan.escaped
+    );
+    return { ...record, executionGroup: scanned };
+  }
+  // A running record that never got a group proof tries again a few times.
+  async function lateGroupProof(record) {
+    const attempts = Number.isSafeInteger(record.executionGroupAttempts)
+      ? record.executionGroupAttempts
+      : 0;
+    if (
+      record.executionGroup !== undefined ||
+      attempts >= maxGroupProofAttempts
+    ) {
+      return record;
+    }
+    const proven = await provenGroup(record.pid, record.processStart);
+    return {
+      ...record,
+      executionGroupAttempts: attempts + 1,
+      ...(proven ? { executionGroup: proven } : {}),
+    };
+  }
+  // Observation only: a record whose ownership is unknown is still re-scanned
+  // while its exact root identity is live, so evidence can be restored, but
+  // ownership, binding and control are never restored by it.
+  function runningSession(record) {
+    const running = { ...record, state: 'running' };
+    if (executionGroupOf(running)) {
+      return refreshedGroup(running);
+    }
+    return record.ownership === 'owned' ? lateGroupProof(running) : running;
+  }
   async function reconciledSession(record) {
     const observation = await observe(record);
     if (observation?.state === 'absent') {
-      const children = await inspectChildren(record);
-      return children.state === 'absent'
-        ? ended(record, now, 'exited')
+      return (await exitProof(record)) === 'proved'
+        ? ended(record, now, endReasonOf(record))
         : unknown(record);
     }
     if (matches(record, observation)) {
+      // Running again: the same root identity is live, so the evidence is
+      // re-scanned and a successful scan restores it (see runningSession).
       return record.state === 'unknown'
-        ? verifiedRunning(record)
-        : { ...record, state: 'running' };
+        ? verifiedRunning(await refreshedGroup(record))
+        : runningSession(record);
     }
-    return unknown(record);
+    // A pid confirmed held by another process says the original is gone; a
+    // root that cannot be observed at all may still be running unobserved.
+    return unknown(evidenceAfter(record, observation));
   }
   function endPreflight(records, id, checkoutIdentity) {
     const index = records.findIndex((candidate) => candidate.id === id);
@@ -486,20 +672,18 @@ export function createAgentSessions({
     return { index, record };
   }
   async function endAbsentRoot(records, index, record) {
-    const children = await inspectChildren(record);
-    const session =
-      children.state === 'absent'
-        ? ended(record, now, 'exited')
-        : unknown(record);
-    const result =
-      children.state === 'absent'
-        ? { ok: true, session }
-        : {
-            code: 'SESSION_OWNERSHIP_UNKNOWN',
-            error: 'Descendant ownership is unresolved',
-            ok: false,
-            session,
-          };
+    const proved = (await exitProof(record)) === 'proved';
+    const session = proved
+      ? ended(record, now, endReasonOf(record))
+      : unknown(record);
+    const result = proved
+      ? { ok: true, session }
+      : {
+          code: 'SESSION_OWNERSHIP_UNKNOWN',
+          error: 'Descendant ownership is unresolved',
+          ok: false,
+          session,
+        };
     return updatedSession(records, index, session, result);
   }
   async function ownedChildren(record) {
@@ -516,30 +700,57 @@ export function createAgentSessions({
       ? tree.children
       : null;
   }
+  // Reports how far stopping got and how many signals were actually delivered.
   async function stopChildren(children) {
+    let signalled = 0;
     for (const child of [...children].reverse()) {
       // biome-ignore lint/performance/noAwaitInLoops: Verify and stop descendants in reverse tree order before signalling their parent.
       const childObservation = await observe(child);
       if (!matches(child, childObservation)) {
-        return 'ownership';
+        return { outcome: 'ownership', signalled };
       }
       try {
         await signal(child.pid, 'SIGTERM');
       } catch {
-        return 'unknown';
+        return { outcome: 'unknown', signalled };
       }
+      signalled += 1;
     }
-    return 'stopped';
+    return { outcome: 'stopped', signalled };
   }
-  async function endAfterSignal(records, index, record, children) {
-    const after = await observe(record);
-    const childrenAfter = await inspectListedChildren(children);
-    if (after?.state === 'absent' && childrenAfter === 'absent') {
-      const session = ended(record, now, 'ended-by-user');
-      return updatedSession(records, index, session, { ok: true, session });
+  // The descendants a successful tree scan found outside the proved group join
+  // what is already retained. The scan was complete, so it also clears an
+  // earlier unverified mark.
+  async function withObservedTree(record, children) {
+    const group = executionGroupOf(record);
+    if (!group) {
+      return record;
     }
-    if (matches(record, after) && childrenAfter === 'absent') {
-      return resultWithRecords(records, {
+    const { unverified: _stale, ...observed } = withEscaped(
+      await withoutAbsent(group),
+      children.filter((child) => child.groupId !== group.id)
+    );
+    return { ...record, executionGroup: observed };
+  }
+  // Attribution only. Asking for a stop proves nothing about what has stopped.
+  const withStopRequest = (record) =>
+    validTime(record.stopRequestedAt)
+      ? record
+      : { ...record, stopRequestedAt: now() };
+  async function endAfterSignal(records, index, record) {
+    const after = await observe(record);
+    if (after?.state === 'absent') {
+      if ((await exitProof(record)) === 'proved') {
+        const session = ended(record, now, endReasonOf(record));
+        return updatedSession(records, index, session, { ok: true, session });
+      }
+    } else if (matches(record, after)) {
+      // Still running: the stop is pending. The complete scan taken just
+      // before the signal stays as the evidence; the root is dying, so it is
+      // not scanned again here (a scan racing its exit could only fail and
+      // forfeit proof for good). The ordinary monitor keeps observing while
+      // the root lives.
+      return updatedSession(records, index, record, {
         ok: true,
         pending: true,
         session: record,
@@ -548,7 +759,7 @@ export function createAgentSessions({
     return unknownSession(
       records,
       index,
-      record,
+      evidenceAfter(record, after),
       'SESSION_END_UNKNOWN',
       'Session stop outcome is unknown'
     );
@@ -558,56 +769,58 @@ export function createAgentSessions({
     if (root?.state === 'absent') {
       return endAbsentRoot(records, index, record);
     }
-    if (root?.state === 'alive' && !matches(record, root)) {
-      return unknownSession(
-        records,
-        index,
-        record,
-        'SESSION_PROCESS_IDENTITY_CHANGED',
-        'Process identity changed'
-      );
+    if (matches(record, root)) {
+      return null;
     }
-    return matches(record, root)
-      ? null
-      : unknownSession(
-          records,
-          index,
-          record,
-          'SESSION_OWNERSHIP_UNKNOWN',
-          'Session ownership is unresolved'
-        );
+    const replaced = root?.state === 'alive';
+    return unknownSession(
+      records,
+      index,
+      evidenceAfter(record, root),
+      replaced
+        ? 'SESSION_PROCESS_IDENTITY_CHANGED'
+        : 'SESSION_OWNERSHIP_UNKNOWN',
+      replaced ? 'Process identity changed' : 'Session ownership is unresolved'
+    );
   }
+  // The refusals that persist what was learned: newly retained descendants and
+  // an attributed stop are kept even when the stop itself goes no further.
+  const unresolvedChildren = (records, index, record) =>
+    updatedSession(records, index, record, {
+      code: 'SESSION_OWNERSHIP_UNKNOWN',
+      error: 'Child ownership is unresolved',
+      ok: false,
+    });
   async function stopOwnedSession(records, index, record) {
     const children = await ownedChildren(record);
     if (!children) {
-      return failedSession(
-        records,
-        'SESSION_OWNERSHIP_UNKNOWN',
-        'Child ownership is unresolved'
-      );
+      // An incomplete scan of a root that may be live: what is retained stays,
+      // but it can no longer vouch for what the root started since.
+      return unresolvedChildren(records, index, unverifiedEvidence(record));
     }
-    const childStop = await stopChildren(children);
-    if (childStop === 'ownership') {
-      return failedSession(
-        records,
-        'SESSION_OWNERSHIP_UNKNOWN',
-        'Child ownership is unresolved'
-      );
+    let current = await withObservedTree(record, children);
+    const stopped = await stopChildren(children);
+    if (stopped.signalled > 0) {
+      current = withStopRequest(current);
     }
-    if (childStop === 'unknown') {
+    if (stopped.outcome === 'ownership') {
+      return unresolvedChildren(records, index, current);
+    }
+    if (stopped.outcome === 'unknown') {
       return unknownSession(
         records,
         index,
-        record,
+        current,
         'SESSION_END_UNKNOWN',
         'Child stop outcome is unknown'
       );
     }
-    if (!matches(record, await observe(record))) {
+    const rootNow = await observe(record);
+    if (!matches(record, rootNow)) {
       return unknownSession(
         records,
         index,
-        record,
+        evidenceAfter(current, rootNow),
         'SESSION_OWNERSHIP_UNKNOWN',
         'Session ownership is unresolved'
       );
@@ -618,12 +831,12 @@ export function createAgentSessions({
       return unknownSession(
         records,
         index,
-        record,
+        current,
         'SESSION_END_UNKNOWN',
         'Session stop outcome is unknown'
       );
     }
-    return endAfterSignal(records, index, record, children);
+    return endAfterSignal(records, index, withStopRequest(current));
   }
   function get(id) {
     return validString(id)
@@ -632,6 +845,17 @@ export function createAgentSessions({
   }
   function list() {
     return storedRecords();
+  }
+  // The group is proven while the registered identity is live, before any lock is held.
+  async function registrationEvidence(launch, hasProcess) {
+    if (!hasProcess) {
+      return {};
+    }
+    const proven = await provenGroup(launch.pid, launch.processStart);
+    return {
+      executionGroupAttempts: 1,
+      ...(proven ? { executionGroup: proven } : {}),
+    };
   }
   async function register(launch) {
     if (
@@ -685,12 +909,19 @@ export function createAgentSessions({
         };
       }
     }
+    const evidence = await registrationEvidence(launch, hasProcess);
     return replace((current) => {
       const existing = current.find((record) => record.id === launch.id);
       if (existing) {
-        return registerExistingSession(current, existing, launch, hasProcess);
+        return registerExistingSession(
+          current,
+          existing,
+          launch,
+          hasProcess,
+          evidence
+        );
       }
-      const session = newSession(launch, hasProcess);
+      const session = newSession(launch, hasProcess, evidence);
       return { records: [...current, session], result: { ok: true, session } };
     }).then((outcome) => outcome.result);
   }
@@ -1156,6 +1387,9 @@ export function publicSession(session) {
     bindingGeneration: _generation,
     bindingInvalid: _invalid,
     bindingAnnounced: _announced,
+    executionGroup: _group,
+    executionGroupAttempts: _attempts,
+    stopRequestedAt: _stop,
     ...visible
   } = session;
   return { ...visible, nativeConversation: nativeConversationView(session) };

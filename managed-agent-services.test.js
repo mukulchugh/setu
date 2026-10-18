@@ -41,7 +41,11 @@ function fixture({
   withTargets,
   nativeAvailability,
   findChildren,
+  findEscaped,
+  lifecycle,
+  observeGroup,
   observeProcess,
+  proveGroup,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'setu-managed-agent-'));
   roots.push(root);
@@ -108,8 +112,11 @@ function fixture({
     clearInterval() {
       /* fixture timer cleanup */
     },
+    ...(lifecycle ? { lifecycle } : {}),
     findChildren:
       findChildren ?? (async () => ({ children: [], state: 'owned' })),
+    // Honest fake world: the session leads its own group for as long as it is active.
+    findEscaped: findEscaped ?? (async () => ({ escaped: [], state: 'owned' })),
     headless: {
       clearTimeout() {
         /* fixture timer cleanup */
@@ -173,6 +180,9 @@ function fixture({
       }
       return { ok: true };
     },
+    observeGroup:
+      observeGroup ??
+      ((groupId) => (groupId === 222 && active ? 'alive' : 'absent')),
     observeProcess:
       observeProcess ??
       ((pid) => {
@@ -195,6 +205,10 @@ function fixture({
     operationEvents:
       events ?? createOperationEvents({ now: () => 1, state: serviceState }),
     privateFiles,
+    proveGroup:
+      proveGroup ??
+      (async ({ pid }) =>
+        pid === 222 ? { escaped: [], state: 'owned' } : { state: 'unknown' }),
     registrationAttempts: 1,
     resolveTarget: async ({ repo, name }) =>
       repo === target.repo && name === target.name ? { ...target } : null,
@@ -869,10 +883,8 @@ test('a failed lease-forget keeps recovery evidence without masking a known file
 
 test('unknown descendants retain the lease and the original launch source survives a later lifecycle completion', async () => {
   const f = fixture({
-    findChildren: async () => ({
-      children: [{ pid: 444, processStart: start }],
-      state: 'owned',
-    }),
+    // The root is gone and its group is empty, but a retained off-group
+    // descendant can no longer be observed.
     observeProcess: async (pid) =>
       pid === 222 ? { state: 'absent' } : { state: 'unknown' },
   });
@@ -896,6 +908,11 @@ test('unknown descendants retain the lease and the original launch source surviv
       'session-1': {
         checkoutIdentity: f.identity,
         checkoutPath: f.target.wtDir,
+        executionGroup: {
+          escaped: [{ pid: 444, processStart: start }],
+          id: 222,
+          provenAt: 1,
+        },
         id: 'session-1',
         launchedAt: 1,
         name: 'topic',
@@ -936,7 +953,7 @@ test('unknown descendants retain the lease and the original launch source surviv
 });
 
 test('an unknown session later records proven completion with its original source', async () => {
-  let childrenUnknown = false,
+  let groupUnknown = false,
     unavailable = false,
     recorder;
   const f = fixture({
@@ -945,21 +962,21 @@ test('an unknown session later records proven completion with its original sourc
         // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes this captured flag between reconciliations.
         unavailable ? { ok: false } : recorder.record(event),
     },
-    findChildren: async () =>
+    observeGroup: () =>
       // biome-ignore lint/suspicious/noUnnecessaryConditions: The test changes this captured flag between reconciliations.
-      childrenUnknown ? { state: 'unknown' } : { children: [], state: 'owned' },
+      groupUnknown ? 'unknown' : 'absent',
   });
   recorder = createOperationEvents({ now: () => 1, state: f.state });
   await f.service.open({ name: 'topic', repo: 'repo', source: 'cli' });
   f.setActive(false);
-  childrenUnknown = true;
+  groupUnknown = true;
   unavailable = true;
   await f.service.reconcileSessions();
   expect(f.state.read('agentSessions').sessions['session-1'].state).toBe(
     'unknown'
   );
   expect(f.releases).toEqual([]);
-  childrenUnknown = false;
+  groupUnknown = false;
   unavailable = false;
   await f.service.reconcileSessions();
   expect(f.state.read('operationEvents').events).toEqual([
@@ -1073,4 +1090,152 @@ test('target replacement inside the shared lock refuses focus, handoff, end and 
     })
   ).resolves.toMatchObject({ code: 'TARGET_CHANGED', ok: false });
   expect(f.scripts).toHaveLength(0);
+});
+
+test('an unknown session completed by group proof is announced at a higher generation before its exact lease is released', async () => {
+  const order = [];
+  let groupState = 'alive';
+  const released = [];
+  const f = fixture({
+    admission: {
+      release: (given) => {
+        order.push(`release:${given.operationId}`);
+        released.push(given);
+        return Promise.resolve({ ok: true });
+      },
+    },
+    lifecycle: {
+      invalidate: (call) => {
+        order.push(`invalidate:${call.generation}:${call.reason}`);
+        return Promise.resolve({ ok: true });
+      },
+      publish: (call) => {
+        order.push(`publish:${call.generation}`);
+        return Promise.resolve({ ok: true });
+      },
+    },
+    observeGroup: () => groupState,
+  });
+  await f.service.open({
+    name: 'topic',
+    repo: 'repo',
+    source: 'cli',
+    tool: 'claude',
+  });
+  await f.service.receiveHook({
+    launchToken: 'token_1234567890123456',
+    payload: {
+      cwd: f.target.wtDir,
+      hook_event_name: 'SessionStart',
+      session_id: 'native-1',
+    },
+    provider: 'claude-code',
+  });
+  const lease = f.leases.get('session-1');
+  expect(lease).toBeDefined();
+
+  // The root disappears while a group member lives: unknown, announced, lease kept.
+  f.setActive(false);
+  await f.service.reconcileSessions();
+  expect(f.state.read('agentSessions').sessions['session-1']).toMatchObject({
+    ownership: 'unknown',
+    state: 'unknown',
+  });
+  expect(released).toEqual([]);
+  const unknownGeneration =
+    f.state.read('agentSessions').sessions['session-1'].bindingGeneration;
+  expect(order).toContain(`invalidate:${unknownGeneration}:ownership-unknown`);
+
+  // A repeated observation is not a new decision and releases nothing.
+  await f.service.reconcileSessions();
+  expect(
+    f.state.read('agentSessions').sessions['session-1'].bindingGeneration
+  ).toBe(unknownGeneration);
+  expect(released).toEqual([]);
+
+  // The group empties: ended at a higher generation, announced, then the exact lease is released once.
+  groupState = 'absent';
+  order.push('group-empty');
+  const marker = order.length;
+  await f.service.reconcileSessions();
+  const ended = f.state.read('agentSessions').sessions['session-1'];
+  expect(ended).toMatchObject({ endReason: 'exited', state: 'ended' });
+  expect(ended.bindingGeneration).toBe(unknownGeneration + 1);
+  expect(order.slice(marker)).toEqual([
+    `invalidate:${ended.bindingGeneration}:ended`,
+    'release:session-1',
+  ]);
+  expect(released).toEqual([lease]);
+  expect(f.state.read('operationEvents').events).toEqual([
+    expect.objectContaining({
+      id: 'session-session-1',
+      source: 'cli',
+      state: 'completed',
+    }),
+  ]);
+  await f.service.reconcileSessions();
+  expect(released).toEqual([lease]);
+
+  // Nothing private leaves the service.
+  const listed = await f.service.listSessions({ name: 'topic', repo: 'repo' });
+  const text = JSON.stringify(listed);
+  for (const key of [
+    'executionGroup',
+    'stopRequestedAt',
+    'executionGroupAttempts',
+  ]) {
+    expect(text).not.toContain(key);
+  }
+});
+
+test('a pending end releases nothing; the reconcile that proves it releases the exact lease once with the original source', async () => {
+  let rootAlive = true;
+  let groupState = 'alive';
+  const f = fixture({
+    observeGroup: () => groupState,
+    observeProcess: (pid) =>
+      Promise.resolve(
+        pid === 222 && rootAlive
+          ? { processId: 222, processStartIdentity: start, state: 'alive' }
+          : { state: 'absent' }
+      ),
+  });
+  await f.service.open({ name: 'topic', repo: 'repo', source: 'cli' });
+  // The stop is delivered but the process outlives the immediate check.
+  const pending = await f.service.endSession({
+    checkoutIdentity: f.identity,
+    name: 'topic',
+    repo: 'repo',
+    sessionId: 'session-1',
+    source: 'portal',
+  });
+  expect(pending).toMatchObject({
+    ok: true,
+    pending: true,
+    session: { state: 'running' },
+  });
+  expect(f.releases).toEqual([]);
+  expect(
+    f.state.read('agentSessions').sessions['session-1'].stopRequestedAt
+  ).toBeDefined();
+
+  // The root exits while the group is still alive: unknown, lease retained.
+  rootAlive = false;
+  await f.service.reconcileSessions();
+  expect(f.state.read('agentSessions').sessions['session-1'].state).toBe(
+    'unknown'
+  );
+  expect(f.releases).toEqual([]);
+
+  groupState = 'absent';
+  await f.service.reconcileSessions();
+  expect(f.state.read('agentSessions').sessions['session-1']).toMatchObject({
+    endReason: 'ended-by-user',
+    state: 'ended',
+  });
+  expect(f.releases).toEqual(['session-1']);
+  expect(f.state.read('operationEvents').events.at(-1)).toMatchObject({
+    source: 'cli',
+    state: 'completed',
+  });
 });

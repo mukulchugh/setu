@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
-import { observeProcessIdentity } from './process-observation.js';
+import {
+  observeProcessGroup,
+  observeProcessIdentity,
+} from './process-observation.js';
 
 const processStartPattern = /\d{2}:\d{2}:\d{2} \d{4}$/;
 
@@ -47,4 +50,48 @@ test('the native observation adapter reads only the current isolated test proces
   const result = await observeProcessIdentity(process.pid);
   expect(result).toMatchObject({ processId: process.pid, state: 'alive' });
   expect(result.processStartIdentity).toMatch(processStartPattern);
+});
+
+test('group observation reads only the presence of a group and never terminates it', () => {
+  const calls = [];
+  const refuse = (code) => () => {
+    throw Object.assign(new Error('fixture signal refused'), { code });
+  };
+  expect(
+    observeProcessGroup(321, {
+      signal: (pid, value) => calls.push([pid, value]),
+    })
+  ).toBe('alive');
+  expect(calls).toEqual([[-321, 0]]);
+  expect(observeProcessGroup(321, { signal: refuse('ESRCH') })).toBe('absent');
+  expect(observeProcessGroup(321, { signal: refuse('EPERM') })).toBe('unknown');
+  expect(observeProcessGroup(321, { signal: refuse('EINVAL') })).toBe(
+    'unknown'
+  );
+  // A collaborator that throws something that is not an Error is still just unknown.
+  for (const thrown of [null, undefined, 'ESRCH', 0, {}]) {
+    expect(
+      observeProcessGroup(321, {
+        signal: () => {
+          throw thrown;
+        },
+      })
+    ).toBe('unknown');
+  }
+  for (const invalid of [0, -1, 1.5, Number.NaN, '5', null, undefined]) {
+    expect(
+      observeProcessGroup(invalid, {
+        signal: () => {
+          throw new Error('an invalid group must not be probed');
+        },
+      })
+    ).toBe('unknown');
+  }
+});
+
+test('the native group observer sees the presence of the test process group', () => {
+  expect(['alive', 'absent', 'unknown']).toContain(
+    observeProcessGroup(process.pid)
+  );
+  expect(observeProcessGroup(2 ** 22 + 12_345)).not.toBe('alive');
 });

@@ -262,6 +262,8 @@ export async function turnFixture({
         /* no monitor in this fixture */
       },
       findChildren: () => Promise.resolve({ children: [], state: 'owned' }),
+      // Each fake process leads its own group for as long as it is alive.
+      findEscaped: () => Promise.resolve({ escaped: [], state: 'owned' }),
       id: () => nextLaunch.id,
       ingressUrl,
       launchNative: (command) => {
@@ -280,6 +282,7 @@ export async function turnFixture({
       ...(recordHookActivity ? { recordHookActivity } : {}),
       ...(lifecycleHeartbeatMs === undefined ? {} : { lifecycleHeartbeatMs }),
       now: () => clock,
+      observeGroup: (groupId) => (alive.has(groupId) ? 'alive' : 'absent'),
       observeProcess: (pid) =>
         Promise.resolve(
           alive.has(pid)
@@ -296,6 +299,12 @@ export async function turnFixture({
         now: () => 1,
         state: workspaceState,
       }),
+      proveGroup: ({ pid }) =>
+        Promise.resolve(
+          alive.has(pid)
+            ? { escaped: [], state: 'owned' }
+            : { state: 'unknown' }
+        ),
       registrationAttempts: 1,
       resolveTarget,
       runAppleScript: (script) => {
