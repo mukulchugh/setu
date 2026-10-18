@@ -2033,6 +2033,12 @@ async function apiResult(call) {
         console.log(JSON.stringify(result));
       } else {
         console.error(JSON.stringify({ ...result, error }, null, 2));
+        const held = result?.recovery?.writer;
+        if (held) {
+          console.error(
+            `The span's writer claim is kept for a retry. To let it go: setu release ${shellQuote(held.checkoutPath)} --session ${shellQuote(held.session)}`
+          );
+        }
       }
       process.exitCode = 1;
       return null;
@@ -2304,6 +2310,65 @@ function spansPlanningCommand(action, usage) {
   return null;
 }
 
+// Live Spans execution. Every subcommand calls the running portal; none of them
+// starts a process locally, and the portal refuses them unless execution is on.
+const spansExecutionRoute = (name) => `/api/spans/execution/${name}`;
+
+// Subcommands with fixed positional arguments: [method, route, body or query].
+const SPANS_EXECUTION_POSITIONAL = {
+  cancel: [4, 'post', (run, attempt) => ({ attemptId: attempt, runId: run })],
+  capabilities: [3, 'get', (profile) => ({ profile })],
+  complete: [4, 'post', (run, action) => ({ actionId: action, runId: run })],
+  probe: [3, 'post', (profile) => ({ profile })],
+  reconcile: [2, 'post', () => ({})],
+  status: [3, 'get', (run) => ({ runId: run })],
+};
+
+function spansExecutionCommand(usage) {
+  const [, action, first, second] = args;
+  if (Object.hasOwn(SPANS_EXECUTION_POSITIONAL, action)) {
+    const [count, method, build] = SPANS_EXECUTION_POSITIONAL[action];
+    if (args.length === count) {
+      validateFlags([], usage);
+      return apiResult(() =>
+        cliApi[method](spansExecutionRoute(action), build(first, second))
+      );
+    }
+  }
+  if ((action === 'accept' || action === 'resolve') && args.length === 4) {
+    validateFlags(['confirmation'], usage);
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post(spansExecutionRoute(action), {
+        actionId: second,
+        runId: first,
+        ...(confirmation === undefined ? {} : { confirmation }),
+      })
+    );
+  }
+  if (action === 'report' && args.length === 2) {
+    validateFlags(['input'], usage);
+    return apiResult(() =>
+      cliApi.post(spansExecutionRoute('report'), spansPlanningInput())
+    );
+  }
+  if ((action === 'review' || action === 'dispatch') && args.length === 2) {
+    validateFlags(
+      action === 'dispatch' ? ['confirmation', 'input'] : ['input'],
+      usage
+    );
+    const input = spansPlanningInput();
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post(
+        spansExecutionRoute(action),
+        confirmation === undefined ? input : { ...input, confirmation }
+      )
+    );
+  }
+  return die(usage);
+}
+
 function spansEventQuery(runId) {
   const since = optionalFlag('since');
   const afterSequence = since === undefined ? 0 : Number(since);
@@ -2319,10 +2384,11 @@ function spansEventQuery(runId) {
 
 async function cmdSpans() {
   const usage =
-    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path>] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
+    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path> | exec capabilities <profile> | exec status <run> | exec probe <profile> | exec review --input <json> | exec dispatch --input <json> [--confirmation <token>] | exec cancel <run> <attempt> | exec complete <run> <action> | exec accept <run> <action> [--confirmation <token>] | exec report --input <json> | exec reconcile | exec resolve <run> <action> [--confirmation <token>]] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
   validateCommand({
     allowedFlags: [
       'after',
+      'confirmation',
       'generation',
       'input',
       'limit',
@@ -2334,12 +2400,15 @@ async function cmdSpans() {
       'since',
       'through',
     ],
-    argCounts: [0, 1, 2, 3],
+    argCounts: [0, 1, 2, 3, 4],
     usage,
   });
   const [action = 'list', runId, artifactId] = args;
   let path;
   let query;
+  if (action === 'exec') {
+    return await spansExecutionCommand(usage);
+  }
   const planning = spansPlanningCommand(action, usage);
   if (planning) {
     return await planning;
@@ -3625,6 +3694,16 @@ function cmdHelp() {
     setu spans search <query> [--run <run> --since <sequence> --through <sequence> --generation <N> --limit <N>] [--json]
                                       A page after --since needs the --generation it returned; a
                                       missing index is unavailable, never zero results
+    setu spans exec capabilities <profile> | status <run> | probe <profile> [--json]
+    setu spans exec review --input '<review JSON>' [--json]
+    setu spans exec dispatch --input '<review JSON>' [--confirmation <token>] [--json]
+    setu spans exec cancel <run> <attempt> [--json]
+    setu spans exec complete <run> <action> [--json]
+    setu spans exec accept <run> <action> [--confirmation <token>] [--json]
+    setu spans exec report --input '<report JSON>' [--json]
+    setu spans exec reconcile [--json]
+    setu spans exec resolve <run> <action> [--confirmation <token>] [--json]
+                                      Releases an authorized dispatch that never reached intent
     setu spans search-status [--json]
     setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
                                       Offline: indexes an existing archive in bounded pages; rerun to resume

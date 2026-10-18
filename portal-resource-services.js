@@ -13,6 +13,7 @@ import { createOperationEvents } from './operation-events.js';
 import { createPortalWiring } from './portal-wiring.js';
 import { createResourceAdmission } from './resource-admission.js';
 import { createSharedCacheCatalog } from './shared-cache-catalog.js';
+import { dispatchSpansExecutionRoute } from './spans-execution-routes.js';
 import { createWorkspaceStorage } from './workspace-storage.js';
 import { createWorktreeCache } from './worktree-cache.js';
 
@@ -773,6 +774,15 @@ export async function dispatchPortalResourceRoute(services, request) {
   );
   if (planning) {
     return planning;
+  }
+  const execution = await dispatchSpansExecutionRoute(
+    services,
+    request,
+    url,
+    response
+  );
+  if (execution) {
+    return execution;
   }
   const getRoutes = {
     '/api/agent-sessions': { action: 'agentSessions', optional: true },

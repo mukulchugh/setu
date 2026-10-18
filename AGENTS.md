@@ -373,6 +373,159 @@ would leak forever with nothing left pointing at it.
 - Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>,pr-review}.log`.
 - PR review (`pr-review.js`): Tier 1 is the existing "Local diff" section (`computeDiff`/`/api/diff`) — a worktree-branch-vs-base diff, not the actual GitHub PR diff, labeled accordingly. Tier 2 shells out to the installed `pr-walkthrough`/`pr-brief` Claude Code plugin headlessly (`claude -p`, `--permission-mode acceptEdits`, `--tools` dropping `Edit`, `--disallowedTools` denying GH/git write-shaped Bash commands as the primary guard — verified empirically, not assumed, see the plugin-marketplace plan). Reads `~/.local/share/pr-walkthrough/{reviews,briefs}/<owner>/<repo>/pr-<N>/latest.json` + that snapshot's `manifest.json` for status/artifacts, never the multi-MB `guide.json`/`brief.json` directly.
 
+## Spans execution (live, opt-in)
+
+Spans can dispatch one reviewed span to one real local worker (Claude Code,
+headless) and finish it through accepted completion. It is **off by default**:
+every `/api/spans/execution/*` route answers 503 `SPANS_EXECUTION_DISABLED` and no
+archive is opened until `~/.setu.json` contains
+`"spansExecution": {"enabled": true, "runBudgetUsd": 10}` (`runBudgetUsd` is
+optional and bounds what a *metered* profile may reserve; the built-in subscription
+profile has no dollar amount, so it does not apply to it). A `spansExecution` block
+that is present but malformed also answers 503, with `SPANS_EXECUTION_CONFIG_INVALID`
+on every execution route. The setting is read once when the portal starts, so
+changing `~/.setu.json` takes effect after a portal restart (`setu portal stop`, then
+`setu portal`). Reads, planning and history never reach execution.
+
+The flow, over HTTP or `setu spans exec ...`:
+
+1. `probe <profile>` starts one fresh, short provider session (one reply, told to use
+   no tool) with the profile's exact mode and toolset, and records what it showed (model,
+   permission mode, tools, effort if the session reported it). The built-in subscription
+   profile passes no dollar budget. This is the only source of capability. Caller JSON,
+   a peer or a model cannot create it. Every probe uses the subscription; what it
+   reported is added to a running total that `capabilities` returns (`probeSpend`) as a
+   token count and a provider estimate, never as a charge. Evidence goes stale after six
+   hours; a re-probe changes every confirmation.
+2. `review` is read-only. It returns the exact binding (plan, generation, profile
+   digest, checkout snapshot including a content digest of the tree the work will start
+   from, instructions, the billing mode, permission mode and exact toolset, the model and
+   the requested effort, wall clock up to one hour, and the optional acceptance
+   conditions `criteria` and `requireChange`) and a confirmation token. A subscription
+   review has no `budgetUsd` and says so (`cost.monetaryCap: null`, `enforcement:
+   'none'`); a `budgetUsd` on it is `SPANS_EXEC_BUDGET_NOT_APPLICABLE`. A metered profile
+   still requires `budgetUsd` (up to 2 USD).
+   `dispatch` without the token returns the review.
+3. `dispatch` with the exact token, after the user confirmed the review, claims the
+   writer slot, takes shared admission, reserves usage, saves the durable intent and
+   then starts one process. Exactly one layer takes each resource. Only one dispatch or
+   resolve of a span runs at a time in a service: the other is refused
+   (`SPANS_EXEC_SPAN_BUSY` for a dispatch, `SPANS_EXEC_NOT_RESOLVABLE` for a resolve)
+   rather than queued, so a resolve can never release what a dispatch has just taken, nor
+   the reverse. A changed
+   instruction, budget, plan, generation, acceptance condition or checkout (including any
+   edit to a file) is `SPANS_EXEC_REVIEW_CHANGED`; a tree that changes after the match but
+   before the launch starts nothing. A dispatch the coordinator refused before any intent
+   or reservation withdraws its authorization, so a newly reviewed dispatch of the same
+   span is not blocked by it. The action, attempt, reservation and admission identities are
+   derived from an ordinal; an ordinal whose ledger reservation was released is never used
+   again, so the next dispatch of the span gets fresh identities and a live reservation,
+   and the released row stays as history. The dispatch contract keeps a span's writer claim
+   after a plain refusal so a retry can reuse it; the refusal then carries
+   `recovery.writer = {checkoutPath, session}` (the CLI prints the exact `setu release`
+   command) and nothing is released for you.
+4. The supervisor spools redacted, bounded output and publishes one artifact. `cancel`
+   delivers a stop to the exact owned attempt; delivery is not an exit. A cancelled
+   attempt is never completion, whatever it printed or however it exited. The wall clock
+   holds an overdue attempt as unknown and stops it.
+5. When the exit is durable, completion is verified and the outcome is recorded, and
+   usage and admission settle. `complete` repeats this by name. The record keeps three
+   things apart: what the provider **reported** (its own result line and cost), what Setu
+   **verified** (clean exit, complete capture, no cancel, the tree before and after, the
+   `requireChange` condition), and what is **accepted** (only an owner's `accept`). Setu
+   runs no test or check of its own, so `independentValidation` is always `false` and
+   acceptance rests on the owner's judgement of the shown evidence. A process exit, a
+   model saying it is done, or a `report` is never acceptance. A run that changes nothing
+   is a legitimate completion unless the reviewed dispatch set `requireChange`, which
+   compares file content (an empty commit moves HEAD but is not a change).
+6. `accept` without a token returns what would be accepted: the tree and HEAD before and
+   after, the changed paths (relative to the reviewed HEAD, so anything already dirty
+   appears too), the criteria the owner set, the captured artifacts, and the reported and
+   verified fields. With the exact token it re-checks that the tree is byte-for-byte the
+   completed one and that the stored completion record still matches its own digest,
+   accepts the span, makes dependents ready and releases the writer claim.
+
+Profile and billing: the built-in profile `claude-code-sonnet` runs on the owner's
+Claude subscription. It sets no dollar budget and passes no `--max-budget-usd`, it
+claims no cap (`hardCostCap` is not required and nothing says `enforced`), and the
+ledger reserves no amount for it (no limits, `hardCap: false`; the run's ledger totals
+count it only in `unmeteredCount`). What bounds a run is the reviewed wall clock,
+`cancel`, one worker and shared admission. Permission mode is `auto`, the mode the
+owner's own sessions use, never `bypassPermissions`; the toolset is exactly
+`Bash, Edit, Glob, Grep, Read, Write` (no sub-agents, no MCP servers). Mode and toolset
+are part of the reviewed binding and of the probe, and after the run the worker's own
+init event must show the same model, permission mode and tools (`verified.session`),
+or the outcome is `failed` (for a profile with a toolset; a profile without one has
+nothing to compare). Every session starts with `--restricted --setting-sources ""`, so
+the user's, project's and local settings, hooks and memory files are not loaded (named
+tools still work; organization-managed settings can still apply). That isolation is part
+of the reviewed mode (`isolation`) and of the probe, and it is built in one place,
+`providerArguments`. A profile with a `billing` other than `subscription` is metered and
+keeps the strict path: a required `budgetUsd`, a hard cost cap, and ledger limits. A
+Claude Code budget stop is a client-side estimate that stops after the response that
+crosses the budget, so no probe sample (under, at or over the cap) is ever `enforced`:
+a metered Claude profile always stays blocked on `hardCostCap`. The generic capability
+and ledger foundation are unchanged and still enforce caps for any provider that proves
+one. The ledger's rule: limits are optional per policy, and a
+policy with no limits and no hard cap measures no money, so a reservation needs no
+amount; any limit or hard cap keeps every earlier rule.
+
+Usage on a subscription is only ever an estimate. The result's token counts and its
+`total_cost_usd` are the provider's own figures (checked only against its per-model
+figures; a mismatch is shown as such). They appear as `reported.usage` with
+`billed: 'unknown'` and `basis: 'provider-reported estimate'`, never as a recorded
+charge, and Setu does not know what, if anything, was billed.
+
+Effort: the init event of a live session did not report an effort level (it reported
+only `per_turn_effort_active: true`), and the provider documents that organization
+settings can clamp `--effort`. The requested flag is shown as `requested`, never as
+`observed`. The built-in profile says `effortPolicy: 'requested-unverified'`, an
+explicit per-profile choice that lets the launch proceed when the session reported no
+effort at all; the review and `launch.unverified` then read `requested, not verified`.
+An effort the session did report that differs from the request (or that cannot be read)
+still blocks, every profile without that policy still needs the effort observed, and the
+policy excuses nothing else. This is not an effort guarantee.
+
+Held work: an attempt whose launch or exit is unknown (a kill mid-launch, mid-run, an
+unprovable process identity, a missed deadline, a capture limit) is held, its action is
+`unknown`, and its writer claim, admission lease and usage reservation stay. `reconcile`
+runs at portal start (and on request), holds such work, settles only what has a durable
+terminal receipt, and never launches or signals anything. Nothing relaunches an unknown
+attempt. **No operation resolves an unknown attempt yet**; that needs its own specified
+owner action. The one exception is a dispatch that was authorized but killed before its
+intent became durable: no worker can have started, and `resolve <run> <action>` shows
+the admission lease, usage reservation and writer claim it would release, and releases
+them only with the exact token (the writer claim stays if the span already has other
+actions). A failed or unknown outcome keeps the span's writer claim; release it
+deliberately with `setu release <worktree> --session <session from status>`.
+
+One supervisor owns an archive: the owner is the highest-numbered `execution.owner.<n>`
+file, and a number is never reused. The newest file is never deleted: a release writes a
+`released` tombstone under the next number. A contender takes over a dead or released
+owner by creating the next number with an exclusive link, so an observer holding an old
+reading can only try a number that already exists. A winner must still be the highest
+file right after creating its own (a lower number can be free again once pruned),
+otherwise it removes only its own file and does not own. Only numbers below a winner's
+own are pruned, so a live successor is never deleted, and an owner that cannot be
+identified is never overtaken.
+
+Trust boundary: the portal API is the local user's cooperative API, as described for
+claims above and for the loopback/Host guard. A confirmation token is a digest the API
+hands back, not proof that a person reviewed anything, and nothing here defends against a
+program running as the same user that calls the API itself.
+
+Not verified: the real `claude` binary was driven once by the parent through the public
+service (one probe, one edit, accepted completion); the default shipped argument list,
+the HTTP and CLI path and Ghostty have not been run live. The metered probe shape is
+recorded and replayed in tests (`spans-execution.recorded-probe.jsonl`, rebuilt from a
+live probe with paths and ids removed). The init and result of a real subscription task
+session are replayed from `spans-execution.recorded-live-subscription-task.jsonl`
+(sanitized; init and result shape only). Everything else is exercised against a local
+process fixture. Work requests approved under Setu Links (ticket 12 /
+#19) are not wired: the seam is the authorization step, where an approved request
+would have to supply the same exact binding (target, input, plan, generation) that
+`review` computes and have it re-checked at dispatch.
+
 ## Verification and polling
 
 Run `bun run verify` after changing lifecycle, resource, access, or cost behavior. It runs
@@ -457,6 +610,13 @@ carry JSON must contain JSON.
 | `path <repo> <branch>`, `cd <repo> <branch>` | none | Print the registered worktree path; `cd` is normally a shell wrapper. |
 | `update` | `--restart`, `--include-untracked` | Run guarded Setu update. A running portal requires explicit `--restart`; this is CLI only. |
 | `version`, `help` | none | Print local version/commit or help. |
+| `spans [list\|show <run>\|events <run>\|artifact <run> <artifact>\|search <query>\|search-status\|workflows]` | `--after`, `--since`, `--through`, `--generation`, `--run`, `--limit` | Read the offline Spans archive. Nothing here starts work. |
+| `spans preview\|create-workflow\|create-draft\|revise-plan` | `--input <json>` | Save offline plans only; does not approve or start work. |
+| `spans exec capabilities <profile>`, `exec status <run>` | none | Read stored probe evidence or run state. Starts nothing. |
+| `spans exec probe <profile>` | none | Start one short fresh provider session to observe capability. It uses the owner's subscription (a metered profile would use a dollar budget); confirm intent first. |
+| `spans exec review`, `exec dispatch` | `--input <json>`, dispatch also `[--confirmation <token>]` | Review is read-only. Dispatch without a token returns the review; with the exact token it starts one real local worker. |
+| `spans exec cancel <run> <attempt>`, `exec complete <run> <action>`, `exec report`, `exec reconcile` | `report --input <json>` | Deliver a stop (not an exit), verify a finished attempt, record a claim as history, or hold and settle after a restart. |
+| `spans exec accept <run> <action>`, `exec resolve <run> <action>` | `[--confirmation <token>]` | Without a token each returns the exact review. Accept completes a verified action; resolve releases a dispatch that never reached intent. |
 | `claim [worktree]` | `--agent --session --task [--pid]` | Claim or refresh a writer slot. |
 | `release [worktree]` | `--session` | Release only the owning writer slot. |
 | `claims` | none | List known writer claims. |
@@ -565,6 +725,17 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/spans/run` | `runId`; full retained run view. | H W C M |
 | `GET` | `/api/spans/events` | `runId`,`afterSequence?`,`limit?`; bounded append-only history. | H W C M |
 | `GET` | `/api/spans/artifact` | `runId`,`artifactId`; inert redacted artifact referenced by that run. | H W C M |
+| `GET` | `/api/spans/execution/capabilities` | `profile`; launch capability from stored local probe evidence only; 503 while execution is disabled. | H C |
+| `POST` | `/api/spans/execution/probe` | `profile`; starts one fresh, short provider session (no budget flag on the subscription profile) to observe capability. It uses the owner's subscription (one recorded probe reported about 0.0103 USD of API-equivalent estimate); confirm user intent first. | H C |
+| `POST` | `/api/spans/execution/review` | runId, spanId, profile, instructions, wallClockMs, target, `budgetUsd?` (metered profiles only), `criteria?`, `requireChange?`; read-only review and exact confirmation token. | H C |
+| `POST` | `/api/spans/execution/dispatch` | the review fields plus `confirmation`; without it returns the review. Starts one real local worker; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/cancel` | `runId`,`attemptId`; deliver a stop to the exact owned attempt. Delivery is not an exit. | H C |
+| `POST` | `/api/spans/execution/accept` | `runId`,`actionId`,`confirmation?`; without it returns the exact review. Accepts a verified completed action only if the tree is unchanged; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/complete` | `runId`,`actionId`; verify the finished attempt, record its outcome and settle usage and admission. Idempotent. | H C |
+| `POST` | `/api/spans/execution/reconcile` | none; hold unknown work and settle proven work after a restart. Starts and signals nothing. | H C |
+| `POST` | `/api/spans/execution/resolve` | `runId`,`actionId`,`confirmation?`; without it returns the exact review. Releases the resources of a dispatch that never reached intent; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/report` | `runId`,`actionId`,`generation`,`outcome`,`artifactIds?`; records a reported outcome as history or an observation. Never completes anything. | H C |
+| `GET` | `/api/spans/execution/status` | `runId`; attempts, captured output references and usage. Never starts anything. | H C |
 | `POST` | `/api/sidecar-approvals/approve` | `repo`,`name`,`command`,`args`; must match reviewed sidecar. | H W |
 | `GET` | `/api/sidecars` | `repo`; list project sidecars. | H W M |
 | `POST` | `/api/sidecars` | `repo`,`sidecars`; replace project sidecars. | H W |

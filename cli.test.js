@@ -1167,3 +1167,39 @@ test('real entry points handle help and invalid input without touching an uninit
     fs.rmSync(home, { force: true, recursive: true });
   }
 }, 60_000);
+
+test('Spans refusal prints a runnable writer release command for a path with spaces and an apostrophe', async () => {
+  const messages = [];
+  const originalError = console.error;
+  const checkoutPath = "/tmp/Setu's demo folder";
+  const session = 'spans-writer-test';
+  console.error = (...parts) => messages.push(parts.join(' '));
+  try {
+    const code = await runCli(['spans', 'exec', 'dispatch', '--input', '{}'], {
+      request: () =>
+        Promise.resolve({
+          code: 'ADMISSION_REFUSED',
+          ok: false,
+          recovery: { writer: { checkoutPath, session } },
+        }),
+    });
+    expect(code).toBe(1);
+    const hint = messages.find((line) => line.includes('To let it go: '));
+    expect(hint).toBeDefined();
+    const [, command] = hint.split('To let it go: ');
+    const parsed = spawnSync(
+      '/bin/sh',
+      ['-c', `setu() { printf '%s\\0' "$@"; }\n${command}`],
+      { encoding: 'utf8' }
+    );
+    expect(parsed.status).toBe(0);
+    expect(parsed.stdout.split('\0').slice(0, -1)).toEqual([
+      'release',
+      checkoutPath,
+      '--session',
+      session,
+    ]);
+  } finally {
+    console.error = originalError;
+  }
+});

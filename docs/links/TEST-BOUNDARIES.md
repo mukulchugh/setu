@@ -4,7 +4,7 @@ What has been observed, what has not, and what no document may claim. Source: [l
 
 ## Scope of the evidence
 
-All live observations were made with Claude Code 2.1.302 and Sonnet 5.5, in native sessions started in a cmux workspace, with tools and MCP disabled, synthetic messages, and an explicit local prompt hook. **They are provider hook and identity observations. They are not tests of the Setu Links service**, and the sessions were **not Setu-managed sessions**. A recorded payload, a prototype receipt or a simulated demo is never provider acceptance.
+The original hook observations O1–O7 were made with Claude Code 2.1.302 and Sonnet 5.5, in native sessions started in a cmux workspace, with tools and MCP disabled, synthetic messages, and an explicit local prompt hook. **O1–O7 are provider hook and identity observations. They are not tests of the Setu Links service**, and the sessions were **not Setu-managed sessions**. A recorded payload, a prototype receipt or a simulated demo is never provider acceptance.
 
 ## Observed
 
@@ -42,7 +42,7 @@ Do not state any of these as true. Each is a gate for the ticket named.
 | U12 | Real device-to-device behavior of the Rust transport. | 08, 09 |
 | U13 | Reproducible Rust build. Toolchain 1.99.1 is verified installed locally in an isolated build-tools directory with no PATH change. No engine source tree exists yet, and CI provisioning and adapting the reused store and transport to the Setu protocol are untested. | 02, 08 |
 | U16 | An explicit authenticated resume path for a native conversation under a new or different managed session record. Ticket 01 refuses cross-record adoption; no such resume operation exists or has been run. O5 covers a native session only. | 03 |
-| U15 | Spans execution beyond the tested fixtures; the dispatch, worker and recovery modules have no production caller at baseline. | 13 |
+| U15 | Local Spans execution is now composed into the portal and CLI and tested with one real Claude subscription task at the service boundary. Still unverified: a complete native task through HTTP/CLI, real-process restart recovery, Linux, unknown-attempt recovery and work-request integration. See the 18 October evidence below. | 13 |
 
 ## Claims that are forbidden until their gate clears
 
@@ -59,3 +59,15 @@ Do not state any of these as true. Each is a gate for the ticket named.
 ## How a ticket clears a gate
 
 A ticket that clears a gate records, in this file, the date, provider and version, session type (native or managed), the scenario, the exact observation, and its limits. It does not edit a limit away. Results from a failed or inconclusive run are recorded as well, with the cause if known.
+
+## Spans execution evidence, 18 October 2026
+
+The local execution service has a production caller, off by default under `spansExecution.enabled`. Independent spec and standards reviews covered it against issue #20; the author ran 1900 JavaScript tests and three typechecks before integration. Those process tests use a local provider fixture. They cover crashes, owner fencing, cancellation, admission, usage and explicit acceptance, but are not native-provider evidence.
+
+One actual Claude Code 2.1.302 / Sonnet 5.5 subscription probe and task used the shipped default command, including restricted mode, no ambient setting sources, auto permission mode and the six named coding tools. No dollar budget flag was passed. The provider did not report effort, which the profile explicitly records as requested but unverified. Token and API-equivalent amounts are provider estimates, not subscription charges.
+
+The real task created `add.mjs` in a disposable Git checkout. The parent independently imported it and checked three arithmetic cases. The build Span remained unaccepted until an explicit owner acceptance; only then did its dependent become ready. The real host had less than the default 20 GiB storage floor, so the successful one-file test used a 10 GiB floor only in its disposable service configuration. Production admission was unchanged.
+
+A separate listening HTTP portal reopened that archive using config-enabled production composition, without an injected execution service, provider, admission or host observation. Capabilities, status and review worked; dispatch correctly returned `ADMISSION_REFUSED` with `admissionCode: STORAGE_LOW`, no launch and exact writer-recovery data. The CLI handler read status over a custom transport to that isolated HTTP port. This is not a full native task through the default-port CLI.
+
+Parent deterministic regressions reproduced and then verified fixes for stale owner acquisition and concurrent resolve/dispatch: recovery refuses the racing dispatch; the next reviewed retry acquires a fresh action identity, writer and usage reservation while retaining the old released ledger row. These used real storage and local fixture processes. Native Ghostty delivery and two-host transport remain separate, open gates. Evidence scripts and synthetic logs are retained outside the repository.

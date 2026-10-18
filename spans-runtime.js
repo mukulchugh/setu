@@ -6,6 +6,9 @@ import { createSpansPlanningRuntime } from './spans-planning-runtime.js';
 import { createSpansService } from './spans-service.js';
 import { openSpansStore, SPANS_STORE_DATABASE_FILE } from './spans-store.js';
 
+export const defaultSpansRoot = () =>
+  join(homedir(), '.local/share/setu/spans');
+
 const unavailable = () => ({
   code: 'SPANS_SERVICE_UNAVAILABLE',
   error: 'Spans history is unavailable. Select or create an archive first.',
@@ -16,9 +19,7 @@ const unavailable = () => ({
 // store opens read-only, so a missing, older or newer schema is simply
 // unavailable. Explicit draft creation owns initialization; the offline index
 // command owns derived search indexing.
-export function createSpansRuntime({
-  root = join(homedir(), '.local/share/setu/spans'),
-} = {}) {
+export function createSpansRuntime({ root = defaultSpansRoot() } = {}) {
   const { close: closePlanning, ...planning } = createSpansPlanningRuntime({
     root,
   });

@@ -45,6 +45,8 @@ const id = (value) =>
   ID_PATTERN.test(value) &&
   isSpansRedactionSafeKey(value);
 const amount = (value) => Number.isSafeInteger(value) && value >= 0;
+// A limit is optional: null means no monetary limit was configured.
+const optionalLimit = (value) => value === null || amount(value);
 const keysOnly = (value, allowed) =>
   record(value) &&
   Reflect.ownKeys(value).every(
@@ -68,8 +70,8 @@ function validObservation(value) {
 function validPolicy(policy) {
   return (
     record(policy) &&
-    amount(policy.aggregateLimitMicro) &&
-    amount(policy.attemptLimitMicro) &&
+    optionalLimit(policy.aggregateLimitMicro) &&
+    optionalLimit(policy.attemptLimitMicro) &&
     typeof policy.hardCap === 'boolean'
   );
 }
@@ -107,8 +109,8 @@ function validReservationFingerprint(row, policy, expectedRunId) {
     actionId === row.actionId &&
     attemptId === row.attemptId &&
     fingerprintReservation === row.reservationMicro &&
-    amount(aggregateLimitMicro) &&
-    amount(attemptLimitMicro) &&
+    optionalLimit(aggregateLimitMicro) &&
+    optionalLimit(attemptLimitMicro) &&
     typeof priceKnown === 'boolean' &&
     typeof hardCap === 'boolean' &&
     typeof enforcementAvailable === 'boolean' &&
@@ -118,10 +120,21 @@ function validReservationFingerprint(row, policy, expectedRunId) {
   );
 }
 
-function validReservationState(row) {
+// A policy with no limit at all and no hard cap measures no money: a
+// reservation under it has no amount, and that is complete, not missing.
+const unmeteredPolicy = (policy) =>
+  policy.aggregateLimitMicro === null &&
+  policy.attemptLimitMicro === null &&
+  policy.hardCap === false;
+
+function validReservationState(row, policy) {
   return (
     (row.state === 'held') === row.held &&
-    !(row.state === 'reserved' && row.reservationMicro === null) &&
+    !(
+      row.state === 'reserved' &&
+      row.reservationMicro === null &&
+      !unmeteredPolicy(policy)
+    ) &&
     !(row.state === 'reserved' && row.observation !== undefined) &&
     !(row.state === 'released' && row.held)
   );
@@ -132,7 +145,7 @@ function validReservation(reservationId, row, policy, expectedRunId) {
     id(reservationId) &&
     validReservationShape(row) &&
     validReservationFingerprint(row, policy, expectedRunId) &&
-    validReservationState(row)
+    validReservationState(row, policy)
   );
 }
 
@@ -314,8 +327,8 @@ function validReserveInput(input) {
     validBase(input, extra) &&
     id(input.reservationId) &&
     (input.reservationMicro === null || amount(input.reservationMicro)) &&
-    amount(input.aggregateLimitMicro) &&
-    amount(input.attemptLimitMicro) &&
+    optionalLimit(input.aggregateLimitMicro) &&
+    optionalLimit(input.attemptLimitMicro) &&
     typeof input.priceKnown === 'boolean' &&
     typeof input.hardCap === 'boolean' &&
     typeof input.enforcementAvailable === 'boolean'
@@ -481,12 +494,18 @@ function reserveUsage(usage, input) {
   if (alreadyHasAttempt(reservations, input.attemptId)) {
     return { failure: 'CONFLICT' };
   }
+  // No limit and no amount: nothing monetary is reserved or measured, so there
+  // is no price to know and no cap to enforce.
+  if (input.reservationMicro === null && unmeteredPolicy(usage.policy)) {
+    return reservedReservationMutation(input, fingerprint, reservations);
+  }
   if (shouldHoldReservation(input)) {
     return heldReservationMutation(input, fingerprint, reservations);
   }
   if (
     input.reservationMicro === null ||
-    input.reservationMicro > input.attemptLimitMicro
+    (input.attemptLimitMicro !== null &&
+      input.reservationMicro > input.attemptLimitMicro)
   ) {
     return { failure: 'CAP' };
   }
@@ -495,8 +514,9 @@ function reserveUsage(usage, input) {
     return { failure: exposure.failure };
   }
   if (
-    exposure.exposure > input.aggregateLimitMicro ||
-    input.reservationMicro > input.aggregateLimitMicro - exposure.exposure
+    input.aggregateLimitMicro !== null &&
+    (exposure.exposure > input.aggregateLimitMicro ||
+      input.reservationMicro > input.aggregateLimitMicro - exposure.exposure)
   ) {
     return { failure: 'CAP' };
   }
@@ -605,7 +625,7 @@ function validReceiptProgress(row, input) {
   return usageRegression ? { failure: 'REGRESSION' } : null;
 }
 
-function pendingReservationMutation(row, input, observation) {
+function pendingReservationMutation(row, input, observation, policy) {
   if (sameObservation(row.observation, observation)) {
     return {
       output: {
@@ -617,9 +637,12 @@ function pendingReservationMutation(row, input, observation) {
       unchanged: true,
     };
   }
+  // An unmetered reservation has no amount to wait for; a known terminal
+  // outcome is enough. An unknown outcome still keeps it held.
+  const unmetered = row.reservationMicro === null && unmeteredPolicy(policy);
   const knownTerminal =
     input.outcome !== 'unknown' &&
-    (input.actualMicro !== null || input.verifiedNoEffect);
+    (input.actualMicro !== null || input.verifiedNoEffect || unmetered);
   const released =
     input.verifiedNoEffect || (input.terminalPolicy && knownTerminal);
   row.actualMicro =
@@ -647,7 +670,7 @@ function reconcileUsage(usage, input) {
   if (row.state === 'released') {
     return releasedReservationMutation(row, input, observation);
   }
-  return pendingReservationMutation(row, input, observation);
+  return pendingReservationMutation(row, input, observation, usage.policy);
 }
 
 function validAggregateInput(input) {
@@ -668,10 +691,22 @@ function emptyAggregate(read, runId) {
     runId,
     scope: 'run',
     unknownActualCount: 0,
+    unmeteredCount: 0,
   };
 }
 
-function summarizeReservations(reservations) {
+// Reservations that carried no monetary amount, under a policy that measures
+// none. They are counted so the money totals are not read as covering them.
+function countUnmetered(reservations, policy) {
+  if (!(policy && unmeteredPolicy(policy))) {
+    return 0;
+  }
+  return Object.values(reservations).filter(
+    (row) => row.reservationMicro === null
+  ).length;
+}
+
+function summarizeReservations(reservations, policy) {
   let outstandingReservationMicro = 0;
   let runExposureMicro = 0;
   let actualMicro = 0;
@@ -720,6 +755,7 @@ function summarizeReservations(reservations) {
     outstandingReservationMicro,
     runExposureMicro,
     unknownActualCount,
+    unmeteredCount: countUnmetered(reservations, policy),
   };
 }
 
@@ -738,6 +774,9 @@ function aggregateResult(read, runId, totals) {
     runId,
     scope: 'run',
     unknownActualCount: totals.unknownActualCount,
+    // Reservations that carried no monetary amount. They add nothing to the
+    // totals above, which therefore say nothing about what they used.
+    unmeteredCount: totals.unmeteredCount,
   };
 }
 
@@ -792,7 +831,10 @@ export function createSpansUsage({ store, maxRetries = RETRIES } = {}) {
       if (!validUsage(view.usage, runId)) {
         return fail('READ');
       }
-      const totals = summarizeReservations(view.usage.reservations);
+      const totals = summarizeReservations(
+        view.usage.reservations,
+        view.usage.policy
+      );
       if (totals.failure) {
         return fail(totals.failure);
       }

@@ -372,16 +372,16 @@ function canonicalJson(value) {
 
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
-function derivedId(prefix, ...parts) {
+export function derivedId(prefix, ...parts) {
   return `${prefix}-${sha256(JSON.stringify([prefix, ...parts])).slice(0, 32)}`;
 }
 
 // One writer owner per span: a later attempt of the same span re-claims it,
 // while another span or session stays blocked until a verified completion.
-const writerSession = (request) =>
+export const writerSession = (request) =>
   derivedId('spans-writer', request.runId, request.spanId);
 
-const admissionOperationId = (request) =>
+export const admissionOperationId = (request) =>
   derivedId(
     'spans-adm',
     request.runId,
@@ -760,7 +760,7 @@ function missingAdapters(adapters) {
 // is the immutable profile identity a trusted adapter reported, never a
 // request field, so an approval for one profile or cap policy cannot be
 // replayed for another.
-function authorizationBinding(request, profileDigest) {
+export function authorizationBinding(request, profileDigest) {
   return {
     action: AUTHORIZATION_ACTION,
     actionId: request.actionId,

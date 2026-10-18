@@ -149,6 +149,7 @@ import {
   createRemovalRouting,
 } from './removal-routing.js';
 import { createSetupProgress } from './setup-progress.js';
+import { createSpansExecutionRuntime } from './spans-execution-runtime.js';
 import { createSpansRuntime } from './spans-runtime.js';
 import {
   createWorkspaceInventory,
@@ -3649,8 +3650,24 @@ export async function createPortalRuntime(options = {}) {
     root: options.linksRoot,
     sessions: { list: () => managedAgents.listSessions({}) },
   });
+  // Live execution is off unless the configuration turns it on; it then shares
+  // this portal's admission, setup records and registered-target resolution.
+  const spansExecution = createSpansExecutionRuntime({
+    admission: portalB205.admission,
+    config: _cfg,
+    injected: options.spansExecution,
+    resolveTarget: async ({ name, repo }) => {
+      const target = await b205Target(repo, name);
+      return target?.checkoutIdentity?.known
+        ? { repoDir: target.repoDir, wtDir: target.wtDir }
+        : null;
+    },
+    root: options.spansRoot,
+    setupProgress,
+  });
   const portalB205Composition = Object.freeze({
     ...spans,
+    ...spansExecution.services,
     ...links,
     ...portalB205,
     agentSessions: (input) => managedAgents.listSessions(input),
@@ -5736,6 +5753,9 @@ export async function createPortalRuntime(options = {}) {
     await managedAgents.recover().catch(() => {
       // Keep portal recovery access available if managed-agent reconciliation fails.
     });
+    await spansExecution.recover().catch(() => {
+      // Held work stays held; the portal still starts.
+    });
     updateControl = createPortalUpdateControl({
       hasSupportingWork: supportingWorkActive,
       lifecycle,
@@ -5893,6 +5913,7 @@ export async function createPortalRuntime(options = {}) {
     server = null;
     try {
       spans.close();
+      await spansExecution.close();
       await managedAgents.dispose();
     } finally {
       await boundServer?.stop(true);
