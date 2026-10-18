@@ -457,17 +457,25 @@ export function createLinksService({ client, resolveTarget, sessions } = {}) {
     if (!resolved.ok) {
       return resolved;
     }
-    const viewed = await client.call('status', { message_id: input.messageId });
+    const viewed = await client.call('status', {
+      message_id: input.messageId,
+      observed: resolved.recipient,
+    });
     if (!viewed.ok) {
       return viewed;
     }
     const message = viewed.result;
     // The engine identifies a recipient by provider, native conversation and checkout alone, and the
     // review must too: a different managed record (or an old locator) for the same conversation is still
-    // that recipient. The engine is asked to redeliver only after the exact token has been matched.
+    // that recipient. Mail from a peer is stored under an opaque address, so the engine answers whether the
+    // message is addressed to this conversation (`observed_match`); this module keeps no copy of that rule.
+    // The engine is asked to redeliver only after the exact token has been matched.
     const identity = (recipient) =>
       canonical([recipient.provider, recipient.native_id, recipient.checkout]);
-    if (identity(message.recipient) !== identity(resolved.recipient)) {
+    const addressedHere =
+      message.observed_match ??
+      identity(message.recipient) === identity(resolved.recipient);
+    if (!addressedHere) {
       return failure(
         'LINKS_RECIPIENT_MISMATCH',
         'This message is addressed to a different conversation'

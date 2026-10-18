@@ -69,6 +69,60 @@ impl Args {
         }
     }
 
+    /// An integer from `min` to `max`. Above `max` fails with `too_large`; anything else out of range is invalid.
+    pub fn count(&mut self, key: &str, min: u64, max: u64, too_large: &'static str) -> Result<u64, Fail> {
+        match self.0.remove(key).as_ref().and_then(Value::as_u64) {
+            Some(n) if n > max => Err(Fail::new(too_large, format!("field `{key}` is too large"))),
+            Some(n) if n >= min => Ok(n),
+            _ => Err(invalid(key)),
+        }
+    }
+
+    /// A JSON array of at most `max_items` values, left for the caller to read.
+    pub fn array(&mut self, key: &str, max_items: usize) -> Result<Vec<Value>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if items.len() <= max_items => Ok(items),
+            _ => Err(invalid(key)),
+        }
+    }
+
+    pub fn optional_array(&mut self, key: &str, max_items: usize) -> Result<Option<Vec<Value>>, Fail> {
+        match self.0.get(key) {
+            None | Some(Value::Null) => {
+                self.0.remove(key);
+                Ok(None)
+            }
+            Some(_) => self.array(key, max_items).map(Some),
+        }
+    }
+
+    /// A whole number from `min` to `max` if the field is present. Present but not such a number is invalid:
+    /// an explicit `null` is not the same as leaving it out.
+    pub fn optional_count(&mut self, key: &str, min: u64, max: u64, too_large: &'static str) -> Result<Option<u64>, Fail> {
+        if self.0.contains_key(key) { self.count(key, min, max, too_large).map(Some) } else { Ok(None) }
+    }
+
+    pub fn boolean(&mut self, key: &str) -> Result<bool, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Bool(flag)) => Ok(flag),
+            _ => Err(invalid(key)),
+        }
+    }
+
+    /// A list of at most `max_items` non-empty strings of at most `max_len` bytes each.
+    pub fn strings(&mut self, key: &str, max_items: usize, max_len: usize) -> Result<Vec<String>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if items.len() <= max_items => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(s) if !s.is_empty() && s.len() <= max_len => Ok(s),
+                    _ => Err(invalid(key)),
+                })
+                .collect(),
+            _ => Err(invalid(key)),
+        }
+    }
+
     pub fn optional_string(&mut self, key: &str, max: usize) -> Result<Option<String>, Fail> {
         match self.0.get(key) {
             None | Some(Value::Null) => {

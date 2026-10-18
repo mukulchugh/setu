@@ -739,6 +739,45 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
   the naming check. A development engine is found at `engines/links/target/release/setu-links` or
   `SETU_LINKS_ENGINE`; shipping the built binary is part of the release-lifecycle work.
 
+### Setu Links (peer transport)
+
+Two engines on different data directories (later, different machines) exchange messages over an
+authenticated, encrypted direct connection. The same engine and the same store do it: `setu-links serve
+--data-dir <dir> [--listen <address>]` is the one long-running process per directory (an exclusive lock
+enforces it; a second start prints `already-running` and exits 0). Nothing here is routed, wired to a front
+door, or started by anything but the lifecycle owner `links-transport.js` (`start`, `status`, `stop`).
+Service packaging (a login item or launchd job) is the release-lifecycle ticket's.
+
+- **A peer is a transport public key.** The connection proves the key (QUIC/TLS, direct addresses only; no
+  relay, no public address lookup, no third-party service). Everything a peer says about itself is display
+  data. A peer is on the roster only because the trusted service added it (`peer_add`); a message, receipt
+  or hello never adds a peer, a grant or a binding. Default is deny.
+- **Authorization is read from the store where it acts, per direction** (the full contract is
+  `docs/links/transport.md`). Receiving and peer-origin claim: roster, a `receive` grant covering the session,
+  a fresh valid binding snapshot, and that snapshot's project being shared right now per #11's sharing policy
+  (`authz::admit_receive`, re-run by `authz::gate_all` before every claim). Sending (`outbox::send`) and
+  publishing (`inbound::published_for`) have their own rules in those functions. Grants only narrow inside a
+  shared project. A lapse holds waiting peer mail (`peer-revoked`, `authorization-lapsed`,
+  `policy-disabled`) and stale evidence never causes a handoff. Operations: `binding_publish` /
+  `binding_invalidate` (persisted generation fence), `peer_*`, `claim` with `expected_generation`.
+- **Nothing private crosses the wire.** Peers name a conversation only by an opaque address (`w1:` plus a
+  SHA-256 of the native id and of the checkout, wire version 2): no path, provider id or provider context is
+  sent or stored by a peer. It is a pseudonym, not encryption. Stored recipients match a trusted local
+  conversation by the local tuple or its address through one function; ask the engine (`observed_match`),
+  never compare tuples in JavaScript.
+- **Sender and receiver keep their own state.** The sender's `outbox` row (the message itself stays in
+  `messages`; it has no delivery row, so no local operation can claim it) says `pending` (accepted here) or
+  `deposited` (the receiver durably took it) and carries the receiver's own reported state. A receipt is a
+  delivery-state report: it is never accepted completion, a claim release or a wake authorization, and it
+  counts only from the peer the message went to, naming the exact recipient, newer than what is known.
+- **Cancel is honest.** Before any attempt it is cancelled locally and atomically. After one, `cancel` is
+  `requested` until the receiver confirms it got there first; a claim that won the race is reported as
+  `refused` with the true state. A cancel that arrives before its deposit leaves a tombstone.
+- **The key and the address.** `transport.key` is made whole and atomically, refused (never replaced) when
+  unusable, and `serve` listens on loopback unless `--listen` says otherwise.
+- **Same-machine peers are contract evidence only.** They prove nothing about real networks, NAT, sleep or
+  DNS; real cross-machine behavior is ticket 09.
+
 ### Runtime and dependency-sharing limits
 
 The package version is `0.2.0`; no release is implied by that source value.

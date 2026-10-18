@@ -13,7 +13,7 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 pub const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Every mutation ends here, so every one can be killed on either side of its commit.
-fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
+pub(crate) fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
     util::fault(&format!("{op}:before-commit"));
     tx.commit()?;
     util::fault(&format!("{op}:after-commit"));
@@ -33,6 +33,22 @@ impl Recipient {
         self.provider == *provider && self.native_id == *native_id && self.checkout == *checkout
     }
 
+    /// The address a peer would use for this conversation.
+    pub fn wire(&self) -> (String, String) {
+        crate::wire::address(&self.provider, &self.native_id, &self.checkout)
+    }
+
+    /// Whether a stored recipient is this conversation: the same local tuple, or the wire address of this trusted
+    /// local tuple (how mail from a peer is stored). Used wherever mail is matched to a conversation; the generation
+    /// fence and snapshots keep the strict `is`.
+    pub fn matches_stored(&self, (provider, native_id, checkout): &(String, String, String)) -> bool {
+        if self.provider != *provider {
+            return false;
+        }
+        let (wire_native, wire_checkout) = self.wire();
+        (self.native_id == *native_id && self.checkout == *checkout) || (wire_native == *native_id && wire_checkout == *checkout)
+    }
+
     pub fn parse(mut args: Args) -> Result<Self, Fail> {
         let recipient = Recipient {
             provider: args.string("provider", 64)?,
@@ -45,6 +61,21 @@ impl Recipient {
     }
 }
 
+/// SQL: is the stored recipient of message alias `m` the conversation `(provider, native, checkout)`? Either the same
+/// local tuple or the wire address computed from it, by the one `wire::address` (the SQL functions call it).
+/// Arguments are SQL expressions, usually numbered parameters.
+pub(crate) fn same_conversation(m: &str, provider: &str, native: &str, checkout: &str) -> String {
+    format!(
+        "({m}.provider = {provider} AND (({m}.native_id = {native} AND {m}.checkout = {checkout}) \
+         OR ({m}.native_id = setu_wire_native({provider}, {native}) AND {m}.checkout = setu_wire_checkout({checkout}))))"
+    )
+}
+
+/// SQL: the same conversation regardless of checkout (same provider and native conversation, either form).
+pub(crate) fn same_native(m: &str, provider: &str, native: &str) -> String {
+    format!("({m}.provider = {provider} AND ({m}.native_id = {native} OR {m}.native_id = setu_wire_native({provider}, {native})))")
+}
+
 pub const MAX_PENDING_PER_RECIPIENT: i64 = 100;
 /// One turn carries at most this many messages and this many body bytes, so mail cannot flood a context.
 pub const CLAIM_MAX_MESSAGES: usize = 8;
@@ -52,6 +83,8 @@ pub const CLAIM_MAX_BYTES: usize = 32 * 1024;
 
 pub struct SendRequest {
     key: String,
+    /// Set when the recipient is on another machine: the message then goes to the outbox, not to a local inbox.
+    peer_id: Option<String>,
     recipient: Recipient,
     body: String,
     reply_to: Option<String>,
@@ -69,20 +102,20 @@ pub fn parse_send(mut args: Args) -> Result<SendRequest, Fail> {
         return Err(Fail::new("SENDER_UNSUPPORTED", "only the local user can send"));
     }
     let recipient = Recipient::parse(args.object("recipient")?)?;
+    let peer_id = args.optional_string("peer_id", 64)?;
     let body = args.bounded("body", MAX_BODY_BYTES, "BODY_TOO_LARGE")?;
     let reply_to = args.optional_string("reply_to", 128)?;
     let run_hint = args.optional_string("run_hint", 128)?;
     let span_hint = args.optional_string("span_hint", 128)?;
     args.finish()?;
-    Ok(SendRequest { key, recipient, body, reply_to, run_hint, span_hint })
+    Ok(SendRequest { key, peer_id, recipient, body, reply_to, run_hint, span_hint })
 }
 
 pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
-    let SendRequest { key, recipient, body, reply_to, run_hint, span_hint } = request;
+    let SendRequest { key, peer_id, recipient, body, reply_to, run_hint, span_hint } = request;
 
     // The digest covers exactly what the caller supplied, in a canonical key order.
-    let digest = util::sha256_hex(
-        &json!({
+    let mut canonical = json!({
             "body": body,
             "kind": "message",
             "reply_to": reply_to,
@@ -94,9 +127,14 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
                 "provider": recipient.provider,
                 "session_hint": recipient.session_hint,
             },
-        })
-        .to_string(),
-    );
+        });
+    if let Some(peer) = &peer_id {
+        canonical["peer_id"] = json!(peer);
+    }
+    let digest = util::sha256_hex(&canonical.to_string());
+    if let Some(peer_id) = peer_id {
+        return crate::outbox::send(store, crate::outbox::Remote { key, peer_id, recipient, body, reply_to, run_hint, span_hint, digest });
+    }
     let now = util::now_ms();
     let id = util::new_id("m");
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -113,9 +151,11 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
         return Ok(json!({ "message_id": existing_id, "state": state["state"], "replayed": true }));
     }
     let pending: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM messages m JOIN deliveries d ON d.message_id = m.id
-         WHERE m.provider = ?1 AND m.native_id = ?2 AND m.checkout = ?3
-           AND d.state IN ('queued', 'held') AND d.expires_at > ?4",
+        &format!(
+            "SELECT COUNT(*) FROM messages m JOIN deliveries d ON d.message_id = m.id
+             WHERE {} AND d.state IN ('queued', 'held') AND d.expires_at > ?4",
+            same_conversation("m", "?1", "?2", "?3")
+        ),
         params![recipient.provider, recipient.native_id, recipient.checkout, now],
         |row| row.get(0),
     )?;
@@ -142,10 +182,18 @@ const VIEW: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run_hin
         d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state
     FROM messages m JOIN deliveries d ON d.message_id = m.id";
 
+/// Who a message is from: the local user, or a peer machine named by its authenticated key.
+fn sender_json(sender: &str) -> Value {
+    match sender.strip_prefix("peer:") {
+        Some(peer_id) => json!({ "kind": "peer", "peer_id": peer_id }),
+        None => json!({ "kind": sender }),
+    }
+}
+
 fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
     let mut value = json!({
         "message_id": row.get::<_, String>(0)?,
-        "sender": { "kind": row.get::<_, String>(1)? },
+        "sender": sender_json(&row.get::<_, String>(1)?),
         "kind": row.get::<_, String>(2)?,
         "size": row.get::<_, i64>(3)?,
         "reply_to": row.get::<_, Option<String>>(4)?,
@@ -184,19 +232,27 @@ fn parse_observed(args: &mut Args) -> Result<Option<Recipient>, Fail> {
 /// `reconcile` is what persists the same
 /// decision; nothing here changes the store.
 fn project(value: &mut Value, observed: Option<&Recipient>) {
+    value["observed_match"] = Value::Null;
     let Some(observed) = observed else { return };
     let recipient = value["recipient"].clone();
+    let text = |field: &str| recipient[field].as_str().unwrap_or_default().to_string();
+    let stored = (text("provider"), text("native_id"), text("checkout"));
+    // The engine, not a caller, says whether a stored recipient is the observed conversation (either form).
+    let same = observed.matches_stored(&stored);
+    value["observed_match"] = json!(same);
     if recipient["session_hint"] != observed.session_hint.as_str() {
         return;
     }
-    let same_conversation = recipient["provider"] == observed.provider.as_str() && recipient["native_id"] == observed.native_id.as_str();
-    let same = same_conversation && recipient["checkout"] == observed.checkout.as_str();
+    let (wire_native, _) = observed.wire();
+    let same_conversation = stored.0 == observed.provider && (stored.1 == observed.native_id || stored.1 == wire_native);
     match value["state"].as_str() {
         Some("queued") if !same => {
             value["state"] = json!("held");
             value["reason"] = json!(if same_conversation { "checkout-changed" } else { "conversation-replaced" });
         }
-        Some("held") if same => {
+        // Only a hold that the conversation itself explains is lifted by seeing the conversation again; a hold for
+        // revoked authorization or an unshared project is not.
+        Some("held") if same && matches!(value["reason"].as_str(), Some("conversation-replaced" | "checkout-changed" | "session-not-running")) => {
             value["state"] = json!("queued");
             value["reason"] = Value::Null;
         }
@@ -215,8 +271,19 @@ pub fn show(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = view(&store.db, &id, util::now_ms())?;
+    let mut value = match view(&store.db, &id, util::now_ms()) {
+        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= 3 => outbound(&store.db, &id, true)?,
+        other => other?,
+    };
     project(&mut value, observed.as_ref());
+    Ok(value)
+}
+
+/// A message this machine sent to a peer: its state is the sender's view, never a local delivery state.
+fn outbound(db: &rusqlite::Connection, id: &str, with_body: bool) -> Result<Value, Fail> {
+    let found = crate::outbox::view(db, id, util::now_ms(), with_body)?;
+    let mut value = found.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
+    value["stored_state"] = value["state"].clone();
     Ok(value)
 }
 
@@ -247,17 +314,36 @@ pub fn status(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = view(&store.db, &id, util::now_ms())?;
+    let mut value = match view(&store.db, &id, util::now_ms()) {
+        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= 3 => outbound(&store.db, &id, false)?,
+        other => other?,
+    };
     project(&mut value, observed.as_ref());
     value.as_object_mut().map(|fields| fields.remove("body"));
     Ok(value)
+}
+
+/// One maintenance pass for the daemon: persist expiry and re-check peer mail against current authorization.
+pub fn maintain(store: &mut Store) -> Result<(), Fail> {
+    let now = util::now_ms();
+    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    expire_due(&tx, now)?;
+    crate::outbox::expire_due(&tx, now)?;
+    crate::inbound::forget_old_tombstones(&tx, now)?;
+    crate::authz::gate_all(&tx, store.version, now)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Persists expiry for queued or held mail whose time has passed.
 pub fn sweep(store: &mut Store, args: Args) -> Result<Value, Fail> {
     args.finish()?;
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let expired = expire_due(&tx, util::now_ms())?;
+    let now = util::now_ms();
+    let expired = expire_due(&tx, now)?;
+    crate::outbox::expire_due(&tx, now)?;
+    crate::inbound::forget_old_tombstones(&tx, now)?;
+    crate::authz::gate_all(&tx, store.version, now)?;
     commit(tx, "sweep")?;
     Ok(json!({ "expired": expired }))
 }
@@ -275,32 +361,41 @@ pub fn parse_reconcile(mut args: Args) -> Result<Recipient, Fail> {
 pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut hold = tx.prepare(
+    let (held, released) = reconcile_in(&tx, &current, now)?;
+    commit(tx, "reconcile")?;
+    Ok(json!({ "held": held, "released": released }))
+}
+
+/// The hold-and-restore decision for one session, inside the caller's write transaction.
+pub fn reconcile_in(tx: &rusqlite::Connection, current: &Recipient, now: i64) -> Result<(Vec<String>, Vec<String>), Fail> {
+    let mut hold = tx.prepare(&format!(
         "UPDATE deliveries SET state = 'held', updated_at = ?5,
-            reason = CASE WHEN (SELECT provider = ?2 AND native_id = ?3 FROM messages WHERE id = message_id)
+            reason = CASE WHEN (SELECT {same_native} FROM messages mm WHERE mm.id = message_id)
                           THEN 'checkout-changed' ELSE 'conversation-replaced' END
          WHERE state = 'queued' AND message_id IN (
-            SELECT id FROM messages WHERE session_hint = ?1
-              AND NOT (provider = ?2 AND native_id = ?3 AND checkout = ?4))
+            SELECT id FROM messages m WHERE m.session_hint = ?1
+              AND NOT {same_conversation})
          RETURNING message_id",
-    )?;
+        same_native = same_native("mm", "?2", "?3"),
+        same_conversation = same_conversation("m", "?2", "?3", "?4"),
+    ))?;
     let held = hold
         .query_map(params![current.session_hint, current.provider, current.native_id, current.checkout, now], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(hold);
-    let mut release = tx.prepare(
+    let mut release = tx.prepare(&format!(
         "UPDATE deliveries SET state = 'queued', reason = NULL, updated_at = ?5
-         WHERE state = 'held' AND expires_at > ?5 AND message_id IN (
-            SELECT id FROM messages WHERE session_hint = ?1
-              AND provider = ?2 AND native_id = ?3 AND checkout = ?4)
+         WHERE state = 'held' AND expires_at > ?5 AND reason IN ('conversation-replaced', 'checkout-changed', 'session-not-running')
+           AND message_id IN (
+            SELECT id FROM messages m WHERE m.session_hint = ?1 AND {})
          RETURNING message_id",
-    )?;
+        same_conversation("m", "?2", "?3", "?4")
+    ))?;
     let released = release
         .query_map(params![current.session_hint, current.provider, current.native_id, current.checkout, now], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(release);
-    commit(tx, "reconcile")?;
-    Ok(json!({ "held": held, "released": released }))
+    Ok((held, released))
 }
 
 fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> {
@@ -314,30 +409,47 @@ fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> 
 
 pub struct ClaimRequest {
     recipient: Recipient,
+    /// The generation the trusted caller authenticated at. When present the claim is refused unless the session's
+    /// snapshot is fresh, valid, this conversation and this generation. Absent keeps the original semantics.
+    expected_generation: Option<i64>,
+}
+
+impl ClaimRequest {
+    pub fn fenced(&self) -> bool {
+        self.expected_generation.is_some()
+    }
 }
 
 pub fn parse_claim(mut args: Args) -> Result<ClaimRequest, Fail> {
     let recipient = Recipient::parse(args.object("recipient")?)?;
+    let expected_generation = args.optional_count("expected_generation", 0, crate::binding::MAX_GENERATION, "FIELD_TOO_LARGE")?.map(|g| g as i64);
     args.finish()?;
-    Ok(ClaimRequest { recipient })
+    Ok(ClaimRequest { recipient, expected_generation })
 }
 
 /// Moves queued mail for this exact conversation to a new attempt in one transaction. From the moment of
 /// commit the mail is `handoff-unknown`: only a confirming report, never the passage of time, resolves it.
 pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
-    let ClaimRequest { recipient } = request;
+    let ClaimRequest { recipient, expected_generation } = request;
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // First of all, before expiry, authorization or any mail is touched: a refusal leaves nothing behind.
+    if let Some(generation) = expected_generation {
+        crate::binding::require_current(&tx, &recipient, generation, now)?;
+    }
     expire_due(&tx, now)?;
-    let mut statement = tx.prepare(
-        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts FROM messages m
+    // Mail from a peer is handed off only on evidence that holds right now: roster, grant, snapshot and policy.
+    crate::authz::gate_all(&tx, store.version, now)?;
+    let mut statement = tx.prepare(&format!(
+        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts, m.sender FROM messages m
          JOIN deliveries d ON d.message_id = m.id
-         WHERE m.provider = ?1 AND m.native_id = ?2 AND m.checkout = ?3 AND d.state = 'queued'
+         WHERE {} AND d.state = 'queued'
          ORDER BY m.created_at, m.rowid",
-    )?;
+        same_conversation("m", "?1", "?2", "?3")
+    ))?;
     let queued = statement
         .query_map(params![recipient.provider, recipient.native_id, recipient.checkout], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
@@ -361,19 +473,19 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
         params![attempt, recipient.provider, recipient.native_id, recipient.checkout, now],
     )?;
     let mut messages = Vec::new();
-    for (id, created_at, reply_to, body, _, attempts) in &taken {
+    for (id, created_at, reply_to, body, _, attempts, sender) in &taken {
         let number = attempts + 1;
         tx.execute(
             "UPDATE deliveries SET state = 'handoff-unknown', reason = 'claimed', attempts = ?2, attempt_id = ?3, updated_at = ?4 WHERE message_id = ?1 AND state = 'queued'",
             params![id, number, attempt, now],
         )?;
         tx.execute("INSERT INTO attempt_messages (attempt_id, message_id, number) VALUES (?1, ?2, ?3)", params![attempt, id, number])?;
-        messages.push(json!({ "message_id": id, "sender": { "kind": "user" }, "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
+        messages.push(json!({ "message_id": id, "sender": sender_json(sender), "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
     }
     commit(tx, "claim")?;
     let framed: Vec<_> = taken
         .iter()
-        .map(|(id, created_at, reply_to, body, _, _)| frame::Framed { id, sender: "user", sent_at: *created_at, reply_to: reply_to.as_deref(), body })
+        .map(|(id, created_at, reply_to, body, _, _, sender)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body })
         .collect();
     Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed) }))
 }
@@ -451,7 +563,7 @@ pub fn acknowledge(store: &mut Store, request: AcknowledgeRequest) -> Result<Val
     let Some((provider, native_id, checkout, state)) = row else {
         return Err(Fail::new("MESSAGE_NOT_FOUND", "no such message"));
     };
-    if !request.recipient.is(&(provider, native_id, checkout)) {
+    if !request.recipient.matches_stored(&(provider, native_id, checkout)) {
         return Err(Fail::new("RECIPIENT_MISMATCH", "this message is addressed to a different conversation"));
     }
     match state.as_str() {
@@ -494,7 +606,7 @@ pub fn redeliver(store: &mut Store, request: RedeliverRequest) -> Result<Value, 
     let Some((provider, native_id, checkout, state, attempt)) = row else {
         return Err(Fail::new("MESSAGE_NOT_FOUND", "no such message"));
     };
-    if !request.recipient.is(&(provider, native_id, checkout)) {
+    if !request.recipient.matches_stored(&(provider, native_id, checkout)) {
         return Err(Fail::new("RECIPIENT_MISMATCH", "this message is addressed to a different conversation"));
     }
     if state != "handoff-unknown" {
@@ -531,6 +643,16 @@ pub fn parse_cancel(mut args: Args) -> Result<CancelRequest, Fail> {
 pub fn cancel(store: &mut Store, request: CancelRequest) -> Result<Value, Fail> {
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // A message for a peer is retracted through its outbox, which is honest about what is still unknown.
+    if crate::outbox::cancel(&tx, &request.message_id, now)?.is_some() {
+        commit(tx, "cancel")?;
+        let shown = crate::outbox::view(&store.db, &request.message_id, now, false)?.unwrap_or(Value::Null);
+        let mut reply = json!({ "message_id": request.message_id, "state": shown["state"] });
+        if shown["transport"]["cancel"] == "requested" {
+            reply["cancel"] = json!("requested");
+        }
+        return Ok(reply);
+    }
     let row: Option<(String, i64)> = tx
         .query_row("SELECT state, expires_at FROM deliveries WHERE message_id = ?1", [&request.message_id], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;

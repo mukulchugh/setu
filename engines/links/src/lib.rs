@@ -1,6 +1,16 @@
 pub mod args;
+pub mod authz;
+pub mod binding;
+pub mod daemon;
 pub mod frame;
+pub mod inbound;
 pub mod mailbox;
+pub mod migrate;
+pub mod outbox;
+pub mod peers;
 pub mod protocol;
+pub mod sharing;
 pub mod store;
+pub mod transport;
 pub mod util;
+pub mod wire;

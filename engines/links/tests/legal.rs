@@ -37,7 +37,9 @@ fn the_required_notices_are_kept_verbatim_beside_the_provenance() {
     }
 }
 
-const ALLOWED: &[&str] = &["MIT", "Apache-2.0", "Unlicense", "Zlib", "Unicode-3.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD"];
+/// CDLA-Permissive-2.0 is the permissive data license on the Mozilla CA bundle crates, reached only through the
+/// relay and name-lookup crates the transport does not use (see the third-party list).
+const ALLOWED: &[&str] = &["MIT", "Apache-2.0", "Unlicense", "Zlib", "Unicode-3.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD", "CDLA-Permissive-2.0"];
 
 /// Every `AND` clause needs one allowed alternative among its `OR` choices.
 fn permitted(expression: &str) -> bool {

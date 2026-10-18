@@ -10,11 +10,21 @@ const MAX_REPLY_BYTES = 2 * 1024 * 1024;
 // others are resolved by looking at the message, and none of them ever requeues anything by itself.
 const RECOVERY = {
   acknowledge: 'Check the message status; acknowledging again is safe.',
+  binding_invalidate:
+    'Repeating it is safe: an invalidation at the same generation changes nothing more.',
+  binding_publish:
+    'Repeating it is safe: a publish at an unchanged generation only refreshes its validity.',
   cancel: 'Check the message status; cancelling again is safe.',
   claim:
     'Anything it claimed is now handoff-unknown and is not delivered again unless redelivery is explicitly requested. Check the message status.',
   confirm:
     'Mail stays handoff-unknown until a confirmation for the exact attempt is accepted; repeating that same confirmation is safe.',
+  identity:
+    'Repeating it is safe: the key is made once, whole, and kept; if it is refused the reply names the file to move aside.',
+  peer_add: 'Repeating it is safe.',
+  peer_grant: 'Repeating it is safe.',
+  peer_grant_remove: 'Repeating it is safe.',
+  peer_remove: 'Repeating it is safe.',
   reconcile: 'Repeating it is safe.',
   redeliver:
     'Check the message status before deciding whether to redeliver again.',
@@ -55,10 +65,17 @@ const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
 const listOf = (check) => (value) => Array.isArray(value) && value.every(check);
-const exactly = (spec) => (value) =>
-  isObject(value) &&
-  Object.keys(value).every((key) => Object.hasOwn(spec, key)) &&
-  Object.entries(spec).every(([key, check]) => check(value[key]));
+const exactly =
+  (spec, optional = {}) =>
+  (value) =>
+    isObject(value) &&
+    Object.keys(value).every(
+      (key) => Object.hasOwn(spec, key) || Object.hasOwn(optional, key)
+    ) &&
+    Object.entries(spec).every(([key, check]) => check(value[key])) &&
+    Object.entries(optional).every(
+      ([key, check]) => value[key] === undefined || check(value[key])
+    );
 const DELIVERY_STATES = new Set([
   'acknowledged',
   'cancelled',
@@ -67,7 +84,24 @@ const DELIVERY_STATES = new Set([
   'handoff-unknown',
   'held',
   'queued',
+  'rejected',
 ]);
+// Who a message is from: the local user, or a peer machine named by its authenticated key.
+const sender = (value) =>
+  exactly({ kind: isText }, { peer_id: isText })(value) &&
+  (value.kind === 'peer') === (value.peer_id !== undefined);
+// The sender's view of a message sent to a peer. `outbox` says whether the peer has durably taken it;
+// `cancel` says whether a retraction is still waiting on the peer's answer.
+const transport = exactly({
+  attempts: count,
+  cancel: isText,
+  last_error: maybe(isText),
+  outbox: isText,
+  peer_id: isText,
+  remote_reason: maybe(isText),
+  remote_state: maybe(isText),
+  remote_updated_at: maybe(count),
+});
 const messageFields = {
   attempt_id: maybe(isText),
   attempts: count,
@@ -85,17 +119,37 @@ const messageFields = {
   redeliveries: count,
   reply_to: maybe(isText),
   run_hint: maybe(isText),
-  sender: exactly({ kind: isText }),
+  sender,
   size: count,
   span_hint: maybe(isText),
   state: (value) => DELIVERY_STATES.has(value),
   stored_state: (value) => DELIVERY_STATES.has(value),
   updated_at: count,
 };
+// `observed_match` is the engine's own answer to "is this message addressed to the conversation I passed as
+// `observed`", true or false, or null when none was passed. Callers must ask the engine rather than compare tuples:
+// mail from a peer is stored under an opaque address the engine alone can match.
+const optionalMessageFields = { observed_match: maybe(flag), transport };
 const statusOf = { message_id: isText, state: isText };
 const RESULT_SHAPES = {
   acknowledge: exactly(statusOf),
-  cancel: exactly(statusOf),
+  binding_invalidate: exactly({ held: listOf(isText) }),
+  binding_publish: exactly({
+    held: listOf(isText),
+    released: listOf(isText),
+    valid_until: count,
+  }),
+  binding_show: exactly(
+    { state: isText },
+    {
+      generation: count,
+      invalid_reason: maybe(isText),
+      project: maybe(isText),
+      recipient: maybe(isObject),
+      valid_until: count,
+    }
+  ),
+  cancel: exactly(statusOf, { cancel: isText }),
   claim: exactly({
     attempt_id: maybe(isText),
     messages: listOf(
@@ -105,7 +159,7 @@ const RESULT_SHAPES = {
         created_at: count,
         message_id: isText,
         reply_to: maybe(isText),
-        sender: exactly({ kind: isText }),
+        sender,
       })
     ),
     text: isText,
@@ -117,13 +171,62 @@ const RESULT_SHAPES = {
     schema_version: count,
     store: isText,
   }),
-  list: exactly({ messages: listOf(exactly(messageFields)) }),
+  identity: exactly({ peer_id: isText }),
+  list: exactly({
+    messages: listOf(exactly(messageFields, optionalMessageFields)),
+  }),
+  peer_add: exactly({ peer_id: isText }),
+  peer_grant: exactly({ peer_id: isText }),
+  peer_grant_remove: exactly({ peer_id: isText }),
+  peer_list: exactly({
+    peers: listOf(
+      exactly({
+        addresses: listOf(isText),
+        created_at: count,
+        grants: listOf(
+          exactly({
+            capability: isText,
+            scope: exactly({ kind: isText }, { id: isText }),
+          })
+        ),
+        label: isText,
+        peer_id: isText,
+        published: listOf(
+          exactly({
+            recipient: exactly({
+              checkout: isText,
+              native_id: isText,
+              provider: isText,
+              session_hint: isText,
+            }),
+            scope: isText,
+            session_hint: isText,
+          })
+        ),
+      })
+    ),
+  }),
+  peer_remove: exactly({ peer_id: isText }),
   reconcile: exactly({ held: listOf(isText), released: listOf(isText) }),
   redeliver: exactly(statusOf),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
-  show: exactly({ ...messageFields, body: isText }),
-  status: exactly(messageFields),
+  show: exactly({ ...messageFields, body: isText }, optionalMessageFields),
+  status: exactly(messageFields, optionalMessageFields),
   sweep: exactly({ expired: listOf(isText) }),
+  transport_status: exactly(
+    { running: flag },
+    {
+      engine_version: isText,
+      links: listOf(
+        exactly({ peer_id: isText, state: isText }, { code: isText })
+      ),
+      listen: listOf(isText),
+      peer_id: isText,
+      pid: count,
+      protocol_versions: listOf(count),
+      started_at: count,
+    }
+  ),
 };
 
 function parseReply(text, id) {

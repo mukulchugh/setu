@@ -26,17 +26,35 @@
         "sha256": "f0bf8dd78a4efb587a45a35da404d928ba2859bc38525067fab694555c21ec63",
         "adaptedInto": "src/frame.rs",
         "use": "Message framing for an agent: attribute escaping, delimiter neutralising and the frame test. Directory and CLI rendering were not brought in."
+      },
+      {
+        "path": "src/net.rs",
+        "gitBlob": "7f8de17184d7ebb30dde3c7b23df2fea073aba7c",
+        "sha256": "a39f99071a801ce949d85694f99cc893364103dd3f8c7b16197dd1dc89a6fc45",
+        "adaptedInto": "src/transport.rs",
+        "use": "The shape of the peer connection manager: one connection per pair of machines, a dial loop with doubling backoff, the rule that both sides keep the connection the smaller key dialed, length-prefixed JSON frames with a size cap, and a bounded wait for each answer. Written again for the Setu wire: the team roster, join protocol, presence, relay selection and address lookup were not brought in, the message type carries no wake flag, and the retry queue is derived from the engine store instead of a table of its own."
       }
     ],
     "consultedOnly": [
       "src/proto.rs",
       "src/daemon/mail.rs",
-      "src/ipc.rs"
+      "src/ipc.rs",
+      "src/daemon/mod.rs",
+      "src/util.rs (lock)"
     ]
   },
   "notices": [
-    { "file": "LICENSE-MIT", "sha256": "0c0f2e36352216ffb048903b26375f2d2a2c2cca5efed60d821090e884b48198" },
-    { "file": "LICENSE-APACHE", "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" },
-    { "file": "NOTICE", "sha256": "5da1765ea1af12a1649cb26e28c2620a706b15a99fbd148eccf3709e98ecb418" }
+    {
+      "file": "LICENSE-MIT",
+      "sha256": "0c0f2e36352216ffb048903b26375f2d2a2c2cca5efed60d821090e884b48198"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "file": "NOTICE",
+      "sha256": "5da1765ea1af12a1649cb26e28c2620a706b15a99fbd148eccf3709e98ecb418"
+    }
   ]
 }

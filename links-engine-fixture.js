@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isServeCommand } from './links-transport.js';
 
 const ENGINE_DIR = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -46,4 +47,54 @@ export function temporaryLinksRoot() {
     cleanup: () => rmSync(root, { force: true, recursive: true }),
     root,
   };
+}
+
+// Daemons a test started, by the process ID it recorded, the engine it ran and the directory it served. A test may
+// stop only these, and only while the process is exactly that engine serving exactly that directory.
+const started = new Map();
+
+export function trackDaemon(pid, dataDir, enginePath) {
+  started.set(pid, { dataDir, enginePath });
+}
+
+function commandLine(pid) {
+  const shown = Bun.spawnSync(['ps', '-p', String(pid), '-o', 'command='], {
+    stderr: 'ignore',
+    stdout: 'pipe',
+  });
+  return shown.exitCode === 0 ? shown.stdout.toString().trim() : '';
+}
+
+// The same exact command-line test production uses, not a substring: a sibling directory is not this one.
+const stillOurs = (pid, { dataDir, enginePath }) =>
+  isServeCommand(commandLine(pid), enginePath, dataDir);
+
+// Runs after every test, whatever the test did or failed to do (a refused stop, a thrown assertion).
+export async function reapDaemons() {
+  for (const [pid, recorded] of [...started]) {
+    started.delete(pid);
+    if (!stillOurs(pid, recorded)) {
+      continue;
+    }
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      continue;
+    }
+    for (
+      let waited = 0;
+      waited < 3000 && stillOurs(pid, recorded);
+      waited += 50
+    ) {
+      // biome-ignore lint/performance/noAwaitInLoops: Waiting for one process to leave.
+      await Bun.sleep(50);
+    }
+    if (stillOurs(pid, recorded)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    }
+  }
 }

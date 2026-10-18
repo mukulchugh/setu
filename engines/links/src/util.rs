@@ -44,3 +44,12 @@ pub fn fault(point: &str) {
     }
     let _ = point;
 }
+
+/// How often the daemon looks at the outbox and the receipt backlog. A `test-hooks` build can shorten it.
+pub fn tick_ms() -> u64 {
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var("SETU_LINKS_TEST_TICK_MS").ok().and_then(|v| v.parse().ok()) {
+        return ms;
+    }
+    1000
+}

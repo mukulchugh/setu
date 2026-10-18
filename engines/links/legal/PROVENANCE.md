@@ -19,16 +19,17 @@ recorded checksums.
 | --- | --- | --- |
 | `src/store.rs` | `src/store.rs` | The SQLite open and write-ahead-logging skeleton. The schema and every operation are new. |
 | `src/util.rs` | `src/util.rs` | `now_ms`, `one_line`, `printable`. |
+| `src/net.rs` | `src/transport.rs` | The shape of the connection manager: one connection per pair of machines, a dial loop with backoff, both sides keeping the connection the smaller key dialed, length-prefixed JSON frames with a size cap. Rewritten for the Setu wire, with no roster, join, presence, relay or lookup code and no wake flag. |
 | `src/render.rs` | `src/frame.rs` | The framing approach, attribute escaping and delimiter neutralising. |
 
-`src/proto.rs`, `src/daemon/mail.rs` and `src/ipc.rs` were read for the request shape, body limit and
+`src/proto.rs`, `src/daemon/mail.rs`, `src/daemon/mod.rs`, the lock helper in `src/util.rs` and `src/ipc.rs` were read for the request shape, body limit and
 validation approach. No code was copied from them.
 
 ## What was left behind
 
 The installer, self-update, login and agent-configuration writers, the menu-bar and notification
-surfaces, the session scanner and transcript-derived "what it is doing" feature, the network transport
-and team roster, and the Windows support. The engine is a Setu-managed local process.
+surfaces, the session scanner and transcript-derived "what it is doing" feature, the team roster,
+invitations, presence, relay selection and address lookup, and the Windows support. The engine is a Setu-managed local process.
 
 ## Other obligations
 

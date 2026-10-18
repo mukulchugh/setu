@@ -275,3 +275,162 @@ test('a send whose reply was lost is retried under the same key to exactly one m
   const inbox = await healthy.call('list', { session_hint: 'session-1' });
   expect(inbox.result.messages).toHaveLength(1);
 });
+
+const PEER = 'a'.repeat(64);
+const PUBLIC_KEY = /^[0-9a-f]{64}$/;
+
+test('the transport operations round-trip through the real engine with strict result shapes', async () => {
+  const { client } = realClient();
+  const identity = await client.call('identity', {});
+  expect(identity).toMatchObject({ ok: true });
+  expect(identity.result.peer_id).toMatch(PUBLIC_KEY);
+  expect(await client.call('transport_status', {})).toEqual({
+    ok: true,
+    result: { running: false },
+  });
+
+  const key = identity.result.peer_id;
+  expect(
+    await client.call('peer_add', {
+      addresses: ['127.0.0.1:4000'],
+      label: 'laptop',
+      peer_id: key,
+    })
+  ).toEqual({ ok: true, result: { peer_id: key } });
+  expect(
+    await client.call('peer_grant', {
+      capability: 'send',
+      peer_id: key,
+      scope: { kind: 'peer' },
+    })
+  ).toMatchObject({ ok: true });
+  const listed = await client.call('peer_list', {});
+  expect(listed.result.peers[0]).toMatchObject({
+    addresses: ['127.0.0.1:4000'],
+    grants: [{ capability: 'send', scope: { kind: 'peer' } }],
+    label: 'laptop',
+    published: [],
+  });
+
+  const published = await client.call('binding_publish', {
+    generation: 1,
+    recipient,
+    valid_for_ms: 60_000,
+  });
+  expect(published).toMatchObject({
+    ok: true,
+    result: { held: [], released: [] },
+  });
+  expect(
+    await client.call('binding_show', { session_hint: 'session-1' })
+  ).toMatchObject({ ok: true, result: { generation: 1, state: 'valid' } });
+  expect(
+    await client.call('binding_invalidate', {
+      generation: 2,
+      reason: 'ownership-unknown',
+      session_hint: 'session-1',
+    })
+  ).toEqual({ ok: true, result: { held: [] } });
+});
+
+test('a mutation of the roster or the snapshots whose reply is lost is unknown, and repeating it is safe', async () => {
+  const { root, cleanup } = temporaryLinksRoot();
+  cleanups.push(cleanup);
+  const client = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: join(root, 'absent'),
+  });
+  for (const op of [
+    'peer_add',
+    'peer_remove',
+    'peer_grant',
+    'peer_grant_remove',
+    'binding_publish',
+    'binding_invalidate',
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: One missing engine per operation.
+    const outcome = await client.call(op, {});
+    expect(outcome).toMatchObject({ code: 'LINKS_OUTCOME_UNKNOWN', ok: false });
+    expect(outcome.error).toContain('Repeating it is safe');
+  }
+});
+
+test('a claim of peer mail names the peer, and a malformed sender is still never believed', async () => {
+  const message = {
+    attempt: 1,
+    body: 'hi',
+    created_at: 1,
+    message_id: 'm_1',
+    reply_to: null,
+  };
+  const claim = (sender) =>
+    replying({
+      ok: true,
+      protocol: 'setu-links/1',
+      result: {
+        attempt_id: 'a_1',
+        messages: [{ ...message, sender }],
+        text: 'framed',
+      },
+    });
+  expect(
+    await claim({ kind: 'peer', peer_id: PEER }).call('claim', {})
+  ).toMatchObject({ ok: true });
+  for (const sender of [
+    { kind: 'peer' },
+    { kind: 'peer', peer_id: 1 },
+    { extra: 1, kind: 'user', peer_id: PEER },
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: One fixture engine per sender shape.
+    expect(await claim(sender).call('claim', {})).toMatchObject({
+      code: 'LINKS_OUTCOME_UNKNOWN',
+      ok: false,
+    });
+  }
+});
+
+test('the sender view of a message sent to a peer keeps the outbox stage and the cancel stage explicit', async () => {
+  const status = (transport) => ({
+    attempt_id: null,
+    attempts: 0,
+    created_at: 1,
+    expires_at: 2,
+    kind: 'message',
+    message_id: 'm_1',
+    reason: null,
+    recipient,
+    redeliveries: 0,
+    reply_to: null,
+    run_hint: null,
+    sender: { kind: 'user' },
+    size: 2,
+    span_hint: null,
+    state: 'queued',
+    stored_state: 'queued',
+    transport,
+    updated_at: 3,
+  });
+  const good = {
+    attempts: 1,
+    cancel: 'requested',
+    last_error: null,
+    outbox: 'pending',
+    peer_id: PEER,
+    remote_reason: null,
+    remote_state: null,
+    remote_updated_at: null,
+  };
+  const reply = (transport) =>
+    replying({
+      ok: true,
+      protocol: 'setu-links/1',
+      result: status(transport),
+    });
+  expect(await reply(good).call('status', {})).toMatchObject({ ok: true });
+  expect(
+    await reply({ ...good, outbox: undefined }).call('status', {})
+  ).toMatchObject({ ok: false });
+  expect(await reply({ ...good, extra: 1 }).call('status', {})).toMatchObject({
+    ok: false,
+  });
+});

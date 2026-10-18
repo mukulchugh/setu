@@ -9,8 +9,7 @@ operation protocol. Required licenses and provenance are kept apart, in `legal/`
 One short-lived process per operation: a JSON request on standard input, a JSON reply on standard
 output, `--data-dir <dir>` for the store. Reasons: it needs no daemon, supervisor or socket in this
 local slice; SQLite already serializes concurrent writers; and a crash can only happen between
-whole operations. A long-running mode for peer transport can later serve the same protocol over the
-same store. Nothing starts on a read: a read of a missing store creates nothing.
+whole operations. A long-running mode, `setu-links serve`, moves messages between engines over the same store (see Peer transport). Nothing starts on a read: a read of a missing store creates nothing.
 
 Exit code 0 means a reply was written (even `ok: false`). Anything else is a process failure, and a
 client treats a mutation without a reply as unknown, never as failed.
@@ -71,6 +70,42 @@ appears.
 | Per turn | 8 messages, 32 KiB | Bounds context injected at one turn; remaining mail waits for the next. Fixed: a caller cannot change it. |
 
 They are tunable constants in `src/mailbox.rs`, not product decisions.
+
+## Peer transport
+
+`setu-links serve --data-dir <dir> [--listen <address>]` is the one long-running process per data
+directory. It holds an exclusive `serve.lock`, so a second start prints `already-running` and exits 0; it writes
+`serve.json` (pid, public key, listen addresses, who is connected) once it is listening and stops on SIGTERM.
+`transport_status` reads the lock and that file and never starts anything. The transport owns no message
+state: its retry queue is the outbox, its receipt backlog is a query over the inbox, and a restart loses
+nothing.
+
+A peer is a transport public key (`transport.key`, owner-only, created by `identity` or the first `serve`). The
+connection is authenticated and encrypted by the transport library (QUIC with TLS 1.3, `ring` provider) and
+dials only addresses the trusted service gave with `peer_add` and listens on loopback unless `--listen` is given: no relay, no public address lookup, no
+third-party service. The wire (`wire.rs`) is length-prefixed JSON, one request and one reply per stream,
+every shape strict and bounded, versioned inside `Hello` so an incompatible peer is rejected by name
+(`PROTOCOL_INCOMPATIBLE`, `CAPABILITY_MISSING`) with no state change.
+
+| Operation | Purpose |
+| --- | --- |
+| `identity`, `transport_status` | This engine's public key (creates the key on first use); passive process status |
+| `peer_add`, `peer_remove`, `peer_list` | The roster. Removing a peer drops its grants, holds its waiting mail (`peer-revoked`) and ends its connection |
+| `peer_grant`, `peer_grant_remove` | `receive` / `visible` / `send` for a scope: every session, a sharing scope (`ps_…`), or one session. Default deny |
+| `binding_publish`, `binding_invalidate`, `binding_show` | The receiver snapshot: derived from the managed session, expiring, fenced by a generation. Publish may name `resumed_from` |
+| `send` with `peer_id` | Accepts a message into the outbox for a conversation that peer has published |
+| `claim` with `expected_generation` | Refused (`BINDING_NOT_CURRENT`, nothing changed) unless the snapshot is fresh, exact and at that generation |
+
+Sending needs the roster, a `send` grant and the receiver's own published view of the session; receiving needs
+the roster, a `receive` grant, a fresh exact snapshot in a project that is shared now, and then the engine's own
+limits (body, per-conversation and per-peer pending, per-peer rate) and its own seven-day expiry. Details and
+the reasons for each default are in `docs/links/transport.md`. Message
+state has one owner per field: the sender owns submission and outbox state, the receiving engine owns inbox,
+claim, handoff and acknowledgement, and reports them back as receipts.
+
+Schema 3 adds `outbox`, `inbound`, `cancel_tombstones`, `remote_bindings`, `peers`, `peer_grants` and
+`binding_snapshots` on top of schema 2 (additive; no message is rewritten). A killed migration leaves the
+store as it was.
 
 ## Store
 

@@ -2,7 +2,7 @@
 
 use crate::{
     args::{Args, Fail},
-    mailbox,
+    binding, daemon, mailbox, peers, sharing,
     store::{SCHEMA_VERSION, Store},
 };
 use serde_json::{Value, json};
@@ -36,6 +36,11 @@ pub fn handle(data_dir: &Path, request: &str) -> Value {
     reply(&id, dispatch(data_dir, parsed))
 }
 
+/// The reply `serve` prints when it ends: the same envelope as an operation, so a caller parses one shape.
+pub fn serve_reply(options: daemon::Options) -> Value {
+    reply(&Value::Null, daemon::serve(options))
+}
+
 /// A read opens the store only if one exists; it never creates one.
 fn reader(data_dir: &Path) -> Result<Option<Store>, Fail> {
     match Store::open_existing(data_dir) {
@@ -65,6 +70,10 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             let request = mailbox::parse_claim(args)?;
             // With no store there is no mail, and a claim must not be what creates one.
             if reader(data_dir)?.is_none() {
+                // A claim that names a generation has no snapshot to match, and says so.
+                if request.fenced() {
+                    return Err(Fail::new("BINDING_NOT_CURRENT", "the session's current conversation is not the one that asked").with(json!({ "reason": "absent" })));
+                }
                 return Ok(json!({ "attempt_id": null, "messages": [], "text": "" }));
             }
             mailbox::claim(&mut Store::open_or_create(data_dir)?, request)
@@ -93,6 +102,58 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             let request = mailbox::parse_cancel(args)?;
             mailbox::cancel(&mut Store::open_or_create(data_dir)?, request)
         }
+        "binding_publish" => {
+            let request = binding::parse_publish(args)?;
+            binding::publish(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "binding_invalidate" => {
+            let request = binding::parse_invalidate(args)?;
+            // A fence is state of its own, so an invalidation creates the store if need be.
+            binding::invalidate(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "binding_show" => binding::show(reader(data_dir)?.as_ref(), args),
+        "peer_add" => {
+            let request = peers::parse_add(args)?;
+            peers::add(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "peer_remove" => {
+            let request = peers::parse_remove(args)?;
+            // Nothing to revoke without a store, and a revocation must not create one.
+            if reader(data_dir)?.is_none() {
+                return Ok(json!({ "peer_id": request.peer_id }));
+            }
+            peers::remove(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "peer_grant" => {
+            let request = peers::parse_grant(args)?;
+            peers::grant(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "peer_grant_remove" => {
+            let request = peers::parse_grant(args)?;
+            if reader(data_dir)?.is_none() {
+                return Ok(json!({ "peer_id": request.peer_id }));
+            }
+            peers::remove_grant(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "peer_list" => peers::list(reader(data_dir)?.as_ref(), args),
+        "identity" => {
+            args.finish()?;
+            daemon::identity(data_dir)
+        }
+        "transport_status" => {
+            args.finish()?;
+            Ok(daemon::status(data_dir))
+        }
+        // #11-owned operations, wired provisionally so the transport can be tested against a real policy.
+        "share_enable" => {
+            let request = sharing::parse_enable(args)?;
+            sharing::enable(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "share_disable" => {
+            let project = sharing::parse_disable(args)?;
+            sharing::disable(&mut Store::open_or_create(data_dir)?, project)
+        }
+        "share_status" => sharing::status(reader(data_dir)?.as_ref(), args),
         "sweep" => mailbox::sweep(&mut Store::open_or_create(data_dir)?, args),
         "status" => mailbox::status(reader(data_dir)?.as_ref(), args),
         "show" => mailbox::show(reader(data_dir)?.as_ref(), args),
