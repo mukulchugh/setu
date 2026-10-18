@@ -34,7 +34,20 @@ const attentionPage = {
   items: [{ ...attentionItem, group_key: 'g', notifying: true }],
   next_before: null,
   notifications: {
-    groups: [{ count: 1, count_complete: true, first_at: 5, group_key: 'g', item_ids: ['att_1'], last_at: 5, latest_attention_id: 'att_1', project: 'repo', recipient_session_hint: 'session-1', sender: { id: 'sender-session', kind: 'session' } }],
+    groups: [
+      {
+        count: 1,
+        count_complete: true,
+        first_at: 5,
+        group_key: 'g',
+        item_ids: ['att_1'],
+        last_at: 5,
+        latest_attention_id: 'att_1',
+        project: 'repo',
+        recipient_session_hint: 'session-1',
+        sender: { id: 'sender-session', kind: 'session' },
+      },
+    ],
     suppressed: 0,
   },
 };
@@ -44,19 +57,51 @@ test('attention replies are believed only in their exact shapes', async () => {
     ['attention_send', { attention_id: 'att_1', replayed: false }],
     ['attention_list', attentionPage],
     ['attention_show', attentionItem],
-    ['share_attention', { changed: true, policy: { attention: true, interrupt: false, owner: 'Mukul', receive: true, scope: 'ps_x', version: 1, visibility: true }, project: 'repo' }],
+    [
+      'share_attention',
+      {
+        changed: true,
+        policy: {
+          attention: true,
+          interrupt: false,
+          owner: 'Mukul',
+          receive: true,
+          scope: 'ps_x',
+          version: 1,
+          visibility: true,
+        },
+        project: 'repo',
+      },
+    ],
   ]) {
     // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
     expect(await answering(result).call(op, {})).toEqual({ ok: true, result });
   }
-  for (const [op, result] of [
+  const wrong = [
     ['attention_send', { attention_id: 'att_1' }],
-    ['attention_list', { ...attentionPage, items: [{ attention_id: 'att_1' }] }],
+    ['attention_send', { attention_id: 'att_1', replayed: 'no' }],
+    [
+      'attention_list',
+      { ...attentionPage, items: [{ attention_id: 'att_1' }] },
+    ],
+    ['attention_list', { ...attentionPage, has_more: 'no' }],
+    [
+      'attention_list',
+      {
+        ...attentionPage,
+        notifications: { groups: [{ count: 1 }], suppressed: 0 },
+      },
+    ],
+    ['attention_list', { ...attentionPage, extra: true }],
     ['attention_show', { ...attentionItem, sender: { kind: 'user' } }],
+    ['attention_show', { ...attentionItem, extra: 1 }],
     ['share_attention', { changed: true, project: 'repo' }],
-  ]) {
+  ];
+  for (const [op, result] of wrong) {
     // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
-    expect((await answering(result).call(op, {})).ok).toBe(false);
+    const outcome = await answering(result).call(op, {});
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain('unusable reply');
   }
 });
 
