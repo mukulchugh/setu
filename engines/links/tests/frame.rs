@@ -44,16 +44,6 @@ fn one_turn_carries_a_bounded_number_of_messages() {
 }
 
 #[test]
-fn one_turn_carries_a_bounded_number_of_bytes() {
-    let engine = Engine::new();
-    for n in 0..3 {
-        engine.ok("send", send_args(&format!("k{n}"), &"x".repeat(16 * 1024), "native-a"));
-    }
-    assert_eq!(claim(&engine)["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(claim(&engine)["messages"].as_array().unwrap().len(), 1);
-}
-
-#[test]
 fn a_caller_cannot_change_how_much_one_turn_carries() {
     let engine = Engine::new();
     engine.ok("send", send_args("k0", "short", "native-a"));

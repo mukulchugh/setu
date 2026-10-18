@@ -36,7 +36,7 @@ fn a_message_reaches_the_remote_inbox_and_the_sender_sees_it_deposited() {
     let shown = pair.b.ok("show", json!({ "message_id": received[0]["message_id"] }));
     assert_eq!(shown["body"], "hello from a");
     assert_eq!(shown["sender"]["kind"], "peer");
-    assert_eq!(shown["sender"]["peer_id"], pair.a_id);
+    assert_eq!(shown["sender"]["id"], pair.a_id);
 }
 
 fn claim_args() -> Value {

@@ -25,10 +25,17 @@ const RECOVERY = {
   peer_grant: 'Repeating it is safe.',
   peer_grant_remove: 'Repeating it is safe.',
   peer_remove: 'Repeating it is safe.',
+  presence_publish:
+    'Repeating it is safe; the next presence round publishes it again.',
   reconcile: 'Repeating it is safe.',
   redeliver:
     'Check the message status before deciding whether to redeliver again.',
+  resume: 'Repeating it is safe.',
   send: 'Check the inbox, or repeat the send with the same idempotency key.',
+  share_disable:
+    'Check the sharing status; disabling again is safe, and sharing stays on until it is confirmed disabled.',
+  share_enable:
+    'Check the sharing status before confirming again; nothing is shared unless the status says it is.',
   sweep: 'Repeating it is safe.',
 };
 const REPLY_KEYS = new Set(['error', 'id', 'ok', 'protocol', 'result']);
@@ -65,6 +72,10 @@ const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
 const listOf = (check) => (value) => Array.isArray(value) && value.every(check);
+const anyOf =
+  (...checks) =>
+  (value) =>
+    checks.some((check) => check(value));
 const exactly =
   (spec, optional = {}) =>
   (value) =>
@@ -86,10 +97,35 @@ const DELIVERY_STATES = new Set([
   'queued',
   'rejected',
 ]);
-// Who a message is from: the local user, or a peer machine named by its authenticated key.
-const sender = (value) =>
-  exactly({ kind: isText }, { peer_id: isText })(value) &&
-  (value.kind === 'peer') === (value.peer_id !== undefined);
+// Who sent a message: the local user, a local session by its id, or a peer machine by its authenticated key.
+const senderShape = anyOf(
+  exactly({ kind: (value) => value === 'user' }),
+  exactly({ id: isText, kind: (value) => value === 'session' }),
+  exactly({ id: isText, kind: (value) => value === 'peer' })
+);
+const policyShape = exactly({
+  attention: flag,
+  interrupt: flag,
+  owner: isText,
+  receive: flag,
+  scope: isText,
+  version: count,
+  visibility: flag,
+});
+const projectStanding = anyOf(
+  exactly({ project: isText, state: (value) => value === 'absent' }),
+  exactly({
+    policy: policyShape,
+    project: isText,
+    state: (value) => value === 'enabled',
+    updated_at: count,
+  }),
+  exactly({
+    error: exactly({ code: isText, reason: isText }),
+    project: isText,
+    state: (value) => value === 'invalid',
+  })
+);
 // The sender's view of a message sent to a peer. `outbox` says whether the peer has durably taken it;
 // `cancel` says whether a retraction is still waiting on the peer's answer.
 const transport = exactly({
@@ -108,7 +144,9 @@ const messageFields = {
   created_at: count,
   expires_at: count,
   kind: isText,
+  locator: isText,
   message_id: isText,
+  project: maybe(isText),
   reason: maybe(isText),
   recipient: exactly({
     checkout: isText,
@@ -119,7 +157,7 @@ const messageFields = {
   redeliveries: count,
   reply_to: maybe(isText),
   run_hint: maybe(isText),
-  sender,
+  sender: senderShape,
   size: count,
   span_hint: maybe(isText),
   state: (value) => DELIVERY_STATES.has(value),
@@ -133,10 +171,11 @@ const optionalMessageFields = { observed_match: maybe(flag), transport };
 const statusOf = { message_id: isText, state: isText };
 const RESULT_SHAPES = {
   acknowledge: exactly(statusOf),
-  binding_invalidate: exactly({ held: listOf(isText) }),
+  binding_invalidate: exactly({ held: listOf(isText), stored: flag }),
   binding_publish: exactly({
     held: listOf(isText),
     released: listOf(isText),
+    stored: flag,
     valid_until: count,
   }),
   binding_show: exactly(
@@ -159,12 +198,32 @@ const RESULT_SHAPES = {
         created_at: count,
         message_id: isText,
         reply_to: maybe(isText),
-        sender,
+        sender: senderShape,
       })
     ),
     text: isText,
   }),
   confirm: exactly({ confirmed: listOf(isText), superseded: listOf(isText) }),
+  directory: exactly({
+    entries: listOf(
+      exactly({
+        activity_at: maybe(count),
+        observed_at: count,
+        owner: isText,
+        project: isText,
+        reachability: exactly({ reason: maybe(isText), state: isText }),
+        session_id: isText,
+        stale: flag,
+        task: maybe(isText),
+        task_at: maybe(count),
+        task_stale: flag,
+      })
+    ),
+    problems: listOf(
+      exactly({ code: isText, project: isText, reason: isText })
+    ),
+    stale_after_ms: count,
+  }),
   health: exactly({
     engine_version: isText,
     protocol: isText,
@@ -207,9 +266,23 @@ const RESULT_SHAPES = {
     ),
   }),
   peer_remove: exactly({ peer_id: isText }),
+  presence_publish: exactly({ project: isText, published: count }),
   reconcile: exactly({ held: listOf(isText), released: listOf(isText) }),
   redeliver: exactly(statusOf),
+  resume: exactly({ moved: listOf(isText), released: listOf(isText) }),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
+  share_disable: exactly({
+    held: listOf(isText),
+    project: isText,
+    removed: flag,
+  }),
+  share_enable: exactly({
+    changed: flag,
+    policy: policyShape,
+    project: isText,
+    released: listOf(isText),
+  }),
+  share_status: exactly({ projects: listOf(projectStanding) }),
   show: exactly({ ...messageFields, body: isText }, optionalMessageFields),
   status: exactly(messageFields, optionalMessageFields),
   sweep: exactly({ expired: listOf(isText) }),
@@ -298,6 +371,10 @@ function interpret(op, finished, id) {
     ...(retryable ? { retryable: true } : {}),
   });
 }
+
+// The engine's one database file inside its data directory (store.rs `DATABASE`). A mailbox exists exactly when this
+// file does: the directory alone says nothing, because the engine also keeps its identity and transport state there.
+export const MAILBOX_FILE = 'mailbox.sqlite3';
 
 export function createLinksClient({
   enginePath,

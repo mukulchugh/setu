@@ -26,6 +26,11 @@ const ENFORCEMENT_LEVELS = Object.freeze([
   'estimated',
   'unavailable',
 ]);
+// `observed` (the default) needs the probe to have seen the effort. The
+// profile may instead say it accepts the requested effort unverified, because a
+// client can clamp the flag without reporting it. That is a profile's explicit
+// choice; a known effort that differs from the request still blocks.
+const EFFORT_POLICIES = Object.freeze(['observed', 'requested-unverified']);
 const PROBE_SOURCE = 'fresh-session-probe';
 const MAX_ID_LENGTH = 256;
 const MAX_REQUIRED_TOOLS = 64;
@@ -37,6 +42,7 @@ const POLICY_KEYS = Object.freeze(['maxClockSkewMs', 'maxEvidenceAgeMs']);
 const PROFILE_KEYS = Object.freeze([
   'client',
   'effort',
+  'effortPolicy',
   'model',
   'provider',
   'requires',
@@ -445,9 +451,14 @@ function parseProfile(value) {
   if (!requirements.ok) {
     return requirements;
   }
+  const effortPolicy = snapshot.effortPolicy ?? 'observed';
+  if (!EFFORT_POLICIES.includes(effortPolicy)) {
+    return refuse('PROFILE_INVALID');
+  }
   const profile = {
     client: snapshot.client,
     effort: effort.effort,
+    effortPolicy,
     model: snapshot.model,
     provider: snapshot.provider,
     requirements: requirements.requirements,
@@ -557,10 +568,19 @@ function modelResult(profile, identity) {
 function effortResult(profile, identity) {
   const observed = observedOneOf(fieldOf(identity, 'effort'), EFFORT_ORDER);
   if (observed === 'unknown') {
-    return { observed, reasons: ['EFFORT_UNKNOWN'], requested: profile.effort };
+    return {
+      observed,
+      policy: profile.effortPolicy,
+      reasons: ['EFFORT_UNKNOWN'],
+      // A value the client did report but this module cannot use is not the
+      // same as silence, and the policy only covers silence.
+      reported: fieldOf(identity, 'effort') !== undefined,
+      requested: profile.effort,
+    };
   }
   return {
     observed,
+    policy: profile.effortPolicy,
     reasons: observed === profile.effort ? [] : ['EFFORT_MISMATCH'],
     requested: profile.effort,
   };
@@ -734,6 +754,20 @@ function capabilities(profile, evidence, verified) {
   };
 }
 
+// Only a profile that chose `requested-unverified` skips the effort check, and
+// only when the effort was not observed at all. The capability itself stays
+// disabled, so nothing reports the effort as verified.
+function effortAccepted(name, capabilityMap) {
+  const { effort } = capabilityMap;
+  return (
+    name === 'effort' &&
+    effort.policy === 'requested-unverified' &&
+    effort.observed === 'unknown' &&
+    effort.reported === false &&
+    effort.reasons.join() === 'EFFORT_UNKNOWN'
+  );
+}
+
 // Launch needs a fresh session that proved installation and connection, the
 // exact model and effort, and every requested capability. A hard cost cap also
 // needs known pricing, so it cannot launch unpriced. This covers capability
@@ -747,7 +781,7 @@ function launchBlockers(evidence, requirements, capabilityMap, verified) {
     blockers.push('connected');
   }
   for (const name of ['effort', 'model']) {
-    if (!capabilityMap[name].enabled) {
+    if (!(capabilityMap[name].enabled || effortAccepted(name, capabilityMap))) {
       blockers.push(name);
     }
   }
@@ -806,7 +840,13 @@ function evaluate(input) {
     capabilities: capabilityMap,
     client: profile.client,
     evidenceAgeMs: Math.max(0, at - evidence.observedAt),
-    launch: { allowed: blockedBy.length === 0, blockedBy },
+    launch: {
+      allowed: blockedBy.length === 0,
+      blockedBy,
+      ...(effortAccepted('effort', capabilityMap)
+        ? { unverified: ['effort'] }
+        : {}),
+    },
     ok: true,
     // Names the exact probe for approval or dispatch binding. The digest's
     // content is not checked here; contentVerified stays false.

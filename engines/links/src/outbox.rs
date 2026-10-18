@@ -5,7 +5,7 @@
 
 use crate::{
     args::Fail,
-    authz,
+    authz, frame,
     mailbox::{self, Recipient},
     store::Store,
     util,
@@ -22,6 +22,8 @@ pub fn retry_after_ms() -> i64 {
 pub struct Remote {
     pub key: String,
     pub peer_id: String,
+    /// The local project the sending session works in. Kept with the message, never sent to the peer.
+    pub project: String,
     pub recipient: Recipient,
     pub body: String,
     pub reply_to: Option<String>,
@@ -69,6 +71,13 @@ pub fn send(store: &mut Store, request: Remote) -> Result<Value, Fail> {
     if !authz::grant_covers(&tx, &request.peer_id, "send", Some(&scope), &to.session_hint)? {
         return Err(Fail::new("PEER_NOT_AUTHORIZED", "this peer may not be sent to"));
     }
+    // What the receiver will frame (its sender is this machine's key) must fit one turn; a message that cannot is refused
+    // here, before anything is stored, instead of being held at the other end.
+    let receiver_sender = format!("peer:{}", "0".repeat(64));
+    let worst_case = frame::Framed { id: &id, sender: &receiver_sender, sent_at: now, reply_to: request.reply_to.as_deref(), body: &request.body };
+    if !frame::fits(&[worst_case]) {
+        return Err(Fail::new("FRAME_TOO_LARGE", "this message, with its metadata, does not fit one turn of provider output").with(json!({ "limit_bytes": frame::MAX_FRAME_BYTES })));
+    }
     let pending: i64 = tx.query_row(
         "SELECT COUNT(*) FROM outbox o JOIN messages m ON m.id = o.message_id
          WHERE o.peer_id = ?1 AND m.provider = ?2 AND m.native_id = ?3 AND m.checkout = ?4 AND o.expires_at > ?5
@@ -80,23 +89,23 @@ pub fn send(store: &mut Store, request: Remote) -> Result<Value, Fail> {
         return Err(Fail::new("RECIPIENT_QUEUE_FULL", "this conversation already has the most pending messages allowed"));
     }
     tx.execute(
-        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at)
-         VALUES (?1, 'user', ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at, project)
+         VALUES (?1, 'user', ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id, request.key, request.digest, request.body, request.body.len() as i64, request.reply_to, request.run_hint, request.span_hint,
-            to.provider, to.native_id, to.checkout, to.session_hint, now
+            to.provider, to.native_id, to.checkout, to.session_hint, now, request.project
         ],
     )?;
     tx.execute(
         "INSERT INTO outbox (message_id, peer_id, outbox_state, expires_at, updated_at) VALUES (?1, ?2, 'pending', ?3, ?4)",
         params![id, request.peer_id, now + mailbox::EXPIRY_MS, now],
     )?;
-    mailbox::commit(tx, "send")?;
+    crate::store::commit(tx, "send")?;
     Ok(json!({ "message_id": id, "state": "queued", "replayed": false }))
 }
 
 const COLUMNS: &str = "m.id, m.kind, m.size, m.reply_to, m.run_hint, m.span_hint, m.provider, m.native_id, m.checkout, m.session_hint, m.created_at, m.body,
-        o.peer_id, o.outbox_state, o.reason, o.attempts, o.expires_at, o.remote_state, o.remote_reason, o.remote_updated_at, o.cancel_state, o.updated_at";
+        o.peer_id, o.outbox_state, o.reason, o.attempts, o.expires_at, o.remote_state, o.remote_reason, o.remote_updated_at, o.cancel_state, o.updated_at, m.project";
 
 /// The message as its sender may see it: the best-known recipient state, with the outbox stage kept explicit so
 /// `queued` in a sender's outbox is never mistaken for deposited at the recipient.
@@ -136,6 +145,8 @@ fn row_json(row: &rusqlite::Row, now: i64, with_body: bool) -> rusqlite::Result<
         "attempt_id": Value::Null,
         "expires_at": expires_at,
         "updated_at": row.get::<_, i64>(21)?,
+        "project": row.get::<_, Option<String>>(22)?,
+        "locator": row.get::<_, String>(9)?,
         "transport": {
             "peer_id": row.get::<_, String>(12)?,
             "outbox": outbox,
@@ -235,7 +246,7 @@ pub fn begin_attempt(store: &mut Store, id: &str) -> Result<bool, Fail> {
     if changed == 0 {
         return Ok(false);
     }
-    mailbox::commit(tx, "attempt")?;
+    crate::store::commit(tx, "attempt")?;
     Ok(true)
 }
 
@@ -264,7 +275,7 @@ pub fn apply_deposit_reply(store: &mut Store, id: &str, reply: &Reply) -> Result
         }
         _ => return Ok(()),
     }
-    mailbox::commit(tx, "ack")?;
+    crate::store::commit(tx, "ack")?;
     Ok(())
 }
 
@@ -307,7 +318,7 @@ pub fn apply_cancel_result(store: &mut Store, id: &str, reply: &Reply) -> Result
         }
         _ => return Ok(()),
     }
-    mailbox::commit(tx, "cancel_apply")?;
+    crate::store::commit(tx, "cancel_apply")?;
     Ok(())
 }
 
@@ -358,7 +369,7 @@ fn try_receipt(store: &mut Store, peer: &str, origin_id: &str, digest: &str, sta
          WHERE message_id = ?1 AND outbox_state IN ('pending', 'deposited')",
         params![origin_id, state, reason, seq, now, cancelled],
     )?;
-    mailbox::commit(tx, "receipt")?;
+    crate::store::commit(tx, "receipt")?;
     Ok(())
 }
 
@@ -383,7 +394,7 @@ pub fn store_published(store: &mut Store, peer: &str, entries: &[Published]) -> 
                 params![peer, entry.session_hint, entry.provider, entry.native_id, entry.checkout, entry.scope, now + entry.ttl_ms.clamp(1, crate::inbound::PUBLISHED_TTL_MS)],
             )?;
         }
-        mailbox::commit(tx, "published")
+        crate::store::commit(tx, "published")
     };
     match run() {
         Ok(()) => Reply::Ok {},

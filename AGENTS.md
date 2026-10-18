@@ -373,6 +373,159 @@ would leak forever with nothing left pointing at it.
 - Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>,pr-review}.log`.
 - PR review (`pr-review.js`): Tier 1 is the existing "Local diff" section (`computeDiff`/`/api/diff`) — a worktree-branch-vs-base diff, not the actual GitHub PR diff, labeled accordingly. Tier 2 shells out to the installed `pr-walkthrough`/`pr-brief` Claude Code plugin headlessly (`claude -p`, `--permission-mode acceptEdits`, `--tools` dropping `Edit`, `--disallowedTools` denying GH/git write-shaped Bash commands as the primary guard — verified empirically, not assumed, see the plugin-marketplace plan). Reads `~/.local/share/pr-walkthrough/{reviews,briefs}/<owner>/<repo>/pr-<N>/latest.json` + that snapshot's `manifest.json` for status/artifacts, never the multi-MB `guide.json`/`brief.json` directly.
 
+## Spans execution (live, opt-in)
+
+Spans can dispatch one reviewed span to one real local worker (Claude Code,
+headless) and finish it through accepted completion. It is **off by default**:
+every `/api/spans/execution/*` route answers 503 `SPANS_EXECUTION_DISABLED` and no
+archive is opened until `~/.setu.json` contains
+`"spansExecution": {"enabled": true, "runBudgetUsd": 10}` (`runBudgetUsd` is
+optional and bounds what a *metered* profile may reserve; the built-in subscription
+profile has no dollar amount, so it does not apply to it). A `spansExecution` block
+that is present but malformed also answers 503, with `SPANS_EXECUTION_CONFIG_INVALID`
+on every execution route. The setting is read once when the portal starts, so
+changing `~/.setu.json` takes effect after a portal restart (`setu portal stop`, then
+`setu portal`). Reads, planning and history never reach execution.
+
+The flow, over HTTP or `setu spans exec ...`:
+
+1. `probe <profile>` starts one fresh, short provider session (one reply, told to use
+   no tool) with the profile's exact mode and toolset, and records what it showed (model,
+   permission mode, tools, effort if the session reported it). The built-in subscription
+   profile passes no dollar budget. This is the only source of capability. Caller JSON,
+   a peer or a model cannot create it. Every probe uses the subscription; what it
+   reported is added to a running total that `capabilities` returns (`probeSpend`) as a
+   token count and a provider estimate, never as a charge. Evidence goes stale after six
+   hours; a re-probe changes every confirmation.
+2. `review` is read-only. It returns the exact binding (plan, generation, profile
+   digest, checkout snapshot including a content digest of the tree the work will start
+   from, instructions, the billing mode, permission mode and exact toolset, the model and
+   the requested effort, wall clock up to one hour, and the optional acceptance
+   conditions `criteria` and `requireChange`) and a confirmation token. A subscription
+   review has no `budgetUsd` and says so (`cost.monetaryCap: null`, `enforcement:
+   'none'`); a `budgetUsd` on it is `SPANS_EXEC_BUDGET_NOT_APPLICABLE`. A metered profile
+   still requires `budgetUsd` (up to 2 USD).
+   `dispatch` without the token returns the review.
+3. `dispatch` with the exact token, after the user confirmed the review, claims the
+   writer slot, takes shared admission, reserves usage, saves the durable intent and
+   then starts one process. Exactly one layer takes each resource. Only one dispatch or
+   resolve of a span runs at a time in a service: the other is refused
+   (`SPANS_EXEC_SPAN_BUSY` for a dispatch, `SPANS_EXEC_NOT_RESOLVABLE` for a resolve)
+   rather than queued, so a resolve can never release what a dispatch has just taken, nor
+   the reverse. A changed
+   instruction, budget, plan, generation, acceptance condition or checkout (including any
+   edit to a file) is `SPANS_EXEC_REVIEW_CHANGED`; a tree that changes after the match but
+   before the launch starts nothing. A dispatch the coordinator refused before any intent
+   or reservation withdraws its authorization, so a newly reviewed dispatch of the same
+   span is not blocked by it. The action, attempt, reservation and admission identities are
+   derived from an ordinal; an ordinal whose ledger reservation was released is never used
+   again, so the next dispatch of the span gets fresh identities and a live reservation,
+   and the released row stays as history. The dispatch contract keeps a span's writer claim
+   after a plain refusal so a retry can reuse it; the refusal then carries
+   `recovery.writer = {checkoutPath, session}` (the CLI prints the exact `setu release`
+   command) and nothing is released for you.
+4. The supervisor spools redacted, bounded output and publishes one artifact. `cancel`
+   delivers a stop to the exact owned attempt; delivery is not an exit. A cancelled
+   attempt is never completion, whatever it printed or however it exited. The wall clock
+   holds an overdue attempt as unknown and stops it.
+5. When the exit is durable, completion is verified and the outcome is recorded, and
+   usage and admission settle. `complete` repeats this by name. The record keeps three
+   things apart: what the provider **reported** (its own result line and cost), what Setu
+   **verified** (clean exit, complete capture, no cancel, the tree before and after, the
+   `requireChange` condition), and what is **accepted** (only an owner's `accept`). Setu
+   runs no test or check of its own, so `independentValidation` is always `false` and
+   acceptance rests on the owner's judgement of the shown evidence. A process exit, a
+   model saying it is done, or a `report` is never acceptance. A run that changes nothing
+   is a legitimate completion unless the reviewed dispatch set `requireChange`, which
+   compares file content (an empty commit moves HEAD but is not a change).
+6. `accept` without a token returns what would be accepted: the tree and HEAD before and
+   after, the changed paths (relative to the reviewed HEAD, so anything already dirty
+   appears too), the criteria the owner set, the captured artifacts, and the reported and
+   verified fields. With the exact token it re-checks that the tree is byte-for-byte the
+   completed one and that the stored completion record still matches its own digest,
+   accepts the span, makes dependents ready and releases the writer claim.
+
+Profile and billing: the built-in profile `claude-code-sonnet` runs on the owner's
+Claude subscription. It sets no dollar budget and passes no `--max-budget-usd`, it
+claims no cap (`hardCostCap` is not required and nothing says `enforced`), and the
+ledger reserves no amount for it (no limits, `hardCap: false`; the run's ledger totals
+count it only in `unmeteredCount`). What bounds a run is the reviewed wall clock,
+`cancel`, one worker and shared admission. Permission mode is `auto`, the mode the
+owner's own sessions use, never `bypassPermissions`; the toolset is exactly
+`Bash, Edit, Glob, Grep, Read, Write` (no sub-agents, no MCP servers). Mode and toolset
+are part of the reviewed binding and of the probe, and after the run the worker's own
+init event must show the same model, permission mode and tools (`verified.session`),
+or the outcome is `failed` (for a profile with a toolset; a profile without one has
+nothing to compare). Every session starts with `--restricted --setting-sources ""`, so
+the user's, project's and local settings, hooks and memory files are not loaded (named
+tools still work; organization-managed settings can still apply). That isolation is part
+of the reviewed mode (`isolation`) and of the probe, and it is built in one place,
+`providerArguments`. A profile with a `billing` other than `subscription` is metered and
+keeps the strict path: a required `budgetUsd`, a hard cost cap, and ledger limits. A
+Claude Code budget stop is a client-side estimate that stops after the response that
+crosses the budget, so no probe sample (under, at or over the cap) is ever `enforced`:
+a metered Claude profile always stays blocked on `hardCostCap`. The generic capability
+and ledger foundation are unchanged and still enforce caps for any provider that proves
+one. The ledger's rule: limits are optional per policy, and a
+policy with no limits and no hard cap measures no money, so a reservation needs no
+amount; any limit or hard cap keeps every earlier rule.
+
+Usage on a subscription is only ever an estimate. The result's token counts and its
+`total_cost_usd` are the provider's own figures (checked only against its per-model
+figures; a mismatch is shown as such). They appear as `reported.usage` with
+`billed: 'unknown'` and `basis: 'provider-reported estimate'`, never as a recorded
+charge, and Setu does not know what, if anything, was billed.
+
+Effort: the init event of a live session did not report an effort level (it reported
+only `per_turn_effort_active: true`), and the provider documents that organization
+settings can clamp `--effort`. The requested flag is shown as `requested`, never as
+`observed`. The built-in profile says `effortPolicy: 'requested-unverified'`, an
+explicit per-profile choice that lets the launch proceed when the session reported no
+effort at all; the review and `launch.unverified` then read `requested, not verified`.
+An effort the session did report that differs from the request (or that cannot be read)
+still blocks, every profile without that policy still needs the effort observed, and the
+policy excuses nothing else. This is not an effort guarantee.
+
+Held work: an attempt whose launch or exit is unknown (a kill mid-launch, mid-run, an
+unprovable process identity, a missed deadline, a capture limit) is held, its action is
+`unknown`, and its writer claim, admission lease and usage reservation stay. `reconcile`
+runs at portal start (and on request), holds such work, settles only what has a durable
+terminal receipt, and never launches or signals anything. Nothing relaunches an unknown
+attempt. **No operation resolves an unknown attempt yet**; that needs its own specified
+owner action. The one exception is a dispatch that was authorized but killed before its
+intent became durable: no worker can have started, and `resolve <run> <action>` shows
+the admission lease, usage reservation and writer claim it would release, and releases
+them only with the exact token (the writer claim stays if the span already has other
+actions). A failed or unknown outcome keeps the span's writer claim; release it
+deliberately with `setu release <worktree> --session <session from status>`.
+
+One supervisor owns an archive: the owner is the highest-numbered `execution.owner.<n>`
+file, and a number is never reused. The newest file is never deleted: a release writes a
+`released` tombstone under the next number. A contender takes over a dead or released
+owner by creating the next number with an exclusive link, so an observer holding an old
+reading can only try a number that already exists. A winner must still be the highest
+file right after creating its own (a lower number can be free again once pruned),
+otherwise it removes only its own file and does not own. Only numbers below a winner's
+own are pruned, so a live successor is never deleted, and an owner that cannot be
+identified is never overtaken.
+
+Trust boundary: the portal API is the local user's cooperative API, as described for
+claims above and for the loopback/Host guard. A confirmation token is a digest the API
+hands back, not proof that a person reviewed anything, and nothing here defends against a
+program running as the same user that calls the API itself.
+
+Not verified: the real `claude` binary was driven once by the parent through the public
+service (one probe, one edit, accepted completion); the default shipped argument list,
+the HTTP and CLI path and Ghostty have not been run live. The metered probe shape is
+recorded and replayed in tests (`spans-execution.recorded-probe.jsonl`, rebuilt from a
+live probe with paths and ids removed). The init and result of a real subscription task
+session are replayed from `spans-execution.recorded-live-subscription-task.jsonl`
+(sanitized; init and result shape only). Everything else is exercised against a local
+process fixture. Work requests approved under Setu Links (ticket 12 /
+#19) are not wired: the seam is the authorization step, where an approved request
+would have to supply the same exact binding (target, input, plan, generation) that
+`review` computes and have it re-checked at dispatch.
+
 ## Verification and polling
 
 Run `bun run verify` after changing lifecycle, resource, access, or cost behavior. It runs
@@ -429,11 +582,16 @@ carry JSON must contain JSON.
 | `storage [inspect <repo> <branch>]` | `--store <id>` | Read cached storage, or explicitly inspect one server-known target/store. |
 | `operations [repo branch]` | `--since`, `--limit` | Read durable operation outcomes. |
 | `sessions [list [repo branch]]` | `end <repo> <branch> --session <id> --checkout <file\|->` | List or end an exact owned session. Identity is mandatory for end. |
+| `sessions resume <repo> <branch>` | `--native <id> [--confirmation <token>]` | The receiving user's reviewed resume of one native Claude conversation under a new managed record. The first call only returns the review and its token (`RESUME_CONFIRMATION_REQUIRED`); only the exact token launches. Needs the running portal. |
 | `links send <repo> <branch>` | `--session <id> --body-file <file\|-> [--idempotency-key <key> --reply-to <message>]` | Queue a message for one exact session's verified native conversation. Needs the running portal (`PORTAL_REQUIRED` otherwise). A refused send stores nothing. After an uncertain result, repeat with the same key. |
 | `links inbox <repo> <branch>` | `--session <id> [--state <state>]` | List that session's messages and their honest states. |
 | `links show <message>`, `links status <message>` | none | Read one message with its body, or its state and attempt count without the body. |
 | `links cancel <message>` | none | Retract a message that has not been handed off. |
 | `links ack <repo> <branch>` | `--session <id> --message <message>` | The addressed conversation's user acknowledges a handed-off message. |
+| `links share enable <repo>` | `--owner <label> --confirmation <token>` | Share one project. The first call changes nothing and returns the exact public fields (owner, task, reachability, freshness, session ID) with a token; only the user passes that token back. Needs the running portal. |
+| `links share disable <repo>` | none | Withdraw sharing: the project leaves the directory and other principals are refused. |
+| `links share status [<repo>]` | none | The sharing policy of one project, or of every project that has one. |
+| `links directory [<repo>]` | none | Managed sessions of shared projects with owner, task, reachability and freshness. |
 | `links redeliver <repo> <branch>` | `--session <id> --message <message> --attempt <attempt>` | Accept a possible duplicate for a `handoff-unknown` message; the next claim is a new, counted attempt. |
 | `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
 | `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
@@ -457,6 +615,13 @@ carry JSON must contain JSON.
 | `path <repo> <branch>`, `cd <repo> <branch>` | none | Print the registered worktree path; `cd` is normally a shell wrapper. |
 | `update` | `--restart`, `--include-untracked` | Run guarded Setu update. A running portal requires explicit `--restart`; this is CLI only. |
 | `version`, `help` | none | Print local version/commit or help. |
+| `spans [list\|show <run>\|events <run>\|artifact <run> <artifact>\|search <query>\|search-status\|workflows]` | `--after`, `--since`, `--through`, `--generation`, `--run`, `--limit` | Read the offline Spans archive. Nothing here starts work. |
+| `spans preview\|create-workflow\|create-draft\|revise-plan` | `--input <json>` | Save offline plans only; does not approve or start work. |
+| `spans exec capabilities <profile>`, `exec status <run>` | none | Read stored probe evidence or run state. Starts nothing. |
+| `spans exec probe <profile>` | none | Start one short fresh provider session to observe capability. It uses the owner's subscription (a metered profile would use a dollar budget); confirm intent first. |
+| `spans exec review`, `exec dispatch` | `--input <json>`, dispatch also `[--confirmation <token>]` | Review is read-only. Dispatch without a token returns the review; with the exact token it starts one real local worker. |
+| `spans exec cancel <run> <attempt>`, `exec complete <run> <action>`, `exec report`, `exec reconcile` | `report --input <json>` | Deliver a stop (not an exit), verify a finished attempt, record a claim as history, or hold and settle after a restart. |
+| `spans exec accept <run> <action>`, `exec resolve <run> <action>` | `[--confirmation <token>]` | Without a token each returns the exact review. Accept completes a verified action; resolve releases a dispatch that never reached intent. |
 | `claim [worktree]` | `--agent --session --task [--pid]` | Claim or refresh a writer slot. |
 | `release [worktree]` | `--session` | Release only the owning writer slot. |
 | `claims` | none | List known writer claims. |
@@ -479,12 +644,13 @@ never downloads a provider tool to make a deployment possible.
 <!-- PORTAL_API_ROUTES_START -->
 | Method | Path | Operation, target, confirmation/recovery | Front doors |
 | --- | --- | --- | --- |
-| `GET` | `/api/agent-sessions` | `repo?`,`name?`; list durable sessions, each with a `nativeConversation` binding (`bound` with `provider`,`id`,`boundAt`; `pending`; or `unavailable` with `provider-unverified`). | H W C M |
+| `GET` | `/api/agent-sessions` | `repo?`,`name?`; list durable sessions, each with a `nativeConversation` binding (`bound` with `provider`,`id`,`boundAt`, plus `resumedFrom` (earlier managed session IDs, a locator list that is public by decision: session IDs are already public and carry no capability) after an explicit resume; `pending`; or `unavailable` with `provider-unverified`). | H W C M |
 | `POST` | `/api/agent-sessions/end` | T plus `sessionId`,`checkoutIdentity`; end only after owned PID/process-start identity is proven. | H W C M |
+| `POST` | `/api/agent-sessions/resume` | T plus `nativeId`,`confirmation?`; the receiving user's reviewed resume of one native Claude conversation under a new managed record. Without the exact token it returns `RESUME_CONFIRMATION_REQUIRED` and launches nothing. | H C |
 | `GET` | `/api/agents` | List installed agent CLIs. | H W R |
 | `GET` | `/api/attention` | `repo?`,`name?`; list normalized attention events. | H W C M |
 | `POST` | `/api/attention/focus` | T plus `sessionId`,`checkoutIdentity`; focus only through an exact Ghostty terminal mapping. | H W C M |
-| `POST` | `/api/attention/hook` | Trusted provider hook payload only; unsupported payload remains unknown. | H W |
+| `POST` | `/api/attention/hook` | Trusted provider hook payload only, with the per-launch capability; unsupported payload remains unknown. A `UserPromptSubmit` payload is a Links turn request, or with `report:{attemptId}` the hook's report that it wrote the context; it never becomes an attention item. | H W |
 | `POST` | `/api/convex/deploy` | T plus `target`,`expectedContext`; current preflight/binding required. | H W |
 | `POST` | `/api/convex/start` | T; start Convex development runtime. | H M |
 | `GET` | `/api/convex/status` | T query; read Convex deployment state. | H W |
@@ -511,9 +677,13 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
 | `POST` | `/api/links/ack` | T plus `sessionId`,`messageId`; the addressed conversation's user acknowledges a handed-off message. Not task completion. | H C |
 | `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
+| `GET` | `/api/links/directory` | `repo?`; entries `{project,sessionId,owner,task,taskAt,taskStale,activityAt,reachability{state,reason},observedAt,stale}` of shared projects' managed sessions, and `problems` for a project whose policy cannot be read. Passive. | H C |
 | `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
 | `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
 | `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
+| `POST` | `/api/links/share/disable` | `repo`; removes the policy and presence, holds mail from other principals. | H C |
+| `POST` | `/api/links/share/enable` | `repo`,`owner?`,`confirmation?`; without the reviewed token it returns `LINKS_CONFIRMATION_REQUIRED` and the field list, and changes nothing. | H C |
+| `GET` | `/api/links/share/status` | `repo?`; policy state `enabled`, `disabled` or `invalid` (with recovery). Passive. | H C |
 | `POST` | `/api/links/send` | T plus `sessionId`,`idempotencyKey`,`body`,`replyTo?`; refused unless the session is running with a verified native conversation. | H C |
 | `GET` | `/api/links/status` | `messageId`; delivery state, reason and attempt count, without the body. `observed` and `storedState` as for inbox. | H C |
 | `GET` | `/api/logs` | T query plus `type?`,`n?`; bounded log tail. | H W C M |
@@ -539,7 +709,7 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/pr/create` | T; push/open GitHub PR. External action. | H W C M |
 | `POST` | `/api/pr/ready` | T plus `ready`; toggle existing PR draft state. | H W C M |
 | `POST` | `/api/project/add` | `github`,`name?`,`label?`; register a project. | H W |
-| `POST` | `/api/project/remove` | `name`; remove a project registration only. | H W |
+| `POST` | `/api/project/remove` | `name`; remove a project registration only, after withdrawing its Links sharing (refused with `LINKS_OUTCOME_UNKNOWN` if the withdrawal is not confirmed). | H W |
 | `GET` | `/api/projects` | List registered projects. | H W M R |
 | `GET` | `/api/resource-admission` | Read admission leases/limits. | H W C M |
 | `GET` | `/api/raycast/log` | Read Raycast bridge log. | H W R |
@@ -565,6 +735,17 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/spans/run` | `runId`; full retained run view. | H W C M |
 | `GET` | `/api/spans/events` | `runId`,`afterSequence?`,`limit?`; bounded append-only history. | H W C M |
 | `GET` | `/api/spans/artifact` | `runId`,`artifactId`; inert redacted artifact referenced by that run. | H W C M |
+| `GET` | `/api/spans/execution/capabilities` | `profile`; launch capability from stored local probe evidence only; 503 while execution is disabled. | H C |
+| `POST` | `/api/spans/execution/probe` | `profile`; starts one fresh, short provider session (no budget flag on the subscription profile) to observe capability. It uses the owner's subscription (one recorded probe reported about 0.0103 USD of API-equivalent estimate); confirm user intent first. | H C |
+| `POST` | `/api/spans/execution/review` | runId, spanId, profile, instructions, wallClockMs, target, `budgetUsd?` (metered profiles only), `criteria?`, `requireChange?`; read-only review and exact confirmation token. | H C |
+| `POST` | `/api/spans/execution/dispatch` | the review fields plus `confirmation`; without it returns the review. Starts one real local worker; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/cancel` | `runId`,`attemptId`; deliver a stop to the exact owned attempt. Delivery is not an exit. | H C |
+| `POST` | `/api/spans/execution/accept` | `runId`,`actionId`,`confirmation?`; without it returns the exact review. Accepts a verified completed action only if the tree is unchanged; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/complete` | `runId`,`actionId`; verify the finished attempt, record its outcome and settle usage and admission. Idempotent. | H C |
+| `POST` | `/api/spans/execution/reconcile` | none; hold unknown work and settle proven work after a restart. Starts and signals nothing. | H C |
+| `POST` | `/api/spans/execution/resolve` | `runId`,`actionId`,`confirmation?`; without it returns the exact review. Releases the resources of a dispatch that never reached intent; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/report` | `runId`,`actionId`,`generation`,`outcome`,`artifactIds?`; records a reported outcome as history or an observation. Never completes anything. | H C |
+| `GET` | `/api/spans/execution/status` | `runId`; attempts, captured output references and usage. Never starts anything. | H C |
 | `POST` | `/api/sidecar-approvals/approve` | `repo`,`name`,`command`,`args`; must match reviewed sidecar. | H W |
 | `GET` | `/api/sidecars` | `repo`; list project sidecars. | H W M |
 | `POST` | `/api/sidecars` | `repo`,`sidecars`; replace project sidecars. | H W |
@@ -732,12 +913,140 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
   it claimed is `handoff-unknown` and is only redelivered on explicit request. Nothing is requeued on
   uncertainty. The client accepts an engine result only if it has exactly the expected shape.
 - `claim` and `confirm` have no HTTP route: they belong to the provider hook, which authenticates a session
-  first. A message or receipt is not Span completion, writer authority, admission, attention approval or
+  first (see Natural-turn delivery below). A message or receipt is not Span completion, writer authority, admission, attention approval or
   spend authorization, and nothing wakes a provider.
+- **Shared projects.** `setu links share enable <repo>` first returns the exact public fields (owner label,
+  task, reachability, freshness, session ID) and what is never shared (transcripts, paths, environment,
+  provider context) with a token; nothing is stored until the user passes that token back. The engine
+  (`sharing_policies`, `presence`; schema 2, migrated by the first write) is the only holder of the policy
+  and the presence. Visibility and receiving are granted; interrupting an agent and raising attention are
+  recorded off. The local user's own mail never needs sharing. Any other principal (a `session` sender,
+  `{kind:'session', id}`; a peer is not yet a sender) is admitted only by a readable policy for the
+  message's project, checked on send and again on claim; an unreadable or unknown-version policy admits
+  nobody for that project (`LINKS_POLICY_INVALID`; recover with `share disable`, then enable again). Mail
+  already stored from a principal the project no longer admits is held (`policy-disabled`) and returns when
+  sharing is enabled again (the new enable is what authorizes it; expiry and the original recipient are
+  unchanged). The policy carries an opaque scope (`ps_…`) for anything outside this machine to bind to; the
+  local project name never leaves it. Changing only the owner label keeps the scope; withdrawing and
+  enabling again mints a new one, so grants made to the old scope stop matching.
+- **A project is a registered Setu project, named by the registry's own rule, and only a printable subset of
+  those names can be shared**: one line of at most 128 bytes with no control character (the registry also allows
+  DEL and the C1 range; such a name is refused at review and has nothing to withdraw, so it can still be
+  removed). Removing a project
+  (`POST /api/project/remove`) withdraws its sharing first, with no extra prompt; if the withdrawal is not
+  confirmed (`LINKS_OUTCOME_UNKNOWN`) the project stays registered. Adding the name again starts unshared and
+  needs a new confirmation. The publisher and the directory skip any project the registry no longer holds,
+  even if a policy row remains (`share status` reports `registered:false`). Worktrees, writer claims and
+  admission are untouched.
+- **Presence and the directory.** A session's presence is its owner label, a short task label, a fixed
+  reachability reason and freshness. The task is the text that session wrote in its worktree's active writer
+  claim, cut to 120 characters with file paths, environment references and recognizable secrets replaced by
+  markers (the Spans redaction finds secrets; `links-labels.js` finds paths and `$VAR`/`NAME=value`
+  references), and dropped when nothing useful is left; the engine applies the same shapes again and stores
+  no task that still carries them, and an owner label that carries one is refused at review. This is a
+  filter on a short label, not a promise about free text in general. Freshness has three honest parts:
+  `observedAt` (the engine's time when the portal last observed the session), `taskAt` (the claim's own
+  heartbeat; `taskStale` after two hours) and `activityAt` (the last authenticated managed-hook event, from
+  the session record's `lastHookAt`; `null` when none has arrived, never inferred from polling or process
+  liveness). An observation older than two minutes stays listed marked `stale` and reads `unknown` rather than
+  reachable; an ended session is published once as `ended` and stays that way (a delayed report cannot make it reachable
+  again; it is reported without reading its checkout or claim); an old writer claim still shows its task, marked
+  `taskStale`. The portal publishes for shared
+  projects when sharing is enabled and every 30 seconds (one interval it starts and disposes, never
+  overlapping), in batches of at most 256 sessions. Reads (`share status`, `directory`) never create a store
+  or write. Enabling and disabling do not touch writer claims or resource admission.
 - Build and test: `bun run engine:build`, `bun run engine:test` (set `SETU_LINKS_CARGO` to the pinned
   toolchain's cargo; a missing toolchain fails the check). `bun run verify` includes the engine tests and
   the naming check. A development engine is found at `engines/links/target/release/setu-links` or
   `SETU_LINKS_ENGINE`; shipping the built binary is part of the release-lifecycle work.
+
+#### Natural-turn delivery (managed Claude, #10)
+
+A queued message reaches one exact managed Claude conversation at its **next normal user turn**, through
+the provider's prompt hook. Nothing starts a turn and nothing is injected into one already running; there
+is no terminal-text fallback. Only Claude launched by Setu is registered: the hook lives in the launch's
+own private settings (`--settings`), and Setu installs or changes no global or user-level hook. Codex is
+**unverified**, not unsupported: a send is refused with `LINKS_PROVIDER_UNVERIFIED` and nothing is registered.
+
+- **Hook** (`managed-claude-hook.js`, one program per launch). For `UserPromptSubmit` it posts only identity
+  fields (`session_id`, `cwd`, event name; never the user's prompt) with the per-launch capability to
+  `POST /api/attention/hook`, writes the returned text to stdout (plain context), awaits that write, and
+  only then posts a second request, `report:{attemptId}`. Every failure exits 0 with nothing else on
+  stdout, so a turn is never blocked. Budget: Claude is told 10 s; the program stops itself at 6 s; the
+  claim request is capped at 3 s and the report gets what remains, up to 2 s.
+- **Authentication.** The portal resolves the request only with the capability, checking provider, managed
+  session, checkout incarnation and lifecycle (`links-delivery.js`). Native ID and cwd only locate. The proven
+  tuple (record, native ID, bound-at, checkout) is **captured once**; the engine is asked only about that
+  tuple, never about the session ID, and the proof is repeated before and after the claim. If the binding
+  moved during the handoff the text is withheld (the mail is already `handoff-unknown`) and the old hook
+  never receives the new conversation's mail.
+- **Failure semantics.** Before the engine claim (portal down, bad credential, engine unavailable or too
+  slow before it started, deadline) the mail stays `queued`. A timeout proves `queued` only if the claim
+  never began. From the claim on, any uncertainty is `handoff-unknown`: a lost response, a killed hook or
+  portal or engine, output written followed by a failed or missing report. It is never requeued and never
+  claimed again; only `setu links redeliver` with the user's reviewed token makes a new attempt. A failed
+  hook is never presumed to have written nothing.
+- **Framing and size** are the engine's (`frame.rs`, `mailbox.rs`). Sender, message ID and time are separate
+  attributes; the body has the frame tag neutralised in any letter case and control characters removed.
+  One turn carries at most `CLAIM_MAX_MESSAGES` messages and its whole serialized text (preamble, metadata,
+  escaping, bodies) at most `MAX_FRAME_BYTES`, because Claude's documented cap on a hook's plain output
+  (https://code.claude.com/docs/en/hooks#json-output, read 2026-10-18) replaces anything beyond it with a
+  file path and a short preview. Text past that cap would reach the agent cut off while the mail read
+  `handed-off`, so a message is never cut: a batch holds whole messages while they fit and the next waits
+  queued. A new send is refused before it is stored if its body exceeds `MAX_BODY_BYTES`
+  (`BODY_TOO_LARGE`) or its exact frame does not fit (`FRAME_TOO_LARGE`). Mail stored under the earlier,
+  larger body rule is never claimed or attempted: it is `held` with reason `provider-output-limit`
+  (shown by a plain read at once, persisted by the next claim), stays readable in full (`show`), can be
+  cancelled, and is recovered by sending a shorter message. The held reason travels as the stable code
+  `provider-output-limit` through the service, API and CLI; the human recovery text (resend a shorter
+  message) belongs to each front door, for example the portal inbox, and is not generated here. There is no automatic splitting and no
+  file-path fallback. The hook compares the same unit, UTF-8 bytes, against the same number
+  (`PROMPT_HOOK_BUDGET.maxTextBytes`) and writes nothing, and reports nothing, past it; a test ties it to
+  `MAX_FRAME_BYTES`. This is attribution and frame integrity. It is **not** prompt-injection immunity; a
+  model may still act on text it reads, and a message carries no authority in Setu's controls.
+- **Internal operations.** `claimExact` and `confirmExact` (the hook's, in the runtime's `delivery`) and
+  `publishBinding` and `invalidateBinding` (the managed authority's, in the runtime's separate `lifecycle`)
+  take an exact tuple. They have no route, tool or command and are kept out of the portal's route
+  composition. The managed session authority is the only publisher and invalidator of a binding; no send,
+  SessionStart or claim reconciles or resumes anything, and a claim carries the generation the hook proved,
+  which the engine checks inside the claim's own transaction before it touches any message or attempt.
+- **Binding generation and the lifecycle seam.** The managed session record keeps a persisted
+  `bindingGeneration` counter, incremented inside the record's own lock on every decision: a new, replaced
+  or resumed conversation, end, ownership becoming unknown, an unknown record verified running again, and a
+  replaced checkout (recorded once, however many hooks follow). It only moves up, never uses the clock,
+  survives a portal restart and is never part of a public session view (neither are the digest, the
+  replaced-ID history or the invalidation detail). `createManagedAgentServices({ lifecycle })` takes an
+  optional trusted publisher with `publish({generation, project: record.repo, recipient, resumedFrom})` for
+  a live verified binding (at bind, resume, each normal turn and the monitor tick, throttled by
+  `lifecycleHeartbeatMs`) and `invalidate({generation, reason, sessionId})` with `ended`,
+  `ownership-unknown` or `checkout-changed` (retried at the same generation until confirmed). It is best
+  effort: a turn or the monitor waits at most `lifecycleTimeoutMs` for a call, a session has at most one
+  publish and one invalidation outstanding until each really settles (a later one is skipped, never queued
+  and never abandoned), so a stuck publish cannot hold back the invalidation that fences it, and only a
+  reply of `{ ok: true }` counts as told. A checkout whose identity returns clears only its own
+  `checkout-changed` invalidation, judged under the record lock like a bind (same capability, native ID,
+  provider, running state and fresh checkout), and advances the generation; any refusal there is the answer.
+  The portal wires the Links service's `publishBinding` and `invalidateBinding` as that publisher.
+  Neither creates a mailbox: with no mailbox file (the file, not its directory) the runtime answers "no
+  mailbox" without starting an engine, which the announcer treats as not told and retries, so an old
+  publication cannot be in flight across the first send and an invalidation only counts once the fence has
+  really landed. The client names the engine's mailbox file (`MAILBOX_FILE`) as metadata only, for that
+  one `existsSync`; nothing in JavaScript opens, reads or writes it, and a test pins the name to the engine's.
+
+**Explicit resume across managed records** (`setu sessions resume <repo> <branch> --native <id>
+[--confirmation <token>]`, `POST /api/agent-sessions/resume`). A native conversation is never bound to two
+live records and a previously bound ID is never adopted implicitly. The receiving user reviews the
+conversation, the ended records that held it and the checkout (the call returns
+`RESUME_CONFIRMATION_REQUIRED` with a token), then passes the exact token back. Only then does Setu admit
+and launch a **fresh** owned process in the same checkout with `--resume <id>` and its own new capability,
+recording the reviewed intent on the new record. The conversation binds only when that launch's
+`SessionStart` carries the new capability for exactly that ID and every earlier holder is an ended record
+named at review; any other start, ID or credential is refused. The mail follows the conversation through
+the engine's `resume` operation (location only; the stored recipient and original session hint never
+change, and only `conversation-replaced` holds are lifted). Refusals: `RESUME_NATIVE_UNKNOWN`,
+`RESUME_CONVERSATION_IN_USE`, `RESUME_SOURCE_UNCONFIRMED`, `RESUME_CHECKOUT_CHANGED`, `RESUME_INVALID`.
+Tests with recorded hook payloads and a fixture process are **contract tests, not provider acceptance**;
+see [TEST-BOUNDARIES](docs/links/TEST-BOUNDARIES.md).
 
 ### Setu Links (peer transport)
 
@@ -777,6 +1086,7 @@ Service packaging (a login item or launchd job) is the release-lifecycle ticket'
   unusable, and `serve` listens on loopback unless `--listen` says otherwise.
 - **Same-machine peers are contract evidence only.** They prove nothing about real networks, NAT, sleep or
   DNS; real cross-machine behavior is ticket 09.
+
 
 ### Runtime and dependency-sharing limits
 

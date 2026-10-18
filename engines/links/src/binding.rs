@@ -24,6 +24,14 @@ pub struct Publish {
     project: Option<String>,
     /// Managed sessions this conversation previously ran under (an explicit, authenticated resume).
     resumed_from: Vec<String>,
+    /// A lifecycle publication from the managed authority never creates a mailbox by itself.
+    existing_store_only: bool,
+}
+
+impl Publish {
+    pub fn existing_store_only(&self) -> bool {
+        self.existing_store_only
+    }
 }
 
 pub fn parse_publish(mut args: Args) -> Result<Publish, Fail> {
@@ -41,13 +49,14 @@ pub fn parse_publish(mut args: Args) -> Result<Publish, Fail> {
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
+    let existing_store_only = args.optional_boolean("existing_store_only")?;
     args.finish()?;
-    Ok(Publish { recipient, generation, valid_for_ms, project, resumed_from })
+    Ok(Publish { recipient, generation, valid_for_ms, project, resumed_from, existing_store_only })
 }
 
 /// Stores the snapshot and applies the same hold-and-restore decision as `reconcile`, in one transaction.
 pub fn publish(store: &mut Store, request: Publish) -> Result<Value, Fail> {
-    let Publish { recipient, generation, valid_for_ms, project, resumed_from } = request;
+    let Publish { recipient, generation, valid_for_ms, project, resumed_from, .. } = request;
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored: Option<(String, String, String, i64, String)> = tx
@@ -82,46 +91,17 @@ pub fn publish(store: &mut Store, request: Publish) -> Result<Value, Fail> {
         params![recipient.session_hint, recipient.provider, recipient.native_id, recipient.checkout, generation, valid_until, project, now],
     )?;
     let (mut held, mut released) = mailbox::reconcile_in(&tx, &recipient, now)?;
-    released.extend(move_and_release(&tx, &recipient, &resumed_from, now)?);
+    // An explicit resume moves the located mail with the one shared helper (also behind the `resume` operation).
+    if !resumed_from.is_empty() {
+        let (_, resumed) = mailbox::resume_in(&tx, &recipient, &resumed_from, now)?;
+        released.extend(resumed);
+    }
     held.extend(authz::gate_all(&tx, store.version, now)?);
     // Report what is true when this commits: mail the conversation released but authorization held again is held (and
     // listed in `held`), not released.
     keep_in_state(&tx, &mut released, "queued")?;
-    mailbox::commit(tx, "binding_publish")?;
-    Ok(json!({ "valid_until": valid_until, "held": held, "released": released }))
-}
-
-/// An explicit resume: mail for exactly this conversation that is located at one of the sessions it ran under
-/// moves to this session and, if it was held only because the session or conversation moved, is queued again.
-/// The message and its recipient are never rewritten; only where it is located changes. Stand-in for #10's
-/// `mailbox::resume`, which the parent substitutes at integration.
-fn move_and_release(tx: &rusqlite::Connection, to: &Recipient, from: &[String], now: i64) -> Result<Vec<String>, Fail> {
-    if from.is_empty() {
-        return Ok(Vec::new());
-    }
-    let from_json = json!(from).to_string();
-    let moved = tx
-        .prepare(&format!(
-            "UPDATE deliveries SET locator = ?5, updated_at = ?6
-             WHERE state IN ('queued', 'held') AND COALESCE(locator, (SELECT session_hint FROM messages WHERE id = message_id)) IN (SELECT value FROM json_each(?4))
-               AND message_id IN (SELECT id FROM messages m WHERE {})
-             RETURNING message_id",
-            mailbox::same_conversation("m", "?1", "?2", "?3")
-        ))?
-        .query_map(params![to.provider, to.native_id, to.checkout, from_json, to.session_hint, now], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut released = Vec::new();
-    for id in moved {
-        let changed = tx.execute(
-            "UPDATE deliveries SET state = 'queued', reason = NULL, updated_at = ?2
-             WHERE message_id = ?1 AND state = 'held' AND expires_at > ?2 AND reason IN ('conversation-replaced', 'session-not-running')",
-            params![id, now],
-        )?;
-        if changed > 0 {
-            released.push(id);
-        }
-    }
-    Ok(released)
+    crate::store::commit(tx, "binding_publish")?;
+    Ok(json!({ "valid_until": valid_until, "held": held, "released": released, "stored": true }))
 }
 
 /// Keeps, once each, the ids whose delivery is in `state` right now.
@@ -151,19 +131,27 @@ pub struct Invalidate {
     generation: i64,
     reason: &'static str,
     hold_reason: &'static str,
+    existing_store_only: bool,
+}
+
+impl Invalidate {
+    pub fn existing_store_only(&self) -> bool {
+        self.existing_store_only
+    }
 }
 
 pub fn parse_invalidate(mut args: Args) -> Result<Invalidate, Fail> {
     let session_hint = args.string("session_hint", 128)?;
     let reason = args.string("reason", 32)?;
     let generation = args.count("generation", 0, MAX_GENERATION, "FIELD_TOO_LARGE")? as i64;
+    let existing_store_only = args.optional_boolean("existing_store_only")?;
     args.finish()?;
     let (reason, hold_reason) = REASONS
         .iter()
         .find(|(name, _)| *name == reason)
         .copied()
         .ok_or_else(|| Fail::new("REQUEST_INVALID", "field `reason` is missing or invalid"))?;
-    Ok(Invalidate { session_hint, generation, reason, hold_reason })
+    Ok(Invalidate { session_hint, generation, reason, hold_reason, existing_store_only })
 }
 
 /// Withdraws the snapshot now and fences its generation, so no earlier publish can bring it back, then holds the
@@ -193,8 +181,8 @@ pub fn invalidate(store: &mut Store, request: Invalidate) -> Result<Value, Fail>
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(hold);
     authz::gate_all(&tx, store.version, now)?;
-    mailbox::commit(tx, "binding_invalidate")?;
-    Ok(json!({ "held": held }))
+    crate::store::commit(tx, "binding_invalidate")?;
+    Ok(json!({ "held": held, "stored": true }))
 }
 
 /// Passive: reports the snapshot as the clock reads it now, and never extends it. A fence with no conversation shows `recipient: null`.

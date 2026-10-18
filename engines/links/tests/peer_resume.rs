@@ -32,7 +32,7 @@ fn publishing_with_resumed_from_moves_peer_mail_to_the_new_session_and_releases_
     let claimed = pair.b.ok("claim", json!({ "recipient": { "provider": "claude-code", "native_id": "native-a",
         "checkout": recipient("native-a")["checkout"], "session_hint": "session-2" } }));
     assert_eq!(claimed["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(claimed["messages"][0]["sender"]["peer_id"], pair.a_id);
+    assert_eq!(claimed["messages"][0]["sender"]["id"], pair.a_id);
     assert!(claimed["text"].as_str().unwrap().contains(&format!("from=\"peer:{}\"", pair.a_id)));
 }
 
@@ -59,5 +59,5 @@ fn resumed_from_is_bounded() {
     let engine = Engine::new();
     let mut args = republished_as_session_2("project-1");
     args["resumed_from"] = json!((0..9).map(|n| format!("session-old-{n}")).collect::<Vec<_>>());
-    assert_eq!(engine.err("binding_publish", args), "REQUEST_INVALID");
+    assert_eq!(engine.err("binding_publish", args), "FIELD_TOO_LARGE");
 }

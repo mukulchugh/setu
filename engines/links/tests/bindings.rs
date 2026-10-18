@@ -201,3 +201,40 @@ mod clock {
         assert_eq!(call_at(&engine, 1_090_000, "binding_show", json!({ "session_hint": "session-1" }))["result"]["state"], "valid");
     }
 }
+
+#[test]
+fn a_lifecycle_publish_that_asks_for_an_existing_store_creates_none_and_says_so() {
+    let engine = Engine::new();
+    let mut args = publish_args("native-a", 1, 60_000);
+    args["existing_store_only"] = json!(true);
+    let result = engine.ok("binding_publish", args.clone());
+    assert_eq!(result["stored"], false);
+    assert_eq!((result["held"].clone(), result["released"].clone()), (json!([]), json!([])));
+    assert!(!engine.dir.exists(), "a managed session existing created a mailbox");
+
+    // Once something else has created the store, the very same request is stored.
+    engine.ok("send", send_args("k", "hello", "native-a"));
+    let stored = engine.ok("binding_publish", args);
+    assert_eq!(stored["stored"], true);
+    assert_eq!(engine.ok("binding_show", json!({ "session_hint": "session-1" }))["state"], "valid");
+}
+
+#[test]
+fn a_lifecycle_invalidation_that_asks_for_an_existing_store_creates_none_and_says_so() {
+    let engine = Engine::new();
+    let args = json!({ "session_hint": "session-1", "reason": "ended", "generation": 3, "existing_store_only": true });
+    let result = engine.ok("binding_invalidate", args.clone());
+    assert_eq!((result["stored"].clone(), result["held"].clone()), (json!(false), json!([])));
+    assert!(!engine.dir.exists());
+
+    engine.ok("send", send_args("k", "hello", "native-a"));
+    assert_eq!(engine.ok("binding_invalidate", args)["stored"], true);
+    assert_eq!(engine.ok("binding_show", json!({ "session_hint": "session-1" }))["state"], "invalid");
+}
+
+#[test]
+fn an_ordinary_publish_still_creates_the_store_and_reports_it_stored() {
+    let engine = Engine::new();
+    assert_eq!(engine.ok("binding_publish", publish_args("native-a", 1, 60_000))["stored"], true);
+    assert!(engine.dir.exists());
+}

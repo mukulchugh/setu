@@ -25,6 +25,7 @@ async function fixture(work) {
     computeWorktrees: () => Promise.resolve([]),
     config,
     indexPage: new Response('fixture'),
+    linksRoot: join(root, 'links'),
     managedAgents: {
       dispose: () => Promise.resolve(),
       recover: () => Promise.resolve(),

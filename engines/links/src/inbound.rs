@@ -4,7 +4,7 @@
 
 use crate::{
     args::Fail,
-    authz,
+    authz, frame,
     mailbox::{self, Recipient},
     sharing::{self, Standing},
     store::Store,
@@ -166,6 +166,12 @@ fn try_deposit(store: &mut Store, peer: &str, request: Deposit) -> Result<Reply,
         return Err(Fail::new("RECIPIENT_QUEUE_FULL", "this conversation already has the most pending messages allowed").retryable());
     }
     let id = util::new_id("m");
+    // The exact text the agent would see must fit one turn of provider output, metadata included: the same bound a
+    // local send is held to, applied before anything from the wire is stored.
+    let framed = frame::Framed { id: &id, sender: &sender, sent_at: now, reply_to: request.reply_to.as_deref(), body: &request.body };
+    if !frame::fits(&[framed]) {
+        return Err(Fail::new("FRAME_TOO_LARGE", "this message, with its metadata, does not fit one turn of provider output"));
+    }
     // The receiver's own clock and limits decide the lifetime; whatever the sender claims about it is ignored.
     let (state, reason) = if exact { ("queued", None) } else { ("held", Some("conversation-replaced")) };
     tx.execute(
@@ -184,7 +190,7 @@ fn try_deposit(store: &mut Store, peer: &str, request: Deposit) -> Result<Reply,
         "INSERT INTO inbound (message_id, peer_id, origin_id, recipient_digest, state_seq, reported_seq, created_at) VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)",
         params![id, peer, request.origin_id, wire::recipient_digest(&request.recipient), now],
     )?;
-    mailbox::commit(tx, "deposit")?;
+    crate::store::commit(tx, "deposit")?;
     Ok(Reply::Deposited { state: state.to_string(), reason: reason.map(str::to_string), seq: 1, replayed: false })
 }
 
@@ -229,7 +235,7 @@ fn try_cancel(store: &mut Store, peer: &str, origin_id: &str) -> Result<Reply, F
             }
         }
         tx.execute("INSERT OR IGNORE INTO cancel_tombstones (peer_id, origin_id, created_at) VALUES (?1, ?2, ?3)", params![peer, origin_id, now])?;
-        mailbox::commit(tx, "cancel")?;
+        crate::store::commit(tx, "cancel")?;
         return Ok(Reply::CancelResult { result: "cancelled".into(), state: "cancelled".into(), reason: Some("cancelled before arrival".into()) });
     };
     let (state, reason, _) = current(&tx, &id, now)?;
@@ -237,7 +243,7 @@ fn try_cancel(store: &mut Store, peer: &str, origin_id: &str) -> Result<Reply, F
         "cancelled" => Reply::CancelResult { result: "cancelled".into(), state, reason },
         "queued" | "held" => {
             tx.execute("UPDATE deliveries SET state = 'cancelled', reason = 'cancelled by sender', updated_at = ?2 WHERE message_id = ?1", params![id, now])?;
-            mailbox::commit(tx, "cancel")?;
+            crate::store::commit(tx, "cancel")?;
             return Ok(Reply::CancelResult { result: "cancelled".into(), state: "cancelled".into(), reason: Some("cancelled by sender".into()) });
         }
         // Already claimed, handed off, acknowledged or expired: the truth is reported and nothing changes.
@@ -276,7 +282,7 @@ pub fn due_receipts(db: &rusqlite::Connection, peer: &str, now: i64) -> Result<V
 pub fn mark_reported(store: &mut Store, message_id: &str, seq: i64) -> Result<(), Fail> {
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("UPDATE inbound SET reported_seq = MAX(reported_seq, ?2) WHERE message_id = ?1", params![message_id, seq])?;
-    mailbox::commit(tx, "reported")?;
+    crate::store::commit(tx, "reported")?;
     Ok(())
 }
 

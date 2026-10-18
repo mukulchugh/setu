@@ -14,7 +14,8 @@ pub const ALPN: &[u8] = b"setu-links/transport";
 /// carried the local canonical form and is refused by name.
 pub const VERSIONS: [u32; 1] = [2];
 pub const CAPABILITIES: [&str; 4] = ["cancel", "deposit", "published", "receipt"];
-/// Large enough for a maximum body written entirely as JSON escapes, small enough to refuse a flood.
+/// Large enough for a complete 256-entry directory publication, small enough to refuse a flood. A transport bound,
+/// not a message or provider-output limit.
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 

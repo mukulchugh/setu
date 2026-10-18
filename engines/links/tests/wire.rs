@@ -66,6 +66,24 @@ fn a_compatible_peer_is_welcomed_with_the_negotiated_version() {
 }
 
 #[test]
+fn a_complete_directory_publication_fits_one_transport_frame() {
+    let entries = (0..256)
+        .map(|n| setu_links::wire::Published {
+            session_hint: format!("session-{n:028x}"),
+            provider: "claude-code".into(),
+            native_id: format!("w1:{n:064x}"),
+            checkout: format!("w1:{:064x}", n + 256),
+            scope: format!("ps_{n:032x}"),
+            ttl_ms: 120_000,
+        })
+        .collect::<Vec<_>>();
+    let frame = serde_json::to_vec(&setu_links::wire::Request::Published { entries }).unwrap();
+
+    assert!(frame.len() > 64 * 1024, "the former limit must reject this valid complete replacement");
+    assert!(frame.len() <= setu_links::wire::MAX_FRAME, "{} bytes", frame.len());
+}
+
+#[test]
 fn an_incompatible_protocol_version_is_rejected_with_the_reason_and_changes_no_state() {
     let target = Target::new(true);
     let before = target.engine.snapshot();

@@ -45,6 +45,73 @@ pub fn fault(point: &str) {
     let _ = point;
 }
 
+/// Words that stand where text was removed; a label that carries only these has nothing left to hide.
+const MARKERS: [&str; 3] = ["[REDACTED]", "[path]", "[env]"];
+
+fn is_secret_like(core: &str) -> bool {
+    let lower = core.to_ascii_lowercase();
+    lower.starts_with("-----begin")
+        || (lower.starts_with("sk-") && core.len() >= 15)
+        || (["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].iter().any(|p| lower.starts_with(p)) && core.len() >= 24)
+        || (lower.starts_with("github_pat_") && core.len() >= 31)
+        || (core.len() == 20 && core.starts_with("AKIA") && core.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+}
+
+fn is_env_like(core: &str) -> bool {
+    let bytes = core.as_bytes();
+    let reference = bytes.windows(2).any(|pair| pair[0] == b'$' && (pair[1].is_ascii_alphabetic() || matches!(pair[1], b'_' | b'{' | b'(')));
+    let windows_variable = core.find('%').is_some_and(|start| {
+        core[start + 1..].find('%').is_some_and(|len| {
+            let name = &core[start + 1..start + 1 + len];
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    });
+    let assignment = core.split_once('=').is_some_and(|(name, value)| {
+        !value.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    });
+    reference || windows_variable || assignment
+}
+
+fn is_path_like(core: &str) -> bool {
+    let bytes = core.as_bytes();
+    let drive = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\');
+    let separators = core.matches('/').count();
+    let extension = core.rsplit('/').next().is_some_and(|last| {
+        last.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && (1..=8).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphanumeric()))
+    });
+    core.starts_with('/')
+        || core.starts_with('~')
+        || core.starts_with("./")
+        || core.starts_with("../")
+        || drive
+        || core.contains('\\')
+        || separators >= 2
+        || (separators == 1 && extension)
+}
+
+/// Whether a short public label (an owner, a task) carries a file path, an environment reference or a
+/// secret. The check is conservative and word-based: it looks for the shapes, never for particular values,
+/// and reads nothing but the label. Text a caller already replaced with `[path]`, `[env]` or `[REDACTED]`
+/// passes.
+pub fn unsafe_label(label: &str) -> bool {
+    let mut text = label.to_string();
+    for marker in MARKERS {
+        text = text.replace(marker, " ");
+    }
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`' | ',' | ';' | '!' | '?')))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().enumerate().any(|(index, word)| {
+        let core = word.trim_end_matches(['.', ':']);
+        is_path_like(core)
+            || is_env_like(core)
+            || is_secret_like(core)
+            || (core.eq_ignore_ascii_case("bearer") && words.get(index + 1).is_some())
+    })
+}
+
 /// How often the daemon looks at the outbox and the receipt backlog. A `test-hooks` build can shorten it.
 pub fn tick_ms() -> u64 {
     #[cfg(feature = "test-hooks")]

@@ -2,23 +2,17 @@
 
 use crate::{
     args::{Args, Fail},
-    frame,
-    store::Store,
+    frame, sharing,
+    store::{SHARING_SCHEMA, Store, TRANSPORT_SCHEMA, commit},
     util,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-pub const MAX_BODY_BYTES: usize = 16 * 1024;
+/// A body this large, framed with the worst-case metadata, is still one whole turn of provider output
+/// (`frame::MAX_FRAME_BYTES`). Mail stored under the earlier 16 KiB rule may be larger; see `claim`.
+pub const MAX_BODY_BYTES: usize = 8 * 1024;
 pub const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-
-/// Every mutation ends here, so every one can be killed on either side of its commit.
-pub(crate) fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
-    util::fault(&format!("{op}:before-commit"));
-    tx.commit()?;
-    util::fault(&format!("{op}:after-commit"));
-    Ok(())
-}
 
 pub struct Recipient {
     pub provider: String,
@@ -77,11 +71,70 @@ pub(crate) fn same_native(m: &str, provider: &str, native: &str) -> String {
 }
 
 pub const MAX_PENDING_PER_RECIPIENT: i64 = 100;
-/// One turn carries at most this many messages and this many body bytes, so mail cannot flood a context.
+/// One turn carries at most this many messages, and their serialized text at most `frame::MAX_FRAME_BYTES`,
+/// so mail cannot flood a context and nothing is claimed that the provider would cut off.
 pub const CLAIM_MAX_MESSAGES: usize = 8;
-pub const CLAIM_MAX_BYTES: usize = 32 * 1024;
+
+/// Mail larger than a turn can carry whole. Both the read projection and `claim` use this one rule (claim
+/// also checks the exact serialized frame), so a plain read and the persisted hold always agree.
+fn over_body_cap(size: i64) -> bool {
+    size > MAX_BODY_BYTES as i64
+}
+
+/// Why mail that can never fit one turn is held rather than claimed.
+pub const OUTPUT_LIMIT: &str = "provider-output-limit";
+
+/// The trusted caller of a send, as the engine's client states it. The engine's protocol is local, so this
+/// is not something message text can establish: a front door sets it from what it authenticated. A peer is
+/// not a principal here; it becomes one only when peer grants exist.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Principal {
+    User,
+    Session(String),
+}
+
+impl Principal {
+    /// One column value: `user`, or `session:<id>`. Ids never contain `:`, so it decodes without ambiguity.
+    fn encode(&self) -> String {
+        match self {
+            Principal::User => "user".to_string(),
+            Principal::Session(id) => format!("session:{id}"),
+        }
+    }
+
+    pub fn is_local_user(&self) -> bool {
+        *self == Principal::User
+    }
+
+    fn parse(mut args: Args) -> Result<Self, Fail> {
+        let kind = args.string("kind", 16)?;
+        let principal = match kind.as_str() {
+            "user" => Principal::User,
+            "session" => {
+                let id = args.string("id", 128)?;
+                if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                    return Err(Fail::new("REQUEST_INVALID", "field `id` is missing or invalid"));
+                }
+                Principal::Session(id)
+            }
+            _ => return Err(Fail::new("SENDER_UNSUPPORTED", "this kind of sender is not supported")),
+        };
+        args.finish()?;
+        Ok(principal)
+    }
+}
+
+/// `user` or `session:<id>` as a public sender object.
+fn sender_json(encoded: &str) -> Value {
+    match encoded.split_once(':') {
+        Some((kind, id)) => json!({ "kind": kind, "id": id }),
+        None => json!({ "kind": encoded }),
+    }
+}
 
 pub struct SendRequest {
+    sender: Principal,
+    project: String,
     key: String,
     /// Set when the recipient is on another machine: the message then goes to the outbox, not to a local inbox.
     peer_id: Option<String>,
@@ -95,12 +148,8 @@ pub struct SendRequest {
 /// Validates a send before any store is opened, so a refused request leaves no trace.
 pub fn parse_send(mut args: Args) -> Result<SendRequest, Fail> {
     let key = args.string("idempotency_key", 128)?;
-    let mut sender = args.object("sender")?;
-    let kind = sender.string("kind", 16)?;
-    sender.finish()?;
-    if kind != "user" {
-        return Err(Fail::new("SENDER_UNSUPPORTED", "only the local user can send"));
-    }
+    let sender = Principal::parse(args.object("sender")?)?;
+    let project = sharing::project_arg(&mut args)?;
     let recipient = Recipient::parse(args.object("recipient")?)?;
     let peer_id = args.optional_string("peer_id", 64)?;
     let body = args.bounded("body", MAX_BODY_BYTES, "BODY_TOO_LARGE")?;
@@ -108,14 +157,39 @@ pub fn parse_send(mut args: Args) -> Result<SendRequest, Fail> {
     let run_hint = args.optional_string("run_hint", 128)?;
     let span_hint = args.optional_string("span_hint", 128)?;
     args.finish()?;
-    Ok(SendRequest { key, peer_id, recipient, body, reply_to, run_hint, span_hint })
+    Ok(SendRequest { sender, project, key, peer_id, recipient, body, reply_to, run_hint, span_hint })
+}
+
+impl SendRequest {
+    /// Whether the project's sharing policy has any say: the local user's own mail never depends on it.
+    pub fn needs_policy(&self) -> bool {
+        !self.sender.is_local_user()
+    }
+
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+}
+
+/// Mail from a principal other than the local user is admitted only by a readable policy that lets the
+/// project receive. Anything else (no policy, withdrawn, unreadable) refuses, so no failure opens access.
+pub fn admit(db: &rusqlite::Connection, version: i64, project: &str) -> Result<(), Fail> {
+    match sharing::standing(db, version, project)? {
+        sharing::Standing::Valid(policy, _) if policy.receive => Ok(()),
+        sharing::Standing::Invalid(reason) => Err(sharing::invalid_policy(project, reason)),
+        _ => Err(sharing::not_shared(project)),
+    }
 }
 
 pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
-    let SendRequest { key, peer_id, recipient, body, reply_to, run_hint, span_hint } = request;
+    let SendRequest { sender, project, key, peer_id, recipient, body, reply_to, run_hint, span_hint } = request;
+    let sender_column = sender.encode();
 
-    // The digest covers exactly what the caller supplied, in a canonical key order.
-    let mut canonical = json!({
+    // The digest covers exactly what the caller supplied, in a canonical key order. Schema 1 did not know
+    // projects, so its digests lack the field; `legacy_digest` is that same computation for replaying a row
+    // that old.
+    let digest_of = |with_project: bool| {
+        let mut payload = json!({
             "body": body,
             "kind": "message",
             "reply_to": reply_to,
@@ -128,26 +202,44 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
                 "session_hint": recipient.session_hint,
             },
         });
-    if let Some(peer) = &peer_id {
-        canonical["peer_id"] = json!(peer);
-    }
-    let digest = util::sha256_hex(&canonical.to_string());
+        if with_project {
+            payload["project"] = json!(project);
+        }
+        if let Some(peer) = &peer_id {
+            payload["peer_id"] = json!(peer);
+        }
+        util::sha256_hex(&payload.to_string())
+    };
+    let digest = digest_of(true);
+    let legacy_digest = digest_of(false);
+    // A message for another machine is accepted into the sender's outbox, not a local inbox. Only the local user
+    // sends to a peer; a peer is not a principal here.
     if let Some(peer_id) = peer_id {
-        return crate::outbox::send(store, crate::outbox::Remote { key, peer_id, recipient, body, reply_to, run_hint, span_hint, digest });
+        if !sender.is_local_user() {
+            return Err(Fail::new("SENDER_UNSUPPORTED", "only the local user can send to a peer"));
+        }
+        return crate::outbox::send(store, crate::outbox::Remote { key, peer_id, project, recipient, body, reply_to, run_hint, span_hint, digest });
     }
     let now = util::now_ms();
     let id = util::new_id("m");
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing: Option<(String, String)> = tx
-        .query_row("SELECT id, payload_digest FROM messages WHERE sender = 'user' AND idempotency_key = ?1", [&key], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+    if !sender.is_local_user() {
+        admit(&tx, store.version, &project)?;
+    }
+    let existing: Option<(String, String, Option<String>)> = tx
+        .query_row("SELECT id, payload_digest, project FROM messages WHERE sender = ?2 AND idempotency_key = ?1", params![key, sender_column], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .optional()?;
-    if let Some((existing_id, existing_digest)) = existing {
-        if existing_digest != digest {
+    if let Some((existing_id, existing_digest, existing_project)) = existing {
+        // A row written before projects existed has no project and its original digest. The same send
+        // retried after the upgrade is that message; anything that differs still conflicts, and the row
+        // itself is never rewritten.
+        let same = existing_digest == digest || (existing_project.is_none() && existing_digest == legacy_digest);
+        if !same {
             return Err(Fail::new("IDEMPOTENCY_CONFLICT", "this key was used for a different message").with(json!({ "message_id": existing_id })));
         }
-        let state = view(&tx, &existing_id, now)?;
+        let state = view(&tx, store.version, &existing_id, now)?;
         return Ok(json!({ "message_id": existing_id, "state": state["state"], "replayed": true }));
     }
     let pending: i64 = tx.query_row(
@@ -162,10 +254,16 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
     if pending >= MAX_PENDING_PER_RECIPIENT {
         return Err(Fail::new("RECIPIENT_QUEUE_FULL", "this conversation already has the most pending messages allowed"));
     }
+    // The exact text the agent would see must fit one turn, metadata included. Refused before anything is stored.
+    let framed = frame::Framed { id: &id, sender: &sender_column, sent_at: now, reply_to: reply_to.as_deref(), body: &body };
+    if !frame::fits(&[framed]) {
+        return Err(Fail::new("FRAME_TOO_LARGE", "this message, with its metadata, does not fit one turn of provider output")
+            .with(json!({ "limit_bytes": frame::MAX_FRAME_BYTES })));
+    }
     tx.execute(
-        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at)
-         VALUES (?1, 'user', ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, key, digest, body, body.len() as i64, reply_to, run_hint, span_hint, recipient.provider, recipient.native_id, recipient.checkout, recipient.session_hint, now],
+        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at, project)
+         VALUES (?1, ?14, ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?15)",
+        params![id, key, digest, body, body.len() as i64, reply_to, run_hint, span_hint, recipient.provider, recipient.native_id, recipient.checkout, recipient.session_hint, now, sender_column, project],
     )?;
     tx.execute(
         "INSERT INTO deliveries (message_id, state, expires_at, updated_at) VALUES (?1, 'queued', ?2, ?3)",
@@ -175,19 +273,16 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
     Ok(json!({ "message_id": id, "state": "queued", "replayed": false }))
 }
 
-const VIEW: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run_hint, m.span_hint, m.provider, m.native_id, m.checkout,
+const VIEW_SQL: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run_hint, m.span_hint, m.provider, m.native_id, m.checkout,
         m.session_hint, m.created_at, m.body,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.state END,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.reason END,
-        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state
+        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state, m.project, COALESCE(d.locator, m.session_hint)
     FROM messages m JOIN deliveries d ON d.message_id = m.id";
 
-/// Who a message is from: the local user, or a peer machine named by its authenticated key.
-fn sender_json(sender: &str) -> Value {
-    match sender.strip_prefix("peer:") {
-        Some(peer_id) => json!({ "kind": "peer", "peer_id": peer_id }),
-        None => json!({ "kind": sender }),
-    }
+/// Schema 1 has no project column; its messages read as having none.
+fn view_sql(version: i64) -> String {
+    if version < SHARING_SCHEMA { VIEW_SQL.replace("m.project", "NULL").replace("COALESCE(d.locator, m.session_hint)", "m.session_hint") } else { VIEW_SQL.to_string() }
 }
 
 fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
@@ -214,6 +309,8 @@ fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
         "expires_at": row.get::<_, i64>(18)?,
         "updated_at": row.get::<_, i64>(19)?,
         "stored_state": row.get::<_, String>(20)?,
+        "project": row.get::<_, Option<String>>(21)?,
+        "locator": row.get::<_, String>(22)?,
     });
     if with_body {
         value["body"] = Value::String(row.get(12)?);
@@ -232,6 +329,12 @@ fn parse_observed(args: &mut Args) -> Result<Option<Recipient>, Fail> {
 /// `reconcile` is what persists the same
 /// decision; nothing here changes the store.
 fn project(value: &mut Value, observed: Option<&Recipient>) {
+    // Mail larger than a turn can carry is held whatever else is known; `claim` persists the same decision.
+    if value["state"] == "queued" && value["size"].as_i64().is_some_and(over_body_cap) {
+        value["state"] = json!("held");
+        value["reason"] = json!(OUTPUT_LIMIT);
+        return;
+    }
     value["observed_match"] = Value::Null;
     let Some(observed) = observed else { return };
     let recipient = value["recipient"].clone();
@@ -240,7 +343,7 @@ fn project(value: &mut Value, observed: Option<&Recipient>) {
     // The engine, not a caller, says whether a stored recipient is the observed conversation (either form).
     let same = observed.matches_stored(&stored);
     value["observed_match"] = json!(same);
-    if recipient["session_hint"] != observed.session_hint.as_str() {
+    if value["locator"] != observed.session_hint.as_str() {
         return;
     }
     let (wire_native, _) = observed.wire();
@@ -250,8 +353,6 @@ fn project(value: &mut Value, observed: Option<&Recipient>) {
             value["state"] = json!("held");
             value["reason"] = json!(if same_conversation { "checkout-changed" } else { "conversation-replaced" });
         }
-        // Only a hold that the conversation itself explains is lifted by seeing the conversation again; a hold for
-        // revoked authorization or an unshared project is not.
         Some("held") if same && matches!(value["reason"].as_str(), Some("conversation-replaced" | "checkout-changed" | "session-not-running")) => {
             value["state"] = json!("queued");
             value["reason"] = Value::Null;
@@ -260,8 +361,26 @@ fn project(value: &mut Value, observed: Option<&Recipient>) {
     }
 }
 
-fn view(db: &rusqlite::Connection, id: &str, now: i64) -> Result<Value, Fail> {
-    db.query_row(&format!("{VIEW} WHERE m.id = ?1"), params![id, now], |row| row_json(row, true))
+/// Mail from another principal that its project no longer admits reads as held. `cache` remembers each
+/// project's answer for one read. This only reports; `claim` and withdrawal are what persist the hold.
+fn project_policy(store: &Store, value: &mut Value, cache: &mut std::collections::HashMap<String, Option<&'static str>>) -> Result<(), Fail> {
+    if value["state"] != "queued" || value["sender"]["kind"] == "user" {
+        return Ok(());
+    }
+    let Some(project) = value["project"].as_str().map(str::to_string) else { return Ok(()) };
+    if !cache.contains_key(&project) {
+        let verdict = admit(&store.db, store.version, &project).err().map(|fail| sharing::hold_reason(&fail));
+        cache.insert(project.clone(), verdict);
+    }
+    if let Some(reason) = cache[&project] {
+        value["state"] = json!("held");
+        value["reason"] = json!(reason);
+    }
+    Ok(())
+}
+
+fn view(db: &rusqlite::Connection, version: i64, id: &str, now: i64) -> Result<Value, Fail> {
+    db.query_row(&format!("{} WHERE m.id = ?1", view_sql(version)), params![id, now], |row| row_json(row, true))
         .optional()?
         .ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))
 }
@@ -271,11 +390,12 @@ pub fn show(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = match view(&store.db, &id, util::now_ms()) {
-        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= 3 => outbound(&store.db, &id, true)?,
+    let mut value = match view(&store.db, store.version, &id, util::now_ms()) {
+        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= TRANSPORT_SCHEMA => outbound(&store.db, &id, true)?,
         other => other?,
     };
     project(&mut value, observed.as_ref());
+    project_policy(store, &mut value, &mut Default::default())?;
     Ok(value)
 }
 
@@ -294,13 +414,16 @@ pub fn list(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let Some(store) = store else { return Ok(json!({ "messages": [] })) };
-    let mut statement = store.db.prepare(&format!("{VIEW} WHERE m.session_hint = ?1 ORDER BY m.created_at, m.id"))?;
+    let found = if store.version >= 2 { "(m.session_hint = ?1 OR d.locator = ?1)" } else { "m.session_hint = ?1" };
+    let mut statement = store.db.prepare(&format!("{} WHERE {found} ORDER BY m.created_at, m.id", view_sql(store.version)))?;
     let now = util::now_ms();
     let rows = statement.query_map(params![session, now], |row| row_json(row, false))?;
     let mut messages = Vec::new();
+    let mut cache = Default::default();
     for row in rows {
         let mut row = row?;
         project(&mut row, observed.as_ref());
+        project_policy(store, &mut row, &mut cache)?;
         if state.as_deref().is_none_or(|wanted| row["state"] == wanted) {
             messages.push(row);
         }
@@ -314,25 +437,14 @@ pub fn status(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = match view(&store.db, &id, util::now_ms()) {
-        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= 3 => outbound(&store.db, &id, false)?,
+    let mut value = match view(&store.db, store.version, &id, util::now_ms()) {
+        Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= TRANSPORT_SCHEMA => outbound(&store.db, &id, false)?,
         other => other?,
     };
     project(&mut value, observed.as_ref());
+    project_policy(store, &mut value, &mut Default::default())?;
     value.as_object_mut().map(|fields| fields.remove("body"));
     Ok(value)
-}
-
-/// One maintenance pass for the daemon: persist expiry and re-check peer mail against current authorization.
-pub fn maintain(store: &mut Store) -> Result<(), Fail> {
-    let now = util::now_ms();
-    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    expire_due(&tx, now)?;
-    crate::outbox::expire_due(&tx, now)?;
-    crate::inbound::forget_old_tombstones(&tx, now)?;
-    crate::authz::gate_all(&tx, store.version, now)?;
-    tx.commit()?;
-    Ok(())
 }
 
 /// Persists expiry for queued or held mail whose time has passed.
@@ -341,11 +453,30 @@ pub fn sweep(store: &mut Store, args: Args) -> Result<Value, Fail> {
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = util::now_ms();
     let expired = expire_due(&tx, now)?;
-    crate::outbox::expire_due(&tx, now)?;
-    crate::inbound::forget_old_tombstones(&tx, now)?;
-    crate::authz::gate_all(&tx, store.version, now)?;
+    if store.version >= TRANSPORT_SCHEMA {
+        transport_upkeep(&tx, store.version, now)?;
+    }
     commit(tx, "sweep")?;
     Ok(json!({ "expired": expired }))
+}
+
+/// What the peer transport keeps up, in one place: outbound mail that expired or was addressed with a local tuple by
+/// an earlier build, cancels and cached peer sessions that aged out, and peer mail whose authorization has lapsed.
+fn transport_upkeep(tx: &rusqlite::Connection, version: i64, now: i64) -> Result<(), Fail> {
+    crate::outbox::expire_due(tx, now)?;
+    crate::inbound::forget_old_tombstones(tx, now)?;
+    crate::authz::gate_all(tx, version, now)?;
+    Ok(())
+}
+
+/// One maintenance pass for the daemon: persist expiry and re-check peer mail against current authorization.
+pub fn maintain(store: &mut Store) -> Result<(), Fail> {
+    let now = util::now_ms();
+    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    expire_due(&tx, now)?;
+    transport_upkeep(&tx, store.version, now)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The trusted service's report of which conversation a managed session runs now. Mail queued for any
@@ -366,14 +497,16 @@ pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
     Ok(json!({ "held": held, "released": released }))
 }
 
-/// The hold-and-restore decision for one session, inside the caller's write transaction.
+/// The hold-and-restore decision for one session, inside the caller's write transaction. Mail is matched to the
+/// trusted conversation by its local tuple or its wire address, and located by its delivery locator.
 pub fn reconcile_in(tx: &rusqlite::Connection, current: &Recipient, now: i64) -> Result<(Vec<String>, Vec<String>), Fail> {
     let mut hold = tx.prepare(&format!(
         "UPDATE deliveries SET state = 'held', updated_at = ?5,
             reason = CASE WHEN (SELECT {same_native} FROM messages mm WHERE mm.id = message_id)
                           THEN 'checkout-changed' ELSE 'conversation-replaced' END
          WHERE state = 'queued' AND message_id IN (
-            SELECT id FROM messages m WHERE m.session_hint = ?1
+            SELECT m.id FROM messages m JOIN deliveries l ON l.message_id = m.id
+             WHERE COALESCE(l.locator, m.session_hint) = ?1
               AND NOT {same_conversation})
          RETURNING message_id",
         same_native = same_native("mm", "?2", "?3"),
@@ -385,9 +518,10 @@ pub fn reconcile_in(tx: &rusqlite::Connection, current: &Recipient, now: i64) ->
     drop(hold);
     let mut release = tx.prepare(&format!(
         "UPDATE deliveries SET state = 'queued', reason = NULL, updated_at = ?5
-         WHERE state = 'held' AND expires_at > ?5 AND reason IN ('conversation-replaced', 'checkout-changed', 'session-not-running')
-           AND message_id IN (
-            SELECT id FROM messages m WHERE m.session_hint = ?1 AND {})
+         WHERE state = 'held' AND reason IN ('conversation-replaced', 'checkout-changed', 'session-not-running') AND expires_at > ?5 AND message_id IN (
+            SELECT m.id FROM messages m JOIN deliveries l ON l.message_id = m.id
+             WHERE COALESCE(l.locator, m.session_hint) = ?1
+              AND {})
          RETURNING message_id",
         same_conversation("m", "?2", "?3", "?4")
     ))?;
@@ -398,6 +532,78 @@ pub fn reconcile_in(tx: &rusqlite::Connection, current: &Recipient, now: i64) ->
     Ok((held, released))
 }
 
+/// Hold reasons that returning the exact conversation resolves. Any other reason is a different decision
+/// and a resume never lifts it.
+/// (`session-not-running` is the hold the transport places when a managed session ends; the exact conversation
+/// returning resolves it the same way.) Holds for policy, revoked peers or lapsed authorization are not in this list.
+const RESUME_RELEASES: [&str; 2] = ["conversation-replaced", "session-not-running"];
+const MAX_RESUME_FROM: usize = 8;
+
+pub struct ResumeRequest {
+    current: Recipient,
+    from: Vec<String>,
+}
+
+pub fn parse_resume(mut args: Args) -> Result<ResumeRequest, Fail> {
+    let current = Recipient::parse(args.object("recipient")?)?;
+    let from = args.string_list("from", MAX_RESUME_FROM, 128)?;
+    args.finish()?;
+    Ok(ResumeRequest { current, from })
+}
+
+/// The trusted service's report that a verified, explicitly reviewed resume brought this exact conversation
+/// (provider, native conversation and checkout) back under a new managed record. Mail already addressed to
+/// that tuple and located at one of the named earlier records is now located at the new one. The recipient
+/// stored on the message is never rewritten, and no state changes except that mail held because the
+/// conversation was replaced is queued again. Repeating it changes nothing.
+pub fn resume(store: &mut Store, request: ResumeRequest) -> Result<Value, Fail> {
+    let ResumeRequest { current, from } = request;
+    let now = util::now_ms();
+    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (moved, released) = resume_in(&tx, &current, &from, now)?;
+    commit(tx, "resume")?;
+    Ok(json!({ "moved": moved, "released": released }))
+}
+
+/// The resume move inside the caller's transaction: mail for this conversation (its local tuple or its wire address)
+/// located at one of the earlier records is now located at the new one, in every state and without replay, and a
+/// hold this resume resolves is lifted. Shared by the `resume` operation and `binding_publish`.
+pub fn resume_in(tx: &rusqlite::Connection, current: &Recipient, from: &[String], now: i64) -> Result<(Vec<String>, Vec<String>), Fail> {
+    let mut moved = Vec::new();
+    let mut released = Vec::new();
+    let mut find = tx.prepare(&format!(
+        "SELECT m.id, d.state, d.reason, d.expires_at FROM messages m JOIN deliveries d ON d.message_id = m.id
+         WHERE {} AND COALESCE(d.locator, m.session_hint) = ?4 AND ?4 != ?5
+         ORDER BY m.created_at, m.id",
+        same_conversation("m", "?1", "?2", "?3")
+    ))?;
+    for hint in from {
+        let rows = find
+            .query_map(params![current.provider, current.native_id, current.checkout, hint, current.session_hint], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, state, reason, expires_at) in rows {
+            let release = state == "held" && expires_at > now && reason.as_deref().is_some_and(|r| RESUME_RELEASES.contains(&r));
+            // One statement for both outcomes: the mail is located at the new record, and a hold this
+            // resume resolves is lifted. Any other state or reason is left exactly as it was.
+            tx.execute(
+                "UPDATE deliveries SET locator = ?2,
+                    state = CASE WHEN ?4 THEN 'queued' ELSE state END,
+                    reason = CASE WHEN ?4 THEN NULL ELSE reason END,
+                    updated_at = CASE WHEN ?4 THEN ?3 ELSE updated_at END
+                 WHERE message_id = ?1",
+                params![id, current.session_hint, now, release],
+            )?;
+            if release {
+                released.push(id.clone());
+            }
+            moved.push(id);
+        }
+    }
+    Ok((moved, released))
+}
+
 fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> {
     let mut statement = tx.prepare("SELECT message_id FROM deliveries WHERE state IN ('queued', 'held') AND expires_at <= ?1 ORDER BY message_id")?;
     let ids = statement.query_map([now], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -405,6 +611,13 @@ fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> 
         tx.execute("UPDATE deliveries SET state = 'expired', reason = 'expired', updated_at = ?2 WHERE message_id = ?1", params![id, now])?;
     }
     Ok(ids)
+}
+
+/// A queued row as claim reads it: id, created_at, reply_to, body, body size, attempts so far, sender, project.
+type Queued = (String, i64, Option<String>, String, i64, i64, String, Option<String>);
+
+fn framed(rows: &[Queued]) -> Vec<frame::Framed<'_>> {
+    rows.iter().map(|(id, created_at, reply_to, body, _, _, sender, _)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body }).collect()
 }
 
 pub struct ClaimRequest {
@@ -433,34 +646,72 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
     let ClaimRequest { recipient, expected_generation } = request;
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // First of all, before expiry, authorization or any mail is touched: a refusal leaves nothing behind.
+    // First of all, before expiry, authorization or any mail is touched: a refusal leaves nothing behind (the whole
+    // transaction is dropped), not a message, an attempt or a hold.
     if let Some(generation) = expected_generation {
         crate::binding::require_current(&tx, &recipient, generation, now)?;
     }
     expire_due(&tx, now)?;
     // Mail from a peer is handed off only on evidence that holds right now: roster, grant, snapshot and policy.
-    crate::authz::gate_all(&tx, store.version, now)?;
+    if store.version >= TRANSPORT_SCHEMA {
+        crate::authz::gate_all(&tx, store.version, now)?;
+    }
     let mut statement = tx.prepare(&format!(
-        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts, m.sender FROM messages m
+        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts, m.sender, m.project FROM messages m
          JOIN deliveries d ON d.message_id = m.id
          WHERE {} AND d.state = 'queued'
          ORDER BY m.created_at, m.rowid",
         same_conversation("m", "?1", "?2", "?3")
     ))?;
-    let queued = statement
+    let candidates = statement
         .query_map(params![recipient.provider, recipient.native_id, recipient.checkout], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    let mut taken = Vec::new();
-    let mut bytes = 0;
+    // Mail from any principal but the local user needs its project's policy at claim time, checked here
+    // from the store whatever any earlier operation did. What it no longer admits is held, in this
+    // transaction, and never claimed.
+    let mut queued = Vec::new();
+    for candidate in candidates {
+        let verdict = if candidate.6 == "user" { Ok(()) } else { admit(&tx, store.version, candidate.7.as_deref().unwrap_or("")) };
+        match verdict {
+            Ok(()) => queued.push(candidate),
+            Err(fail) => {
+                tx.execute("UPDATE deliveries SET state = 'held', reason = ?2, updated_at = ?3 WHERE message_id = ?1 AND state = 'queued'", params![candidate.0, sharing::hold_reason(&fail), now])?;
+            }
+        }
+    }
+    // Mail that can never fit one turn is not claimed and not attempted: it is held, with the reason, and
+    // stays readable in full. That is only mail stored under the earlier, larger body cap (a new send is
+    // refused up front), and the exact serialized frame decides, not the body size alone.
+    let (too_big, queued): (Vec<_>, Vec<_>) = queued.into_iter().partition(|(id, created_at, reply_to, body, size, _, sender, _)| {
+        over_body_cap(*size) || !frame::fits(&[frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body }])
+    });
+    for (id, ..) in &too_big {
+        tx.execute(
+            "UPDATE deliveries SET state = 'held', reason = ?2, updated_at = ?3 WHERE message_id = ?1 AND state = 'queued'",
+            params![id, OUTPUT_LIMIT, now],
+        )?;
+    }
+    // The rest go in order, whole, while the serialized text of the batch still fits one turn. The first
+    // message that does not fit waits for the next turn; nothing is ever cut to make room.
+    let mut taken: Vec<Queued> = Vec::new();
     for message in queued {
-        if taken.len() >= CLAIM_MAX_MESSAGES || bytes + message.4 as usize > CLAIM_MAX_BYTES {
+        taken.push(message);
+        if taken.len() > CLAIM_MAX_MESSAGES || !frame::fits(&framed(&taken)) {
+            taken.pop();
             break;
         }
-        bytes += message.4 as usize;
-        taken.push(message);
     }
     if taken.is_empty() {
         // Expiry decided above still counts.
@@ -473,7 +724,7 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
         params![attempt, recipient.provider, recipient.native_id, recipient.checkout, now],
     )?;
     let mut messages = Vec::new();
-    for (id, created_at, reply_to, body, _, attempts, sender) in &taken {
+    for (id, created_at, reply_to, body, _, attempts, sender, _) in &taken {
         let number = attempts + 1;
         tx.execute(
             "UPDATE deliveries SET state = 'handoff-unknown', reason = 'claimed', attempts = ?2, attempt_id = ?3, updated_at = ?4 WHERE message_id = ?1 AND state = 'queued'",
@@ -483,11 +734,7 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
         messages.push(json!({ "message_id": id, "sender": sender_json(sender), "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
     }
     commit(tx, "claim")?;
-    let framed: Vec<_> = taken
-        .iter()
-        .map(|(id, created_at, reply_to, body, _, _, sender)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body })
-        .collect();
-    Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed) }))
+    Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed(&taken)) }))
 }
 
 pub struct ConfirmRequest {
@@ -644,7 +891,7 @@ pub fn cancel(store: &mut Store, request: CancelRequest) -> Result<Value, Fail> 
     let now = util::now_ms();
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // A message for a peer is retracted through its outbox, which is honest about what is still unknown.
-    if crate::outbox::cancel(&tx, &request.message_id, now)?.is_some() {
+    if store.version >= TRANSPORT_SCHEMA && crate::outbox::cancel(&tx, &request.message_id, now)?.is_some() {
         commit(tx, "cancel")?;
         let shown = crate::outbox::view(&store.db, &request.message_id, now, false)?.unwrap_or(Value::Null);
         let mut reply = json!({ "message_id": request.message_id, "state": shown["state"] });

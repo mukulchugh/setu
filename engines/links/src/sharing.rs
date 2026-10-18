@@ -1,11 +1,9 @@
-// PROVISIONAL, #11-OWNED: carried verbatim from the directory slice snapshot so transport tests can compile
-// against the real sharing read helper. The parent replaces this file with the reviewed slice at integration.
 //! Sharing policy: the one authority over which projects are shared. A project that is not shared admits
 //! nothing from any principal but the local user, and a policy the engine cannot read admits nothing either.
 
 use crate::{
     args::{Args, Fail},
-    store::Store,
+    store::{SHARING_SCHEMA, Store, commit},
     util,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -75,8 +73,9 @@ fn scope_is_valid(scope: &str) -> bool {
     scope.strip_prefix("ps_").is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// An owner label is one short printable line that carries no path, environment reference or secret.
 pub fn owner_is_valid(owner: &str) -> bool {
-    !owner.is_empty() && util::one_line(owner, MAX_OWNER_CHARS) == owner
+    !owner.is_empty() && util::one_line(owner, MAX_OWNER_CHARS) == owner && !util::unsafe_label(owner)
 }
 
 pub(crate) fn project_arg(args: &mut Args) -> Result<String, Fail> {
@@ -89,7 +88,7 @@ pub(crate) fn project_arg(args: &mut Args) -> Result<String, Fail> {
 
 /// A project's standing, read from the store as it is. A version 1 store has no policies.
 pub fn standing(db: &rusqlite::Connection, version: i64, project: &str) -> Result<Standing, Fail> {
-    if version < 2 {
+    if version < SHARING_SCHEMA {
         return Ok(Standing::Absent);
     }
     let row: Option<(i64, String, i64)> = db
@@ -109,7 +108,24 @@ pub fn standing(db: &rusqlite::Connection, version: i64, project: &str) -> Resul
 
 /// Whether the store holds any policy row for the project, readable or not.
 pub fn has_row(store: &Store, project: &str) -> Result<bool, Fail> {
-    Ok(store.version >= 2 && store.db.query_row("SELECT EXISTS (SELECT 1 FROM sharing_policies WHERE project = ?1)", [project], |row| row.get(0))?)
+    Ok(store.has_sharing() && store.db.query_row("SELECT EXISTS (SELECT 1 FROM sharing_policies WHERE project = ?1)", [project], |row| row.get(0))?)
+}
+
+pub fn not_shared(project: &str) -> Fail {
+    Fail::new("NOT_SHARED", "this project is not shared").with(json!({ "project": project }))
+}
+
+/// Why mail from another principal is held: the policy is unreadable, or the project is not shared.
+pub fn hold_reason(refusal: &Fail) -> &'static str {
+    if refusal.code == "POLICY_INVALID" { "policy-invalid" } else { "policy-disabled" }
+}
+
+fn optional_project(args: &mut Args) -> Result<Option<String>, Fail> {
+    match args.optional_string("project", MAX_PROJECT_BYTES)? {
+        Some(project) if util::one_line(&project, MAX_PROJECT_BYTES) == project => Ok(Some(project)),
+        Some(_) => Err(Fail::new("REQUEST_INVALID", "field `project` is missing or invalid")),
+        None => Ok(None),
+    }
 }
 
 pub fn invalid_policy(project: &str, reason: &str) -> Fail {
@@ -139,7 +155,9 @@ pub fn enable(store: &mut Store, request: EnableRequest) -> Result<Value, Fail> 
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let existing: Option<(i64, String)> =
         tx.query_row("SELECT version, policy FROM sharing_policies WHERE project = ?1", [&project], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-    // The same policy again keeps its scope; a new, replaced or unreadable one gets a fresh scope.
+    // The scope belongs to the project's sharing, not to its display label: enabling again, even with a
+    // different owner label, keeps it. Only a first enable, a replaced unreadable policy or a re-enable after
+    // a withdrawal mints a new one, so grants made to the old scope stop matching.
     let earlier = match &existing {
         Some((POLICY_VERSION, text)) => Policy::parse(text),
         _ => None,
@@ -160,7 +178,7 @@ pub fn enable(store: &mut Store, request: EnableRequest) -> Result<Value, Fail> 
             params![project, POLICY_VERSION, policy.to_json().to_string(), now],
         )?;
     }
-    crate::mailbox::commit(tx, "share_enable")?;
+    commit(tx, "share_enable")?;
     Ok(json!({ "project": project, "changed": changed, "policy": policy.to_json(), "released": released }))
 }
 
@@ -197,7 +215,7 @@ pub fn disable(store: &mut Store, project: String) -> Result<Value, Fail> {
         )?
         .query_map(params![project, util::now_ms()], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    crate::mailbox::commit(tx, "share_disable")?;
+    commit(tx, "share_disable")?;
     Ok(json!({ "project": project, "removed": removed, "held": held }))
 }
 
@@ -215,11 +233,7 @@ fn project_json(project: &str, standing: Standing) -> Value {
 
 /// One project, or every project that has a policy row. Passive: it never creates or writes a store.
 pub fn status(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
-    let project = match args.optional_string("project", MAX_PROJECT_BYTES)? {
-        Some(project) if util::one_line(&project, MAX_PROJECT_BYTES) == project => Some(project),
-        Some(_) => return Err(Fail::new("REQUEST_INVALID", "field `project` is missing or invalid")),
-        None => None,
-    };
+    let project = optional_project(&mut args)?;
     args.finish()?;
     let Some(store) = store else {
         return Ok(json!({ "projects": project.map(|p| vec![project_json(&p, Standing::Absent)]).unwrap_or_default() }));
@@ -232,7 +246,7 @@ pub fn status(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
 
 /// Every project that has a policy row, in name order.
 pub fn policy_projects(store: &Store) -> Result<Vec<String>, Fail> {
-    if store.version < 2 {
+    if !store.has_sharing() {
         return Ok(Vec::new());
     }
     let mut statement = store.db.prepare("SELECT project FROM sharing_policies ORDER BY project")?;
@@ -250,9 +264,19 @@ pub const MAX_TASK_CHARS: usize = 120;
 /// Why a session cannot receive mail: a fixed vocabulary, so presence cannot carry free text.
 const UNREACHABLE_REASONS: [&str; 5] = ["ended", "not-running", "no-native-binding", "provider-unverified", "checkout-changed"];
 
+/// How far ahead of the engine's clock a caller's timestamp may be (clock skew between the trusted service and
+/// the engine is nil on one machine; this only absorbs rounding).
+const FUTURE_SKEW_MS: i64 = 60_000;
+/// A task older than this (the writer claim's own staleness horizon) is flagged, not dropped.
+pub const TASK_STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+
 pub struct Observed {
     session_id: String,
     task: Option<String>,
+    /// When the session last refreshed the claim that carried the task, as observed by the trusted service.
+    task_at: Option<i64>,
+    /// The last authenticated managed-hook event of the session, as recorded by the trusted service.
+    activity_at: Option<i64>,
     reachable: bool,
     reason: Option<&'static str>,
 }
@@ -262,13 +286,35 @@ pub struct PublishRequest {
     sessions: Vec<Observed>,
 }
 
+impl PublishRequest {
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+}
+
+fn observed_time(args: &mut Args, key: &str, now: i64) -> Result<Option<i64>, Fail> {
+    match args.optional_u64(key)? {
+        Some(at) if at > now + FUTURE_SKEW_MS => Err(Fail::new("REQUEST_INVALID", format!("field `{key}` is missing or invalid"))),
+        at => Ok(at),
+    }
+}
+
 fn parse_observed(value: Value) -> Result<Observed, Fail> {
     let mut args = Args::new(value)?;
     let session_id = args.string("session_id", 128)?;
     if !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return Err(Fail::new("REQUEST_INVALID", "field `session_id` is missing or invalid"));
     }
-    let task = args.optional_string("task", 1024)?.map(|task| util::one_line(&task, MAX_TASK_CHARS)).filter(|task| !task.is_empty());
+    let given = args.optional_string("task", 1024)?;
+    let now = util::now_ms();
+    let task_at = observed_time(&mut args, "task_at", now)?;
+    let activity_at = observed_time(&mut args, "activity_at", now)?;
+    if task_at.is_some() && given.is_none() {
+        return Err(Fail::new("REQUEST_INVALID", "field `task_at` is missing or invalid"));
+    }
+    // A label that carries a path, an environment reference or a secret is not stored at all.
+    let task = given.map(|task| util::one_line(&task, MAX_TASK_CHARS)).filter(|task| !(task.is_empty() || util::unsafe_label(task)));
+    let task_at = task.as_ref().and(task_at);
     let mut reachability = args.object("reachability")?;
     let state = reachability.string("state", 16)?;
     let reason = reachability.optional_string("reason", 32)?;
@@ -282,7 +328,7 @@ fn parse_observed(value: Value) -> Result<Observed, Fail> {
         },
         _ => return Err(Fail::new("REQUEST_INVALID", "field `reachability` is missing or invalid")),
     };
-    Ok(Observed { session_id, task, reachable, reason })
+    Ok(Observed { session_id, task, task_at, activity_at, reachable, reason })
 }
 
 pub fn parse_publish(mut args: Args) -> Result<PublishRequest, Fail> {
@@ -316,33 +362,43 @@ pub fn publish(store: &mut Store, request: PublishRequest) -> Result<Value, Fail
         return Err(invalid_policy(&project, reason));
     }
     if visible(&current).is_none() {
-        return Err(Fail::new("NOT_SHARED", "this project is not shared").with(json!({ "project": project })));
+        return Err(not_shared(&project));
     }
     tx.execute("DELETE FROM presence WHERE project = ?1 AND observed_at < ?2", params![project, now - RETENTION_MS])?;
     for session in &sessions {
         tx.execute(
-            "INSERT INTO presence (project, session_id, task, reach_state, reach_reason, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (project, session_id) DO UPDATE SET task = excluded.task, reach_state = excluded.reach_state,
-                reach_reason = excluded.reach_reason, observed_at = excluded.observed_at",
-            params![project, session.session_id, session.task, if session.reachable { "reachable" } else { "unreachable" }, session.reason, now],
+            // An end is final for a managed session ID. Nothing later replaces it: not another ended report
+            // (so the observation ages on its own and is never mistaken for fresh activity), and not a
+            // delayed round that listed the session before it ended.
+            "INSERT INTO presence (project, session_id, task, task_at, activity_at, reach_state, reach_reason, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (project, session_id) DO UPDATE SET task = excluded.task, task_at = excluded.task_at,
+                activity_at = excluded.activity_at, reach_state = excluded.reach_state,
+                reach_reason = excluded.reach_reason, observed_at = excluded.observed_at
+             WHERE presence.reach_reason IS NOT 'ended'",
+            params![
+                project,
+                session.session_id,
+                session.task,
+                session.task_at,
+                session.activity_at,
+                if session.reachable { "reachable" } else { "unreachable" },
+                session.reason,
+                now
+            ],
         )?;
     }
-    crate::mailbox::commit(tx, "presence_publish")?;
+    commit(tx, "presence_publish")?;
     Ok(json!({ "project": project, "published": sessions.len() }))
 }
 
 /// The sessions of shared projects with owner, task, reachability and freshness. Passive: it never creates
 /// or writes a store. A stale observation stays listed, marked stale, and no longer claims to be reachable.
 pub fn directory(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
-    let only = match args.optional_string("project", MAX_PROJECT_BYTES)? {
-        Some(project) if util::one_line(&project, MAX_PROJECT_BYTES) == project => Some(project),
-        Some(_) => return Err(Fail::new("REQUEST_INVALID", "field `project` is missing or invalid")),
-        None => None,
-    };
+    let only = optional_project(&mut args)?;
     args.finish()?;
     let empty = || json!({ "entries": [], "problems": [], "stale_after_ms": STALE_AFTER_MS });
     let Some(store) = store else { return Ok(empty()) };
-    if store.version < 2 {
+    if !store.has_sharing() {
         return Ok(empty());
     }
     let now = util::now_ms();
@@ -361,18 +417,37 @@ pub fn directory(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
         let Some(policy) = visible(&current) else { continue };
         let mut statement = store
             .db
-            .prepare("SELECT session_id, task, reach_state, reach_reason, observed_at FROM presence WHERE project = ?1 ORDER BY session_id")?;
+            .prepare("SELECT session_id, task, reach_state, reach_reason, observed_at, task_at, activity_at FROM presence WHERE project = ?1 ORDER BY session_id")?;
         let rows = statement
-            .query_map([&project], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, i64>(4)?)))?
+            .query_map([&project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (session_id, task, state, reason, observed_at) in rows {
+        for (session_id, task, state, reason, observed_at, task_at, activity_at) in rows {
             let stale = now - observed_at > STALE_AFTER_MS;
-            let reachability = if stale { json!({ "state": "unknown", "reason": "stale" }) } else { json!({ "state": state, "reason": reason }) };
+            // An end is final, so it stays an end however old the observation. Anything else that nobody
+            // has refreshed lately is unknown, not reachable.
+            let reachability = if stale && reason.as_deref() != Some("ended") {
+                json!({ "state": "unknown", "reason": "stale" })
+            } else {
+                json!({ "state": state, "reason": reason })
+            };
             entries.push(json!({
                 "project": project,
                 "session_id": session_id,
                 "owner": policy.owner,
                 "task": task,
+                "task_at": task_at,
+                "task_stale": task_at.is_some_and(|at| now - at > TASK_STALE_AFTER_MS),
+                "activity_at": activity_at,
                 "reachability": reachability,
                 "observed_at": observed_at,
                 "stale": stale,

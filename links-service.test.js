@@ -3,7 +3,7 @@ import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createLinksClient } from './links-client.js';
 import { ensureEngine, temporaryLinksRoot } from './links-engine-fixture.js';
-import { createLinksService } from './links-service.js';
+import { canonicalCheckout, createLinksService } from './links-service.js';
 
 // Built before any test runs so a first compile is never charged to a test's own time limit.
 const ENGINE = ensureEngine();
@@ -41,6 +41,48 @@ function session(overrides = {}) {
   };
 }
 
+// What the authenticated hook does for a session record, through the exact seam and nothing else: the managed
+// authority has published the record's binding (at a new generation whenever the conversation changed), then the
+// claim is fenced by that generation. The service's own claim and confirm by session lookup no longer exist.
+function withHook(service, lookup) {
+  const generations = new Map();
+  const recipientFor = (record) => ({
+    checkoutIdentity: record.checkoutIdentity,
+    nativeId: record.nativeConversation.id,
+    provider: 'claude-code',
+    sessionId: record.id,
+  });
+  async function claim(who) {
+    const record = lookup(who);
+    const recipient = recipientFor(record);
+    const key = `${recipient.nativeId}|${canonicalCheckout(recipient.checkoutIdentity)}`;
+    const last = generations.get(record.id) ?? { generation: 0, key: null };
+    const generation = last.key === key ? last.generation : last.generation + 1;
+    generations.set(record.id, { generation, key });
+    const published = await service.publishBinding({
+      generation,
+      project: record.repo,
+      recipient,
+      resumedFrom: record.nativeConversation.resumedFrom ?? [],
+    });
+    // A mailbox that does not exist yet is the one refusal that goes on to the claim, to show it creates nothing.
+    if (!published.ok && published.code !== 'LINKS_STORE_ABSENT') {
+      return published;
+    }
+    return await service.claimExact({
+      expectedGeneration: generation,
+      recipient,
+    });
+  }
+  function confirm(input) {
+    return service.confirmExact({
+      attemptId: input.attemptId,
+      recipient: recipientFor(lookup(input)),
+    });
+  }
+  return { ...service, claim, confirm };
+}
+
 function fixture(initial = [session()]) {
   const { root, cleanup } = temporaryLinksRoot();
   cleanups.push(cleanup);
@@ -52,12 +94,15 @@ function fixture(initial = [session()]) {
     dataDir: join(root, 'links'),
     enginePath: ENGINE,
   });
-  const service = createLinksService({
-    client,
-    resolveTarget: ({ repo, name }) =>
-      repo === 'repo' && name === 'topic' ? world.target : null,
-    sessions: { list: () => ({ ok: true, sessions: world.sessions }) },
-  });
+  const service = withHook(
+    createLinksService({
+      client,
+      resolveTarget: ({ repo, name }) =>
+        repo === 'repo' && name === 'topic' ? world.target : null,
+      sessions: { list: () => ({ ok: true, sessions: world.sessions }) },
+    }),
+    ({ sessionId }) => world.sessions.find((record) => record.id === sessionId)
+  );
   return { client, dataDir: join(root, 'links'), service, world };
 }
 
@@ -218,8 +263,9 @@ test('mail for a conversation the session has since replaced is held and the new
   expect(
     await service.claim({ name: 'topic', repo: 'repo', sessionId: 'session-1' })
   ).toMatchObject({
-    messages: [{ body: 'for the new one' }],
+    messages: [{ messageId: expect.any(String) }],
     ok: true,
+    text: expect.stringContaining('for the new one'),
   });
 
   const shown = await service.status({ messageId: old.messageId });
@@ -433,7 +479,7 @@ test('a replacement is visible to inbox, status and show with no later send or c
     (await client.call('status', { message_id: sent.messageId })).result.state
   ).toBe('queued');
 
-  // Only an explicit send or claim persists the transition.
+  // Only the managed authority's publication (reached here through the hook's claim) persists the transition.
   await service.claim(target);
   expect(
     (await client.call('status', { message_id: sent.messageId })).result.state
@@ -453,7 +499,11 @@ test('reads create no store, and a session with nothing sent reads as empty', as
     code: 'LINKS_MESSAGE_NOT_FOUND',
   });
   expect(existsSync(dataDir)).toBe(false);
-  expect(await service.claim(target)).toMatchObject({ messages: [], ok: true });
+  // With no mailbox there is no snapshot to fence on: the claim is refused, and creates nothing.
+  expect(await service.claim(target)).toMatchObject({
+    code: 'LINKS_BINDING_NOT_CURRENT',
+    ok: false,
+  });
   expect(existsSync(dataDir)).toBe(false);
 });
 
@@ -561,12 +611,20 @@ test('a claim for the wrong conversation neither delivers nor holds anything', a
   });
 
   // Another session's authoritative claim cannot take or hold this session's mail either.
-  const { service: other } = fixture([
+  const both = fixture([
+    session(),
     session({ id: 'session-2', nativeConversation: binding('native-z') }),
   ]);
+  const mine = await both.service.send(send());
   expect(
-    await other.claim({ ...target, sessionId: 'session-2' })
+    await both.service.claim({ ...target, sessionId: 'session-2' })
   ).toMatchObject({ messages: [], ok: true });
+  expect(
+    await both.service.status({ messageId: mine.messageId })
+  ).toMatchObject({
+    reason: null,
+    state: 'queued',
+  });
 });
 
 test('a read without a managed binding to compare reports the stored state and says it was not observed', async () => {
@@ -686,16 +744,19 @@ test('a redelivery through another managed record of the same conversation is st
     session({ id: 'session-3', nativeConversation: binding('native-z') }),
   ]);
   const calls = [];
-  const service = createLinksService({
-    client: {
-      call: (op, args) => {
-        calls.push(op);
-        return client.call(op, args);
+  const service = withHook(
+    createLinksService({
+      client: {
+        call: (op, args) => {
+          calls.push(op);
+          return client.call(op, args);
+        },
       },
-    },
-    resolveTarget: () => world.target,
-    sessions: { list: () => ({ ok: true, sessions: world.sessions }) },
-  });
+      resolveTarget: () => world.target,
+      sessions: { list: () => ({ ok: true, sessions: world.sessions }) },
+    }),
+    ({ sessionId }) => world.sessions.find((record) => record.id === sessionId)
+  );
   const sent = await service.send(send());
   const first = await service.claim(target);
   const viaOld = { ...target, sessionId: 'session-2' };
@@ -738,14 +799,17 @@ test('a redelivery through another managed record of the same conversation is st
 test('a send that is not confirmed carries its idempotency key, and the other unknown outcomes carry none', async () => {
   const { root, cleanup } = temporaryLinksRoot();
   cleanups.push(cleanup);
-  const service = createLinksService({
-    client: createLinksClient({
-      dataDir: join(root, 'links'),
-      enginePath: join(root, 'absent'),
+  const service = withHook(
+    createLinksService({
+      client: createLinksClient({
+        dataDir: join(root, 'links'),
+        enginePath: join(root, 'absent'),
+      }),
+      resolveTarget: () => ({ checkoutIdentity, name: 'topic', repo: 'repo' }),
+      sessions: { list: () => ({ ok: true, sessions: [session()] }) },
     }),
-    resolveTarget: () => ({ checkoutIdentity, name: 'topic', repo: 'repo' }),
-    sessions: { list: () => ({ ok: true, sessions: [session()] }) },
-  });
+    () => session()
+  );
   const sent = await service.send(send({ idempotencyKey: 'key-77' }));
   expect(sent).toMatchObject({
     code: 'LINKS_OUTCOME_UNKNOWN',

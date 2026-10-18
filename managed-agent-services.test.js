@@ -236,6 +236,36 @@ function fixture({
   };
 }
 
+test('the public session listing shows when the session was last heard from by an authenticated hook, and only then', async () => {
+  const f = fixture();
+  await f.service.open({ name: 'topic', repo: 'repo', tool: 'claude' });
+  const hook = (event, launchToken) =>
+    f.service.receiveHook({
+      launchToken,
+      payload: {
+        cwd: f.target.wtDir,
+        hook_event_name: event,
+        session_id: 'native-1',
+      },
+      provider: 'claude-code',
+    });
+  const listed = async () =>
+    (await f.service.listSessions({ name: 'topic', repo: 'repo' })).sessions[0];
+
+  await hook('SessionStart', 'token_1234567890123456');
+  expect((await listed()).lastHookAt).toBeUndefined();
+  await hook('Stop', undefined);
+  await hook('Stop', 'wrong_1234567890123456');
+  expect((await listed()).lastHookAt).toBeUndefined();
+
+  await hook('Stop', 'token_1234567890123456');
+  const session = await listed();
+  expect(Number.isFinite(session.lastHookAt)).toBe(true);
+  const text = JSON.stringify(session);
+  expect(text).not.toContain('token_1234567890123456');
+  expect(text).not.toContain('launchProofDigest');
+});
+
 test('composes a token-bound Ghostty launch, trusted Claude hook and exact existing terminal actions', async () => {
   const f = fixture();
   const opened = await f.service.open({
@@ -258,7 +288,9 @@ test('composes a token-bound Ghostty launch, trusted Claude hook and exact exist
   expect(launcher).toContain(
     "export SETU_SESSION_TOKEN='token_1234567890123456'"
   );
-  expect(hook).toContain('AbortSignal.timeout(1000)');
+  // Non-prompt events keep their one-second, fire-and-forget request.
+  expect(hook).toContain('AbortSignal.timeout(ms)');
+  expect(hook).toContain('payload}, 1000);');
   expect(
     permissionMode(fs.statSync(join(f.root, runtime, 'launch.zsh')).mode)
   ).toBe(0o700);

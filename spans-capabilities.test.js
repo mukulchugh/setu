@@ -376,6 +376,75 @@ test('observed effort that is unsupported or different disables effort', () => {
   });
 });
 
+test('a profile may accept an unobserved effort only by saying so, and nothing else changes', () => {
+  const silent = { identity: { effort: undefined } };
+
+  // The default policy needs the effort observed, exactly as before.
+  const strict = run({ evidenceChanges: silent });
+  expect(strict.launch.allowed).toBe(false);
+  expect(strict.launch.blockedBy).toContain('effort');
+  expect(strict.launch.unverified).toBeUndefined();
+
+  const accepted = run({
+    evidenceChanges: silent,
+    profileChanges: { effortPolicy: 'requested-unverified' },
+  });
+  expect(accepted.launch).toEqual({
+    allowed: true,
+    blockedBy: [],
+    unverified: ['effort'],
+  });
+  // The effort capability itself stays disabled: nothing calls it verified.
+  expect(accepted.capabilities.effort).toMatchObject({
+    enabled: false,
+    observed: 'unknown',
+    policy: 'requested-unverified',
+    reasons: ['EFFORT_UNKNOWN'],
+  });
+
+  // A reported effort that differs, or that cannot be read, still blocks.
+  for (const effort of ['high', 'max']) {
+    const reported = run({
+      evidenceChanges: { identity: { effort } },
+      profileChanges: { effortPolicy: 'requested-unverified' },
+    });
+    expect(reported.launch.allowed).toBe(false);
+    expect(reported.launch.blockedBy).toContain('effort');
+  }
+
+  // The policy cannot excuse any other missing proof.
+  const unfresh = run({
+    evidenceChanges: { ...silent, session: { origin: 'resumed' } },
+    profileChanges: { effortPolicy: 'requested-unverified' },
+  });
+  expect(unfresh.launch.allowed).toBe(false);
+  expect(unfresh.launch.unverified).toBeUndefined();
+
+  expect(run({ profileChanges: { effortPolicy: 'whatever' } })).toMatchObject({
+    code: 'PROFILE_INVALID',
+    ok: false,
+  });
+});
+
+test('a profile that requires no hard cost cap is not blocked by an unavailable one', () => {
+  const noCap = run({
+    evidenceChanges: {
+      cost: { enforcement: 'unavailable', pricing: undefined },
+    },
+    profileChanges: { requires: { hardCostCap: false } },
+  });
+  expect(noCap.launch.allowed).toBe(true);
+  expect(noCap.capabilities.hardCostCap.enabled).toBe(false);
+
+  const required = run({
+    evidenceChanges: {
+      cost: { enforcement: 'unavailable', pricing: undefined },
+    },
+  });
+  expect(required.launch.allowed).toBe(false);
+  expect(required.launch.blockedBy).toContain('hardCostCap');
+});
+
 test('missing or unsupported hook proof disables hooks and blocks a profile that requires them', () => {
   const missing = run({ evidenceChanges: { hooks: undefined } });
   expect(missing.capabilities.hooks).toMatchObject({

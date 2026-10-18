@@ -1,5 +1,3 @@
-// Schema 1 and the 1->2 step below are #11-OWNED (provisional snapshot, replaced at integration). The 2->3 step is
-// the transport slice's and lives in migrate.rs.
 //! The one durable mailbox store. Only this process opens the database.
 
 use crate::{args::Fail, migrate, util};
@@ -11,6 +9,10 @@ use std::{
 };
 
 pub const SCHEMA_VERSION: i64 = 3;
+/// The first schema that has sharing policy and presence; a store before it reads as having none.
+pub const SHARING_SCHEMA: i64 = 2;
+/// The first schema with the peer transport tables (outbox, inbound, peers, grants, binding snapshots).
+pub const TRANSPORT_SCHEMA: i64 = 3;
 const DATABASE: &str = "mailbox.sqlite3";
 
 const SCHEMA_V1: &str = "
@@ -69,10 +71,8 @@ CREATE TABLE attempt_messages (
 /// rows are kept as they are; a message also records the project it was addressed in, so a policy that
 /// later withdraws can hold mail from a principal it no longer admits. Older messages have no project.
 const MIGRATION_1_TO_2: &str = "
-ALTER TABLE messages ADD COLUMN project TEXT;
--- PROVISIONAL, #10-OWNED: where a delivery is located after an explicit resume. The immutable message keeps its
--- original session hint; the parent combines the final schema 1 -> 2 at integration.
 ALTER TABLE deliveries ADD COLUMN locator TEXT;
+ALTER TABLE messages ADD COLUMN project TEXT;
 CREATE INDEX messages_project ON messages (project);
 CREATE TABLE sharing_policies (
     project TEXT PRIMARY KEY,
@@ -84,6 +84,8 @@ CREATE TABLE presence (
     project TEXT NOT NULL,
     session_id TEXT NOT NULL,
     task TEXT,
+    task_at INTEGER,
+    activity_at INTEGER,
     reach_state TEXT NOT NULL CHECK (reach_state IN ('reachable', 'unreachable')),
     reach_reason TEXT,
     observed_at INTEGER NOT NULL,
@@ -115,7 +117,20 @@ fn private_dir(dir: &Path, create: bool) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Every mutation ends here, so every one can be killed on either side of its commit.
+pub fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
+    util::fault(&format!("{op}:before-commit"));
+    tx.commit()?;
+    util::fault(&format!("{op}:after-commit"));
+    Ok(())
+}
+
 impl Store {
+    /// Whether this store has the sharing tables (schema 1 does not).
+    pub fn has_sharing(&self) -> bool {
+        self.version >= SHARING_SCHEMA
+    }
+
     pub fn path(dir: &Path) -> PathBuf {
         dir.join(DATABASE)
     }
@@ -158,10 +173,9 @@ impl Store {
             let _ = db.execute_batch("ROLLBACK");
             return Err(unavailable());
         }
-        if version != SCHEMA_VERSION {
-            util::fault("migrate:before-commit");
-        }
+        util::fault("migrate:before-commit");
         db.execute_batch("COMMIT")?;
+        util::fault("migrate:after-commit");
         Ok(Store { db, version: SCHEMA_VERSION })
     }
 

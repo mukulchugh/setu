@@ -3,7 +3,6 @@
 
 use crate::{
     args::{Args, Fail},
-    mailbox,
     store::Store,
     util,
 };
@@ -48,7 +47,7 @@ pub fn add(store: &mut Store, request: AddPeer) -> Result<Value, Fail> {
          ON CONFLICT (peer_id) DO UPDATE SET label = ?2, addresses = ?3",
         params![request.peer_id, request.label, json!(request.addresses).to_string(), now],
     )?;
-    mailbox::commit(tx, "peer_add")?;
+    crate::store::commit(tx, "peer_add")?;
     Ok(json!({ "peer_id": request.peer_id }))
 }
 
@@ -68,7 +67,7 @@ pub fn remove(store: &mut Store, request: RemovePeer) -> Result<Value, Fail> {
     tx.execute("DELETE FROM peers WHERE peer_id = ?1", [&request.peer_id])?;
     // Revocation is visible at once: the peer's waiting mail is held, not left looking queued.
     crate::authz::gate_all(&tx, store.version, util::now_ms())?;
-    mailbox::commit(tx, "peer_remove")?;
+    crate::store::commit(tx, "peer_remove")?;
     Ok(json!({ "peer_id": request.peer_id }))
 }
 
@@ -110,7 +109,7 @@ pub fn grant(store: &mut Store, request: Grant) -> Result<Value, Fail> {
         "INSERT OR IGNORE INTO peer_grants (peer_id, capability, scope_kind, scope_id) VALUES (?1, ?2, ?3, ?4)",
         params![request.peer_id, request.capability, request.scope_kind, request.scope_id],
     )?;
-    mailbox::commit(tx, "peer_grant")?;
+    crate::store::commit(tx, "peer_grant")?;
     Ok(json!({ "peer_id": request.peer_id }))
 }
 
@@ -121,7 +120,7 @@ pub fn remove_grant(store: &mut Store, request: Grant) -> Result<Value, Fail> {
         params![request.peer_id, request.capability, request.scope_kind, request.scope_id],
     )?;
     crate::authz::gate_all(&tx, store.version, util::now_ms())?;
-    mailbox::commit(tx, "peer_grant_remove")?;
+    crate::store::commit(tx, "peer_grant_remove")?;
     Ok(json!({ "peer_id": request.peer_id }))
 }
 

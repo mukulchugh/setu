@@ -775,3 +775,132 @@ test('secret field names cannot become reservation keys and corrupt the run', as
     ok: true,
   });
 });
+
+// A policy with no limits and no hard cap measures no money: a subscription
+// run reserves nothing and claims no cap. Callers that give limits or require a
+// hard cap keep every rule above.
+const UNMETERED = {
+  aggregateLimitMicro: null,
+  attemptLimitMicro: null,
+  enforcementAvailable: false,
+  hardCap: false,
+  priceKnown: false,
+  reservationMicro: null,
+};
+const settleInput = (overrides = {}) => ({
+  actionId: 'action-1',
+  actualMicro: null,
+  attemptId: 'attempt-1',
+  generation: 0,
+  outcome: 'completed',
+  reservationId: 'reservation-1',
+  runId: 'run-1',
+  terminalPolicy: true,
+  verifiedNoEffect: false,
+  ...overrides,
+});
+
+test('an unmetered reservation needs no amount, price or cap, and a terminal outcome releases it', async () => {
+  const { store } = open();
+  seed(store);
+  const usage = createSpansUsage({ store });
+
+  const reserved = await usage.reserve(request(UNMETERED));
+  expect(reserved).toMatchObject({
+    dispatchAuthorized: true,
+    held: false,
+    ok: true,
+  });
+  const active = await usage.readAggregate({ runId: 'run-1' });
+  expect(active).toMatchObject({
+    actualComplete: false,
+    outstandingReservationMicro: 0,
+    runExposureMicro: null,
+    unknownActualCount: 1,
+  });
+
+  // An unknown outcome still keeps it held.
+  expect(
+    await usage.reconcile(settleInput({ outcome: 'unknown' }))
+  ).toMatchObject({ code: 'SPANS_USAGE_HELD', held: true, ok: false });
+
+  expect(await usage.reconcile(settleInput())).toMatchObject({
+    actualMicro: null,
+    ok: true,
+    released: true,
+  });
+  // The totals say how many reservations measured no money.
+  expect(await usage.readAggregate({ runId: 'run-1' })).toMatchObject({
+    actualComplete: true,
+    runActualMicro: 0,
+    unmeteredCount: 1,
+  });
+});
+
+test('limits or a hard cap keep every strict rule, with or without an amount', async () => {
+  const strict = [
+    // A hard cap with no amount is held, as before.
+    [
+      {
+        ...UNMETERED,
+        enforcementAvailable: true,
+        hardCap: true,
+        priceKnown: true,
+      },
+      'held',
+    ],
+    // Explicit limits with no amount cannot be checked, so they are refused.
+    [
+      {
+        ...UNMETERED,
+        aggregateLimitMicro: 100,
+        attemptLimitMicro: 80,
+        priceKnown: true,
+      },
+      'SPANS_USAGE_CAP',
+    ],
+    // One limit given and one not does not make the policy unmetered.
+    [
+      { ...UNMETERED, aggregateLimitMicro: 100, priceKnown: true },
+      'SPANS_USAGE_CAP',
+    ],
+  ];
+  for (const [overrides, expected] of strict) {
+    const { store } = open();
+    seed(store);
+    const usage = createSpansUsage({ store });
+    // biome-ignore lint/performance/noAwaitInLoops: Each case uses its own store, so they run in order.
+    const result = await usage.reserve(request(overrides));
+    if (expected === 'held') {
+      expect(result).toMatchObject({ held: true, ok: false });
+    } else {
+      expect(result).toMatchObject({ code: expected, ok: false });
+    }
+  }
+});
+
+test('an unmetered policy cannot be mixed with a limited one, and a no-amount release stays in the old rules', async () => {
+  const { store } = open();
+  seed(store);
+  const usage = createSpansUsage({ store });
+  await usage.reserve(request(UNMETERED));
+  expect(
+    await usage.reserve(
+      request({
+        actionId: 'action-2',
+        attemptId: 'attempt-2',
+        reservationId: 'reservation-2',
+      })
+    )
+  ).toMatchObject({ code: 'SPANS_USAGE_CONFLICT', ok: false });
+
+  // A metered run still cannot release without an amount.
+  const metered = open();
+  seed(metered.store);
+  const limited = createSpansUsage({ store: metered.store });
+  await limited.reserve(request());
+  expect(await limited.reconcile(settleInput())).toMatchObject({
+    code: 'SPANS_USAGE_HELD',
+    ok: false,
+  });
+});

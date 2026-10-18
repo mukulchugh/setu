@@ -1,5 +1,14 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCli } from './cli.js';
@@ -9,6 +18,7 @@ import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { createPortalRuntime } from './portal.js';
 import { PORTAL_API_ROUTES } from './portal-routes.js';
 import { createWorkspaceState } from './workspace-state.js';
+import { claimWriter } from './writer-claims.js';
 
 // Built before any test runs so a first compile is never charged to a test's own time limit.
 const ENGINE = ensureEngine();
@@ -55,7 +65,7 @@ function workspace() {
   return root;
 }
 
-async function portal(root, sessions = [baseSession]) {
+async function portal(root, sessions = [baseSession], extra = {}) {
   const state = createWorkspaceState({
     configPath: join(root, 'config.json'),
     setuDir: root,
@@ -67,7 +77,7 @@ async function portal(root, sessions = [baseSession]) {
     computeWorktrees: () => Promise.resolve([]),
     config,
     indexPage: new Response('fixture'),
-    linksEngine: ENGINE,
+    linksEngine: extra.linksEngine ?? ENGINE,
     linksRoot: join(root, 'links'),
     linksTarget: (repo, name) =>
       repo === 'repo' && name === 'topic'
@@ -75,12 +85,22 @@ async function portal(root, sessions = [baseSession]) {
         : null,
     managedAgents: {
       dispose: () => Promise.resolve(),
-      listSessions: () => Promise.resolve({ ok: true, sessions }),
+      listSessions:
+        extra.listSessions ?? (() => Promise.resolve({ ok: true, sessions })),
       recover: () => Promise.resolve(),
     },
     observeProcess: () => Promise.resolve({ state: 'unknown' }),
     port: 43_211,
-    projects: {},
+    ...(extra.registry
+      ? {
+          loadProjects: () => state.read('projects'),
+          removeProject: (_workspace, name) =>
+            state.update('projects', (projects) => {
+              const { [name]: _removed, ...rest } = projects;
+              return rest;
+            }),
+        }
+      : { projects: { repo: { label: 'repo' } } }),
     reconcileDevServers: () => Promise.resolve(),
     reconcileTriggerSidecars: () => Promise.resolve(),
     routing: { syncHosts: () => Promise.resolve() },
@@ -88,7 +108,10 @@ async function portal(root, sessions = [baseSession]) {
     serve: () => ({ stop: () => undefined }),
     spansRoot: join(root, 'spans'),
     state,
-    timers: { clearInterval: () => undefined, setInterval: () => 1 },
+    timers: extra.timers ?? {
+      clearInterval: () => undefined,
+      setInterval: () => 1,
+    },
   });
   await runtime.start();
   runtimes.push(runtime);
@@ -107,7 +130,14 @@ async function portal(root, sessions = [baseSession]) {
       })
     ).json();
   const get = async (path) => (await request(path)).json();
-  return { dispose: () => runtime.dispose(), get, post, request, runtime };
+  return {
+    dispose: () => runtime.dispose(),
+    get,
+    post,
+    request,
+    runtime,
+    state,
+  };
 }
 
 const target = { name: 'topic', repo: 'repo', sessionId: 'session-1' };
@@ -184,14 +214,20 @@ test('every registered Links route is served, and the hook-only operations are n
   expect(
     links.map((route) => `${route.methods[0]} ${route.path}`).sort()
   ).toEqual([
+    'GET /api/links/directory',
     'GET /api/links/inbox',
     'GET /api/links/message',
+    'GET /api/links/share/status',
     'GET /api/links/status',
     'POST /api/links/ack',
     'POST /api/links/cancel',
     'POST /api/links/redeliver',
     'POST /api/links/send',
+    'POST /api/links/share/disable',
+    'POST /api/links/share/enable',
   ]);
+  // Listing everything shared is a complete request; every other route needs its target.
+  const listings = new Set(['/api/links/directory', '/api/links/share/status']);
   for (const route of links) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.
     const response = await api.request(route.path, {
@@ -199,10 +235,11 @@ test('every registered Links route is served, and the hook-only operations are n
       headers: { 'content-type': 'application/json' },
       method: route.methods[0],
     });
-    expect(await response.json()).toMatchObject({
-      code: 'LINKS_INVALID',
-      ok: false,
-    });
+    expect(await response.json()).toMatchObject(
+      listings.has(route.path)
+        ? { ok: true }
+        : { code: 'LINKS_INVALID', ok: false }
+    );
   }
   for (const hookOnly of ['claim', 'confirm']) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.
@@ -433,4 +470,442 @@ test('the CLI, the portal and the engine agree from send to cancel, across a por
   });
   const refused = await cli(['cancel', sent.result.messageId, 'extra']);
   expect(refused.code).toBe(1);
+});
+
+// ── sharing and the directory ──────────────────────────────────────────────────────────────────────
+
+const enableOver = async (api, repo = 'repo') => {
+  const review = await api.post('/api/links/share/enable', { repo });
+  expect(review).toMatchObject({
+    code: 'LINKS_CONFIRMATION_REQUIRED',
+    ok: false,
+  });
+  return api.post('/api/links/share/enable', {
+    confirmation: review.confirmation.token,
+    repo,
+  });
+};
+
+test('enabling over HTTP shows the fields first, lists the project’s sessions after, and withdraws on disable', async () => {
+  const root = workspace();
+  const api = await portal(root);
+  const review = await api.post('/api/links/share/enable', { repo: 'repo' });
+  expect(review.confirmation.fields.map((field) => field.field)).toEqual([
+    'owner',
+    'task',
+    'reachability',
+    'freshness',
+    'session',
+  ]);
+  expect(existsSync(join(root, 'links'))).toBe(false);
+  expect(await api.get('/api/links/directory')).toMatchObject({
+    entries: [],
+    ok: true,
+  });
+
+  expect(await enableOver(api)).toMatchObject({
+    changed: true,
+    ok: true,
+    presence: { published: 1 },
+  });
+  const listed = await api.get('/api/links/directory');
+  expect(listed.entries).toHaveLength(1);
+  expect(listed.entries[0]).toMatchObject({
+    project: 'repo',
+    reachability: { state: 'reachable' },
+    sessionId: 'session-1',
+    stale: false,
+  });
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({ shared: true, state: 'enabled' });
+
+  expect(
+    await api.post('/api/links/share/disable', { repo: 'repo' })
+  ).toMatchObject({
+    ok: true,
+    removed: true,
+  });
+  expect((await api.get('/api/links/directory')).entries).toEqual([]);
+});
+
+test('a portal restart keeps the policy and the engine still decides for other principals', async () => {
+  const root = workspace();
+  let api = await portal(root);
+  await enableOver(api);
+  await api.dispose();
+  runtimes.length = 0;
+
+  api = await portal(root);
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({ shared: true });
+  const engine = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: ENGINE,
+  });
+  const deposit = (key) =>
+    engine.call('send', {
+      body: 'from a session',
+      idempotency_key: key,
+      project: 'repo',
+      recipient: {
+        checkout: 'c',
+        native_id: 'native-a',
+        provider: 'claude-code',
+        session_hint: 'session-1',
+      },
+      sender: { id: 'other-session', kind: 'session' },
+    });
+  expect((await deposit('k1')).ok).toBe(true);
+  await api.post('/api/links/share/disable', { repo: 'repo' });
+  expect(await deposit('k2')).toMatchObject({ code: 'LINKS_NOT_SHARED' });
+});
+
+test('a corrupt policy is reported over HTTP as recoverable and the route recovers on disable', async () => {
+  const root = workspace();
+  const api = await portal(root);
+  await enableOver(api);
+  const db = new Database(join(root, 'links', 'mailbox.sqlite3'));
+  db.run('UPDATE sharing_policies SET version = 99');
+  db.close();
+
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({
+    code: 'LINKS_POLICY_INVALID',
+    ok: false,
+    reason: 'unsupported-version',
+  });
+  const listed = await api.get('/api/links/directory');
+  expect(listed.entries).toEqual([]);
+  expect(listed.problems[0]).toMatchObject({ code: 'LINKS_POLICY_INVALID' });
+  expect(
+    await api.post('/api/links/share/disable', { repo: 'repo' })
+  ).toMatchObject({
+    ok: true,
+    removed: true,
+  });
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({ ok: true, shared: false });
+});
+
+test('enabling or disabling leaves the worktree’s writer claim and resource admission exactly as they were, and the claim supplies the task', async () => {
+  const root = workspace();
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  execFileSync('git', ['init', '--quiet', checkout]);
+  claimWriter(checkout, {
+    agent: 'claude-code',
+    pid: process.pid,
+    session: 'session-1',
+    task: 'Fix the login redirect',
+  });
+  const claimFile = join(checkout, '.git', 'setu-writer.json');
+  const claimBefore = readFileSync(claimFile, 'utf8');
+
+  const api = await portal(root, [{ ...baseSession, checkoutPath: checkout }]);
+  const admissionBefore = await api.get('/api/resource-admission');
+  await enableOver(api);
+  const listed = await api.get('/api/links/directory');
+  expect(listed.entries[0].task).toBe('Fix the login redirect');
+  expect(JSON.stringify(listed)).not.toContain(checkout);
+  await api.post('/api/links/share/disable', { repo: 'repo' });
+
+  expect(readFileSync(claimFile, 'utf8')).toBe(claimBefore);
+  expect(await api.get('/api/resource-admission')).toEqual(admissionBefore);
+});
+
+test('another session’s writer claim is not offered as this session’s task', async () => {
+  const root = workspace();
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  execFileSync('git', ['init', '--quiet', checkout]);
+  claimWriter(checkout, {
+    agent: 'codex',
+    pid: process.pid,
+    session: 'someone-else',
+    task: 'Not yours',
+  });
+  const api = await portal(root, [{ ...baseSession, checkoutPath: checkout }]);
+  await enableOver(api);
+  expect((await api.get('/api/links/directory')).entries[0].task).toBeNull();
+});
+
+test('presence is published by an interval the portal owns, which stops when the portal is disposed', async () => {
+  const root = workspace();
+  const intervals = [];
+  const cleared = [];
+  const timers = {
+    clearInterval: (id) => cleared.push(id),
+    setInterval: (callback, ms) => {
+      intervals.push({ callback, ms });
+      return intervals.length;
+    },
+  };
+  const sessions = [{ ...baseSession }];
+  const api = await portal(root, sessions, { timers });
+  const presence = intervals.find((entry) => entry.ms === 30_000);
+  expect(presence).toBeDefined();
+
+  // Nothing is shared: a round writes nothing and creates no store.
+  await presence.callback();
+  expect(existsSync(join(root, 'links'))).toBe(false);
+
+  await enableOver(api);
+  sessions.push({ ...baseSession, id: 'session-2' });
+  await presence.callback();
+  expect(
+    (await api.get('/api/links/directory')).entries.map(
+      (entry) => entry.sessionId
+    )
+  ).toEqual(['session-1', 'session-2']);
+
+  await api.dispose();
+  runtimes.length = 0;
+  expect(cleared).toContain(intervals.indexOf(presence) + 1);
+  // A round after disposal does nothing, whoever calls it.
+  sessions.push({ ...baseSession, id: 'session-3' });
+  await presence.callback();
+  const after = await portal(root, sessions);
+  expect(
+    (await after.get('/api/links/directory')).entries.map(
+      (entry) => entry.sessionId
+    )
+  ).toEqual(['session-1', 'session-2']);
+});
+
+test('a presence round that fails never escapes the interval or overlaps itself', async () => {
+  const root = workspace();
+  const intervals = [];
+  const timers = {
+    clearInterval: () => undefined,
+    setInterval: (callback, ms) => {
+      intervals.push({ callback, ms });
+      return intervals.length;
+    },
+  };
+  let calls = 0;
+  let list = () => Promise.resolve({ ok: true, sessions: [baseSession] });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const api = await portal(root, [baseSession], {
+    listSessions: () => {
+      calls += 1;
+      return list();
+    },
+    timers,
+  });
+  await enableOver(api);
+  const presence = intervals.find((entry) => entry.ms === 30_000);
+  calls = 0;
+  list = async () => {
+    await gate;
+    throw new Error('boom');
+  };
+  const first = presence.callback();
+  const second = presence.callback();
+  release();
+  await expect(Promise.all([first, second])).resolves.toBeDefined();
+  expect(calls).toBe(1);
+  // The next round runs again.
+  list = () => Promise.resolve({ ok: true, sessions: [baseSession] });
+  await presence.callback();
+  expect(calls).toBe(2);
+});
+
+// ── removing and re-adding a project ───────────────────────────────────────────────────────────────
+
+const registerRepo = (state) =>
+  state.update('projects', (projects) => ({
+    ...projects,
+    repo: { base: 3000, label: 'repo', slug: '' },
+  }));
+const registered = (state) => Object.hasOwn(state.read('projects'), 'repo');
+const scopeOf = async (root) => {
+  const engine = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: ENGINE,
+  });
+  const status = await engine.call('share_status', { project: 'repo' });
+  return status.result.projects[0].policy?.scope ?? null;
+};
+
+test('removing a project through the portal withdraws its sharing, and adding it again starts from nothing', async () => {
+  const root = workspace();
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  execFileSync('git', ['init', '--quiet', checkout]);
+  claimWriter(checkout, {
+    agent: 'claude-code',
+    pid: process.pid,
+    session: 'session-1',
+    task: 'Fix the login redirect',
+  });
+  const claimFile = join(checkout, '.git', 'setu-writer.json');
+  const claimBefore = readFileSync(claimFile, 'utf8');
+  const api = await portal(root, [{ ...baseSession, checkoutPath: checkout }], {
+    registry: true,
+  });
+  await registerRepo(api.state);
+  await enableOver(api);
+  const firstScope = await scopeOf(root);
+  expect((await api.get('/api/links/directory')).entries).toHaveLength(1);
+  const admissionBefore = await api.get('/api/resource-admission');
+
+  const removed = await api.post('/api/project/remove', { name: 'repo' });
+  expect(removed).toMatchObject({ ok: true });
+  expect(registered(api.state)).toBe(false);
+  expect(await scopeOf(root)).toBeNull();
+  expect((await api.get('/api/links/directory')).entries).toEqual([]);
+  expect(readFileSync(claimFile, 'utf8')).toBe(claimBefore);
+  expect(await api.get('/api/resource-admission')).toEqual(admissionBefore);
+
+  // The name comes back: nothing is shared until the user confirms again, and the scope is new.
+  await registerRepo(api.state);
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({ shared: false });
+  expect((await api.get('/api/links/directory')).entries).toEqual([]);
+  expect(
+    await api.post('/api/links/share/enable', { repo: 'repo' })
+  ).toMatchObject({ code: 'LINKS_CONFIRMATION_REQUIRED' });
+  expect(await enableOver(api)).toMatchObject({ ok: true });
+  expect(await scopeOf(root)).not.toBe(firstScope);
+});
+
+test('a project whose sharing cannot be confirmed withdrawn is not removed', async () => {
+  const root = workspace();
+  const first = await portal(root, [baseSession], { registry: true });
+  await registerRepo(first.state);
+  await enableOver(first);
+  const scope = await scopeOf(root);
+  await first.dispose();
+  runtimes.length = 0;
+
+  const broken = join(root, 'broken-engine');
+  writeFileSync(broken, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const api = await portal(root, [baseSession], {
+    linksEngine: broken,
+    registry: true,
+  });
+  const refused = await api.post('/api/project/remove', { name: 'repo' });
+  expect(refused).toMatchObject({ code: 'LINKS_OUTCOME_UNKNOWN', ok: false });
+  expect(refused.error).toContain('was not removed');
+  expect(registered(api.state)).toBe(true);
+  await api.dispose();
+  runtimes.length = 0;
+
+  // The policy is exactly as it was, and with the engine back the removal goes through.
+  expect(await scopeOf(root)).toBe(scope);
+  const again = await portal(root, [baseSession], { registry: true });
+  expect(
+    await again.post('/api/project/remove', { name: 'repo' })
+  ).toMatchObject({
+    ok: true,
+  });
+  expect(registered(again.state)).toBe(false);
+});
+
+test('removing a project nothing was ever shared for needs no engine at all', async () => {
+  const root = workspace();
+  const api = await portal(root, [baseSession], {
+    linksEngine: join(root, 'no-such-engine'),
+    registry: true,
+  });
+  await registerRepo(api.state);
+  expect(await api.post('/api/project/remove', { name: 'repo' })).toMatchObject(
+    {
+      ok: true,
+    }
+  );
+  expect(registered(api.state)).toBe(false);
+  expect(existsSync(join(root, 'links'))).toBe(false);
+});
+
+test('a project that has left the registry is not listed or published even if its policy remains', async () => {
+  const root = workspace();
+  const intervals = [];
+  const api = await portal(root, [baseSession], {
+    registry: true,
+    timers: {
+      clearInterval: () => undefined,
+      setInterval: (callback, ms) => {
+        intervals.push({ callback, ms });
+        return intervals.length;
+      },
+    },
+  });
+  await registerRepo(api.state);
+  await enableOver(api);
+  // The registry is edited behind the portal's back (not through the supported removal).
+  await api.state.update('projects', () => ({}));
+  expect((await api.get('/api/links/directory')).entries).toEqual([]);
+  expect(
+    await api.get(`/api/links/share/status${query({ repo: 'repo' })}`)
+  ).toMatchObject({ registered: false, shared: true });
+  const presence = intervals.find((timer) => timer.ms === 30_000);
+  await presence.callback();
+  await registerRepo(api.state);
+  const [entry] = (await api.get('/api/links/directory')).entries;
+  expect(entry.sessionId).toBe('session-1');
+  expect(entry.observedAt).toBeLessThan(Date.now());
+});
+
+test('a writer claim that has gone stale still shows its task, marked old', async () => {
+  const root = workspace();
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  execFileSync('git', ['init', '--quiet', checkout]);
+  claimWriter(checkout, {
+    agent: 'claude-code',
+    pid: process.pid,
+    session: 'session-1',
+    task: 'Fix the login redirect',
+  });
+  // Three hours without a heartbeat, held by a process that no longer exists: the claim is stale.
+  const dead = Bun.spawnSync(['true']).pid;
+  const claimFile = join(checkout, '.git', 'setu-writer.json');
+  const heartbeat = Date.now() - 3 * 60 * 60 * 1000;
+  const claim = JSON.parse(readFileSync(claimFile, 'utf8'));
+  writeFileSync(
+    claimFile,
+    JSON.stringify({
+      ...claim,
+      heartbeat: new Date(heartbeat).toISOString(),
+      pid: dead,
+    })
+  );
+
+  const api = await portal(root, [{ ...baseSession, checkoutPath: checkout }]);
+  await enableOver(api);
+  const [entry] = (await api.get('/api/links/directory')).entries;
+  expect(entry).toMatchObject({
+    task: 'Fix the login redirect',
+    taskAt: heartbeat,
+    taskStale: true,
+  });
+  expect(entry.stale).toBe(false);
+});
+
+test('removing a project whose registered name the engine cannot hold still works', async () => {
+  const root = workspace();
+  const api = await portal(root, [baseSession], { registry: true });
+  // Another project is shared, so the engine has a store and a withdrawal really is asked for.
+  await registerRepo(api.state);
+  await enableOver(api);
+  for (const name of ['a\u007fb', 'a\u0085b']) {
+    // biome-ignore lint/performance/noAwaitInLoops: Calls share one portal.
+    await api.state.update('projects', (projects) => ({
+      ...projects,
+      [name]: { base: 3100, label: name, slug: '' },
+    }));
+    expect(await api.post('/api/project/remove', { name })).toMatchObject({
+      ok: true,
+    });
+    expect(Object.hasOwn(api.state.read('projects'), name)).toBe(false);
+  }
 });

@@ -13,6 +13,7 @@ import { createOperationEvents } from './operation-events.js';
 import { createPortalWiring } from './portal-wiring.js';
 import { createResourceAdmission } from './resource-admission.js';
 import { createSharedCacheCatalog } from './shared-cache-catalog.js';
+import { dispatchSpansExecutionRoute } from './spans-execution-routes.js';
 import { createWorkspaceStorage } from './workspace-storage.js';
 import { createWorktreeCache } from './worktree-cache.js';
 
@@ -774,6 +775,15 @@ export async function dispatchPortalResourceRoute(services, request) {
   if (planning) {
     return planning;
   }
+  const execution = await dispatchSpansExecutionRoute(
+    services,
+    request,
+    url,
+    response
+  );
+  if (execution) {
+    return execution;
+  }
   const getRoutes = {
     '/api/agent-sessions': { action: 'agentSessions', optional: true },
     '/api/attention': { action: 'attention', optional: true },
@@ -781,8 +791,10 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/github/runs': { action: 'githubRuns' },
     '/api/github/workflows': { action: 'githubWorkflows' },
     '/api/headless-runs': { action: 'headlessRuns', optional: true },
+    '/api/links/directory': { action: 'linksDirectory', optional: true },
     '/api/links/inbox': { action: 'linksInbox', optional: true },
     '/api/links/message': { action: 'linksShow', optional: true },
+    '/api/links/share/status': { action: 'linksShareStatus', optional: true },
     '/api/links/status': { action: 'linksStatus', optional: true },
     '/api/mcp-actions': { action: 'mcpActions', input: {} },
     '/api/operations': {
@@ -833,6 +845,7 @@ export async function dispatchPortalResourceRoute(services, request) {
   }
   const routes = {
     '/api/agent-sessions/end': 'endAgentSession',
+    '/api/agent-sessions/resume': 'resumeAgentSession',
     '/api/attention/focus': 'attentionFocus',
     '/api/attention/hook': 'attentionHook',
     '/api/dependency-sharing/repair': 'dependencyRepair',
@@ -845,6 +858,8 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/links/cancel': 'linksCancel',
     '/api/links/redeliver': 'linksRedeliver',
     '/api/links/send': 'linksSend',
+    '/api/links/share/disable': 'linksShareDisable',
+    '/api/links/share/enable': 'linksShareEnable',
     '/api/mcp-actions/invoke': 'invokeMcpAction',
     '/api/mcp-actions/preflight': 'preflightMcpAction',
     '/api/mcp-actions/save': 'saveMcpAction',

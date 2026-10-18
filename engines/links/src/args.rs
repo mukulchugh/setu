@@ -78,14 +78,6 @@ impl Args {
         }
     }
 
-    /// A JSON array of at most `max_items` values, left for the caller to read.
-    pub fn array(&mut self, key: &str, max_items: usize) -> Result<Vec<Value>, Fail> {
-        match self.0.remove(key) {
-            Some(Value::Array(items)) if items.len() <= max_items => Ok(items),
-            _ => Err(invalid(key)),
-        }
-    }
-
     pub fn optional_array(&mut self, key: &str, max_items: usize) -> Result<Option<Vec<Value>>, Fail> {
         match self.0.get(key) {
             None | Some(Value::Null) => {
@@ -100,6 +92,13 @@ impl Args {
     /// an explicit `null` is not the same as leaving it out.
     pub fn optional_count(&mut self, key: &str, min: u64, max: u64, too_large: &'static str) -> Result<Option<u64>, Fail> {
         if self.0.contains_key(key) { self.count(key, min, max, too_large).map(Some) } else { Ok(None) }
+    }
+
+    pub fn optional_boolean(&mut self, key: &str) -> Result<bool, Fail> {
+        match self.0.get(key) {
+            None => Ok(false),
+            Some(_) => self.boolean(key),
+        }
     }
 
     pub fn boolean(&mut self, key: &str) -> Result<bool, Fail> {
@@ -133,6 +132,15 @@ impl Args {
         }
     }
 
+    /// A non-negative integer, or absent.
+    pub fn optional_u64(&mut self, key: &str) -> Result<Option<i64>, Fail> {
+        match self.0.remove(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(number)) => number.as_u64().and_then(|n| i64::try_from(n).ok()).map(Some).ok_or_else(|| invalid(key)),
+            Some(_) => Err(invalid(key)),
+        }
+    }
+
     pub fn optional_object(&mut self, key: &str) -> Result<Option<Args>, Fail> {
         match self.0.get(key) {
             None | Some(Value::Null) => {
@@ -140,6 +148,29 @@ impl Args {
                 Ok(None)
             }
             Some(_) => self.object(key).map(Some),
+        }
+    }
+
+    /// An array of at most `max` items, each returned as a raw value for the caller to validate.
+    pub fn array(&mut self, key: &str, max: usize) -> Result<Vec<Value>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if items.len() <= max => Ok(items),
+            Some(Value::Array(_)) => Err(Fail::new("FIELD_TOO_LARGE", format!("field `{key}` has too many items"))),
+            _ => Err(invalid(key)),
+        }
+    }
+
+    /// A non-empty list of at most `max_items` non-empty strings of at most `max` bytes each.
+    pub fn string_list(&mut self, key: &str, max_items: usize, max: usize) -> Result<Vec<String>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if !items.is_empty() && items.len() <= max_items => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(s) if !s.is_empty() && s.len() <= max => Ok(s),
+                    _ => Err(invalid(key)),
+                })
+                .collect(),
+            _ => Err(invalid(key)),
         }
     }
 

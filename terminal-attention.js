@@ -194,8 +194,12 @@ export function createTrustedHookIngress({ sessions } = {}) {
     });
     return resolved.ok
       ? {
+          boundAt: resolved.session.nativeConversation.boundAt,
           checkoutIdentity: resolved.session.checkoutIdentity,
+          generation: resolved.session.bindingGeneration ?? 0,
+          nativeId: resolved.session.nativeConversation.id,
           ok: true,
+          resumedFrom: resolved.session.nativeConversation.resumedFrom ?? [],
           sessionId: resolved.session.id,
         }
       : resolved;
@@ -237,6 +241,16 @@ export function createTerminalAttention({
     }
     return null;
   };
+
+  // Only an event this module has just authenticated counts as the session's activity. It is bookkeeping:
+  // the attention event is recorded whether or not this succeeds.
+  async function noteActivity(id, at) {
+    try {
+      await sessions.recordHookActivity?.({ at, id });
+    } catch {
+      // The next authenticated event records it again.
+    }
+  }
 
   async function receive({ provider, payload, launchToken }) {
     const at = clock();
@@ -291,6 +305,9 @@ export function createTerminalAttention({
           state: normalized.kind,
         }
       : unknownAttention(source, at);
+    if (verified) {
+      await noteActivity(mapping.sessionId, at);
+    }
     await state.update('attention', (document) => {
       const current = attentionEvents(document);
       if (!current.ok) {

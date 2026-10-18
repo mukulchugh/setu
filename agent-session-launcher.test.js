@@ -110,7 +110,7 @@ test('the generated launcher keeps an owned coding process foreground in a pty a
     fs.writeFileSync(join(home, '.zshrc'), '');
     fs.writeFileSync(
       join(bin, 'ps'),
-      '#!/bin/sh\nprintf "Mon Sep 21 10:10:00 2026\\n"\n',
+      '#!/bin/sh\nprintf "  Mon Sep 21 10:10:00 2026  \\n"\n',
       { mode: 0o755 }
     );
     fs.writeFileSync(

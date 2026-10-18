@@ -3,27 +3,60 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 const sessionStates = new Set(['starting', 'running', 'ended', 'unknown']);
 const ownershipStates = new Set(['owned', 'unknown']);
 
-const maxReplacedHistory = 8;
+export const maxReplacedHistory = 8;
 const digestPattern = /^[0-9a-f]{64}$/;
 
 // Only this digest of a per-launch capability is ever persisted.
 export const launchProofDigest = (token) =>
   createHash('sha256').update(token).digest('hex');
 
+// Stable text for an identity object, so equal identities digest equally whatever their key order.
+const stable = (value) => {
+  if (Array.isArray(value)) {
+    return `[${value.map(stable).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stable(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
+export const identityDigest = (identity) =>
+  createHash('sha256').update(stable(identity)).digest('hex');
+
 const digestMatches = (stored, presented) =>
   digestPattern.test(stored) &&
   digestPattern.test(presented) &&
   timingSafeEqual(Buffer.from(stored, 'hex'), Buffer.from(presented, 'hex'));
+
+// A reviewed resume carried by one fresh launch: which conversation, and which ended records held it.
+const validResumeIntent = (intent) =>
+  intent === undefined ||
+  (validString(intent?.nativeId) &&
+    Array.isArray(intent.from) &&
+    intent.from.length > 0 &&
+    intent.from.length <= maxReplacedHistory &&
+    intent.from.every(validString) &&
+    validTime(intent.reviewedAt));
 
 const validReplaced = (entry) =>
   validString(entry?.id) &&
   validTime(entry.boundAt) &&
   validTime(entry.replacedAt);
 
+const validResumedFrom = (value) =>
+  value === undefined ||
+  (Array.isArray(value) &&
+    value.length <= maxReplacedHistory &&
+    value.every(validString));
+
 // Optional and validated apart from validRecord, so a bad binding never makes
 // the whole session list unreadable. An invalid one counts as no binding.
 const validBinding = (binding) =>
   validString(binding?.provider) &&
+  validResumedFrom(binding.resumedFrom) &&
   validString(binding.id) &&
   validTime(binding.boundAt) &&
   Array.isArray(binding.history) &&
@@ -35,7 +68,7 @@ const currentBinding = (record) =>
 
 // Same id: unchanged. A new id replaces the current one, which joins the
 // bounded history. An id from that history is an exact resume, not a new entry.
-function nextBinding(binding, { nativeId, provider }, at) {
+function nextBinding(binding, { nativeId, provider, resumedFrom }, at) {
   if (binding?.id === nativeId) {
     return binding;
   }
@@ -50,6 +83,8 @@ function nextBinding(binding, { nativeId, provider }, at) {
     history: history.slice(-maxReplacedHistory),
     id: nativeId,
     provider,
+    // Only an explicit, reviewed resume sets this: the earlier records this conversation was bound under.
+    ...(resumedFrom?.length ? { resumedFrom } : {}),
   };
 }
 
@@ -60,6 +95,9 @@ const validString = (value) => typeof value === 'string' && value.length > 0;
 const validPid = (value) => Number.isSafeInteger(value) && value > 0;
 const validTime = (value) =>
   validString(value) || (typeof value === 'number' && Number.isFinite(value));
+// A hook time is a number of milliseconds: finite (validTime) and positive.
+const validHookTime = (value) =>
+  typeof value === 'number' && validTime(value) && value > 0;
 const ghosttyTerminalId =
   /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
 const validTerminal = (value) =>
@@ -98,7 +136,8 @@ function validRecord(value) {
     ownershipStates.has(value.ownership) &&
     validTerminal(value.terminal) &&
     (value.endedAt === undefined || validTime(value.endedAt)) &&
-    (value.endReason === undefined || validString(value.endReason))
+    (value.endReason === undefined || validString(value.endReason)) &&
+    (value.lastHookAt === undefined || validHookTime(value.lastHookAt))
   );
 }
 
@@ -112,12 +151,48 @@ function matches(record, observation) {
   );
 }
 
+// The binding's generation is a persisted counter on the record itself. It only moves up, once per
+// decision, inside the same document lock that makes the decision. Wall clocks play no part.
+const generationOf = (record) =>
+  Number.isSafeInteger(record.bindingGeneration) && record.bindingGeneration > 0
+    ? record.bindingGeneration
+    : 0;
+
+// A decision that ends or voids the binding: the new generation is the one the invalidation is sent at,
+// strictly above the binding it ends.
+function invalidated(record, reason) {
+  const generation = generationOf(record) + 1;
+  return {
+    ...record,
+    bindingGeneration: generation,
+    bindingInvalid: { generation, reason },
+  };
+}
+
 function unknown(record) {
-  return { ...record, ownership: 'unknown', state: 'unknown' };
+  const next = { ...record, ownership: 'unknown', state: 'unknown' };
+  // Repeated observations of an already unknown record are not new decisions.
+  return record.state === 'unknown'
+    ? next
+    : invalidated(next, 'ownership-unknown');
 }
 
 function ended(record, now, endReason) {
-  return { ...record, endedAt: now(), endReason, state: 'ended' };
+  return invalidated(
+    { ...record, endedAt: now(), endReason, state: 'ended' },
+    'ended'
+  );
+}
+
+// An unknown record observed running again is a decision of its own, so the generation advances past the
+// invalidation. Only a record that is still owned has a binding that can be live again.
+function verifiedRunning(record) {
+  const { bindingInvalid: _voided, ...rest } = record;
+  return {
+    ...(record.ownership === 'owned' ? rest : record),
+    bindingGeneration: generationOf(record) + 1,
+    state: 'running',
+  };
 }
 
 function stateFailure() {
@@ -353,6 +428,9 @@ export function createAgentSessions({
       ...(launch.launchProofDigest
         ? { launchProofDigest: launch.launchProofDigest }
         : {}),
+      ...(launch.resumeIntent
+        ? { resumeIntent: clone(launch.resumeIntent) }
+        : {}),
     };
   }
   async function reconciledSession(record) {
@@ -363,9 +441,12 @@ export function createAgentSessions({
         ? ended(record, now, 'exited')
         : unknown(record);
     }
-    return matches(record, observation)
-      ? { ...record, state: 'running' }
-      : unknown(record);
+    if (matches(record, observation)) {
+      return record.state === 'unknown'
+        ? verifiedRunning(record)
+        : { ...record, state: 'running' };
+    }
+    return unknown(record);
   }
   function endPreflight(records, id, checkoutIdentity) {
     const index = records.findIndex((candidate) => candidate.id === id);
@@ -562,7 +643,8 @@ export function createAgentSessions({
         launch.checkoutIdentity !== undefined &&
         validTerminal(launch.terminal) &&
         (launch.launchProofDigest === undefined ||
-          digestPattern.test(launch.launchProofDigest))
+          digestPattern.test(launch.launchProofDigest)) &&
+        validResumeIntent(launch.resumeIntent)
       )
     ) {
       return {
@@ -706,13 +788,39 @@ export function createAgentSessions({
   const refusal = (records, reason) =>
     resultWithRecords(records, { ok: false, reason });
   // Only a live owned record currently holding the id is a concurrent owner.
-  // Anything else (ended, unconfirmed, or replaced away) is never adopted.
-  const conflictReason = (holder, nativeId) =>
-    holder.ownership === 'owned' &&
-    ['starting', 'running'].includes(holder.state) &&
-    holder.nativeConversation.id === nativeId
+  // Anything else (ended, unconfirmed, or replaced away) is never adopted by itself.
+  const conflictReason = (holders, nativeId) =>
+    holders.some(
+      (holder) =>
+        holder.ownership === 'owned' &&
+        ['starting', 'running'].includes(holder.state) &&
+        holder.nativeConversation.id === nativeId
+    )
       ? 'native-conversation-in-use'
       : 'native-conversation-previously-bound';
+  // The one way a conversation bound under earlier records binds again: this fresh launch carries a
+  // reviewed intent for exactly this ID, and every earlier holder is a record that ended in this same
+  // checkout and was named at review. A holder that appeared after review is never adopted.
+  function reviewedResume(record, holders, nativeId) {
+    const intent = record.resumeIntent;
+    if (
+      !(
+        validResumeIntent(intent) &&
+        intent?.nativeId === nativeId &&
+        holders.every(
+          (holder) =>
+            holder.state === 'ended' &&
+            holder.repo === record.repo &&
+            holder.name === record.name &&
+            sameValue(holder.checkoutIdentity, record.checkoutIdentity) &&
+            intent.from.includes(holder.id)
+        )
+      )
+    ) {
+      return null;
+    }
+    return holders.map((holder) => holder.id).slice(-maxReplacedHistory);
+  }
   async function freshIdentity(record) {
     try {
       return (await observeCheckout(record)) ?? null;
@@ -752,6 +860,52 @@ export function createAgentSessions({
         digestMatches(record.launchProofDigest, digest) ? record : found,
       null
     );
+  // The time of the latest authenticated hook event of a running, owned session. Only the hook ingress calls
+  // this, after it has verified the launch capability, provider, checkout and lifecycle; nothing else (not a
+  // poll, not process liveness) is activity. It never moves backwards and is never set for any other session.
+  function recordHookActivity({ id, at }) {
+    return replace((current) => {
+      const index = current.findIndex((candidate) => candidate.id === id);
+      const heard = current[index];
+      if (
+        !(
+          heard &&
+          heard.state === 'running' &&
+          heard.ownership === 'owned' &&
+          validHookTime(at) &&
+          at > (heard.lastHookAt ?? 0)
+        )
+      ) {
+        return resultWithRecords(current, { ok: false });
+      }
+      return updatedSession(
+        current,
+        index,
+        { ...heard, lastHookAt: at },
+        { ok: true }
+      );
+    }).then((outcome) => outcome.result);
+  }
+  // The judgement a hook's capability must pass, made inside the record lock with the checkout observed
+  // there: the capability finds the record, then provider, ownership, lifecycle, checkout path and the
+  // checkout's identity are all judged against what is true now. Bind and restore share it so neither can
+  // rest on a record or an observation from before they waited for the lock.
+  async function judgeUnderLock(
+    current,
+    { provider, launchProofDigest: digest, checkoutPath, states }
+  ) {
+    const record = findByLaunchProof(current, digest);
+    if (!record) {
+      return { reason: 'launch-proof-invalid' };
+    }
+    const problem = sessionProblem(record, {
+      checkoutPath,
+      fresh: await freshIdentity(record),
+      provider,
+      states,
+    });
+    return problem ? { reason: problem } : { record };
+  }
   function bindNativeConversation({
     provider,
     nativeId,
@@ -763,20 +917,17 @@ export function createAgentSessions({
     // the filesystem only and must never take a state or target lock: open()
     // holds the target lock while the start hook arrives.
     return replace(async (current) => {
-      const record = findByLaunchProof(current, digest);
-      if (!record) {
-        return refusal(current, 'launch-proof-invalid');
-      }
-      const problem = sessionProblem(record, {
+      const judged = await judgeUnderLock(current, {
         checkoutPath,
-        fresh: await freshIdentity(record),
+        launchProofDigest: digest,
         provider,
         states: ['starting', 'running'],
       });
-      if (problem) {
-        return refusal(current, problem);
+      if (!judged.record) {
+        return refusal(current, judged.reason);
       }
-      const holder = current.find(
+      const { record } = judged;
+      const holders = current.filter(
         (other) =>
           other.id !== record.id &&
           currentBinding(other)?.provider === provider &&
@@ -785,18 +936,97 @@ export function createAgentSessions({
               (entry) => entry.id === nativeId
             ))
       );
-      if (holder) {
-        return refusal(current, conflictReason(holder, nativeId));
+      const resumedFrom = holders.length
+        ? reviewedResume(record, holders, nativeId)
+        : null;
+      if (holders.length && !resumedFrom) {
+        return refusal(current, conflictReason(holders, nativeId));
       }
       const index = current.indexOf(record);
+      const binding = nextBinding(
+        currentBinding(record),
+        { nativeId, provider, resumedFrom: resumedFrom ?? undefined },
+        now()
+      );
+      // A new, replaced or resumed conversation is a decision. The same conversation again is not.
+      const decided = currentBinding(record)?.id !== binding.id;
+      const { bindingInvalid: _voided, ...undecided } = record;
       const session = {
-        ...record,
-        nativeConversation: nextBinding(
-          currentBinding(record),
-          { nativeId, provider },
-          now()
-        ),
+        ...(decided ? undecided : record),
+        nativeConversation: binding,
+        ...(decided ? { bindingGeneration: generationOf(record) + 1 } : {}),
       };
+      return updatedSession(current, index, session, { ok: true, session });
+    }).then((outcome) => outcome.result);
+  }
+  // The checkout is no longer the one the binding was made in. Recorded once per generation: hooks that
+  // keep arriving for the same changed checkout do not each advance it.
+  async function invalidateBinding(id, reason) {
+    return await replace((current) => {
+      const index = current.findIndex((candidate) => candidate.id === id);
+      const record = current[index];
+      if (!(record && currentBinding(record))) {
+        return resultWithRecords(current, { ok: false });
+      }
+      if (record.bindingInvalid) {
+        return resultWithRecords(current, { ok: true, session: record });
+      }
+      const session = invalidated(record, reason);
+      return updatedSession(current, index, session, { ok: true, session });
+    }).then((outcome) => outcome.result);
+  }
+  // The one invalidation a hook may undo: the checkout identity this binding was made in has returned
+  // (for example the original directory was put back) and the hook proves it with the launch capability.
+  // Judged under the record lock exactly as a bind is, and answered only from that judgement: the same
+  // conversation must still be bound, the session must still be owned and running in a checkout that is
+  // fresh right now, or the answer is the refusal. The generation then advances past the invalidation so
+  // the binding can be published again. An ended or unknown session, another reason, or anything the lock
+  // finds changed is never recovered this way.
+  function restoreBinding({
+    provider,
+    nativeId,
+    launchProofDigest: digest,
+    checkoutPath,
+  }) {
+    return replace(async (current) => {
+      const judged = await judgeUnderLock(current, {
+        checkoutPath,
+        launchProofDigest: digest,
+        provider,
+        states: ['running'],
+      });
+      if (!judged.record) {
+        return refusal(current, judged.reason);
+      }
+      const { record } = judged;
+      if (currentBinding(record)?.id !== nativeId) {
+        return refusal(current, 'conversation-unbound');
+      }
+      if (record.bindingInvalid?.reason !== 'checkout-changed') {
+        // Nothing to undo, and the record is authenticated as just judged.
+        return resultWithRecords(current, { ok: true, session: record });
+      }
+      const {
+        bindingAnnounced: _told,
+        bindingInvalid: _voided,
+        ...live
+      } = record;
+      const session = { ...live, bindingGeneration: generationOf(record) + 1 };
+      return updatedSession(current, current.indexOf(record), session, {
+        ok: true,
+        session,
+      });
+    }).then((outcome) => outcome.result);
+  }
+  // The publisher's own confirmation that it was told this generation's invalidation.
+  async function markAnnounced(id, generation) {
+    return await replace((current) => {
+      const index = current.findIndex((candidate) => candidate.id === id);
+      const record = current[index];
+      if (!(record && record.bindingInvalid?.generation === generation)) {
+        return resultWithRecords(current, { ok: false });
+      }
+      const session = { ...record, bindingAnnounced: generation };
       return updatedSession(current, index, session, { ok: true, session });
     }).then((outcome) => outcome.result);
   }
@@ -813,15 +1043,17 @@ export function createAgentSessions({
   // reason for each way it can fail.
   function locateConversation(nativeId, digest) {
     const records = storedRecords();
-    const record = records.find(
+    // After an explicit resume an ended record and the live one both name the ID: the capability decides.
+    const holders = records.filter(
       (candidate) => currentBinding(candidate)?.id === nativeId
     );
-    if (!record) {
+    if (holders.length === 0) {
       return { reason: unlocated(records, nativeId, digest) };
     }
-    return digestMatches(record.launchProofDigest, digest)
-      ? { record }
-      : { reason: 'launch-proof-invalid' };
+    const record = holders.find((candidate) =>
+      digestMatches(candidate.launchProofDigest, digest)
+    );
+    return record ? { record } : { reason: 'launch-proof-invalid' };
   }
   async function resolveNativeConversation({
     provider,
@@ -849,17 +1081,41 @@ export function createAgentSessions({
       provider,
       states: ['running'],
     });
-    return problem
-      ? { ok: false, reason: problem }
-      : { ok: true, session: current.record };
+    if (problem === 'checkout-changed') {
+      await invalidateBinding(current.record.id, 'checkout-changed').catch(
+        () => {
+          // The next hook records it.
+        }
+      );
+    }
+    if (problem) {
+      return { ok: false, reason: problem, sessionId: current.record.id };
+    }
+    if (current.record.bindingInvalid?.reason === 'checkout-changed') {
+      // The checkout returned. The restore re-judges everything under the record lock and its answer, a
+      // refusal included, is the answer: this function never falls back to the record read above.
+      const restored = await restoreBinding({
+        checkoutPath,
+        launchProofDigest: digest,
+        nativeId,
+        provider,
+      }).catch(() => ({ ok: false, reason: 'binding-unavailable' }));
+      return restored.ok
+        ? { ok: true, session: restored.session }
+        : { ok: false, reason: restored.reason, sessionId: current.record.id };
+    }
+    return { ok: true, session: current.record };
   }
   return {
     bindNativeConversation,
     end,
     fail,
     get,
+    invalidateBinding,
     list,
+    markAnnounced,
     reconcile,
+    recordHookActivity,
     register,
     resolveNativeConversation,
   };
@@ -873,7 +1129,13 @@ export function nativeConversationView(session) {
   }
   const bound = currentBinding(session);
   if (bound) {
-    return { boundAt: bound.boundAt, id: bound.id, provider, state: 'bound' };
+    return {
+      boundAt: bound.boundAt,
+      id: bound.id,
+      provider,
+      ...(bound.resumedFrom?.length ? { resumedFrom: bound.resumedFrom } : {}),
+      state: 'bound',
+    };
   }
   return session.nativeConversation === undefined
     ? { provider, state: 'pending' }
@@ -890,6 +1152,10 @@ export function publicSession(session) {
     launchProofDigest: _digest,
     managedLease: _lease,
     nativeConversation: _private,
+    resumeIntent: _intent,
+    bindingGeneration: _generation,
+    bindingInvalid: _invalid,
+    bindingAnnounced: _announced,
     ...visible
   } = session;
   return { ...visible, nativeConversation: nativeConversationView(session) };

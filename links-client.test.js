@@ -40,6 +40,7 @@ test('a send reaches the real engine and its status can be read back', async () 
   const sent = await client.call('send', {
     body: 'hello',
     idempotency_key: 'key-1',
+    project: 'repo',
     recipient,
     sender: { kind: 'user' },
   });
@@ -60,6 +61,7 @@ test('a send reaches the real engine and its status can be read back', async () 
 const sendArgs = (key = 'key-1', body = 'hello') => ({
   body,
   idempotency_key: key,
+  project: 'repo',
   recipient,
   sender: { kind: 'user' },
 });
@@ -330,7 +332,7 @@ test('the transport operations round-trip through the real engine with strict re
       reason: 'ownership-unknown',
       session_hint: 'session-1',
     })
-  ).toEqual({ ok: true, result: { held: [] } });
+  ).toEqual({ ok: true, result: { held: [], stored: true } });
 });
 
 test('a mutation of the roster or the snapshots whose reply is lost is unknown, and repeating it is safe', async () => {
@@ -374,12 +376,12 @@ test('a claim of peer mail names the peer, and a malformed sender is still never
       },
     });
   expect(
-    await claim({ kind: 'peer', peer_id: PEER }).call('claim', {})
+    await claim({ id: PEER, kind: 'peer' }).call('claim', {})
   ).toMatchObject({ ok: true });
   for (const sender of [
     { kind: 'peer' },
-    { kind: 'peer', peer_id: 1 },
-    { extra: 1, kind: 'user', peer_id: PEER },
+    { id: 1, kind: 'peer' },
+    { extra: 1, id: PEER, kind: 'user' },
   ]) {
     // biome-ignore lint/performance/noAwaitInLoops: One fixture engine per sender shape.
     expect(await claim(sender).call('claim', {})).toMatchObject({
@@ -396,7 +398,9 @@ test('the sender view of a message sent to a peer keeps the outbox stage and the
     created_at: 1,
     expires_at: 2,
     kind: 'message',
+    locator: 'locator-1',
     message_id: 'm_1',
+    project: null,
     reason: null,
     recipient,
     redeliveries: 0,

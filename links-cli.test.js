@@ -331,6 +331,12 @@ test('every Links route has a CLI command and every CLI command has a route', as
       'a_1',
     ],
   ];
+  commands.push(
+    ['share', 'enable', 'repo'],
+    ['share', 'disable', 'repo'],
+    ['share', 'status', 'repo'],
+    ['directory']
+  );
   const used = new Set();
   for (const argv of commands) {
     // biome-ignore lint/performance/noAwaitInLoops: Each call replaces the shared console.
@@ -343,4 +349,102 @@ test('every Links route has a CLI command and every CLI command has a route', as
     route.methods.map((method) => `${method} ${route.path}`)
   );
   expect([...used].sort()).toEqual(routes.sort());
+});
+
+test('share enable posts only the project until the user passes the reviewed token back, and no other command accepts one', async () => {
+  const review = await links(['share', 'enable', 'repo', '--json']);
+  expect(review.calls).toEqual([
+    { body: { repo: 'repo' }, method: 'POST', path: '/api/links/share/enable' },
+  ]);
+
+  const owner = await links([
+    'share',
+    'enable',
+    'repo',
+    '--owner',
+    'Mukul',
+    '--confirmation',
+    'share:repo;owner:Mukul',
+    '--json',
+  ]);
+  expect(owner.calls[0].body).toEqual({
+    confirmation: 'share:repo;owner:Mukul',
+    owner: 'Mukul',
+    repo: 'repo',
+  });
+
+  for (const argv of [
+    ['share', 'disable', 'repo', '--confirmation', 'x'],
+    ['share', 'status', 'repo', '--owner', 'x'],
+    ['directory', '--confirmation', 'x'],
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each call replaces the shared console.
+    const run = await links(argv);
+    expect(run.code).toBe(1);
+    expect(run.calls).toEqual([]);
+  }
+});
+
+test('a sharing review is printed for the user to read and exits non-zero so nothing is taken as confirmed', async () => {
+  const run = await links(['share', 'enable', 'repo', '--json'], {
+    reply: {
+      code: 'LINKS_CONFIRMATION_REQUIRED',
+      confirmation: {
+        fields: [{ field: 'owner', keys: ['owner'], meaning: 'Owner label' }],
+        project: 'repo',
+        token: 'share:repo;owner:mukul',
+      },
+      error: 'Nothing has been shared.',
+      ok: false,
+    },
+  });
+  expect(run.code).toBe(1);
+  const printed = JSON.parse(run.out);
+  expect(printed.confirmation.fields[0].field).toBe('owner');
+  expect(printed.confirmation.token).toBe('share:repo;owner:mukul');
+});
+
+test('share status and the directory take an optional project and read only', async () => {
+  const cases = [
+    [['share', 'status'], 'GET', '/api/links/share/status'],
+    [['share', 'status', 'repo'], 'GET', '/api/links/share/status?repo=repo'],
+    [['directory'], 'GET', '/api/links/directory'],
+    [['directory', 'repo'], 'GET', '/api/links/directory?repo=repo'],
+    [['share', 'disable', 'repo'], 'POST', '/api/links/share/disable'],
+  ];
+  for (const [argv, method, path] of cases) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each call replaces the shared console.
+    const run = await links(argv);
+    expect(run.calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      `${method} ${path}`,
+    ]);
+  }
+});
+
+test('malformed sharing commands never reach the portal', async () => {
+  for (const argv of [
+    ['share'],
+    ['share', 'enable'],
+    ['share', 'enable', 'repo', 'extra'],
+    ['share', 'disable'],
+    ['share', 'bogus', 'repo'],
+    ['share', 'status', 'a', 'b'],
+    ['directory', 'a', 'b'],
+    ['share', 'enable', 'repo', '--wake'],
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each call replaces the shared console.
+    const run = await links(argv);
+    expect(run.code).toBe(1);
+    expect(run.calls).toEqual([]);
+  }
+});
+
+test('with the portal down sharing commands refuse with PORTAL_REQUIRED', async () => {
+  const refused = Object.assign(new Error('connect failed'), {
+    code: 'ConnectionRefused',
+  });
+  const run = await links(['share', 'enable', 'repo', '--json'], {
+    fail: refused,
+  });
+  expect(JSON.parse(run.out)).toMatchObject({ code: 'PORTAL_REQUIRED' });
 });

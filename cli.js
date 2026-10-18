@@ -2033,6 +2033,12 @@ async function apiResult(call) {
         console.log(JSON.stringify(result));
       } else {
         console.error(JSON.stringify({ ...result, error }, null, 2));
+        const held = result?.recovery?.writer;
+        if (held) {
+          console.error(
+            `The span's writer claim is kept for a retry. To let it go: setu release ${shellQuote(held.checkoutPath)} --session ${shellQuote(held.session)}`
+          );
+        }
       }
       process.exitCode = 1;
       return null;
@@ -2304,6 +2310,65 @@ function spansPlanningCommand(action, usage) {
   return null;
 }
 
+// Live Spans execution. Every subcommand calls the running portal; none of them
+// starts a process locally, and the portal refuses them unless execution is on.
+const spansExecutionRoute = (name) => `/api/spans/execution/${name}`;
+
+// Subcommands with fixed positional arguments: [method, route, body or query].
+const SPANS_EXECUTION_POSITIONAL = {
+  cancel: [4, 'post', (run, attempt) => ({ attemptId: attempt, runId: run })],
+  capabilities: [3, 'get', (profile) => ({ profile })],
+  complete: [4, 'post', (run, action) => ({ actionId: action, runId: run })],
+  probe: [3, 'post', (profile) => ({ profile })],
+  reconcile: [2, 'post', () => ({})],
+  status: [3, 'get', (run) => ({ runId: run })],
+};
+
+function spansExecutionCommand(usage) {
+  const [, action, first, second] = args;
+  if (Object.hasOwn(SPANS_EXECUTION_POSITIONAL, action)) {
+    const [count, method, build] = SPANS_EXECUTION_POSITIONAL[action];
+    if (args.length === count) {
+      validateFlags([], usage);
+      return apiResult(() =>
+        cliApi[method](spansExecutionRoute(action), build(first, second))
+      );
+    }
+  }
+  if ((action === 'accept' || action === 'resolve') && args.length === 4) {
+    validateFlags(['confirmation'], usage);
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post(spansExecutionRoute(action), {
+        actionId: second,
+        runId: first,
+        ...(confirmation === undefined ? {} : { confirmation }),
+      })
+    );
+  }
+  if (action === 'report' && args.length === 2) {
+    validateFlags(['input'], usage);
+    return apiResult(() =>
+      cliApi.post(spansExecutionRoute('report'), spansPlanningInput())
+    );
+  }
+  if ((action === 'review' || action === 'dispatch') && args.length === 2) {
+    validateFlags(
+      action === 'dispatch' ? ['confirmation', 'input'] : ['input'],
+      usage
+    );
+    const input = spansPlanningInput();
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post(
+        spansExecutionRoute(action),
+        confirmation === undefined ? input : { ...input, confirmation }
+      )
+    );
+  }
+  return die(usage);
+}
+
 function spansEventQuery(runId) {
   const since = optionalFlag('since');
   const afterSequence = since === undefined ? 0 : Number(since);
@@ -2319,10 +2384,11 @@ function spansEventQuery(runId) {
 
 async function cmdSpans() {
   const usage =
-    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path>] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
+    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path> | exec capabilities <profile> | exec status <run> | exec probe <profile> | exec review --input <json> | exec dispatch --input <json> [--confirmation <token>] | exec cancel <run> <attempt> | exec complete <run> <action> | exec accept <run> <action> [--confirmation <token>] | exec report --input <json> | exec reconcile | exec resolve <run> <action> [--confirmation <token>]] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
   validateCommand({
     allowedFlags: [
       'after',
+      'confirmation',
       'generation',
       'input',
       'limit',
@@ -2334,12 +2400,15 @@ async function cmdSpans() {
       'since',
       'through',
     ],
-    argCounts: [0, 1, 2, 3],
+    argCounts: [0, 1, 2, 3, 4],
     usage,
   });
   const [action = 'list', runId, artifactId] = args;
   let path;
   let query;
+  if (action === 'exec') {
+    return await spansExecutionCommand(usage);
+  }
   const planning = spansPlanningCommand(action, usage);
   if (planning) {
     return await planning;
@@ -2384,11 +2453,12 @@ async function cmdSpans() {
 
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSessions() {
+  const usage =
+    'setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|-> | resume <repo> <branch> --native <id> [--confirmation <token>]] [--json]';
   validateCommand({
-    allowedFlags: ['checkout', 'session'],
+    allowedFlags: ['checkout', 'confirmation', 'native', 'session'],
     argCounts: [0, 1, 3],
-    usage:
-      'setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]',
+    usage,
   });
   const [action, repo, name] = args;
   if (!action) {
@@ -2401,11 +2471,31 @@ async function cmdSessions() {
     }
     return apiResult(() => cliApi.get('/api/agent-sessions', { name, repo }));
   }
-  if (action !== 'end') {
-    die(
-      'Usage: setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <identity>] [--json]'
+  if (action === 'resume') {
+    // The receiving user's explicit, reviewed resume. Without --confirmation the portal answers with the
+    // review (conversation, ended sessions that held it, checkout) and the token to confirm with; the CLI
+    // never makes one up and never launches without it.
+    validateFlags(
+      ['confirmation', 'native'],
+      'setu sessions resume <repo> <branch> --native <id> [--confirmation <token>] [--json]'
+    );
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post('/api/agent-sessions/resume', {
+        ...(confirmation === undefined ? {} : { confirmation }),
+        name,
+        nativeId: requireFlag('native'),
+        repo,
+      })
     );
   }
+  if (action !== 'end') {
+    die(`Usage: ${usage}`);
+  }
+  validateFlags(
+    ['checkout', 'session'],
+    'setu sessions end <repo> <branch> --session <id> --checkout <file|-> [--json]'
+  );
   return apiResult(() =>
     cliApi.post('/api/agent-sessions/end', {
       checkoutIdentity: checkoutIdentity(),
@@ -2417,7 +2507,7 @@ async function cmdSessions() {
 }
 
 const LINKS_USAGE =
-  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] [--json]';
+  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] | share enable <repo> [--owner <label>] [--confirmation <token>] | share disable <repo> | share status [<repo>] | directory [<repo>] [--json]';
 
 // Links needs the running portal and never starts anything itself. An unreachable portal is a refusal;
 // a send the portal or engine may or may not have recorded is unknown, and says how to repeat it safely.
@@ -2474,9 +2564,60 @@ const LINKS_ACTIONS = new Map([
   ['status', { argCount: 2, flags: [] }],
 ]);
 
+// Sharing is the user's own decision about a project, and enabling shows the exact public fields first: the
+// first request returns them with a token, and only that token passed back (`--confirmation`) enables.
+const LINKS_SHARE_ACTIONS = new Map([
+  ['disable', { argCounts: [3], flags: [] }],
+  ['enable', { argCounts: [3], flags: ['confirmation', 'owner'] }],
+  ['status', { argCounts: [2, 3], flags: [] }],
+]);
+
+function cmdLinksShare() {
+  const [, sub, repo] = args;
+  const accepted = LINKS_SHARE_ACTIONS.get(sub);
+  if (!accepted) {
+    die(`Usage: ${LINKS_USAGE}`);
+  }
+  validateCommand({
+    allowedFlags: accepted.flags,
+    argCounts: accepted.argCounts,
+    usage: LINKS_USAGE,
+  });
+  if (sub === 'status') {
+    return linksResult(() =>
+      cliApi.get('/api/links/share/status', repo ? { repo } : {})
+    );
+  }
+  if (sub === 'disable') {
+    return linksResult(() => cliApi.post('/api/links/share/disable', { repo }));
+  }
+  const owner = optionalFlag('owner');
+  const confirmation = optionalFlag('confirmation');
+  return linksResult(() =>
+    cliApi.post('/api/links/share/enable', {
+      repo,
+      ...(owner === undefined ? {} : { owner }),
+      ...(confirmation === undefined ? {} : { confirmation }),
+    })
+  );
+}
+
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdLinks() {
   const [action, first, name] = args;
+  if (action === 'share') {
+    return cmdLinksShare();
+  }
+  if (action === 'directory') {
+    validateCommand({
+      allowedFlags: [],
+      argCounts: [1, 2],
+      usage: LINKS_USAGE,
+    });
+    return linksResult(() =>
+      cliApi.get('/api/links/directory', first ? { repo: first } : {})
+    );
+  }
   const accepted = LINKS_ACTIONS.get(action);
   if (!accepted) {
     die(`Usage: ${LINKS_USAGE}`);
@@ -3625,15 +3766,28 @@ function cmdHelp() {
     setu spans search <query> [--run <run> --since <sequence> --through <sequence> --generation <N> --limit <N>] [--json]
                                       A page after --since needs the --generation it returned; a
                                       missing index is unavailable, never zero results
+    setu spans exec capabilities <profile> | status <run> | probe <profile> [--json]
+    setu spans exec review --input '<review JSON>' [--json]
+    setu spans exec dispatch --input '<review JSON>' [--confirmation <token>] [--json]
+    setu spans exec cancel <run> <attempt> [--json]
+    setu spans exec complete <run> <action> [--json]
+    setu spans exec accept <run> <action> [--confirmation <token>] [--json]
+    setu spans exec report --input '<report JSON>' [--json]
+    setu spans exec reconcile [--json]
+    setu spans exec resolve <run> <action> [--confirmation <token>] [--json]
+                                      Releases an authorized dispatch that never reached intent
     setu spans search-status [--json]
     setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
                                       Offline: indexes an existing archive in bounded pages; rerun to resume
-    setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|-> | resume <repo> <branch> --native <id> [--confirmation <token>]] [--json]
     setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] [--json]
     setu links inbox <repo> <branch> --session <id> [--state <state>] [--json]
     setu links show|status|cancel <message> [--json]
     setu links ack <repo> <branch> --session <id> --message <message> [--json]
     setu links redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--json]
+    setu links share enable <repo> [--owner <label>] [--confirmation <token>] [--json]
+    setu links share disable <repo> | status [<repo>] [--json]
+    setu links directory [<repo>] [--json]
                                       Needs the running portal. A message is addressed to one verified
                                       native conversation; handoff-unknown is never retried automatically
     setu caches prepare <repo> <branch> [--json]

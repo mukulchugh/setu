@@ -149,6 +149,7 @@ import {
   createRemovalRouting,
 } from './removal-routing.js';
 import { createSetupProgress } from './setup-progress.js';
+import { createSpansExecutionRuntime } from './spans-execution-runtime.js';
 import { createSpansRuntime } from './spans-runtime.js';
 import {
   createWorkspaceInventory,
@@ -444,12 +445,14 @@ export async function createPortalRuntime(options = {}) {
 
   // ── repo metadata ─────────────────────────────────────────────────────────────
 
+  // Tests supply their own registry reader and remover; production reads and edits the real registry.
+  const readProjects = () => (options.loadProjects ?? loadProjects)(WORKSPACE);
   let REPO_META = options.projects ?? {};
   // `setu init` from the CLI registers projects without telling a running
   // portal; reload on a miss instead of serving a stale registry.
   const repoMeta = (repo) => {
     if (!(REPO_META[repo] || options.projects)) {
-      REPO_META = loadProjects(WORKSPACE);
+      REPO_META = readProjects();
     }
     return REPO_META[repo];
   };
@@ -1640,7 +1643,7 @@ export async function createPortalRuntime(options = {}) {
         identityFs
       ),
     isLinkedWorktree: linkedWorktree,
-    isRegisteredProject: (repo) => Object.hasOwn(loadProjects(WORKSPACE), repo),
+    isRegisteredProject: (repo) => Object.hasOwn(readProjects(), repo),
     readRecords: readAdoptionRecords,
     registeredPort: (repo, name) => getPort(WORKSPACE, repo, name),
     validateTarget: (repo, name) =>
@@ -1925,7 +1928,7 @@ export async function createPortalRuntime(options = {}) {
           return;
         }
         if (kind === 'setup') {
-          if (!loadProjects(WORKSPACE)[target.repo]) {
+          if (!readProjects()[target.repo]) {
             throw new Error('Project is not registered');
           }
           return;
@@ -3354,7 +3357,7 @@ export async function createPortalRuntime(options = {}) {
       projectSetupTarget(name),
       'project-setup',
       async () => {
-        if (loadProjects(WORKSPACE)[name]) {
+        if (readProjects()[name]) {
           return { error: `${name} is already registered`, ok: false };
         }
 
@@ -3389,7 +3392,7 @@ export async function createPortalRuntime(options = {}) {
           name,
           slug,
         });
-        REPO_META = loadProjects(WORKSPACE);
+        REPO_META = readProjects();
 
         return { base, label: label_, name, ok: true, slug: slug || null };
       }
@@ -3631,26 +3634,58 @@ export async function createPortalRuntime(options = {}) {
     state: b205State,
   });
   let setupRecovery = { ok: true };
+  // The Links runtime reads sessions through the managed-agent service and hands that service its
+  // delivery operations and its lifecycle publisher. Those are internal to the authenticated prompt hook and
+  // the managed session authority: they are kept out of the route composition below and have no route, tool
+  // or command.
+  const {
+    delivery: linksDelivery,
+    lifecycle: linksLifecycle,
+    linksPresence,
+    linksWithdrawSharing,
+    ...links
+  } = createLinksRuntime({
+    enginePath: options.linksEngine,
+    // The registry itself, read fresh: the cached metadata would still hold a project that was just removed.
+    isProject: (repo) =>
+      Object.hasOwn(options.projects ?? readProjects(), repo),
+    resolveTarget: ({ repo, name }) =>
+      (options.linksTarget ?? b205Target)(repo, name),
+    root: options.linksRoot,
+    sessions: { list: () => managedAgents.listSessions({}) },
+    timers: runtimeTimers,
+  });
+  // Live execution is off unless the configuration turns it on; it then shares
+  // this portal's admission, setup records and registered-target resolution.
+  const spansExecution = createSpansExecutionRuntime({
+    admission: portalB205.admission,
+    config: _cfg,
+    injected: options.spansExecution,
+    resolveTarget: async ({ name, repo }) => {
+      const target = await b205Target(repo, name);
+      return target?.checkoutIdentity?.known
+        ? { repoDir: target.repoDir, wtDir: target.wtDir }
+        : null;
+    },
+    root: options.spansRoot,
+    setupProgress,
+  });
   const managedAgents =
     options.managedAgents ??
     createManagedAgentServices({
       admission: portalB205.admission,
       ingressUrl: `http://127.0.0.1:${PORT}/api/attention/hook`,
+      lifecycle: linksLifecycle,
+      links: linksDelivery,
       operationEvents: portalB205.events,
       resolveTarget: async ({ repo, name }) => b205Target(repo, name),
       runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
       state: b205State,
     });
   const spans = createSpansRuntime({ root: options.spansRoot });
-  const links = createLinksRuntime({
-    enginePath: options.linksEngine,
-    resolveTarget: ({ repo, name }) =>
-      (options.linksTarget ?? b205Target)(repo, name),
-    root: options.linksRoot,
-    sessions: { list: () => managedAgents.listSessions({}) },
-  });
   const portalB205Composition = Object.freeze({
     ...spans,
+    ...spansExecution.services,
     ...links,
     ...portalB205,
     agentSessions: (input) => managedAgents.listSessions(input),
@@ -3663,6 +3698,7 @@ export async function createPortalRuntime(options = {}) {
     headlessResume: (input) => managedAgents.resumeRun(input),
     headlessRuns: (input) => managedAgents.listRuns(input),
     headlessStart: (input) => managedAgents.startRun(input),
+    resumeAgentSession: (input) => managedAgents.resume(input),
   });
 
   async function retrySetupProgress(body, source = 'portal') {
@@ -3861,7 +3897,7 @@ export async function createPortalRuntime(options = {}) {
 
   // Shared by /api/projects and mcp-server.js's list_projects tool.
   function listProjectsSummary() {
-    return Object.entries(loadProjects(WORKSPACE)).map(([name, m]) => ({
+    return Object.entries(readProjects()).map(([name, m]) => ({
       github: m.github,
       label: m.label,
       name,
@@ -3884,9 +3920,22 @@ export async function createPortalRuntime(options = {}) {
 
     if (method === 'POST' && pathname === '/api/project/remove') {
       const body = await req.json().catch(() => ({}));
-      return jsonTry(async () =>
-        persistedAction(await removeProject(WORKSPACE, body.name))
-      );
+      return jsonTry(async () => {
+        // Removing a project withdraws its sharing first, as part of the removal and with no further prompt.
+        // If the withdrawal is not confirmed the project stays registered, so a removed name never keeps a
+        // grant.
+        const withdrawn = await linksWithdrawSharing(body.name);
+        if (!withdrawn.ok) {
+          return {
+            ...withdrawn,
+            error: `The project was not removed because its sharing could not be withdrawn. ${withdrawn.error}`,
+            ok: false,
+          };
+        }
+        return persistedAction(
+          await (options.removeProject ?? removeProject)(WORKSPACE, body.name)
+        );
+      });
     }
 
     // Sweep: finds plain git clones already on disk that were never brought
@@ -3916,7 +3965,7 @@ export async function createPortalRuntime(options = {}) {
       // Same guard addProject() already uses — a conflicting candidate should
       // never reach here (the UI disables those rows), but importRepo() itself
       // would otherwise silently no-op against the wrong existing project.
-      if (loadProjects(WORKSPACE)[name]) {
+      if (readProjects()[name]) {
         return Response.json({
           error: `${name} is already registered`,
           ok: false,
@@ -3927,7 +3976,7 @@ export async function createPortalRuntime(options = {}) {
           projectSetupTarget(name),
           'project-setup',
           async () => {
-            if (loadProjects(WORKSPACE)[name]) {
+            if (readProjects()[name]) {
               return { error: `${name} is already registered`, ok: false };
             }
             await importRepo(
@@ -3935,7 +3984,7 @@ export async function createPortalRuntime(options = {}) {
               { label, name, remoteUrl },
               { readStorage: readHostHealth }
             );
-            REPO_META = loadProjects(WORKSPACE);
+            REPO_META = readProjects();
             return { ok: true };
           }
         )
@@ -5731,10 +5780,13 @@ export async function createPortalRuntime(options = {}) {
     await (options.seedSidecarApprovals ?? seedSidecarApprovalsIfMissing)(
       WORKSPACE
     );
-    REPO_META = options.projects ?? loadProjects(WORKSPACE);
+    REPO_META = options.projects ?? readProjects();
     setupRecovery = await setupProgress.recover();
     await managedAgents.recover().catch(() => {
       // Keep portal recovery access available if managed-agent reconciliation fails.
+    });
+    await spansExecution.recover().catch(() => {
+      // Held work stays held; the portal still starts.
     });
     updateControl = createPortalUpdateControl({
       hasSupportingWork: supportingWorkActive,
@@ -5843,6 +5895,7 @@ export async function createPortalRuntime(options = {}) {
       });
       installMcpTools();
       startTimers();
+      linksPresence.start();
       processHooks.set('unhandledRejection', (error) =>
         console.error('Unhandled promise rejection:', error)
       );
@@ -5893,6 +5946,8 @@ export async function createPortalRuntime(options = {}) {
     server = null;
     try {
       spans.close();
+      await spansExecution.close();
+      await linksPresence.dispose();
       await managedAgents.dispose();
     } finally {
       await boundServer?.stop(true);

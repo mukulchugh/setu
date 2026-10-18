@@ -64,6 +64,15 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
     match op.as_str() {
         "send" => {
             let request = mailbox::parse_send(args)?;
+            // A principal other than the local user needs a readable policy that admits its project. A
+            // refusal is decided on a read (with no store there is no policy), so it creates, migrates and
+            // writes nothing; the write checks again inside its own transaction.
+            if request.needs_policy() {
+                match reader(data_dir)? {
+                    Some(store) => mailbox::admit(&store.db, store.version, request.project())?,
+                    None => return Err(sharing::not_shared(request.project())),
+                }
+            }
             mailbox::send(&mut Store::open_or_create(data_dir)?, request)
         }
         "claim" => {
@@ -98,16 +107,32 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             }
             mailbox::reconcile(&mut Store::open_or_create(data_dir)?, current)
         }
+        "resume" => {
+            let request = mailbox::parse_resume(args)?;
+            // With no store there is no mail to move, and a resume must not be what creates one.
+            if reader(data_dir)?.is_none() {
+                return Ok(json!({ "moved": [], "released": [] }));
+            }
+            mailbox::resume(&mut Store::open_or_create(data_dir)?, request)
+        }
         "cancel" => {
             let request = mailbox::parse_cancel(args)?;
             mailbox::cancel(&mut Store::open_or_create(data_dir)?, request)
         }
         "binding_publish" => {
             let request = binding::parse_publish(args)?;
+            // The managed authority's lifecycle publication creates no mailbox: with none yet there is nothing to
+            // publish into, and it says so rather than pretend.
+            if request.existing_store_only() && reader(data_dir)?.is_none() {
+                return Ok(json!({ "stored": false, "valid_until": 0, "held": [], "released": [] }));
+            }
             binding::publish(&mut Store::open_or_create(data_dir)?, request)
         }
         "binding_invalidate" => {
             let request = binding::parse_invalidate(args)?;
+            if request.existing_store_only() && reader(data_dir)?.is_none() {
+                return Ok(json!({ "stored": false, "held": [] }));
+            }
             // A fence is state of its own, so an invalidation creates the store if need be.
             binding::invalidate(&mut Store::open_or_create(data_dir)?, request)
         }
@@ -144,15 +169,29 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             args.finish()?;
             Ok(daemon::status(data_dir))
         }
-        // #11-owned operations, wired provisionally so the transport can be tested against a real policy.
         "share_enable" => {
             let request = sharing::parse_enable(args)?;
             sharing::enable(&mut Store::open_or_create(data_dir)?, request)
         }
         "share_disable" => {
             let project = sharing::parse_disable(args)?;
+            // With no policy to withdraw there is nothing to change, and a withdrawal must not be what
+            // creates or migrates a store.
+            match reader(data_dir)? {
+                Some(store) if sharing::has_row(&store, &project)? => {}
+                _ => return Ok(json!({ "project": project, "removed": false, "held": [] })),
+            }
             sharing::disable(&mut Store::open_or_create(data_dir)?, project)
         }
+        "presence_publish" => {
+            let request = sharing::parse_publish(args)?;
+            // Presence exists only for a shared project, so with no store there is nothing to publish into.
+            if reader(data_dir)?.is_none() {
+                return Err(sharing::not_shared(request.project()));
+            }
+            sharing::publish(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "directory" => sharing::directory(reader(data_dir)?.as_ref(), args),
         "share_status" => sharing::status(reader(data_dir)?.as_ref(), args),
         "sweep" => mailbox::sweep(&mut Store::open_or_create(data_dir)?, args),
         "status" => mailbox::status(reader(data_dir)?.as_ref(), args),
