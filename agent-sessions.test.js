@@ -4,7 +4,15 @@ import fs, { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAgentSessions } from './agent-sessions.js';
-import { observeProcessIdentity } from './process-observation.js';
+import {
+  observeProcessGroup,
+  observeProcessIdentity,
+} from './process-observation.js';
+import {
+  findEscapedDescendants,
+  findProcessChildren,
+  proveProcessGroupOwnership,
+} from './process-tree.js';
 import { createWorkspaceState } from './workspace-state.js';
 
 const roots = [];
@@ -27,7 +35,21 @@ afterEach(() => {
   }
 });
 
-function fixture({ children, identities } = {}) {
+// A fake process world with honest group semantics: a group is alive while any
+// of its member pids still has an identity. By default a group is its leader.
+function groupCollaborators({ escaped = [], identities, members = new Map() }) {
+  const alive = (groupId) =>
+    (members.get(groupId) ?? [groupId]).some((pid) => identities?.has(pid));
+  return {
+    findEscaped: async ({ groupId }) =>
+      alive(groupId) ? { escaped, state: 'owned' } : { state: 'unknown' },
+    observeGroup: (groupId) => (alive(groupId) ? 'alive' : 'absent'),
+    proveGroup: async ({ groupId }) =>
+      alive(groupId) ? { escaped, state: 'owned' } : { state: 'unknown' },
+  };
+}
+
+function fixture({ children, identities, escaped, members } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'setu-agent-sessions-'));
   roots.push(root);
   const state = createWorkspaceState({
@@ -37,6 +59,7 @@ function fixture({ children, identities } = {}) {
   });
   const signals = [];
   const sessions = createAgentSessions({
+    ...groupCollaborators({ escaped, identities, members }),
     findChildren: async () => children ?? { children: [], state: 'owned' },
     now: () => '2026-10-05T12:00:00.000Z',
     observeProcess: async (pid) => identities?.get(pid) ?? { state: 'absent' },
@@ -204,8 +227,12 @@ test('ending signals only the owned child tree and root, leaving sibling session
     identities,
   });
   f.sessions = createAgentSessions({
+    ...groupCollaborators({
+      identities,
+      members: new Map([[321, [321, 322]]]),
+    }),
     findChildren: async () => ({
-      children: [{ pid: 322, processStart: childStart }],
+      children: [{ groupId: 321, pid: 322, processStart: childStart }],
       state: 'owned',
     }),
     now: () => '2026-10-05T12:00:00.000Z',
@@ -318,16 +345,23 @@ test('reconcile leaves a root-ended session unknown when a proven descendant sur
 });
 
 test('an owned harmless coding child can be ended without touching a sibling process', async () => {
-  const coding = spawn('sleep', ['5']);
+  // A group leader of its own, as the launcher's job control makes it; the
+  // sibling shares this test's group and is never signalled.
+  const coding = spawn('sleep', ['5'], { detached: true });
   const sibling = spawn('sleep', ['5']);
   processes.push(coding, sibling);
   const observed = await observeProcessIdentity(coding.pid);
   expect(observed).toMatchObject({ processId: coding.pid, state: 'alive' });
   const f = fixture();
   const sessions = createAgentSessions({
-    findChildren: async () => ({ children: [], state: 'owned' }),
+    findChildren: ({ pid, processStart }) =>
+      findProcessChildren(pid, { processStart }),
+    findEscaped: ({ groupId, pid, processStart }) =>
+      findEscapedDescendants(pid, { groupId, processStart }),
     now: () => '2026-10-05T12:00:00.000Z',
+    observeGroup: observeProcessGroup,
     observeProcess: observeProcessIdentity,
+    proveGroup: proveProcessGroupOwnership,
     signal: (pid, value) => process.kill(pid, value),
     state: f.state,
   });
@@ -336,13 +370,20 @@ test('an owned harmless coding child can be ended without touching a sibling pro
     pid: coding.pid,
     processStart: observed.processStartIdentity,
   });
+  expect(sessions.get('session-1').executionGroup).toMatchObject({
+    escaped: [],
+    id: coding.pid,
+  });
   const exited = new Promise((resolve) => coding.once('exit', resolve));
   await expect(
     sessions.end('session-1', { checkoutIdentity })
   ).resolves.toMatchObject({ ok: true });
   await exited;
   await sessions.reconcile();
-  expect(sessions.get('session-1')).toMatchObject({ state: 'ended' });
+  expect(sessions.get('session-1')).toMatchObject({
+    endReason: 'ended-by-user',
+    state: 'ended',
+  });
   expect((await observeProcessIdentity(sibling.pid)).state).toBe('alive');
 });
 

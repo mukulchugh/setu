@@ -89,17 +89,70 @@ function snapshotDescendants(rows, rootPid) {
   return descendants;
 }
 
-function hasParentRelation(rows, pid, parentPid) {
-  const current = snapshotDescendants(rows, parentPid);
-  return current?.some((row) => row.pid === pid && row.parentPid === parentPid);
+// The group a row reports, when it reports one. Fixtures and callers that
+// only care about parentage may omit it.
+const groupOf = (row) => (positiveInteger(row?.groupId) ? row.groupId : null);
+
+function hasParentRelation(rows, candidate) {
+  const current = snapshotDescendants(rows, candidate.parentPid);
+  return current?.some(
+    (row) =>
+      row.pid === candidate.pid &&
+      row.parentPid === candidate.parentPid &&
+      groupOf(row) === groupOf(candidate)
+  );
 }
 
-export async function findProcessChildren(
+// The root still reports the group a caller asked about; no group, no demand.
+const rootInGroup = (rows, pid, groupId) =>
+  groupId === undefined ||
+  (Array.isArray(rows) &&
+    groupOf(rows.find((row) => row?.pid === pid)) === groupId);
+
+// One candidate, certified by its own identity and a fresh parent (and group)
+// relation. `null` means unknown; `'gone'` a candidate already proven absent,
+// which cannot make other children unsafe.
+async function certifyCandidate(candidate, { listProcesses, observeProcess }) {
+  let child, currentRows;
+  try {
+    child = await observeProcess(candidate.pid);
+    // The process-table command itself is commonly a short-lived direct child
+    // of the caller. Its already-proven absence cannot make other children
+    // unsafe, but an uncertain or live PID still needs a current parent proof.
+    if (child?.state === 'absent') {
+      return 'gone';
+    }
+    if (!matches(child, candidate.pid)) {
+      return null;
+    }
+    currentRows = await listProcesses();
+  } catch {
+    return null;
+  }
+  return hasParentRelation(currentRows, candidate)
+    ? {
+        ...(groupOf(candidate) ? { groupId: candidate.groupId } : {}),
+        pid: candidate.pid,
+        processStart: child.processStartIdentity,
+      }
+    : null;
+}
+
+// Certifies the live descendants of `pid`, each by its own process identity and
+// current parent (and group) relation. `include` narrows which candidates are
+// certified; a skipped candidate is simply not reported. `rootGroupId`, when
+// given, also requires the root itself to still be in that group. `limit`
+// stops certifying once that many have been certified, for callers that treat
+// anything beyond it as one overflow and gain nothing from more.
+async function certifyDescendants(
   pid,
   {
+    include = () => true,
+    limit = Number.POSITIVE_INFINITY,
     listProcesses = () => readProcessTable(),
     observeProcess = observeProcessIdentity,
     processStart,
+    rootGroupId,
   } = {}
 ) {
   if (!positiveInteger(pid)) {
@@ -119,44 +172,38 @@ export async function findProcessChildren(
   if (!(Array.isArray(rows) && rows.some((row) => row?.pid === pid))) {
     return { state: 'unknown' };
   }
+  if (!rootInGroup(rows, pid, rootGroupId)) {
+    return { state: 'unknown' };
+  }
   const candidates = snapshotDescendants(rows, pid);
   if (!candidates) {
     return { state: 'unknown' };
   }
   const descendants = [];
-  for (const candidate of candidates) {
-    let child;
-    try {
-      // biome-ignore lint/performance/noAwaitInLoops: Each current process identity and parent proof must be established before returning any owned child.
-      child = await observeProcess(candidate.pid);
-    } catch {
-      return { state: 'unknown' };
+  for (const candidate of candidates.filter(include)) {
+    if (descendants.length >= limit) {
+      break;
     }
-    // The process-table command itself is commonly a short-lived direct child
-    // of the caller. Its already-proven absence cannot make other children
-    // unsafe, but an uncertain or live PID still needs a current parent proof.
-    if (child?.state === 'absent') {
-      continue;
-    }
-    if (!matches(child, candidate.pid)) {
-      return { state: 'unknown' };
-    }
-    let currentRows;
-    try {
-      currentRows = await listProcesses();
-    } catch {
-      return { state: 'unknown' };
-    }
-    if (!hasParentRelation(currentRows, candidate.pid, candidate.parentPid)) {
-      return { state: 'unknown' };
-    }
-    descendants.push({
-      pid: candidate.pid,
-      processStart: child.processStartIdentity,
+    // biome-ignore lint/performance/noAwaitInLoops: Each current process identity and parent proof must be established before returning any owned child.
+    const child = await certifyCandidate(candidate, {
+      listProcesses,
+      observeProcess,
     });
+    if (!child) {
+      return { state: 'unknown' };
+    }
+    if (child !== 'gone') {
+      descendants.push(child);
+    }
   }
   try {
     root = await observeProcess(pid);
+    if (
+      rootGroupId !== undefined &&
+      !rootInGroup(await listProcesses(), pid, rootGroupId)
+    ) {
+      return { state: 'unknown' };
+    }
   } catch {
     return { state: 'unknown' };
   }
@@ -164,6 +211,46 @@ export async function findProcessChildren(
     return { state: 'unknown' };
   }
   return { children: descendants, state: 'owned' };
+}
+
+// The whole tree, never truncated: stopping a session signals every one of these.
+export function findProcessChildren(
+  pid,
+  { listProcesses, observeProcess, processStart } = {}
+) {
+  return certifyDescendants(pid, {
+    listProcesses,
+    observeProcess,
+    processStart,
+  });
+}
+
+// The live descendants of a group-leading root that are no longer in its
+// group: the ones a group-wide check cannot see. The group is a cooperative
+// lifecycle boundary, not a sandbox, so only descendants observed here (while
+// the root identity is live) can ever be accounted for after the root exits.
+// An optional \`limit\` bounds how many are certified.
+export async function findEscapedDescendants(
+  pid,
+  { groupId, ...options } = {}
+) {
+  if (!positiveInteger(groupId)) {
+    return { state: 'unknown' };
+  }
+  const tree = await certifyDescendants(pid, {
+    ...options,
+    include: (row) => groupOf(row) !== groupId,
+    rootGroupId: groupId,
+  });
+  return tree.state === 'owned'
+    ? {
+        escaped: tree.children.map(({ pid: childPid, processStart }) => ({
+          pid: childPid,
+          processStart,
+        })),
+        state: 'owned',
+      }
+    : { state: 'unknown' };
 }
 
 export async function proveProcessGroupOwnership(
@@ -209,6 +296,13 @@ export async function proveProcessGroupOwnership(
     return { state: 'unknown' };
   }
   return {
+    // Descendants already outside the group when it is proven.
+    escaped: tree.children
+      .filter((child) => child.groupId !== groupId)
+      .map(({ pid: childPid, processStart: childStart }) => ({
+        pid: childPid,
+        processStart: childStart,
+      })),
     members: [...new Set(members)].sort((a, b) => a - b),
     state: 'owned',
   };

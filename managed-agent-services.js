@@ -16,6 +16,7 @@ import {
   createAgentSessions,
   identityDigest,
   launchProofDigest,
+  maxEscapedDescendants,
   maxReplacedHistory,
   publicSessionResult,
   publicSession as safeSession,
@@ -29,8 +30,15 @@ import {
   createGhosttyTerminalAdapter,
   parseGhosttyLaunchResponse,
 } from './native-terminal.js';
-import { observeProcessIdentity } from './process-observation.js';
-import { findProcessChildren } from './process-tree.js';
+import {
+  observeProcessGroup,
+  observeProcessIdentity,
+} from './process-observation.js';
+import {
+  findEscapedDescendants,
+  findProcessChildren,
+  proveProcessGroupOwnership,
+} from './process-tree.js';
 import { createReviewHandoff } from './review-handoff.js';
 import {
   createTerminalAttention,
@@ -237,6 +245,20 @@ export function createManagedAgentServices({
   observeProcess = observeProcessIdentity,
   findChildren = ({ pid, processStart }) =>
     findProcessChildren(pid, { observeProcess, processStart }),
+  // Execution-group evidence for a managed process: the group is proven once
+  // while the root is live, escaped descendants are re-observed while it stays
+  // live, and a dead root is ended only when all of it is gone. Cooperative
+  // lifecycle accounting, not containment.
+  proveGroup = (input) => proveProcessGroupOwnership(input, { observeProcess }),
+  // One more than a session can retain: past that it is overflow either way.
+  findEscaped = ({ pid, groupId, processStart }) =>
+    findEscapedDescendants(pid, {
+      groupId,
+      limit: maxEscapedDescendants + 1,
+      observeProcess,
+      processStart,
+    }),
+  observeGroup = (groupId) => observeProcessGroup(groupId),
   signal = (pid, value) => process.kill(pid, value),
   now = () => Date.now(),
   id = () => crypto.randomUUID(),
@@ -268,10 +290,13 @@ export function createManagedAgentServices({
   }
   const sessions = createAgentSessions({
     findChildren,
+    findEscaped,
     now,
     observeCheckout: async ({ repo, name }) =>
       (await target({ name, repo }))?.checkoutIdentity,
+    observeGroup,
     observeProcess,
+    proveGroup,
     signal,
     state,
   });

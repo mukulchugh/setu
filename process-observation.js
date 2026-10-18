@@ -53,3 +53,23 @@ export async function observeProcessIdentity(
     return { state: presence() === 'absent' ? 'absent' : 'unknown' };
   }
 }
+
+// A group-wide signal-0 check. `absent` (ESRCH) means no process currently has
+// this group id; it says nothing about processes that left the group, and a
+// recycled group number can only make it read `alive`, never `absent`. Like
+// the identity observer it never terminates anything.
+export function observeProcessGroup(
+  groupId,
+  { signal = (pid, value) => process.kill(pid, value) } = {}
+) {
+  if (!Number.isSafeInteger(groupId) || groupId <= 0) {
+    return 'unknown';
+  }
+  try {
+    signal(-groupId, 0);
+    return 'alive';
+  } catch (error) {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: An injected signal collaborator may throw null, undefined or any non-Error value.
+    return error?.code === 'ESRCH' ? 'absent' : 'unknown';
+  }
+}

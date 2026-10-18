@@ -89,6 +89,8 @@ async function fixture(names = ['topic']) {
         /* no monitor in this fixture */
       },
       findChildren: () => Promise.resolve({ children: [], state: 'owned' }),
+      // Each fake process leads its own group for as long as it is alive.
+      findEscaped: () => Promise.resolve({ escaped: [], state: 'owned' }),
       id: () => nextLaunch.id,
       ingressUrl,
       launchNative: async (command) => {
@@ -100,6 +102,7 @@ async function fixture(names = ['topic']) {
         return { availability: 'available', stdout: `SETU:LAUNCHED:${uuid}` };
       },
       now: () => clock,
+      observeGroup: (groupId) => (alive.has(groupId) ? 'alive' : 'absent'),
       observeProcess: (pid) =>
         Promise.resolve(
           alive.has(pid)
@@ -113,6 +116,12 @@ async function fixture(names = ['topic']) {
             : { state: 'absent' }
         ),
       operationEvents: createOperationEvents({ now: () => 1, state }),
+      proveGroup: ({ pid }) =>
+        Promise.resolve(
+          alive.has(pid)
+            ? { escaped: [], state: 'owned' }
+            : { state: 'unknown' }
+        ),
       registrationAttempts: 1,
       resolveTarget: async ({ repo, name }) => {
         const checkout = checkouts[name];
