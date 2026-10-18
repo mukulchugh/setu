@@ -67,7 +67,7 @@ if [[ -t 0 ]] && setopt monitor 2>/dev/null; then
 fi
 ${command} <&0 &
 agent_pid=$!
-agent_start="$(LC_ALL=C ps -p "$agent_pid" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g')"
+agent_start="$(LC_ALL=C ps -p "$agent_pid" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]][[:space:]]*/ /g')"
 if [ -n "$agent_start" ]; then
   registration_tmp=${registration}.$$
   token_suffix=''
