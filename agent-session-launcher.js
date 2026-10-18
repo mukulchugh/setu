@@ -43,6 +43,10 @@ export function buildAgentSessionLaunch({
   }
   const id = JSON.stringify(sessionId);
   const registration = shellQuote(registrationPath);
+  const tokenExport =
+    launchToken === undefined
+      ? ''
+      : `export SETU_SESSION_TOKEN=${shellQuote(launchToken)}\n`;
   return {
     args: [
       'open',
@@ -56,7 +60,7 @@ export function buildAgentSessionLaunch({
     script: `#!/bin/zsh -i
 source "$HOME/.zshrc"
 unset ${API_KEY_VARS.join(' ')}
-cd -- ${shellQuote(checkoutPath)} || exit
+${tokenExport}cd -- ${shellQuote(checkoutPath)} || exit
 foreground_job=0
 if [[ -t 0 ]] && setopt monitor 2>/dev/null; then
   foreground_job=1

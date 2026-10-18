@@ -253,6 +253,11 @@ test('composes a token-bound Ghostty launch, trusted Claude hook and exact exist
     .readdirSync(f.root)
     .find((name) => name.startsWith('setu-agent-session-1-'));
   const hook = fs.readFileSync(join(f.root, runtime, 'claude-hook.js'), 'utf8');
+  const launcher = fs.readFileSync(join(f.root, runtime, 'launch.zsh'), 'utf8');
+  expect(launcher.startsWith('#!/bin/zsh -i\n')).toBe(true);
+  expect(launcher).toContain(
+    "export SETU_SESSION_TOKEN='token_1234567890123456'"
+  );
   expect(hook).toContain('AbortSignal.timeout(1000)');
   expect(
     permissionMode(fs.statSync(join(f.root, runtime, 'launch.zsh')).mode)

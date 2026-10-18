@@ -1043,11 +1043,7 @@ export function createManagedAgentServices({
           }
           // `open -na` has no documented per-launch environment option. Keep the
           // token only in this 0700 launcher so its registration can still be bound.
-          await files.write(
-            files.launcherPath,
-            `export SETU_SESSION_TOKEN=${shellQuote(launchToken)}\n${launch.script}`,
-            0o700
-          );
+          await files.write(files.launcherPath, launch.script, 0o700);
           await files.write(files.registrationPath, '', 0o600);
         } catch {
           return prelaunchFailure({
