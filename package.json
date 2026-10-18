@@ -107,6 +107,7 @@
     "spans-search.js",
     "spans-search-text.js",
     "spans-planning-runtime.js",
+    "links-attention.js",
     "links-client.js",
     "links-naming-check.js",
     "links-engine.js",

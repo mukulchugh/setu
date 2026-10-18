@@ -60,12 +60,19 @@ test('attention replies are believed only in their exact shapes', async () => {
   }
 });
 
-test('a lost attention mutation is unknown and reads are unavailable', async () => {
+test('a lost attention mutation is unknown and says how to settle it; reads are only unavailable', async () => {
   const { root, cleanup } = temporaryLinksRoot();
   cleanups.push(cleanup);
-  const client = createLinksClient({ dataDir: join(root, 'links'), enginePath: join(root, 'absent') });
-  expect((await client.call('attention_send', {})).code).toBe('LINKS_OUTCOME_UNKNOWN');
-  expect((await client.call('share_attention', {})).code).toBe('LINKS_OUTCOME_UNKNOWN');
+  const client = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: join(root, 'absent'),
+  });
+  const sent = await client.call('attention_send', {});
+  expect(sent.code).toBe('LINKS_OUTCOME_UNKNOWN');
+  expect(sent.error).toContain('same idempotency key');
+  const opt = await client.call('share_attention', {});
+  expect(opt.code).toBe('LINKS_OUTCOME_UNKNOWN');
+  expect(opt.error).toContain('sharing status');
   for (const op of ['attention_list', 'attention_show', 'wake']) {
     // biome-ignore lint/performance/noAwaitInLoops: One missing engine serves every operation.
     expect((await client.call(op, {})).code).toBe('LINKS_ENGINE_UNAVAILABLE');
@@ -85,6 +92,71 @@ function realClient(options = {}) {
     dataDir,
   };
 }
+
+test('attention and a wake refusal travel through the real engine under their own stable codes', async () => {
+  const { client } = realClient();
+  expect(
+    await client.call('share_enable', { owner: 'Mukul', project: 'repo' })
+  ).toMatchObject({ ok: true });
+  const request = {
+    body: 'look',
+    idempotency_key: 'a1',
+    project: 'repo',
+    recipient,
+    sender: { id: 'sender-session', kind: 'session' },
+  };
+  expect(await client.call('attention_send', request)).toMatchObject({
+    code: 'LINKS_ATTENTION_NOT_ENABLED',
+    ok: false,
+  });
+  // Enabling names the scope that was reviewed.
+  expect(
+    await client.call('share_attention', { enabled: true, project: 'repo' })
+  ).toMatchObject({ code: 'LINKS_REQUEST_INVALID', ok: false });
+  const status = await client.call('share_status', { project: 'repo' });
+  const { scope } = status.result.projects[0].policy;
+  expect(
+    await client.call('share_attention', {
+      enabled: true,
+      project: 'repo',
+      scope: 'ps_00000000000000000000000000000000',
+    })
+  ).toMatchObject({ code: 'LINKS_SCOPE_CHANGED', ok: false });
+  expect(
+    await client.call('share_attention', {
+      enabled: true,
+      project: 'repo',
+      scope,
+    })
+  ).toMatchObject({ ok: true, result: { changed: true } });
+  const sent = await client.call('attention_send', request);
+  expect(sent).toMatchObject({ ok: true, result: { replayed: false } });
+  const listed = await client.call('attention_list', {});
+  expect(listed.result.items).toHaveLength(1);
+  expect(listed.result.notifications.groups[0].count).toBe(1);
+  expect(
+    await client.call('attention_show', {
+      attention_id: sent.result.attention_id,
+    })
+  ).toMatchObject({ ok: true, result: { body: 'look' } });
+
+  expect(
+    await client.call('wake', {
+      message_id: 'm_1',
+      principal: { id: 'sender-session', kind: 'session' },
+    })
+  ).toMatchObject({ code: 'LINKS_WAKE_NOT_AUTHORIZED', ok: false });
+  expect(
+    await client.call('wake', {
+      message_id: 'm_1',
+      principal: { kind: 'user' },
+    })
+  ).toMatchObject({
+    code: 'LINKS_WAKE_UNAVAILABLE',
+    details: { reason: 'no-verified-mechanism' },
+    ok: false,
+  });
+});
 
 test('a send reaches the real engine and its status can be read back', async () => {
   const { client } = realClient();
