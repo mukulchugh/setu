@@ -238,6 +238,16 @@ export function createTerminalAttention({
     return null;
   };
 
+  // Only an event this module has just authenticated counts as the session's activity. It is bookkeeping:
+  // the attention event is recorded whether or not this succeeds.
+  async function noteActivity(id, at) {
+    try {
+      await sessions.recordHookActivity?.({ at, id });
+    } catch {
+      // The next authenticated event records it again.
+    }
+  }
+
   async function receive({ provider, payload, launchToken }) {
     const at = clock();
     const source = canonicalProvider(provider);
@@ -291,6 +301,9 @@ export function createTerminalAttention({
           state: normalized.kind,
         }
       : unknownAttention(source, at);
+    if (verified) {
+      await noteActivity(mapping.sessionId, at);
+    }
     await state.update('attention', (document) => {
       const current = attentionEvents(document);
       if (!current.ok) {

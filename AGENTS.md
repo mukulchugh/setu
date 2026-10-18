@@ -587,6 +587,10 @@ carry JSON must contain JSON.
 | `links show <message>`, `links status <message>` | none | Read one message with its body, or its state and attempt count without the body. |
 | `links cancel <message>` | none | Retract a message that has not been handed off. |
 | `links ack <repo> <branch>` | `--session <id> --message <message>` | The addressed conversation's user acknowledges a handed-off message. |
+| `links share enable <repo>` | `--owner <label> --confirmation <token>` | Share one project. The first call changes nothing and returns the exact public fields (owner, task, reachability, freshness, session ID) with a token; only the user passes that token back. Needs the running portal. |
+| `links share disable <repo>` | none | Withdraw sharing: the project leaves the directory and other principals are refused. |
+| `links share status [<repo>]` | none | The sharing policy of one project, or of every project that has one. |
+| `links directory [<repo>]` | none | Managed sessions of shared projects with owner, task, reachability and freshness. |
 | `links redeliver <repo> <branch>` | `--session <id> --message <message> --attempt <attempt>` | Accept a possible duplicate for a `handoff-unknown` message; the next claim is a new, counted attempt. |
 | `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
 | `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
@@ -671,9 +675,13 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
 | `POST` | `/api/links/ack` | T plus `sessionId`,`messageId`; the addressed conversation's user acknowledges a handed-off message. Not task completion. | H C |
 | `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
+| `GET` | `/api/links/directory` | `repo?`; entries `{project,sessionId,owner,task,taskAt,taskStale,activityAt,reachability{state,reason},observedAt,stale}` of shared projects' managed sessions, and `problems` for a project whose policy cannot be read. Passive. | H C |
 | `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
 | `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
 | `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
+| `POST` | `/api/links/share/disable` | `repo`; removes the policy and presence, holds mail from other principals. | H C |
+| `POST` | `/api/links/share/enable` | `repo`,`owner?`,`confirmation?`; without the reviewed token it returns `LINKS_CONFIRMATION_REQUIRED` and the field list, and changes nothing. | H C |
+| `GET` | `/api/links/share/status` | `repo?`; policy state `enabled`, `disabled` or `invalid` (with recovery). Passive. | H C |
 | `POST` | `/api/links/send` | T plus `sessionId`,`idempotencyKey`,`body`,`replyTo?`; refused unless the session is running with a verified native conversation. | H C |
 | `GET` | `/api/links/status` | `messageId`; delivery state, reason and attempt count, without the body. `observed` and `storedState` as for inbox. | H C |
 | `GET` | `/api/logs` | T query plus `type?`,`n?`; bounded log tail. | H W C M |
@@ -699,7 +707,7 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/pr/create` | T; push/open GitHub PR. External action. | H W C M |
 | `POST` | `/api/pr/ready` | T plus `ready`; toggle existing PR draft state. | H W C M |
 | `POST` | `/api/project/add` | `github`,`name?`,`label?`; register a project. | H W |
-| `POST` | `/api/project/remove` | `name`; remove a project registration only. | H W |
+| `POST` | `/api/project/remove` | `name`; remove a project registration only, after withdrawing its Links sharing (refused with `LINKS_OUTCOME_UNKNOWN` if the withdrawal is not confirmed). | H W |
 | `GET` | `/api/projects` | List registered projects. | H W M R |
 | `GET` | `/api/resource-admission` | Read admission leases/limits. | H W C M |
 | `GET` | `/api/raycast/log` | Read Raycast bridge log. | H W R |
@@ -905,6 +913,46 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
 - `claim` and `confirm` have no HTTP route: they belong to the provider hook, which authenticates a session
   first. A message or receipt is not Span completion, writer authority, admission, attention approval or
   spend authorization, and nothing wakes a provider.
+- **Shared projects.** `setu links share enable <repo>` first returns the exact public fields (owner label,
+  task, reachability, freshness, session ID) and what is never shared (transcripts, paths, environment,
+  provider context) with a token; nothing is stored until the user passes that token back. The engine
+  (`sharing_policies`, `presence`; schema 2, migrated by the first write) is the only holder of the policy
+  and the presence. Visibility and receiving are granted; interrupting an agent and raising attention are
+  recorded off. The local user's own mail never needs sharing. Any other principal (a `session` sender,
+  `{kind:'session', id}`; a peer is not yet a sender) is admitted only by a readable policy for the
+  message's project, checked on send and again on claim; an unreadable or unknown-version policy admits
+  nobody for that project (`LINKS_POLICY_INVALID`; recover with `share disable`, then enable again). Mail
+  already stored from a principal the project no longer admits is held (`policy-disabled`) and returns when
+  sharing is enabled again (the new enable is what authorizes it; expiry and the original recipient are
+  unchanged). The policy carries an opaque scope (`ps_…`) for anything outside this machine to bind to; the
+  local project name never leaves it. Changing only the owner label keeps the scope; withdrawing and
+  enabling again mints a new one, so grants made to the old scope stop matching.
+- **A project is a registered Setu project, named by the registry's own rule, and only a printable subset of
+  those names can be shared**: one line of at most 128 bytes with no control character (the registry also allows
+  DEL and the C1 range; such a name is refused at review and has nothing to withdraw, so it can still be
+  removed). Removing a project
+  (`POST /api/project/remove`) withdraws its sharing first, with no extra prompt; if the withdrawal is not
+  confirmed (`LINKS_OUTCOME_UNKNOWN`) the project stays registered. Adding the name again starts unshared and
+  needs a new confirmation. The publisher and the directory skip any project the registry no longer holds,
+  even if a policy row remains (`share status` reports `registered:false`). Worktrees, writer claims and
+  admission are untouched.
+- **Presence and the directory.** A session's presence is its owner label, a short task label, a fixed
+  reachability reason and freshness. The task is the text that session wrote in its worktree's active writer
+  claim, cut to 120 characters with file paths, environment references and recognizable secrets replaced by
+  markers (the Spans redaction finds secrets; `links-labels.js` finds paths and `$VAR`/`NAME=value`
+  references), and dropped when nothing useful is left; the engine applies the same shapes again and stores
+  no task that still carries them, and an owner label that carries one is refused at review. This is a
+  filter on a short label, not a promise about free text in general. Freshness has three honest parts:
+  `observedAt` (the engine's time when the portal last observed the session), `taskAt` (the claim's own
+  heartbeat; `taskStale` after two hours) and `activityAt` (the last authenticated managed-hook event, from
+  the session record's `lastHookAt`; `null` when none has arrived, never inferred from polling or process
+  liveness). An observation older than two minutes stays listed marked `stale` and reads `unknown` rather than
+  reachable; an ended session is published once as `ended` and stays that way (a delayed report cannot make it reachable
+  again; it is reported without reading its checkout or claim); an old writer claim still shows its task, marked
+  `taskStale`. The portal publishes for shared
+  projects when sharing is enabled and every 30 seconds (one interval it starts and disposes, never
+  overlapping), in batches of at most 256 sessions. Reads (`share status`, `directory`) never create a store
+  or write. Enabling and disabling do not touch writer claims or resource admission.
 - Build and test: `bun run engine:build`, `bun run engine:test` (set `SETU_LINKS_CARGO` to the pinned
   toolchain's cargo; a missing toolchain fails the check). `bun run verify` includes the engine tests and
   the naming check. A development engine is found at `engines/links/target/release/setu-links` or

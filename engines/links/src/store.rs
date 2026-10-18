@@ -1,6 +1,6 @@
 //! The one durable mailbox store. Only this process opens the database.
 
-use crate::args::Fail;
+use crate::{args::Fail, util};
 use rusqlite::{Connection, OpenFlags};
 use std::{
     fs,
@@ -8,10 +8,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+/// The first schema that has sharing policy and presence; a store before it reads as having none.
+pub const SHARING_SCHEMA: i64 = 2;
 const DATABASE: &str = "mailbox.sqlite3";
 
-const SCHEMA: &str = "
+const SCHEMA_V1: &str = "
 CREATE TABLE messages (
     id TEXT PRIMARY KEY,
     sender TEXT NOT NULL,
@@ -63,8 +65,35 @@ CREATE TABLE attempt_messages (
 );
 ";
 
+/// Schema 1 to 2: sharing policy and presence live beside the mailbox in the one store. Existing tables and
+/// rows are kept as they are; a message also records the project it was addressed in, so a policy that
+/// later withdraws can hold mail from a principal it no longer admits. Older messages have no project.
+const MIGRATION_1_TO_2: &str = "
+ALTER TABLE messages ADD COLUMN project TEXT;
+CREATE INDEX messages_project ON messages (project);
+CREATE TABLE sharing_policies (
+    project TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    policy TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE presence (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    task TEXT,
+    task_at INTEGER,
+    activity_at INTEGER,
+    reach_state TEXT NOT NULL CHECK (reach_state IN ('reachable', 'unreachable')),
+    reach_reason TEXT,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY (project, session_id)
+);
+";
+
 pub struct Store {
     pub db: Connection,
+    /// The schema version on disk. A store opened for reading may still be at version 1.
+    pub version: i64,
 }
 
 fn unavailable() -> Fail {
@@ -85,7 +114,20 @@ fn private_dir(dir: &Path, create: bool) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Every mutation ends here, so every one can be killed on either side of its commit.
+pub fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
+    util::fault(&format!("{op}:before-commit"));
+    tx.commit()?;
+    util::fault(&format!("{op}:after-commit"));
+    Ok(())
+}
+
 impl Store {
+    /// Whether this store has the sharing tables (schema 1 does not).
+    pub fn has_sharing(&self) -> bool {
+        self.version >= SHARING_SCHEMA
+    }
+
     pub fn path(dir: &Path) -> PathBuf {
         dir.join(DATABASE)
     }
@@ -108,24 +150,28 @@ impl Store {
         }
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
-        // Decided inside one write transaction, so engines started together create the schema once.
+        // Decided inside one write transaction, so engines started together create or migrate the schema once.
         db.execute_batch("BEGIN IMMEDIATE")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let ready = match version {
-            0 => db.execute_batch(&format!("{SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};")).is_ok(),
-            SCHEMA_VERSION => true,
-            _ => false,
+        let steps: &[&str] = match version {
+            0 => &[SCHEMA_V1, MIGRATION_1_TO_2],
+            1 => &[MIGRATION_1_TO_2],
+            SCHEMA_VERSION => &[],
+            _ => {
+                let _ = db.execute_batch("ROLLBACK");
+                return Err(Fail::new("SCHEMA_UNSUPPORTED", "the store was written by a different version"));
+            }
         };
-        if !ready {
+        let migrated = steps.iter().all(|step| db.execute_batch(step).is_ok())
+            && (steps.is_empty() || db.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};")).is_ok());
+        if !migrated {
             let _ = db.execute_batch("ROLLBACK");
-            return Err(if version == 0 || version == SCHEMA_VERSION {
-                unavailable()
-            } else {
-                Fail::new("SCHEMA_UNSUPPORTED", "the store was written by a different version")
-            });
+            return Err(unavailable());
         }
+        util::fault("migrate:before-commit");
         db.execute_batch("COMMIT")?;
-        Ok(Store { db })
+        util::fault("migrate:after-commit");
+        Ok(Store { db, version: SCHEMA_VERSION })
     }
 
     /// Opens an existing store without changing it. A read never creates a store.
@@ -138,9 +184,10 @@ impl Store {
         let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| unavailable())?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
+        // A read never migrates: a version 1 store is read as it is, and has no sharing policy yet.
+        if !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(Fail::new("SCHEMA_UNSUPPORTED", "the store was written by a different version"));
         }
-        Ok(Store { db })
+        Ok(Store { db, version })
     }
 }

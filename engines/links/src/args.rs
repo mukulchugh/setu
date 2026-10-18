@@ -79,6 +79,15 @@ impl Args {
         }
     }
 
+    /// A non-negative integer, or absent.
+    pub fn optional_u64(&mut self, key: &str) -> Result<Option<i64>, Fail> {
+        match self.0.remove(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(number)) => number.as_u64().and_then(|n| i64::try_from(n).ok()).map(Some).ok_or_else(|| invalid(key)),
+            Some(_) => Err(invalid(key)),
+        }
+    }
+
     pub fn optional_object(&mut self, key: &str) -> Result<Option<Args>, Fail> {
         match self.0.get(key) {
             None | Some(Value::Null) => {
@@ -86,6 +95,15 @@ impl Args {
                 Ok(None)
             }
             Some(_) => self.object(key).map(Some),
+        }
+    }
+
+    /// An array of at most `max` items, each returned as a raw value for the caller to validate.
+    pub fn array(&mut self, key: &str, max: usize) -> Result<Vec<Value>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if items.len() <= max => Ok(items),
+            Some(Value::Array(_)) => Err(Fail::new("FIELD_TOO_LARGE", format!("field `{key}` has too many items"))),
+            _ => Err(invalid(key)),
         }
     }
 

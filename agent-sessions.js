@@ -60,6 +60,9 @@ const validString = (value) => typeof value === 'string' && value.length > 0;
 const validPid = (value) => Number.isSafeInteger(value) && value > 0;
 const validTime = (value) =>
   validString(value) || (typeof value === 'number' && Number.isFinite(value));
+// A hook time is a number of milliseconds: finite (validTime) and positive.
+const validHookTime = (value) =>
+  typeof value === 'number' && validTime(value) && value > 0;
 const ghosttyTerminalId =
   /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
 const validTerminal = (value) =>
@@ -98,7 +101,8 @@ function validRecord(value) {
     ownershipStates.has(value.ownership) &&
     validTerminal(value.terminal) &&
     (value.endedAt === undefined || validTime(value.endedAt)) &&
-    (value.endReason === undefined || validString(value.endReason))
+    (value.endReason === undefined || validString(value.endReason)) &&
+    (value.lastHookAt === undefined || validHookTime(value.lastHookAt))
   );
 }
 
@@ -752,6 +756,32 @@ export function createAgentSessions({
         digestMatches(record.launchProofDigest, digest) ? record : found,
       null
     );
+  // The time of the latest authenticated hook event of a running, owned session. Only the hook ingress calls
+  // this, after it has verified the launch capability, provider, checkout and lifecycle; nothing else (not a
+  // poll, not process liveness) is activity. It never moves backwards and is never set for any other session.
+  function recordHookActivity({ id, at }) {
+    return replace((current) => {
+      const index = current.findIndex((candidate) => candidate.id === id);
+      const heard = current[index];
+      if (
+        !(
+          heard &&
+          heard.state === 'running' &&
+          heard.ownership === 'owned' &&
+          validHookTime(at) &&
+          at > (heard.lastHookAt ?? 0)
+        )
+      ) {
+        return resultWithRecords(current, { ok: false });
+      }
+      return updatedSession(
+        current,
+        index,
+        { ...heard, lastHookAt: at },
+        { ok: true }
+      );
+    }).then((outcome) => outcome.result);
+  }
   function bindNativeConversation({
     provider,
     nativeId,
@@ -860,6 +890,7 @@ export function createAgentSessions({
     get,
     list,
     reconcile,
+    recordHookActivity,
     register,
     resolveNativeConversation,
   };

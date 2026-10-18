@@ -17,7 +17,12 @@ async function fixture(options = {}) {
   });
   const config = { tunnel: 'fixture', workspace: root };
   await state.replace('config', config);
-  const portal = await createPortalRuntime({ config, state, ...options });
+  const portal = await createPortalRuntime({
+    config,
+    linksRoot: join(root, 'links'),
+    state,
+    ...options,
+  });
   const server = {
     requestIP: () => ({ address: '127.0.0.1' }),
     timeout: () => undefined,
@@ -334,7 +339,8 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     expect(served).toBe(0);
     await Promise.all([fx.portal.start(), fx.portal.start()]);
     expect([served, migrations, routed]).toEqual([1, 1, 1]);
-    expect(timers.size).toBe(3);
+    // Log retention, memory ceilings, idle timeouts and the Links presence round.
+    expect(timers.size).toBe(4);
     expect(process.listenerCount('SIGTERM')).toBe(before + 1);
     const address = { requestIP: () => ({ address: '127.0.0.1' }) };
     expect(

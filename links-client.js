@@ -15,10 +15,16 @@ const RECOVERY = {
     'Anything it claimed is now handoff-unknown and is not delivered again unless redelivery is explicitly requested. Check the message status.',
   confirm:
     'Mail stays handoff-unknown until a confirmation for the exact attempt is accepted; repeating that same confirmation is safe.',
+  presence_publish:
+    'Repeating it is safe; the next presence round publishes it again.',
   reconcile: 'Repeating it is safe.',
   redeliver:
     'Check the message status before deciding whether to redeliver again.',
   send: 'Check the inbox, or repeat the send with the same idempotency key.',
+  share_disable:
+    'Check the sharing status; disabling again is safe, and sharing stays on until it is confirmed disabled.',
+  share_enable:
+    'Check the sharing status before confirming again; nothing is shared unless the status says it is.',
   sweep: 'Repeating it is safe.',
 };
 const REPLY_KEYS = new Set(['error', 'id', 'ok', 'protocol', 'result']);
@@ -55,6 +61,10 @@ const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
 const listOf = (check) => (value) => Array.isArray(value) && value.every(check);
+const anyOf =
+  (...checks) =>
+  (value) =>
+    checks.some((check) => check(value));
 const exactly = (spec) => (value) =>
   isObject(value) &&
   Object.keys(value).every((key) => Object.hasOwn(spec, key)) &&
@@ -68,6 +78,34 @@ const DELIVERY_STATES = new Set([
   'held',
   'queued',
 ]);
+// Who sent a message: the local user, or a local session by its id. Nothing else is a sender yet.
+const senderShape = anyOf(
+  exactly({ kind: (value) => value === 'user' }),
+  exactly({ id: isText, kind: (value) => value === 'session' })
+);
+const policyShape = exactly({
+  attention: flag,
+  interrupt: flag,
+  owner: isText,
+  receive: flag,
+  scope: isText,
+  version: count,
+  visibility: flag,
+});
+const projectStanding = anyOf(
+  exactly({ project: isText, state: (value) => value === 'absent' }),
+  exactly({
+    policy: policyShape,
+    project: isText,
+    state: (value) => value === 'enabled',
+    updated_at: count,
+  }),
+  exactly({
+    error: exactly({ code: isText, reason: isText }),
+    project: isText,
+    state: (value) => value === 'invalid',
+  })
+);
 const messageFields = {
   attempt_id: maybe(isText),
   attempts: count,
@@ -75,6 +113,7 @@ const messageFields = {
   expires_at: count,
   kind: isText,
   message_id: isText,
+  project: maybe(isText),
   reason: maybe(isText),
   recipient: exactly({
     checkout: isText,
@@ -85,7 +124,7 @@ const messageFields = {
   redeliveries: count,
   reply_to: maybe(isText),
   run_hint: maybe(isText),
-  sender: exactly({ kind: isText }),
+  sender: senderShape,
   size: count,
   span_hint: maybe(isText),
   state: (value) => DELIVERY_STATES.has(value),
@@ -105,12 +144,32 @@ const RESULT_SHAPES = {
         created_at: count,
         message_id: isText,
         reply_to: maybe(isText),
-        sender: exactly({ kind: isText }),
+        sender: senderShape,
       })
     ),
     text: isText,
   }),
   confirm: exactly({ confirmed: listOf(isText), superseded: listOf(isText) }),
+  directory: exactly({
+    entries: listOf(
+      exactly({
+        activity_at: maybe(count),
+        observed_at: count,
+        owner: isText,
+        project: isText,
+        reachability: exactly({ reason: maybe(isText), state: isText }),
+        session_id: isText,
+        stale: flag,
+        task: maybe(isText),
+        task_at: maybe(count),
+        task_stale: flag,
+      })
+    ),
+    problems: listOf(
+      exactly({ code: isText, project: isText, reason: isText })
+    ),
+    stale_after_ms: count,
+  }),
   health: exactly({
     engine_version: isText,
     protocol: isText,
@@ -118,9 +177,22 @@ const RESULT_SHAPES = {
     store: isText,
   }),
   list: exactly({ messages: listOf(exactly(messageFields)) }),
+  presence_publish: exactly({ project: isText, published: count }),
   reconcile: exactly({ held: listOf(isText), released: listOf(isText) }),
   redeliver: exactly(statusOf),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
+  share_disable: exactly({
+    held: listOf(isText),
+    project: isText,
+    removed: flag,
+  }),
+  share_enable: exactly({
+    changed: flag,
+    policy: policyShape,
+    project: isText,
+    released: listOf(isText),
+  }),
+  share_status: exactly({ projects: listOf(projectStanding) }),
   show: exactly({ ...messageFields, body: isText }),
   status: exactly(messageFields),
   sweep: exactly({ expired: listOf(isText) }),

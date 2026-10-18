@@ -2,7 +2,11 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createAgentSessions, launchProofDigest } from './agent-sessions.js';
+import {
+  createAgentSessions,
+  launchProofDigest,
+  validAgentSessionRecord,
+} from './agent-sessions.js';
 import {
   createTerminalAttention,
   createTrustedHookIngress,
@@ -313,6 +317,118 @@ test('the hook ingress binds native ids through the durable session record and a
   expect(JSON.stringify(fixture.state.read('attention'))).not.toContain(
     'native-1'
   );
+});
+
+test('an authenticated hook event records when the managed session was last heard from, and nothing else does', async () => {
+  const fixture = stateFixture();
+  let clock = 1000;
+  const sessions = createAgentSessions({
+    now: () => clock,
+    observeCheckout: () => Promise.resolve('checkout-a'),
+    observeProcess: () =>
+      Promise.resolve({
+        processId: 7,
+        processStartIdentity: 'Mon Oct 5 12:00:00 2026',
+        state: 'alive',
+      }),
+    signal: () => Promise.resolve(),
+    state: fixture.state,
+  });
+  await sessions.register({
+    checkoutIdentity: 'checkout-a',
+    checkoutPath: '/worktree',
+    id: 'setu-1',
+    launchProofDigest: launchProofDigest('token_1234567890123456'),
+    name: 'topic',
+    pid: 7,
+    processStart: 'Mon Oct 5 12:00:00 2026',
+    repo: 'repo',
+    tool: 'claude-code',
+  });
+  const ingress = createTrustedHookIngress({ sessions });
+  await ingress.bind({
+    checkoutPath: '/worktree',
+    launchToken: 'token_1234567890123456',
+    nativeSessionId: 'native-1',
+    provider: 'claude-code',
+  });
+  const attention = createTerminalAttention({
+    now: () => clock,
+    resolveHookSession: ingress.resolveHookSession,
+    sessions,
+    state: fixture.state,
+  });
+  const stop = (launchToken, cwd = '/worktree') =>
+    attention.receive({
+      launchToken,
+      payload: { cwd, hook_event_name: 'Stop', session_id: 'native-1' },
+      provider: 'claude-code',
+    });
+  const heard = () => sessions.get('setu-1').lastHookAt;
+
+  // Being bound, running and listed is not activity.
+  expect(heard()).toBeUndefined();
+
+  clock = 5000;
+  await stop('wrong_1234567890123456');
+  await stop(undefined);
+  await stop('token_1234567890123456', '/elsewhere');
+  expect(heard()).toBeUndefined();
+
+  await stop('token_1234567890123456');
+  expect(heard()).toBe(5000);
+
+  // An older event never moves the time backwards.
+  clock = 3000;
+  await stop('token_1234567890123456');
+  expect(heard()).toBe(5000);
+  clock = 9000;
+  await stop('token_1234567890123456');
+  expect(heard()).toBe(9000);
+});
+
+test('a hook time must be a positive finite number, in the record and when it is recorded', async () => {
+  const fixture = stateFixture();
+  const sessions = createAgentSessions({
+    now: () => 1,
+    observeCheckout: () => Promise.resolve('checkout-a'),
+    observeProcess: () =>
+      Promise.resolve({
+        processId: 7,
+        processStartIdentity: 'Mon Oct 5 12:00:00 2026',
+        state: 'alive',
+      }),
+    signal: () => Promise.resolve(),
+    state: fixture.state,
+  });
+  await sessions.register({
+    checkoutIdentity: 'checkout-a',
+    checkoutPath: '/worktree',
+    id: 'setu-1',
+    name: 'topic',
+    pid: 7,
+    processStart: 'Mon Oct 5 12:00:00 2026',
+    repo: 'repo',
+    tool: 'claude-code',
+  });
+  for (const at of [
+    Number.NaN,
+    -5,
+    0,
+    Number.POSITIVE_INFINITY,
+    '5000',
+    null,
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each attempt reads the shared record.
+    await sessions.recordHookActivity({ at, id: 'setu-1' });
+    expect(sessions.get('setu-1').lastHookAt).toBeUndefined();
+    expect(
+      validAgentSessionRecord({ ...sessions.get('setu-1'), lastHookAt: at })
+    ).toBe(false);
+  }
+  await sessions.recordHookActivity({ at: 5000, id: 'setu-1' });
+  expect(sessions.get('setu-1').lastHookAt).toBe(5000);
+  expect(validAgentSessionRecord(sessions.get('setu-1'))).toBe(true);
 });
 
 test('malformed attention events are refused without changing journal bytes', async () => {

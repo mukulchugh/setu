@@ -91,6 +91,8 @@ const repoName = (value) =>
   !hasAsciiControlCharacter(value) &&
   !['.', '..'].includes(value) &&
   !value.startsWith('-');
+// The one rule for a registered project name; other modules that name a project use it rather than their own.
+export const isRepositoryName = repoName;
 const branchName = (value) =>
   typeof value === 'string' && value.split('/').every(repoName);
 const portNumber = (value) =>

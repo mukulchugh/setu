@@ -40,6 +40,7 @@ test('a send reaches the real engine and its status can be read back', async () 
   const sent = await client.call('send', {
     body: 'hello',
     idempotency_key: 'key-1',
+    project: 'repo',
     recipient,
     sender: { kind: 'user' },
   });
@@ -60,6 +61,7 @@ test('a send reaches the real engine and its status can be read back', async () 
 const sendArgs = (key = 'key-1', body = 'hello') => ({
   body,
   idempotency_key: key,
+  project: 'repo',
   recipient,
   sender: { kind: 'user' },
 });

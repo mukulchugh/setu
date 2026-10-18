@@ -2,8 +2,8 @@
 
 use crate::{
     args::{Args, Fail},
-    frame,
-    store::Store,
+    frame, sharing,
+    store::{SHARING_SCHEMA, Store, commit},
     util,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -11,14 +11,6 @@ use serde_json::{Value, json};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 pub const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-
-/// Every mutation ends here, so every one can be killed on either side of its commit.
-fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
-    util::fault(&format!("{op}:before-commit"));
-    tx.commit()?;
-    util::fault(&format!("{op}:after-commit"));
-    Ok(())
-}
 
 pub struct Recipient {
     pub provider: String,
@@ -50,7 +42,57 @@ pub const MAX_PENDING_PER_RECIPIENT: i64 = 100;
 pub const CLAIM_MAX_MESSAGES: usize = 8;
 pub const CLAIM_MAX_BYTES: usize = 32 * 1024;
 
+/// The trusted caller of a send, as the engine's client states it. The engine's protocol is local, so this
+/// is not something message text can establish: a front door sets it from what it authenticated. A peer is
+/// not a principal here; it becomes one only when peer grants exist.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Principal {
+    User,
+    Session(String),
+}
+
+impl Principal {
+    /// One column value: `user`, or `session:<id>`. Ids never contain `:`, so it decodes without ambiguity.
+    fn encode(&self) -> String {
+        match self {
+            Principal::User => "user".to_string(),
+            Principal::Session(id) => format!("session:{id}"),
+        }
+    }
+
+    pub fn is_local_user(&self) -> bool {
+        *self == Principal::User
+    }
+
+    fn parse(mut args: Args) -> Result<Self, Fail> {
+        let kind = args.string("kind", 16)?;
+        let principal = match kind.as_str() {
+            "user" => Principal::User,
+            "session" => {
+                let id = args.string("id", 128)?;
+                if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                    return Err(Fail::new("REQUEST_INVALID", "field `id` is missing or invalid"));
+                }
+                Principal::Session(id)
+            }
+            _ => return Err(Fail::new("SENDER_UNSUPPORTED", "this kind of sender is not supported")),
+        };
+        args.finish()?;
+        Ok(principal)
+    }
+}
+
+/// `user` or `session:<id>` as a public sender object.
+fn sender_json(encoded: &str) -> Value {
+    match encoded.split_once(':') {
+        Some((kind, id)) => json!({ "kind": kind, "id": id }),
+        None => json!({ "kind": encoded }),
+    }
+}
+
 pub struct SendRequest {
+    sender: Principal,
+    project: String,
     key: String,
     recipient: Recipient,
     body: String,
@@ -62,27 +104,47 @@ pub struct SendRequest {
 /// Validates a send before any store is opened, so a refused request leaves no trace.
 pub fn parse_send(mut args: Args) -> Result<SendRequest, Fail> {
     let key = args.string("idempotency_key", 128)?;
-    let mut sender = args.object("sender")?;
-    let kind = sender.string("kind", 16)?;
-    sender.finish()?;
-    if kind != "user" {
-        return Err(Fail::new("SENDER_UNSUPPORTED", "only the local user can send"));
-    }
+    let sender = Principal::parse(args.object("sender")?)?;
+    let project = sharing::project_arg(&mut args)?;
     let recipient = Recipient::parse(args.object("recipient")?)?;
     let body = args.bounded("body", MAX_BODY_BYTES, "BODY_TOO_LARGE")?;
     let reply_to = args.optional_string("reply_to", 128)?;
     let run_hint = args.optional_string("run_hint", 128)?;
     let span_hint = args.optional_string("span_hint", 128)?;
     args.finish()?;
-    Ok(SendRequest { key, recipient, body, reply_to, run_hint, span_hint })
+    Ok(SendRequest { sender, project, key, recipient, body, reply_to, run_hint, span_hint })
+}
+
+impl SendRequest {
+    /// Whether the project's sharing policy has any say: the local user's own mail never depends on it.
+    pub fn needs_policy(&self) -> bool {
+        !self.sender.is_local_user()
+    }
+
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+}
+
+/// Mail from a principal other than the local user is admitted only by a readable policy that lets the
+/// project receive. Anything else (no policy, withdrawn, unreadable) refuses, so no failure opens access.
+pub fn admit(db: &rusqlite::Connection, version: i64, project: &str) -> Result<(), Fail> {
+    match sharing::standing(db, version, project)? {
+        sharing::Standing::Valid(policy, _) if policy.receive => Ok(()),
+        sharing::Standing::Invalid(reason) => Err(sharing::invalid_policy(project, reason)),
+        _ => Err(sharing::not_shared(project)),
+    }
 }
 
 pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
-    let SendRequest { key, recipient, body, reply_to, run_hint, span_hint } = request;
+    let SendRequest { sender, project, key, recipient, body, reply_to, run_hint, span_hint } = request;
+    let sender_column = sender.encode();
 
-    // The digest covers exactly what the caller supplied, in a canonical key order.
-    let digest = util::sha256_hex(
-        &json!({
+    // The digest covers exactly what the caller supplied, in a canonical key order. Schema 1 did not know
+    // projects, so its digests lack the field; `legacy_digest` is that same computation for replaying a row
+    // that old.
+    let digest_of = |with_project: bool| {
+        let mut payload = json!({
             "body": body,
             "kind": "message",
             "reply_to": reply_to,
@@ -94,22 +156,34 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
                 "provider": recipient.provider,
                 "session_hint": recipient.session_hint,
             },
-        })
-        .to_string(),
-    );
+        });
+        if with_project {
+            payload["project"] = json!(project);
+        }
+        util::sha256_hex(&payload.to_string())
+    };
+    let digest = digest_of(true);
+    let legacy_digest = digest_of(false);
     let now = util::now_ms();
     let id = util::new_id("m");
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing: Option<(String, String)> = tx
-        .query_row("SELECT id, payload_digest FROM messages WHERE sender = 'user' AND idempotency_key = ?1", [&key], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+    if !sender.is_local_user() {
+        admit(&tx, store.version, &project)?;
+    }
+    let existing: Option<(String, String, Option<String>)> = tx
+        .query_row("SELECT id, payload_digest, project FROM messages WHERE sender = ?2 AND idempotency_key = ?1", params![key, sender_column], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .optional()?;
-    if let Some((existing_id, existing_digest)) = existing {
-        if existing_digest != digest {
+    if let Some((existing_id, existing_digest, existing_project)) = existing {
+        // A row written before projects existed has no project and its original digest. The same send
+        // retried after the upgrade is that message; anything that differs still conflicts, and the row
+        // itself is never rewritten.
+        let same = existing_digest == digest || (existing_project.is_none() && existing_digest == legacy_digest);
+        if !same {
             return Err(Fail::new("IDEMPOTENCY_CONFLICT", "this key was used for a different message").with(json!({ "message_id": existing_id })));
         }
-        let state = view(&tx, &existing_id, now)?;
+        let state = view(&tx, store.version, &existing_id, now)?;
         return Ok(json!({ "message_id": existing_id, "state": state["state"], "replayed": true }));
     }
     let pending: i64 = tx.query_row(
@@ -123,9 +197,9 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
         return Err(Fail::new("RECIPIENT_QUEUE_FULL", "this conversation already has the most pending messages allowed"));
     }
     tx.execute(
-        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at)
-         VALUES (?1, 'user', ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, key, digest, body, body.len() as i64, reply_to, run_hint, span_hint, recipient.provider, recipient.native_id, recipient.checkout, recipient.session_hint, now],
+        "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at, project)
+         VALUES (?1, ?14, ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?15)",
+        params![id, key, digest, body, body.len() as i64, reply_to, run_hint, span_hint, recipient.provider, recipient.native_id, recipient.checkout, recipient.session_hint, now, sender_column, project],
     )?;
     tx.execute(
         "INSERT INTO deliveries (message_id, state, expires_at, updated_at) VALUES (?1, 'queued', ?2, ?3)",
@@ -135,17 +209,22 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
     Ok(json!({ "message_id": id, "state": "queued", "replayed": false }))
 }
 
-const VIEW: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run_hint, m.span_hint, m.provider, m.native_id, m.checkout,
+const VIEW_SQL: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run_hint, m.span_hint, m.provider, m.native_id, m.checkout,
         m.session_hint, m.created_at, m.body,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.state END,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.reason END,
-        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state
+        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state, m.project
     FROM messages m JOIN deliveries d ON d.message_id = m.id";
+
+/// Schema 1 has no project column; its messages read as having none.
+fn view_sql(version: i64) -> String {
+    if version < SHARING_SCHEMA { VIEW_SQL.replace("m.project", "NULL") } else { VIEW_SQL.to_string() }
+}
 
 fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
     let mut value = json!({
         "message_id": row.get::<_, String>(0)?,
-        "sender": { "kind": row.get::<_, String>(1)? },
+        "sender": sender_json(&row.get::<_, String>(1)?),
         "kind": row.get::<_, String>(2)?,
         "size": row.get::<_, i64>(3)?,
         "reply_to": row.get::<_, Option<String>>(4)?,
@@ -166,6 +245,7 @@ fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
         "expires_at": row.get::<_, i64>(18)?,
         "updated_at": row.get::<_, i64>(19)?,
         "stored_state": row.get::<_, String>(20)?,
+        "project": row.get::<_, Option<String>>(21)?,
     });
     if with_body {
         value["body"] = Value::String(row.get(12)?);
@@ -196,7 +276,7 @@ fn project(value: &mut Value, observed: Option<&Recipient>) {
             value["state"] = json!("held");
             value["reason"] = json!(if same_conversation { "checkout-changed" } else { "conversation-replaced" });
         }
-        Some("held") if same => {
+        Some("held") if same && matches!(value["reason"].as_str(), Some("conversation-replaced" | "checkout-changed")) => {
             value["state"] = json!("queued");
             value["reason"] = Value::Null;
         }
@@ -204,8 +284,26 @@ fn project(value: &mut Value, observed: Option<&Recipient>) {
     }
 }
 
-fn view(db: &rusqlite::Connection, id: &str, now: i64) -> Result<Value, Fail> {
-    db.query_row(&format!("{VIEW} WHERE m.id = ?1"), params![id, now], |row| row_json(row, true))
+/// Mail from another principal that its project no longer admits reads as held. `cache` remembers each
+/// project's answer for one read. This only reports; `claim` and withdrawal are what persist the hold.
+fn project_policy(store: &Store, value: &mut Value, cache: &mut std::collections::HashMap<String, Option<&'static str>>) -> Result<(), Fail> {
+    if value["state"] != "queued" || value["sender"]["kind"] == "user" {
+        return Ok(());
+    }
+    let Some(project) = value["project"].as_str().map(str::to_string) else { return Ok(()) };
+    if !cache.contains_key(&project) {
+        let verdict = admit(&store.db, store.version, &project).err().map(|fail| sharing::hold_reason(&fail));
+        cache.insert(project.clone(), verdict);
+    }
+    if let Some(reason) = cache[&project] {
+        value["state"] = json!("held");
+        value["reason"] = json!(reason);
+    }
+    Ok(())
+}
+
+fn view(db: &rusqlite::Connection, version: i64, id: &str, now: i64) -> Result<Value, Fail> {
+    db.query_row(&format!("{} WHERE m.id = ?1", view_sql(version)), params![id, now], |row| row_json(row, true))
         .optional()?
         .ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))
 }
@@ -215,8 +313,9 @@ pub fn show(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = view(&store.db, &id, util::now_ms())?;
+    let mut value = view(&store.db, store.version, &id, util::now_ms())?;
     project(&mut value, observed.as_ref());
+    project_policy(store, &mut value, &mut Default::default())?;
     Ok(value)
 }
 
@@ -227,13 +326,15 @@ pub fn list(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let Some(store) = store else { return Ok(json!({ "messages": [] })) };
-    let mut statement = store.db.prepare(&format!("{VIEW} WHERE m.session_hint = ?1 ORDER BY m.created_at, m.id"))?;
+    let mut statement = store.db.prepare(&format!("{} WHERE m.session_hint = ?1 ORDER BY m.created_at, m.id", view_sql(store.version)))?;
     let now = util::now_ms();
     let rows = statement.query_map(params![session, now], |row| row_json(row, false))?;
     let mut messages = Vec::new();
+    let mut cache = Default::default();
     for row in rows {
         let mut row = row?;
         project(&mut row, observed.as_ref());
+        project_policy(store, &mut row, &mut cache)?;
         if state.as_deref().is_none_or(|wanted| row["state"] == wanted) {
             messages.push(row);
         }
@@ -247,8 +348,9 @@ pub fn status(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let store = store.ok_or_else(|| Fail::new("MESSAGE_NOT_FOUND", "no such message"))?;
-    let mut value = view(&store.db, &id, util::now_ms())?;
+    let mut value = view(&store.db, store.version, &id, util::now_ms())?;
     project(&mut value, observed.as_ref());
+    project_policy(store, &mut value, &mut Default::default())?;
     value.as_object_mut().map(|fields| fields.remove("body"));
     Ok(value)
 }
@@ -290,7 +392,7 @@ pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
     drop(hold);
     let mut release = tx.prepare(
         "UPDATE deliveries SET state = 'queued', reason = NULL, updated_at = ?5
-         WHERE state = 'held' AND expires_at > ?5 AND message_id IN (
+         WHERE state = 'held' AND reason IN ('conversation-replaced', 'checkout-changed') AND expires_at > ?5 AND message_id IN (
             SELECT id FROM messages WHERE session_hint = ?1
               AND provider = ?2 AND native_id = ?3 AND checkout = ?4)
          RETURNING message_id",
@@ -330,17 +432,39 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     expire_due(&tx, now)?;
     let mut statement = tx.prepare(
-        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts FROM messages m
+        "SELECT m.id, m.created_at, m.reply_to, m.body, m.size, d.attempts, m.sender, m.project FROM messages m
          JOIN deliveries d ON d.message_id = m.id
          WHERE m.provider = ?1 AND m.native_id = ?2 AND m.checkout = ?3 AND d.state = 'queued'
          ORDER BY m.created_at, m.rowid",
     )?;
-    let queued = statement
+    let candidates = statement
         .query_map(params![recipient.provider, recipient.native_id, recipient.checkout], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
+    // Mail from any principal but the local user needs its project's policy at claim time, checked here
+    // from the store whatever any earlier operation did. What it no longer admits is held, in this
+    // transaction, and never claimed.
+    let mut queued = Vec::new();
+    for candidate in candidates {
+        let verdict = if candidate.6 == "user" { Ok(()) } else { admit(&tx, store.version, candidate.7.as_deref().unwrap_or("")) };
+        match verdict {
+            Ok(()) => queued.push(candidate),
+            Err(fail) => {
+                tx.execute("UPDATE deliveries SET state = 'held', reason = ?2, updated_at = ?3 WHERE message_id = ?1 AND state = 'queued'", params![candidate.0, sharing::hold_reason(&fail), now])?;
+            }
+        }
+    }
     let mut taken = Vec::new();
     let mut bytes = 0;
     for message in queued {
@@ -361,19 +485,19 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
         params![attempt, recipient.provider, recipient.native_id, recipient.checkout, now],
     )?;
     let mut messages = Vec::new();
-    for (id, created_at, reply_to, body, _, attempts) in &taken {
+    for (id, created_at, reply_to, body, _, attempts, sender, _) in &taken {
         let number = attempts + 1;
         tx.execute(
             "UPDATE deliveries SET state = 'handoff-unknown', reason = 'claimed', attempts = ?2, attempt_id = ?3, updated_at = ?4 WHERE message_id = ?1 AND state = 'queued'",
             params![id, number, attempt, now],
         )?;
         tx.execute("INSERT INTO attempt_messages (attempt_id, message_id, number) VALUES (?1, ?2, ?3)", params![attempt, id, number])?;
-        messages.push(json!({ "message_id": id, "sender": { "kind": "user" }, "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
+        messages.push(json!({ "message_id": id, "sender": sender_json(sender), "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
     }
     commit(tx, "claim")?;
     let framed: Vec<_> = taken
         .iter()
-        .map(|(id, created_at, reply_to, body, _, _)| frame::Framed { id, sender: "user", sent_at: *created_at, reply_to: reply_to.as_deref(), body })
+        .map(|(id, created_at, reply_to, body, _, _, sender, _)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body })
         .collect();
     Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed) }))
 }

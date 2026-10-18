@@ -39,11 +39,19 @@ contains message bodies. A request may be at most 1 MiB.
 | `confirm` | The hook's report for one exact attempt: `handoff-unknown` to `handed-off`. A report for an attempt a redelivery has superseded changes nothing. |
 | `acknowledge` | The addressed conversation's user: `handed-off` to `acknowledged`. |
 | `redeliver` | Names the message, its current unknown attempt and its recipient, and returns the message to `queued`; the next claim is a new, counted attempt. The engine checks all three but cannot tell whether the receiving user chose this: the service that calls it must have obtained that choice (see AGENTS.md). |
+| `share_enable`, `share_disable`, `share_status` | Sharing policy per project (schema 2). `share_enable {project, owner}` records visibility and receiving on and interrupt and attention off, mints an opaque `scope` (kept while sharing stays on, even if the owner label changes; new after a withdrawal), and returns held policy mail to the queue. `share_disable` removes the policy and presence and holds queued mail from principals other than the user (`policy-disabled`). `share_status {project?}` reads: `absent`, `enabled`, or `invalid` (`malformed`, `unsupported-version`). Reads create nothing and a disable with nothing to withdraw writes nothing. |
+| `presence_publish`, `directory` | `presence_publish {project, sessions:[{session_id, task?, task_at?, activity_at?, reachability}]}` stores owner-less presence for a shared project (`NOT_SHARED` or `POLICY_INVALID` otherwise), at most 256 sessions per call. `observed_at` is the engine's own clock; `task_at` (the claim heartbeat, only with a task) and `activity_at` (the last authenticated hook) are the trusted service's, rejected if more than a minute ahead. A task or owner label that carries a path, an environment reference (`$VAR`, `%VAR%`, `NAME=value`) or a secret shape is not stored (a task becomes null; an owner is refused). An ended session is stored once and later `ended` reports do not refresh it. `directory {project?}` is passive: owner, task, reachability, `observed_at` and `stale` for shared projects, `problems` for unreadable policies; an observation older than two minutes is listed `stale` with reachability `unknown` (an `ended` one keeps `unreachable/ended`); `task_at`, `task_stale` (task older than two hours) and `activity_at` are returned as stored. Presence has no column for paths, environment, transcripts or provider context. |
 | `health` | Passive: protocol, schema version, and whether a store exists. |
 
 There is deliberately no operation that returns a claimed message to the queue on its own.
 
-`send` and `claim` do not decide holds. The engine is the only mailbox authority and the managed session
+A `send` names a trusted `sender`: `{kind:"user"}` (the local user; never needs sharing) or
+`{kind:"session", id}` (admitted only by a readable, receiving policy for `project`, checked again in the
+transaction and again at `claim`). Any other kind is `SENDER_UNSUPPORTED`: a peer becomes a sender only when
+peer grants exist, and never because message text says so. `project` is the registered project the
+recipient session belongs to; it is stored with the message and is not part of the recipient's identity.
+
+`send` and `claim` do not decide holds (apart from the policy hold above). The engine is the only mailbox authority and the managed session
 record is the only identity authority; `reconcile` is the one explicit, small boundary between them, and
 the service calls it with the record's current binding before every send and claim. Reads never call it; they pass the same observation to the read operations instead. With no store, `reconcile` and `claim` return empty results and create nothing; only a `send` creates the store.
 
@@ -53,7 +61,7 @@ never affect delivery. No front door sets them yet.
 
 ## States
 
-`queued` (durable, not delivered), `held` (with a reason: `conversation-replaced`, `checkout-changed`),
+`queued` (durable, not delivered), `held` (with a reason: `conversation-replaced`, `checkout-changed`, `policy-disabled`, `policy-invalid`),
 `handoff-unknown`, `handed-off`, `acknowledged`, `expired`, `cancelled`. A recipient is a provider, a
 native conversation and a checkout, captured at send time and immutable (enforced by the schema, not only
 by the operations). The managed session ID is a locator hint: it can cause mail to be held, never
@@ -76,7 +84,9 @@ They are tunable constants in `src/mailbox.rs`, not product decisions.
 
 `mailbox.sqlite3` in the data directory (owner-only: directory 0700, file 0600; a directory open to
 others is refused). Write-ahead logging, full synchronous writes, foreign keys. `PRAGMA user_version` is
-the schema version: a newer store is refused and left untouched. Messages are append-only; delivery state
+the schema version: a newer store is refused and left untouched. A version 1 store is migrated to 2 by the
+first operation that writes (tables and rows kept; older messages have no project); reads of a version 1
+store are served as it is and report nothing shared. Messages are append-only; delivery state
 lives in a separate table. SIGKILL survival is tested; power-loss durability is not claimed.
 
 ## Build and test

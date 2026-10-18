@@ -2486,7 +2486,7 @@ async function cmdSessions() {
 }
 
 const LINKS_USAGE =
-  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] [--json]';
+  'setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] | inbox <repo> <branch> --session <id> [--state <state>] | show <message> | status <message> | cancel <message> | ack <repo> <branch> --session <id> --message <message> | redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--confirmation <token>] | share enable <repo> [--owner <label>] [--confirmation <token>] | share disable <repo> | share status [<repo>] | directory [<repo>] [--json]';
 
 // Links needs the running portal and never starts anything itself. An unreachable portal is a refusal;
 // a send the portal or engine may or may not have recorded is unknown, and says how to repeat it safely.
@@ -2543,9 +2543,60 @@ const LINKS_ACTIONS = new Map([
   ['status', { argCount: 2, flags: [] }],
 ]);
 
+// Sharing is the user's own decision about a project, and enabling shows the exact public fields first: the
+// first request returns them with a token, and only that token passed back (`--confirmation`) enables.
+const LINKS_SHARE_ACTIONS = new Map([
+  ['disable', { argCounts: [3], flags: [] }],
+  ['enable', { argCounts: [3], flags: ['confirmation', 'owner'] }],
+  ['status', { argCounts: [2, 3], flags: [] }],
+]);
+
+function cmdLinksShare() {
+  const [, sub, repo] = args;
+  const accepted = LINKS_SHARE_ACTIONS.get(sub);
+  if (!accepted) {
+    die(`Usage: ${LINKS_USAGE}`);
+  }
+  validateCommand({
+    allowedFlags: accepted.flags,
+    argCounts: accepted.argCounts,
+    usage: LINKS_USAGE,
+  });
+  if (sub === 'status') {
+    return linksResult(() =>
+      cliApi.get('/api/links/share/status', repo ? { repo } : {})
+    );
+  }
+  if (sub === 'disable') {
+    return linksResult(() => cliApi.post('/api/links/share/disable', { repo }));
+  }
+  const owner = optionalFlag('owner');
+  const confirmation = optionalFlag('confirmation');
+  return linksResult(() =>
+    cliApi.post('/api/links/share/enable', {
+      repo,
+      ...(owner === undefined ? {} : { owner }),
+      ...(confirmation === undefined ? {} : { confirmation }),
+    })
+  );
+}
+
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdLinks() {
   const [action, first, name] = args;
+  if (action === 'share') {
+    return cmdLinksShare();
+  }
+  if (action === 'directory') {
+    validateCommand({
+      allowedFlags: [],
+      argCounts: [1, 2],
+      usage: LINKS_USAGE,
+    });
+    return linksResult(() =>
+      cliApi.get('/api/links/directory', first ? { repo: first } : {})
+    );
+  }
   const accepted = LINKS_ACTIONS.get(action);
   if (!accepted) {
     die(`Usage: ${LINKS_USAGE}`);
@@ -3713,6 +3764,9 @@ function cmdHelp() {
     setu links show|status|cancel <message> [--json]
     setu links ack <repo> <branch> --session <id> --message <message> [--json]
     setu links redeliver <repo> <branch> --session <id> --message <message> --attempt <attempt> [--json]
+    setu links share enable <repo> [--owner <label>] [--confirmation <token>] [--json]
+    setu links share disable <repo> | status [<repo>] [--json]
+    setu links directory [<repo>] [--json]
                                       Needs the running portal. A message is addressed to one verified
                                       native conversation; handoff-unknown is never retried automatically
     setu caches prepare <repo> <branch> [--json]

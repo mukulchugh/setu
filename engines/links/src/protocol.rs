@@ -2,7 +2,7 @@
 
 use crate::{
     args::{Args, Fail},
-    mailbox,
+    mailbox, sharing,
     store::{SCHEMA_VERSION, Store},
 };
 use serde_json::{Value, json};
@@ -59,6 +59,15 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
     match op.as_str() {
         "send" => {
             let request = mailbox::parse_send(args)?;
+            // A principal other than the local user needs a readable policy that admits its project. A
+            // refusal is decided on a read (with no store there is no policy), so it creates, migrates and
+            // writes nothing; the write checks again inside its own transaction.
+            if request.needs_policy() {
+                match reader(data_dir)? {
+                    Some(store) => mailbox::admit(&store.db, store.version, request.project())?,
+                    None => return Err(sharing::not_shared(request.project())),
+                }
+            }
             mailbox::send(&mut Store::open_or_create(data_dir)?, request)
         }
         "claim" => {
@@ -94,6 +103,30 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             mailbox::cancel(&mut Store::open_or_create(data_dir)?, request)
         }
         "sweep" => mailbox::sweep(&mut Store::open_or_create(data_dir)?, args),
+        "share_enable" => {
+            let request = sharing::parse_enable(args)?;
+            sharing::enable(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "share_disable" => {
+            let project = sharing::parse_disable(args)?;
+            // With no policy to withdraw there is nothing to change, and a withdrawal must not be what
+            // creates or migrates a store.
+            match reader(data_dir)? {
+                Some(store) if sharing::has_row(&store, &project)? => {}
+                _ => return Ok(json!({ "project": project, "removed": false, "held": [] })),
+            }
+            sharing::disable(&mut Store::open_or_create(data_dir)?, project)
+        }
+        "presence_publish" => {
+            let request = sharing::parse_publish(args)?;
+            // Presence exists only for a shared project, so with no store there is nothing to publish into.
+            if reader(data_dir)?.is_none() {
+                return Err(sharing::not_shared(request.project()));
+            }
+            sharing::publish(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "directory" => sharing::directory(reader(data_dir)?.as_ref(), args),
+        "share_status" => sharing::status(reader(data_dir)?.as_ref(), args),
         "status" => mailbox::status(reader(data_dir)?.as_ref(), args),
         "show" => mailbox::show(reader(data_dir)?.as_ref(), args),
         "list" => mailbox::list(reader(data_dir)?.as_ref(), args),
