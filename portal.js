@@ -3634,18 +3634,15 @@ export async function createPortalRuntime(options = {}) {
     state: b205State,
   });
   let setupRecovery = { ok: true };
-  const managedAgents =
-    options.managedAgents ??
-    createManagedAgentServices({
-      admission: portalB205.admission,
-      ingressUrl: `http://127.0.0.1:${PORT}/api/attention/hook`,
-      operationEvents: portalB205.events,
-      resolveTarget: async ({ repo, name }) => b205Target(repo, name),
-      runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
-      state: b205State,
-    });
-  const spans = createSpansRuntime({ root: options.spansRoot });
-  const { linksPresence, linksWithdrawSharing, ...links } = createLinksRuntime({
+  // The Links runtime reads sessions through the managed-agent service and hands that service its
+  // delivery operations. Those operations are internal to the authenticated prompt hook: they are kept out
+  // of the route composition below and have no route, tool or command.
+  const {
+    delivery: linksDelivery,
+    linksPresence,
+    linksWithdrawSharing,
+    ...links
+  } = createLinksRuntime({
     enginePath: options.linksEngine,
     // The registry itself, read fresh: the cached metadata would still hold a project that was just removed.
     isProject: (repo) =>
@@ -3671,6 +3668,18 @@ export async function createPortalRuntime(options = {}) {
     root: options.spansRoot,
     setupProgress,
   });
+  const managedAgents =
+    options.managedAgents ??
+    createManagedAgentServices({
+      admission: portalB205.admission,
+      ingressUrl: `http://127.0.0.1:${PORT}/api/attention/hook`,
+      links: linksDelivery,
+      operationEvents: portalB205.events,
+      resolveTarget: async ({ repo, name }) => b205Target(repo, name),
+      runtimeDir: join(WORKSPACE, '.setu-agent-runtime'),
+      state: b205State,
+    });
+  const spans = createSpansRuntime({ root: options.spansRoot });
   const portalB205Composition = Object.freeze({
     ...spans,
     ...spansExecution.services,
@@ -3686,6 +3695,7 @@ export async function createPortalRuntime(options = {}) {
     headlessResume: (input) => managedAgents.resumeRun(input),
     headlessRuns: (input) => managedAgents.listRuns(input),
     headlessStart: (input) => managedAgents.startRun(input),
+    resumeAgentSession: (input) => managedAgents.resume(input),
   });
 
   async function retrySetupProgress(body, source = 'portal') {

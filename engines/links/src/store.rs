@@ -69,6 +69,7 @@ CREATE TABLE attempt_messages (
 /// rows are kept as they are; a message also records the project it was addressed in, so a policy that
 /// later withdraws can hold mail from a principal it no longer admits. Older messages have no project.
 const MIGRATION_1_TO_2: &str = "
+ALTER TABLE deliveries ADD COLUMN locator TEXT;
 ALTER TABLE messages ADD COLUMN project TEXT;
 CREATE INDEX messages_project ON messages (project);
 CREATE TABLE sharing_policies (

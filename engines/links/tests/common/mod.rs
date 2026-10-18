@@ -12,6 +12,59 @@ use std::{
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
+// The schema exactly as the first release candidate created it.
+pub const SCHEMA_1: &str = "
+CREATE TABLE messages (
+    id TEXT PRIMARY KEY,
+    sender TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    reply_to TEXT,
+    run_hint TEXT,
+    span_hint TEXT,
+    provider TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    checkout TEXT NOT NULL,
+    session_hint TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (sender, idempotency_key)
+);
+CREATE INDEX messages_recipient ON messages (provider, native_id, checkout);
+CREATE INDEX messages_session ON messages (session_hint);
+CREATE TRIGGER messages_immutable BEFORE UPDATE ON messages
+BEGIN SELECT RAISE(ABORT, 'messages are immutable'); END;
+CREATE TRIGGER messages_permanent BEFORE DELETE ON messages
+BEGIN SELECT RAISE(ABORT, 'messages are permanent'); END;
+CREATE TABLE deliveries (
+    message_id TEXT PRIMARY KEY REFERENCES messages (id),
+    state TEXT NOT NULL CHECK (state IN
+        ('queued', 'held', 'handoff-unknown', 'handed-off', 'acknowledged', 'expired', 'cancelled')),
+    reason TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    redeliveries INTEGER NOT NULL DEFAULT 0,
+    attempt_id TEXT,
+    expires_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX deliveries_state ON deliveries (state);
+CREATE TABLE attempts (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    checkout TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
+);
+CREATE TABLE attempt_messages (
+    attempt_id TEXT NOT NULL REFERENCES attempts (id),
+    message_id TEXT NOT NULL REFERENCES messages (id),
+    number INTEGER NOT NULL,
+    PRIMARY KEY (attempt_id, message_id)
+);
+";
+
 pub struct Engine {
     pub dir: PathBuf,
     owned: bool,
@@ -102,29 +155,6 @@ impl Drop for Engine {
         }
     }
 }
-
-// The schema-1 tables, written out here rather than shared with the engine so this test can disagree with it.
-const SCHEMA_1: &str = "
-CREATE TABLE messages (
-    id TEXT PRIMARY KEY, sender TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_digest TEXT NOT NULL,
-    kind TEXT NOT NULL, body TEXT NOT NULL, size INTEGER NOT NULL, reply_to TEXT, run_hint TEXT, span_hint TEXT,
-    provider TEXT NOT NULL, native_id TEXT NOT NULL, checkout TEXT NOT NULL, session_hint TEXT NOT NULL,
-    created_at INTEGER NOT NULL, UNIQUE (sender, idempotency_key)
-);
-CREATE INDEX messages_recipient ON messages (provider, native_id, checkout);
-CREATE INDEX messages_session ON messages (session_hint);
-CREATE TRIGGER messages_immutable BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'messages are immutable'); END;
-CREATE TRIGGER messages_permanent BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'messages are permanent'); END;
-CREATE TABLE deliveries (
-    message_id TEXT PRIMARY KEY REFERENCES messages (id),
-    state TEXT NOT NULL CHECK (state IN ('queued', 'held', 'handoff-unknown', 'handed-off', 'acknowledged', 'expired', 'cancelled')),
-    reason TEXT, attempts INTEGER NOT NULL DEFAULT 0, redeliveries INTEGER NOT NULL DEFAULT 0, attempt_id TEXT,
-    expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-);
-CREATE INDEX deliveries_state ON deliveries (state);
-CREATE TABLE attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, native_id TEXT NOT NULL, checkout TEXT NOT NULL, claimed_at INTEGER NOT NULL);
-CREATE TABLE attempt_messages (attempt_id TEXT NOT NULL REFERENCES attempts (id), message_id TEXT NOT NULL REFERENCES messages (id), number INTEGER NOT NULL, PRIMARY KEY (attempt_id, message_id));
-";
 
 // The digest the schema-1 engine (the 805ab1f build) stored for exactly this send: key `legacy-key`, the body
 // below, recipient native-a / the checkout below / session-1, no reply or hints. It was produced by running

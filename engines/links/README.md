@@ -34,6 +34,7 @@ contains message bodies. A request may be at most 1 MiB.
 | `status`, `show`, `list` | Read state, a message with its body, or a session's messages without bodies. Passive: they open an existing store read-only, never create one and never write. An optional `observed` recipient (the trusted service's observation of the session's current conversation and checkout) makes them report the effective state: queued mail for another conversation of that session reads `held`, held mail for exactly the observed conversation reads `queued`. `stored_state` is always what the store holds: mail whose time has passed reads `expired` in `state` but keeps its stored `queued`/`held` until a `sweep` or `claim` persists the expiry. |
 | `cancel` | The sender retracts a `queued` or `held` message. |
 | `reconcile` | The trusted service's explicit report (made on a send or claim, never by a read) of which conversation (provider, native ID, checkout) a managed session runs now. Queued mail for any other conversation of that session becomes `held`; held mail for exactly this conversation becomes `queued` again. Safe to repeat. It never delivers, re-addresses or revives cancelled, expired or claimed mail. This is the only way a hold or restore is persisted. |
+| `resume` | The trusted service's report that an explicit, reviewed resume brought one exact conversation (provider, native ID, checkout) back under a new managed record, naming the 1-8 earlier locators. Mail addressed to that tuple and located at a named locator is now located at the new one (`locator`; the stored recipient and its original `session_hint` never change), and mail held as `conversation-replaced` is `queued` again. No other hold reason is lifted, and no state changes otherwise. Safe to repeat; with no store it creates none. `list` finds mail by either its original hint or its current locator. |
 | `sweep` | Persists expiry. Also applied lazily by `claim`; reads report the expiry that has passed. |
 | `claim` | Atomically moves the exact conversation's queued mail to a new attempt (`handoff-unknown`) and returns it, framed. A claim for a conversation with no queued mail returns nothing and changes nothing for anyone else; it never holds another conversation's mail. |
 | `confirm` | The hook's report for one exact attempt: `handoff-unknown` to `handed-off`. A report for an attempt a redelivery has superseded changes nothing. |
@@ -73,21 +74,35 @@ appears.
 
 | Limit | Value | Rationale |
 | --- | --- | --- |
-| Message body | 16 KiB | Mail enters an agent's context. 16 KiB is several pages of text, and a single message must always fit in one turn. |
+| Message body | `MAX_BODY_BYTES` = 8 KiB | A message must always fit one turn whole. Claude caps a hook's plain output at 10000 characters and cuts the rest, so the body cap leaves room for the worst-case metadata and preamble inside `MAX_FRAME_BYTES`. A send is also refused if its exact frame does not fit (`FRAME_TOO_LARGE`). Mail stored under the earlier 16 KiB rule is held, never claimed (below). |
 | Pending per conversation | 100 | A sender cannot flood one conversation; far more than a person triages. Counts `queued` and `held`. |
 | Expiry | 7 days | Old requests should not linger; long enough for a weekend away. Expiry is visible, never a silent delete. |
-| Per turn | 8 messages, 32 KiB | Bounds context injected at one turn; remaining mail waits for the next. Fixed: a caller cannot change it. |
+| Per turn | `CLAIM_MAX_MESSAGES` = 8 messages and the whole serialized text within `MAX_FRAME_BYTES` = 10000 bytes | The provider's documented plain-output cap, counted in UTF-8 bytes (never smaller than characters). Whole messages only, never truncated; the next waits queued. Fixed: a caller cannot change it. |
 
-They are tunable constants in `src/mailbox.rs`, not product decisions.
+They are tunable constants in `src/mailbox.rs` and `src/frame.rs`, not product decisions, except that
+`MAX_FRAME_BYTES` is set by the provider's documented cap and must not be raised without re-reading it.
+
+**Mail stored under the earlier body rule.** A queued message larger than `MAX_BODY_BYTES`, or whose frame
+cannot fit one turn, is not claimed and gets no attempt. A plain read shows it as `held` with reason
+`provider-output-limit` at once; the next `claim` persists that. Its full body stays readable (`show`), it
+can be cancelled, and no restoring operation (`reconcile`, `resume`, an observation) lifts this hold: the
+way out is to send a shorter message. A peer-origin message will be held to the same cap by the transport, which reuses `frame::fits` and these constants at merge.
 
 ## Store
 
 `mailbox.sqlite3` in the data directory (owner-only: directory 0700, file 0600; a directory open to
 others is refused). Write-ahead logging, full synchronous writes, foreign keys. `PRAGMA user_version` is
-the schema version: a newer store is refused and left untouched. A version 1 store is migrated to 2 by the
-first operation that writes (tables and rows kept; older messages have no project); reads of a version 1
-store are served as it is and report nothing shared. Messages are append-only; delivery state
-lives in a separate table. SIGKILL survival is tested; power-loss durability is not claimed.
+the schema version: a newer store is refused and left untouched. Messages are append-only; delivery state
+lives in a separate table. Schema 2 adds project sharing and presence plus nullable `deliveries.locator`
+(where a conversation's mail is located after an explicit resume; NULL means the message's own session hint).
+A schema-1 store keeps working: reads are passive, show no project sharing and use the original session hint.
+The first write adds the columns and sharing tables inside one transaction, then advances `user_version`
+to 2. A process killed before commit leaves schema 1 whole; retry completes the upgrade. No existing message
+or delivery row is rewritten. SIGKILL survival is tested; power-loss durability is not claimed.
+
+Schema 2 is the combined, unreleased format. The independent directory and delivery development branches
+used partial schema-2 fixtures; those disposable branch fixtures are not supported upgrade inputs. The
+compatibility path above covers schema 1 and the complete combined schema 2. No partial-branch format shipped.
 
 ## Build and test
 

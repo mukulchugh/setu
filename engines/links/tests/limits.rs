@@ -5,10 +5,11 @@ use serde_json::json;
 #[test]
 fn an_oversized_message_is_rejected_with_a_reason_and_nothing_is_stored() {
     let engine = Engine::new();
-    let largest = "x".repeat(16 * 1024);
+    // The body cap comes from what one provider turn can carry (see output_limit.rs).
+    let largest = "x".repeat(8 * 1024);
     engine.ok("send", send_args("fits", &largest, "native-a"));
 
-    let too_big = "x".repeat(16 * 1024 + 1);
+    let too_big = "x".repeat(8 * 1024 + 1);
     assert_eq!(engine.err("send", send_args("too-big", &too_big, "native-a")), "BODY_TOO_LARGE");
 
     let inbox = engine.ok("list", json!({ "session_hint": "session-1" }));

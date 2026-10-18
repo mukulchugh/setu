@@ -2453,11 +2453,12 @@ async function cmdSpans() {
 
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSessions() {
+  const usage =
+    'setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|-> | resume <repo> <branch> --native <id> [--confirmation <token>]] [--json]';
   validateCommand({
-    allowedFlags: ['checkout', 'session'],
+    allowedFlags: ['checkout', 'confirmation', 'native', 'session'],
     argCounts: [0, 1, 3],
-    usage:
-      'setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]',
+    usage,
   });
   const [action, repo, name] = args;
   if (!action) {
@@ -2470,11 +2471,31 @@ async function cmdSessions() {
     }
     return apiResult(() => cliApi.get('/api/agent-sessions', { name, repo }));
   }
-  if (action !== 'end') {
-    die(
-      'Usage: setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <identity>] [--json]'
+  if (action === 'resume') {
+    // The receiving user's explicit, reviewed resume. Without --confirmation the portal answers with the
+    // review (conversation, ended sessions that held it, checkout) and the token to confirm with; the CLI
+    // never makes one up and never launches without it.
+    validateFlags(
+      ['confirmation', 'native'],
+      'setu sessions resume <repo> <branch> --native <id> [--confirmation <token>] [--json]'
+    );
+    const confirmation = optionalFlag('confirmation');
+    return apiResult(() =>
+      cliApi.post('/api/agent-sessions/resume', {
+        ...(confirmation === undefined ? {} : { confirmation }),
+        name,
+        nativeId: requireFlag('native'),
+        repo,
+      })
     );
   }
+  if (action !== 'end') {
+    die(`Usage: ${usage}`);
+  }
+  validateFlags(
+    ['checkout', 'session'],
+    'setu sessions end <repo> <branch> --session <id> --checkout <file|-> [--json]'
+  );
   return apiResult(() =>
     cliApi.post('/api/agent-sessions/end', {
       checkoutIdentity: checkoutIdentity(),
@@ -3758,7 +3779,7 @@ function cmdHelp() {
     setu spans search-status [--json]
     setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
                                       Offline: indexes an existing archive in bounded pages; rerun to resume
-    setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|->] [--json]
+    setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|-> | resume <repo> <branch> --native <id> [--confirmation <token>]] [--json]
     setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] [--json]
     setu links inbox <repo> <branch> --session <id> [--state <state>] [--json]
     setu links show|status|cancel <message> [--json]

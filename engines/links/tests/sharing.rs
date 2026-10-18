@@ -333,3 +333,46 @@ fn changing_the_owner_label_keeps_the_scope_and_only_a_withdrawal_mints_a_new_on
     engine.ok("share_disable", json!({ "project": "repo" }));
     assert_ne!(enable(&engine, "repo")["policy"]["scope"], first["policy"]["scope"]);
 }
+
+
+#[test]
+fn a_cross_record_resume_preserves_a_policy_hold_until_the_project_is_shared_again() {
+    let engine = Engine::new();
+    enable(&engine, "repo");
+    let id = queued_id(&engine, "resume-policy");
+    engine.ok("share_disable", json!({ "project": "repo" }));
+    let mut current = recipient("native-a");
+    current["session_hint"] = json!("session-resumed");
+    let resumed = engine.ok("resume", json!({ "recipient": current, "from": ["session-1"] }));
+    assert_eq!(resumed["moved"], json!([id]));
+    assert_eq!(resumed["released"], json!([]));
+    engine.ok("reconcile", json!({ "recipient": current }));
+    let held = state(&engine, &id);
+    assert_eq!(held["locator"], "session-resumed");
+    assert_eq!(held["reason"], "policy-disabled");
+    assert_eq!(held["attempts"], 0);
+    assert_eq!(engine.ok("claim", json!({ "recipient": current }))["messages"], json!([]));
+    enable(&engine, "repo");
+    assert_eq!(engine.ok("claim", json!({ "recipient": current }))["messages"][0]["message_id"], id);
+}
+
+#[test]
+fn session_principal_batches_preserve_attribution_and_fit_whole_provider_frames() {
+    let engine = Engine::new();
+    enable(&engine, "repo");
+    let sender = "s".repeat(128);
+    let body = "界".repeat(2000);
+    for key in ["first", "second"] {
+        engine.ok("send", session_send_args(key, &body, "native-a", &sender, "repo"));
+    }
+    for _ in 0..2 {
+        let claim = engine.ok("claim", json!({ "recipient": recipient("native-a") }));
+        assert_eq!(claim["messages"].as_array().unwrap().len(), 1);
+        let text = claim["text"].as_str().unwrap();
+        assert!(text.len() <= 10000);
+        assert!(text.contains(&format!("from=\"session:{sender}\"")));
+        assert!(text.contains(&body));
+        assert!(text.ends_with("</setu-link-message>\n"));
+    }
+    assert_eq!(engine.ok("claim", json!({ "recipient": recipient("native-a") }))["messages"], json!([]));
+}

@@ -288,7 +288,9 @@ test('composes a token-bound Ghostty launch, trusted Claude hook and exact exist
   expect(launcher).toContain(
     "export SETU_SESSION_TOKEN='token_1234567890123456'"
   );
-  expect(hook).toContain('AbortSignal.timeout(1000)');
+  // Non-prompt events keep their one-second, fire-and-forget request.
+  expect(hook).toContain('AbortSignal.timeout(ms)');
+  expect(hook).toContain('payload}, 1000);');
   expect(
     permissionMode(fs.statSync(join(f.root, runtime, 'launch.zsh')).mode)
   ).toBe(0o700);

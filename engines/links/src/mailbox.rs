@@ -9,7 +9,9 @@ use crate::{
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-pub const MAX_BODY_BYTES: usize = 16 * 1024;
+/// A body this large, framed with the worst-case metadata, is still one whole turn of provider output
+/// (`frame::MAX_FRAME_BYTES`). Mail stored under the earlier 16 KiB rule may be larger; see `claim`.
+pub const MAX_BODY_BYTES: usize = 8 * 1024;
 pub const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 pub struct Recipient {
@@ -38,9 +40,18 @@ impl Recipient {
 }
 
 pub const MAX_PENDING_PER_RECIPIENT: i64 = 100;
-/// One turn carries at most this many messages and this many body bytes, so mail cannot flood a context.
+/// One turn carries at most this many messages, and their serialized text at most `frame::MAX_FRAME_BYTES`,
+/// so mail cannot flood a context and nothing is claimed that the provider would cut off.
 pub const CLAIM_MAX_MESSAGES: usize = 8;
-pub const CLAIM_MAX_BYTES: usize = 32 * 1024;
+
+/// Mail larger than a turn can carry whole. Both the read projection and `claim` use this one rule (claim
+/// also checks the exact serialized frame), so a plain read and the persisted hold always agree.
+fn over_body_cap(size: i64) -> bool {
+    size > MAX_BODY_BYTES as i64
+}
+
+/// Why mail that can never fit one turn is held rather than claimed.
+pub const OUTPUT_LIMIT: &str = "provider-output-limit";
 
 /// The trusted caller of a send, as the engine's client states it. The engine's protocol is local, so this
 /// is not something message text can establish: a front door sets it from what it authenticated. A peer is
@@ -196,6 +207,12 @@ pub fn send(store: &mut Store, request: SendRequest) -> Result<Value, Fail> {
     if pending >= MAX_PENDING_PER_RECIPIENT {
         return Err(Fail::new("RECIPIENT_QUEUE_FULL", "this conversation already has the most pending messages allowed"));
     }
+    // The exact text the agent would see must fit one turn, metadata included. Refused before anything is stored.
+    let framed = frame::Framed { id: &id, sender: &sender_column, sent_at: now, reply_to: reply_to.as_deref(), body: &body };
+    if !frame::fits(&[framed]) {
+        return Err(Fail::new("FRAME_TOO_LARGE", "this message, with its metadata, does not fit one turn of provider output")
+            .with(json!({ "limit_bytes": frame::MAX_FRAME_BYTES })));
+    }
     tx.execute(
         "INSERT INTO messages (id, sender, idempotency_key, payload_digest, kind, body, size, reply_to, run_hint, span_hint, provider, native_id, checkout, session_hint, created_at, project)
          VALUES (?1, ?14, ?2, ?3, 'message', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?15)",
@@ -213,12 +230,12 @@ const VIEW_SQL: &str = "SELECT m.id, m.sender, m.kind, m.size, m.reply_to, m.run
         m.session_hint, m.created_at, m.body,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.state END,
         CASE WHEN d.state IN ('queued', 'held') AND d.expires_at <= ?2 THEN 'expired' ELSE d.reason END,
-        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state, m.project
+        d.attempts, d.redeliveries, d.attempt_id, d.expires_at, d.updated_at, d.state, m.project, COALESCE(d.locator, m.session_hint)
     FROM messages m JOIN deliveries d ON d.message_id = m.id";
 
 /// Schema 1 has no project column; its messages read as having none.
 fn view_sql(version: i64) -> String {
-    if version < SHARING_SCHEMA { VIEW_SQL.replace("m.project", "NULL") } else { VIEW_SQL.to_string() }
+    if version < SHARING_SCHEMA { VIEW_SQL.replace("m.project", "NULL").replace("COALESCE(d.locator, m.session_hint)", "m.session_hint") } else { VIEW_SQL.to_string() }
 }
 
 fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
@@ -246,6 +263,7 @@ fn row_json(row: &rusqlite::Row, with_body: bool) -> rusqlite::Result<Value> {
         "updated_at": row.get::<_, i64>(19)?,
         "stored_state": row.get::<_, String>(20)?,
         "project": row.get::<_, Option<String>>(21)?,
+        "locator": row.get::<_, String>(22)?,
     });
     if with_body {
         value["body"] = Value::String(row.get(12)?);
@@ -264,9 +282,15 @@ fn parse_observed(args: &mut Args) -> Result<Option<Recipient>, Fail> {
 /// `reconcile` is what persists the same
 /// decision; nothing here changes the store.
 fn project(value: &mut Value, observed: Option<&Recipient>) {
+    // Mail larger than a turn can carry is held whatever else is known; `claim` persists the same decision.
+    if value["state"] == "queued" && value["size"].as_i64().is_some_and(over_body_cap) {
+        value["state"] = json!("held");
+        value["reason"] = json!(OUTPUT_LIMIT);
+        return;
+    }
     let Some(observed) = observed else { return };
     let recipient = value["recipient"].clone();
-    if recipient["session_hint"] != observed.session_hint.as_str() {
+    if value["locator"] != observed.session_hint.as_str() {
         return;
     }
     let same_conversation = recipient["provider"] == observed.provider.as_str() && recipient["native_id"] == observed.native_id.as_str();
@@ -326,7 +350,8 @@ pub fn list(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     let observed = parse_observed(&mut args)?;
     args.finish()?;
     let Some(store) = store else { return Ok(json!({ "messages": [] })) };
-    let mut statement = store.db.prepare(&format!("{} WHERE m.session_hint = ?1 ORDER BY m.created_at, m.id", view_sql(store.version)))?;
+    let found = if store.version >= 2 { "(m.session_hint = ?1 OR d.locator = ?1)" } else { "m.session_hint = ?1" };
+    let mut statement = store.db.prepare(&format!("{} WHERE {found} ORDER BY m.created_at, m.id", view_sql(store.version)))?;
     let now = util::now_ms();
     let rows = statement.query_map(params![session, now], |row| row_json(row, false))?;
     let mut messages = Vec::new();
@@ -382,8 +407,9 @@ pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
             reason = CASE WHEN (SELECT provider = ?2 AND native_id = ?3 FROM messages WHERE id = message_id)
                           THEN 'checkout-changed' ELSE 'conversation-replaced' END
          WHERE state = 'queued' AND message_id IN (
-            SELECT id FROM messages WHERE session_hint = ?1
-              AND NOT (provider = ?2 AND native_id = ?3 AND checkout = ?4))
+            SELECT m.id FROM messages m JOIN deliveries l ON l.message_id = m.id
+             WHERE COALESCE(l.locator, m.session_hint) = ?1
+              AND NOT (m.provider = ?2 AND m.native_id = ?3 AND m.checkout = ?4))
          RETURNING message_id",
     )?;
     let held = hold
@@ -393,8 +419,9 @@ pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
     let mut release = tx.prepare(
         "UPDATE deliveries SET state = 'queued', reason = NULL, updated_at = ?5
          WHERE state = 'held' AND reason IN ('conversation-replaced', 'checkout-changed') AND expires_at > ?5 AND message_id IN (
-            SELECT id FROM messages WHERE session_hint = ?1
-              AND provider = ?2 AND native_id = ?3 AND checkout = ?4)
+            SELECT m.id FROM messages m JOIN deliveries l ON l.message_id = m.id
+             WHERE COALESCE(l.locator, m.session_hint) = ?1
+              AND m.provider = ?2 AND m.native_id = ?3 AND m.checkout = ?4)
          RETURNING message_id",
     )?;
     let released = release
@@ -405,6 +432,70 @@ pub fn reconcile(store: &mut Store, current: Recipient) -> Result<Value, Fail> {
     Ok(json!({ "held": held, "released": released }))
 }
 
+/// Hold reasons that returning the exact conversation resolves. Any other reason is a different decision
+/// and a resume never lifts it.
+const RESUME_RELEASES: &str = "conversation-replaced";
+const MAX_RESUME_FROM: usize = 8;
+
+pub struct ResumeRequest {
+    current: Recipient,
+    from: Vec<String>,
+}
+
+pub fn parse_resume(mut args: Args) -> Result<ResumeRequest, Fail> {
+    let current = Recipient::parse(args.object("recipient")?)?;
+    let from = args.string_list("from", MAX_RESUME_FROM, 128)?;
+    args.finish()?;
+    Ok(ResumeRequest { current, from })
+}
+
+/// The trusted service's report that a verified, explicitly reviewed resume brought this exact conversation
+/// (provider, native conversation and checkout) back under a new managed record. Mail already addressed to
+/// that tuple and located at one of the named earlier records is now located at the new one. The recipient
+/// stored on the message is never rewritten, and no state changes except that mail held because the
+/// conversation was replaced is queued again. Repeating it changes nothing.
+pub fn resume(store: &mut Store, request: ResumeRequest) -> Result<Value, Fail> {
+    let ResumeRequest { current, from } = request;
+    let now = util::now_ms();
+    let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut moved = Vec::new();
+    let mut released = Vec::new();
+    {
+        let mut find = tx.prepare(
+            "SELECT m.id, d.state, d.reason, d.expires_at FROM messages m JOIN deliveries d ON d.message_id = m.id
+             WHERE m.provider = ?1 AND m.native_id = ?2 AND m.checkout = ?3
+               AND COALESCE(d.locator, m.session_hint) = ?4 AND ?4 != ?5
+             ORDER BY m.created_at, m.id",
+        )?;
+        for hint in &from {
+            let rows = find
+                .query_map(params![current.provider, current.native_id, current.checkout, hint, current.session_hint], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (id, state, reason, expires_at) in rows {
+                let release = state == "held" && expires_at > now && reason.as_deref() == Some(RESUME_RELEASES);
+                // One statement for both outcomes: the mail is located at the new record, and a hold this
+                // resume resolves is lifted. Any other state or reason is left exactly as it was.
+                tx.execute(
+                    "UPDATE deliveries SET locator = ?2,
+                        state = CASE WHEN ?4 THEN 'queued' ELSE state END,
+                        reason = CASE WHEN ?4 THEN NULL ELSE reason END,
+                        updated_at = CASE WHEN ?4 THEN ?3 ELSE updated_at END
+                     WHERE message_id = ?1",
+                    params![id, current.session_hint, now, release],
+                )?;
+                if release {
+                    released.push(id.clone());
+                }
+                moved.push(id);
+            }
+        }
+    }
+    commit(tx, "resume")?;
+    Ok(json!({ "moved": moved, "released": released }))
+}
+
 fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> {
     let mut statement = tx.prepare("SELECT message_id FROM deliveries WHERE state IN ('queued', 'held') AND expires_at <= ?1 ORDER BY message_id")?;
     let ids = statement.query_map([now], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -412,6 +503,13 @@ fn expire_due(tx: &rusqlite::Connection, now: i64) -> Result<Vec<String>, Fail> 
         tx.execute("UPDATE deliveries SET state = 'expired', reason = 'expired', updated_at = ?2 WHERE message_id = ?1", params![id, now])?;
     }
     Ok(ids)
+}
+
+/// A queued row as claim reads it: id, created_at, reply_to, body, body size, attempts so far, sender, project.
+type Queued = (String, i64, Option<String>, String, i64, i64, String, Option<String>);
+
+fn framed(rows: &[Queued]) -> Vec<frame::Framed<'_>> {
+    rows.iter().map(|(id, created_at, reply_to, body, _, _, sender, _)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body }).collect()
 }
 
 pub struct ClaimRequest {
@@ -465,14 +563,27 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
             }
         }
     }
-    let mut taken = Vec::new();
-    let mut bytes = 0;
+    // Mail that can never fit one turn is not claimed and not attempted: it is held, with the reason, and
+    // stays readable in full. That is only mail stored under the earlier, larger body cap (a new send is
+    // refused up front), and the exact serialized frame decides, not the body size alone.
+    let (too_big, queued): (Vec<_>, Vec<_>) = queued.into_iter().partition(|(id, created_at, reply_to, body, size, _, sender, _)| {
+        over_body_cap(*size) || !frame::fits(&[frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body }])
+    });
+    for (id, ..) in &too_big {
+        tx.execute(
+            "UPDATE deliveries SET state = 'held', reason = ?2, updated_at = ?3 WHERE message_id = ?1 AND state = 'queued'",
+            params![id, OUTPUT_LIMIT, now],
+        )?;
+    }
+    // The rest go in order, whole, while the serialized text of the batch still fits one turn. The first
+    // message that does not fit waits for the next turn; nothing is ever cut to make room.
+    let mut taken: Vec<Queued> = Vec::new();
     for message in queued {
-        if taken.len() >= CLAIM_MAX_MESSAGES || bytes + message.4 as usize > CLAIM_MAX_BYTES {
+        taken.push(message);
+        if taken.len() > CLAIM_MAX_MESSAGES || !frame::fits(&framed(&taken)) {
+            taken.pop();
             break;
         }
-        bytes += message.4 as usize;
-        taken.push(message);
     }
     if taken.is_empty() {
         // Expiry decided above still counts.
@@ -495,11 +606,7 @@ pub fn claim(store: &mut Store, request: ClaimRequest) -> Result<Value, Fail> {
         messages.push(json!({ "message_id": id, "sender": sender_json(sender), "created_at": created_at, "reply_to": reply_to, "body": body, "attempt": number }));
     }
     commit(tx, "claim")?;
-    let framed: Vec<_> = taken
-        .iter()
-        .map(|(id, created_at, reply_to, body, _, _, sender, _)| frame::Framed { id, sender, sent_at: *created_at, reply_to: reply_to.as_deref(), body })
-        .collect();
-    Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed) }))
+    Ok(json!({ "attempt_id": attempt, "messages": messages, "text": frame::for_agent(&framed(&taken)) }))
 }
 
 pub struct ConfirmRequest {

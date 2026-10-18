@@ -98,6 +98,14 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             }
             mailbox::reconcile(&mut Store::open_or_create(data_dir)?, current)
         }
+        "resume" => {
+            let request = mailbox::parse_resume(args)?;
+            // With no store there is no mail to move, and a resume must not be what creates one.
+            if reader(data_dir)?.is_none() {
+                return Ok(json!({ "moved": [], "released": [] }));
+            }
+            mailbox::resume(&mut Store::open_or_create(data_dir)?, request)
+        }
         "cancel" => {
             let request = mailbox::parse_cancel(args)?;
             mailbox::cancel(&mut Store::open_or_create(data_dir)?, request)

@@ -105,6 +105,12 @@ export function createLinksRuntime({
     taskLabel,
   });
   return Object.freeze({
+    // For the authenticated prompt hook only (see portal.js): never a route, tool or command.
+    delivery: Object.freeze({
+      claimExact: service.claimExact,
+      confirmExact: service.confirmExact,
+      reconcileExact: service.reconcileExact,
+    }),
     linksAck: service.ack,
     linksCancel: service.cancel,
     linksDirectory: service.directory,

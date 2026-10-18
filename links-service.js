@@ -155,6 +155,13 @@ const publicEntry = (entry) => ({
   taskStale: entry.task_stale,
 });
 
+// The checkout text the engine stores and compares, for callers that hold an identity object.
+export const canonicalCheckout = canonical;
+
+// The most earlier records one resume names. The record authority (`maxReplacedHistory`) and the engine
+// (`MAX_RESUME_FROM`) hold the same bound; this module cannot import either, so the value is stated here.
+const MAX_RESUMED_FROM = 8;
+
 const invalid = () => failure('LINKS_INVALID', 'Invalid Links request.');
 const idPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const nameFields = ['name', 'repo', 'sessionId'];
@@ -189,6 +196,7 @@ const publicMessage = (row) => ({
   messageId: row.message_id,
   reason: row.reason ?? null,
   recipient: {
+    currentSessionId: row.locator,
     nativeId: row.recipient.native_id,
     provider: row.recipient.provider,
     sessionId: row.recipient.session_hint,
@@ -271,14 +279,21 @@ export function createLinksService({
         provider: binding.provider,
         session_hint: session.id,
       },
+      resumedFrom: binding.resumedFrom ?? [],
     };
   }
 
   // An explicit send or claim tells the engine which conversation the managed record says a session runs
   // now, and the engine persists the hold or restore. Reads never do this.
-  async function reconcile(recipient) {
+  async function reconcile(recipient, resumedFrom = []) {
     const outcome = await client.call('reconcile', { recipient });
-    return outcome.ok ? { ok: true } : outcome;
+    if (!outcome.ok || resumedFrom.length === 0) {
+      return outcome.ok ? { ok: true } : outcome;
+    }
+    // A record born of an explicit, reviewed resume also brings the conversation's mail along. The engine
+    // repeats this safely, so every report may include it.
+    const moved = await client.call('resume', { from: resumedFrom, recipient });
+    return moved.ok ? { ok: true } : moved;
   }
 
   // What a read may compare stored mail against: the verified conversation of a session that is verifiably
@@ -405,7 +420,7 @@ export function createLinksService({
       refusal.code === 'LINKS_OUTCOME_UNKNOWN'
         ? { ...refusal, idempotencyKey: input.idempotencyKey }
         : refusal;
-    const reported = await reconcile(resolved.recipient);
+    const reported = await reconcile(resolved.recipient, resolved.resumedFrom);
     if (!reported.ok) {
       return withKey(reported);
     }
@@ -464,9 +479,7 @@ export function createLinksService({
     }
     // The stored message says which session to observe; the second read is the same read plus that
     // observation, and falls back to the stored one if it cannot be had.
-    const observed = await observationById(
-      stored.result.recipient.session_hint
-    );
+    const observed = await observationById(stored.result.locator);
     const looked = observed
       ? await client.call(op, { ...args, observed })
       : null;
@@ -507,7 +520,7 @@ export function createLinksService({
     if (!resolved.ok) {
       return resolved;
     }
-    const reported = await reconcile(resolved.recipient);
+    const reported = await reconcile(resolved.recipient, resolved.resumedFrom);
     if (!reported.ok) {
       return reported;
     }
@@ -953,14 +966,104 @@ export function createLinksService({
     return { failed, published };
   }
 
+  // Operations for the authenticated provider hook only. The caller has already proved which exact
+  // conversation it speaks for and passes that tuple; nothing here looks a session up by its ID, so a
+  // conversation bound after authentication can neither receive nor confirm this one's mail. They have no
+  // route, tool or command: an unauthenticated entry would let any local caller take another's mail.
+  function exactRecipient(raw) {
+    const resumedFrom = raw?.resumedFrom ?? [];
+    if (
+      !(
+        raw &&
+        typeof raw === 'object' &&
+        raw.provider === 'claude-code' &&
+        typeof raw.nativeId === 'string' &&
+        raw.nativeId.length > 0 &&
+        typeof raw.sessionId === 'string' &&
+        idPattern.test(raw.sessionId) &&
+        raw.checkoutIdentity !== undefined &&
+        Array.isArray(resumedFrom) &&
+        resumedFrom.length <= MAX_RESUMED_FROM &&
+        resumedFrom.every((id) => typeof id === 'string' && idPattern.test(id))
+      )
+    ) {
+      return null;
+    }
+    return {
+      recipient: {
+        checkout: canonical(raw.checkoutIdentity),
+        native_id: raw.nativeId,
+        provider: raw.provider,
+        session_hint: raw.sessionId,
+      },
+      resumedFrom,
+    };
+  }
+
+  async function reconcileExact(raw) {
+    const exact = exactRecipient(raw?.recipient);
+    return exact
+      ? await reconcile(exact.recipient, exact.resumedFrom)
+      : invalid();
+  }
+
+  async function claimExact(raw) {
+    const exact = exactRecipient(raw?.recipient);
+    if (!exact) {
+      return invalid();
+    }
+    const reported = await reconcile(exact.recipient, exact.resumedFrom);
+    if (!reported.ok) {
+      return reported;
+    }
+    const outcome = await client.call('claim', { recipient: exact.recipient });
+    return outcome.ok
+      ? {
+          attemptId: outcome.result.attempt_id,
+          messages: outcome.result.messages.map((message) => ({
+            messageId: message.message_id,
+          })),
+          ok: true,
+          text: outcome.result.text,
+        }
+      : outcome;
+  }
+
+  async function confirmExact(raw) {
+    const exact = exactRecipient(raw?.recipient);
+    if (
+      !(
+        exact &&
+        typeof raw.attemptId === 'string' &&
+        idPattern.test(raw.attemptId)
+      )
+    ) {
+      return invalid();
+    }
+    const outcome = await client.call('confirm', {
+      attempt_id: raw.attemptId,
+      recipient: exact.recipient,
+    });
+    return outcome.ok
+      ? {
+          confirmed: outcome.result.confirmed,
+          ok: true,
+          superseded: outcome.result.superseded,
+        }
+      : outcome;
+  }
+
   return Object.freeze({
     ack,
     cancel,
     claim,
+    claimExact,
     confirm,
+    confirmExact,
     directory,
     inbox,
     publishPresence,
+    reconcileExact,
     redeliver,
     send,
     shareDisable,

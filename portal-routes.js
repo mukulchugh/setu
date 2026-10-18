@@ -34,6 +34,7 @@ export const PORTAL_API_ROUTES = Object.freeze([
   { methods: ['GET'], path: '/api/spans/search/status' },
   { methods: ['GET'], path: '/api/agent-sessions' },
   { methods: ['POST'], path: '/api/agent-sessions/end' },
+  { methods: ['POST'], path: '/api/agent-sessions/resume' },
   { methods: ['GET'], path: '/api/agents' },
   { methods: ['GET'], path: '/api/attention' },
   { methods: ['POST'], path: '/api/attention/focus' },

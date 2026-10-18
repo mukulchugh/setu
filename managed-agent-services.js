@@ -14,11 +14,16 @@ import {
 } from './agent-session-launcher.js';
 import {
   createAgentSessions,
+  identityDigest,
   launchProofDigest,
+  maxReplacedHistory,
   publicSessionResult,
   publicSession as safeSession,
 } from './agent-sessions.js';
 import { createHeadlessRun } from './headless-run.js';
+import { createLinksDelivery } from './links-delivery.js';
+import { createLifecycleAnnouncer } from './links-lifecycle.js';
+import { claudeHookProgram, claudeSettings } from './managed-claude-hook.js';
 import {
   buildGhosttyScriptLaunch,
   createGhosttyTerminalAdapter,
@@ -34,6 +39,7 @@ import {
 
 const tokenPattern = /^[A-Za-z0-9_-]{16,128}$/;
 const sessionIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
+const nativeIdPattern = sessionIdPattern;
 const authorizationErrorPattern = /not authorized|not permitted/i;
 const safeId = (value) =>
   typeof value === 'string' && sessionIdPattern.test(value);
@@ -124,49 +130,6 @@ function safeRun(run) {
   );
 }
 
-function claudeSettings({ hookPath }) {
-  const command = (event) => `${shellQuote(hookPath)} ${shellQuote(event)}`;
-  const hooks = (event, matcher) => [
-    {
-      ...(matcher ? { matcher } : {}),
-      hooks: [{ command: command(event), type: 'command' }],
-    },
-  ];
-  return JSON.stringify({
-    hooks: {
-      Notification: hooks('Notification', 'agent_needs_input'),
-      PermissionRequest: hooks('PermissionRequest'),
-      SessionStart: hooks('SessionStart'),
-      Stop: hooks('Stop'),
-    },
-  });
-}
-
-function claudeHookProgram(ingressUrl) {
-  return `#!/usr/bin/env bun
-const event = process.argv[2];
-const token = process.env.SETU_SESSION_TOKEN;
-if (!/^[A-Za-z0-9_-]{16,128}$/.test(token ?? '')) process.exit(0);
-let input = '';
-let bytes = 0;
-for await (const part of process.stdin) {
-  bytes += Buffer.byteLength(part);
-  if (bytes > 131072) process.exit(0);
-  input += part;
-}
-let payload;
-try { payload = JSON.parse(input); } catch { process.exit(0); }
-if (payload?.hook_event_name !== event) process.exit(0);
-try {
-  await fetch(${JSON.stringify(ingressUrl)}, {
-    method: 'POST', headers: {'content-type':'application/json'},
-    body: JSON.stringify({provider:'claude-code', launchToken:token, payload}),
-    signal: AbortSignal.timeout(1000),
-  });
-} catch {}
-`;
-}
-
 async function defaultPrivateFiles({ id, runtimeDir = tmpdir() }) {
   await mkdir(runtimeDir, { mode: 0o700, recursive: true });
   const dir = await mkdtemp(join(runtimeDir, `setu-agent-${id}-`));
@@ -233,6 +196,17 @@ async function defaultOpen(command) {
   }
 }
 
+// What an explicit, reviewed resume adds to a launch: the intent kept on the new record, and the provider's
+// own resume argument for exactly that conversation.
+function resumeLaunchParts(resumeIntent) {
+  return resumeIntent
+    ? {
+        intentFields: { resumeIntent },
+        resumeArgs: ` --resume ${shellQuote(resumeIntent.nativeId)}`,
+      }
+    : { intentFields: {}, resumeArgs: '' };
+}
+
 function resultTarget(record, target) {
   return (
     record &&
@@ -254,6 +228,11 @@ export function createManagedAgentServices({
   privateFiles,
   launchNative,
   launchOpen,
+  links,
+  lifecycle,
+  lifecycleHeartbeatMs = 60_000,
+  lifecycleTimeoutMs,
+  recordHookActivity,
   runAppleScript = defaultAppleScript,
   observeProcess = observeProcessIdentity,
   findChildren = ({ pid, processStart }) =>
@@ -310,6 +289,29 @@ export function createManagedAgentServices({
           'The managed session could not be verified'
         );
   };
+  const { announceAll, announceSession } = createLifecycleAnnouncer({
+    heartbeatMs: lifecycleHeartbeatMs,
+    lifecycle,
+    now,
+    sessions,
+    timeoutMs: lifecycleTimeoutMs,
+  });
+  // Natural-turn delivery exists only when a Links runtime is composed in; without one the prompt hook
+  // finds no mail and everything else is unchanged.
+  const delivery = links?.claimExact
+    ? createLinksDelivery({
+        // The directory's activity clock, merged from its own work: `sessions.recordHookActivity`. Only an
+        // exactly authenticated prompt submission calls it; this branch adds no clock or field of its own.
+        activity: (sessionId) =>
+          (recordHookActivity ?? sessions.recordHookActivity)?.({
+            at: now(),
+            id: sessionId,
+          }),
+        announce: announceSession,
+        links,
+        resolve: ingress.resolveHookSession,
+      })
+    : null;
   const terminal = createGhosttyTerminalAdapter({
     runAppleScript,
     verifySession,
@@ -650,7 +652,13 @@ export function createManagedAgentServices({
       });
   };
 
-  async function open({ repo, name, tool = 'claude-code', source } = {}) {
+  async function launchSession({
+    repo,
+    name,
+    tool = 'claude-code',
+    source,
+    resumeIntent,
+  } = {}) {
     let resolved = await target({ name, repo });
     const reviewed = resolved && {
       checkoutIdentity: resolved.checkoutIdentity,
@@ -669,6 +677,7 @@ export function createManagedAgentServices({
         'This coding tool is not supported for managed sessions'
       );
     }
+    const { intentFields, resumeArgs } = resumeLaunchParts(resumeIntent);
     const sessionId = id();
     const launchToken = token();
     if (!(safeId(sessionId) && tokenPattern.test(launchToken))) {
@@ -973,6 +982,7 @@ export function createManagedAgentServices({
             launchProofDigest: proofDigest,
             name,
             repo,
+            ...intentFields,
             tool: provider,
           });
         } catch {
@@ -1021,7 +1031,7 @@ export function createManagedAgentServices({
           : null;
       const command =
         provider === 'claude-code'
-          ? `claude --settings "$(cat -- ${shellQuote(files.settingsPath)})"`
+          ? `claude --settings "$(cat -- ${shellQuote(files.settingsPath)})"${resumeArgs}`
           : 'codex';
       const launch = buildAgentSessionLaunch({
         checkoutPath: resolved.wtDir,
@@ -1074,6 +1084,102 @@ export function createManagedAgentServices({
     } catch {
       return failedLaunchLock();
     }
+  }
+
+  // The public launch never carries a resume intent: only the reviewed `resume` below can.
+  const open = ({ resumeIntent: _ignored, ...input } = {}) =>
+    launchSession(input);
+
+  // Explicit resume of one native conversation under a new managed record. The receiving user reviews the
+  // exact conversation, the ended records that held it and the checkout; only the token for that review
+  // launches a fresh, owned process with its own capability. Binding the conversation to the new record
+  // still needs that launch's proof (see bindNativeConversation); nothing here adopts an ID by itself.
+  async function resume({ repo, name, nativeId, confirmation, source } = {}) {
+    if (!(typeof nativeId === 'string' && nativeIdPattern.test(nativeId))) {
+      return failure('RESUME_INVALID', 'The conversation to resume is invalid');
+    }
+    const resolved = await target({ name, repo });
+    if (!resolved) {
+      return failure(
+        'TARGET_CHANGED',
+        'The selected worktree is no longer registered'
+      );
+    }
+    let records;
+    try {
+      records = sessions.list();
+    } catch {
+      return failure('SESSION_STATE_CORRUPT', 'Session state is malformed');
+    }
+    const holders = records.filter(
+      (record) =>
+        normalTool(record.tool) === 'claude-code' &&
+        (record.nativeConversation?.id === nativeId ||
+          record.nativeConversation?.history?.some(
+            (entry) => entry.id === nativeId
+          ))
+    );
+    if (holders.length === 0) {
+      return failure(
+        'RESUME_NATIVE_UNKNOWN',
+        'No managed session of this checkout ever held that conversation'
+      );
+    }
+    if (
+      holders.some(
+        (holder) =>
+          holder.ownership === 'owned' &&
+          ['starting', 'running'].includes(holder.state)
+      )
+    ) {
+      return failure(
+        'RESUME_CONVERSATION_IN_USE',
+        'A running managed session holds that conversation'
+      );
+    }
+    if (holders.some((holder) => holder.state !== 'ended')) {
+      return failure(
+        'RESUME_SOURCE_UNCONFIRMED',
+        'A session that held that conversation has not been proven ended'
+      );
+    }
+    if (
+      !holders.every(
+        (holder) =>
+          holder.repo === repo &&
+          holder.name === name &&
+          same(holder.checkoutIdentity, resolved.checkoutIdentity)
+      )
+    ) {
+      return failure(
+        'RESUME_CHECKOUT_CHANGED',
+        'That conversation belongs to a different checkout'
+      );
+    }
+    const from = holders.map((holder) => holder.id).slice(-maxReplacedHistory);
+    const review = {
+      from,
+      name,
+      nativeId,
+      repo,
+      token: `resume:${nativeId};from:${[...from].sort().join(',')};checkout:${identityDigest(resolved.checkoutIdentity)}`,
+    };
+    if (confirmation !== review.token) {
+      return {
+        ...failure(
+          'RESUME_CONFIRMATION_REQUIRED',
+          'Review this conversation, the ended sessions that held it and the checkout. Only the receiving user may confirm; an agent must not.'
+        ),
+        confirmation: review,
+      };
+    }
+    return launchSession({
+      name,
+      repo,
+      resumeIntent: { from, nativeId, reviewedAt: now() },
+      source,
+      tool: 'claude-code',
+    });
   }
 
   async function recordReconciledSession(
@@ -1166,6 +1272,8 @@ export function createManagedAgentServices({
     const recording = [];
     const retain = new Set();
     if (result.ok) {
+      // Heartbeats for live bindings, and invalidations for ended, unknown or replaced-checkout ones.
+      await announceAll();
       await recordSessionChanges(
         result.sessions,
         before,
@@ -1261,6 +1369,7 @@ export function createManagedAgentServices({
         return selected.error;
       }
       const result = await sessions.end(sessionId, { checkoutIdentity });
+      await announceSession(sessionId);
       const operationId = `session-${sessionId}`;
       let recording;
       if (result.session?.state === 'ended') {
@@ -1292,8 +1401,7 @@ export function createManagedAgentServices({
     });
   }
 
-  // biome-ignore lint/suspicious/useAwait: Hook ingress adapters may throw synchronously; portal callers receive this boundary as a Promise.
-  async function receiveHook({ provider, payload, launchToken } = {}) {
+  async function receiveHook({ provider, payload, launchToken, report } = {}) {
     const canonical = normalTool(provider);
     if (!canonical) {
       return failure(
@@ -1302,12 +1410,31 @@ export function createManagedAgentServices({
       );
     }
     if (payload?.hook_event_name === 'SessionStart') {
-      return ingress.bind({
+      const bound = await ingress.bind({
         checkoutPath: payload.cwd,
         launchToken,
         nativeSessionId: payload.session_id,
         provider: canonical,
       });
+      if (bound.ok) {
+        if (delivery) {
+          await delivery.reconcileBound(sessions.get(bound.sessionId));
+        }
+        await announceSession(bound.sessionId);
+      }
+      return bound;
+    }
+    if (payload?.hook_event_name === 'UserPromptSubmit') {
+      // A prompt submission is a delivery opportunity, never an attention event.
+      if (!(canonical === 'claude-code' && delivery)) {
+        return failure(
+          'LINKS_UNAVAILABLE',
+          'Natural-turn delivery is not available for this session'
+        );
+      }
+      return report === undefined
+        ? delivery.deliver({ launchToken, payload })
+        : delivery.report({ launchToken, payload }, report?.attemptId);
     }
     return attention.receive({ launchToken, payload, provider: canonical });
   }
@@ -1753,6 +1880,7 @@ export function createManagedAgentServices({
     receiveHook,
     reconcileSessions,
     recover,
+    resume,
     resumeRun,
     startRun,
   });

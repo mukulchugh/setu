@@ -107,6 +107,20 @@ impl Args {
         }
     }
 
+    /// A non-empty list of at most `max_items` non-empty strings of at most `max` bytes each.
+    pub fn string_list(&mut self, key: &str, max_items: usize, max: usize) -> Result<Vec<String>, Fail> {
+        match self.0.remove(key) {
+            Some(Value::Array(items)) if !items.is_empty() && items.len() <= max_items => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(s) if !s.is_empty() && s.len() <= max => Ok(s),
+                    _ => Err(invalid(key)),
+                })
+                .collect(),
+            _ => Err(invalid(key)),
+        }
+    }
+
     pub fn object(&mut self, key: &str) -> Result<Args, Fail> {
         match self.0.remove(key) {
             Some(value @ Value::Object(_)) => Args::new(value),

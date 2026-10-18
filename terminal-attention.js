@@ -194,8 +194,12 @@ export function createTrustedHookIngress({ sessions } = {}) {
     });
     return resolved.ok
       ? {
+          boundAt: resolved.session.nativeConversation.boundAt,
           checkoutIdentity: resolved.session.checkoutIdentity,
+          generation: resolved.session.bindingGeneration ?? 0,
+          nativeId: resolved.session.nativeConversation.id,
           ok: true,
+          resumedFrom: resolved.session.nativeConversation.resumedFrom ?? [],
           sessionId: resolved.session.id,
         }
       : resolved;

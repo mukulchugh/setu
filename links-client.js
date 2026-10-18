@@ -20,6 +20,7 @@ const RECOVERY = {
   reconcile: 'Repeating it is safe.',
   redeliver:
     'Check the message status before deciding whether to redeliver again.',
+  resume: 'Repeating it is safe.',
   send: 'Check the inbox, or repeat the send with the same idempotency key.',
   share_disable:
     'Check the sharing status; disabling again is safe, and sharing stays on until it is confirmed disabled.',
@@ -112,6 +113,7 @@ const messageFields = {
   created_at: count,
   expires_at: count,
   kind: isText,
+  locator: isText,
   message_id: isText,
   project: maybe(isText),
   reason: maybe(isText),
@@ -180,6 +182,7 @@ const RESULT_SHAPES = {
   presence_publish: exactly({ project: isText, published: count }),
   reconcile: exactly({ held: listOf(isText), released: listOf(isText) }),
   redeliver: exactly(statusOf),
+  resume: exactly({ moved: listOf(isText), released: listOf(isText) }),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
   share_disable: exactly({
     held: listOf(isText),

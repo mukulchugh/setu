@@ -845,6 +845,7 @@ export async function dispatchPortalResourceRoute(services, request) {
   }
   const routes = {
     '/api/agent-sessions/end': 'endAgentSession',
+    '/api/agent-sessions/resume': 'resumeAgentSession',
     '/api/attention/focus': 'attentionFocus',
     '/api/attention/hook': 'attentionHook',
     '/api/dependency-sharing/repair': 'dependencyRepair',

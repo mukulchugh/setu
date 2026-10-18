@@ -42,7 +42,7 @@ fn an_oversized_request_is_refused_before_it_is_parsed() {
 #[test]
 fn message_bodies_never_appear_in_errors_or_diagnostics() {
     let engine = Engine::new();
-    let body = format!("{SECRET} {}", "x".repeat(16 * 1024));
+    let body = format!("{SECRET} {}", "x".repeat(8 * 1024));
     let mut wrong_type = send_args("k3", SECRET, "native-a");
     wrong_type["recipient"]["native_id"] = json!({ "oops": SECRET });
     let mut extra = send_args("k4", SECRET, "native-a");
