@@ -197,6 +197,8 @@ The hook never blocks the user's turn, but no guarantee is made that a failed ho
 
 A narrow execution composition beside the offline runtime wires the existing dispatch, actions, worker and recovery modules to real local adapters for one owned worker and one provider. One owner reserves each resource, so a launch never reserves twice. Process exit, reported outcome and accepted completion stay distinct. Active-plan edits are not a workaround; replanning an active run needs its own specified transition.
 
+The first Claude Code profile uses the receiving user's existing subscription, without a dollar budget or `--max-budget-usd` (user decision, 2026-10-18). Usage records retain observed tokens and provider cost estimates, clearly distinguished from subscription charges. Cancellation, wall-clock limits, writer ownership and shared resource admission still apply. A profile that explicitly requires a monetary ceiling must still refuse when that ceiling cannot be enforced. Requested effort and observed effort are separate: an absent runtime observation is not reported as verified.
+
 ### Naming
 
 All authored code, docs, prompts, hooks, configs and assets use Setu-native names. A branding check covers first-party source and distributable assets, with narrow exceptions for required notices and provenance. Source provenance and license text for any reused code are maintained separately in a legal-notices location and in shipped artifacts. That work is tracked outside these product documents.
