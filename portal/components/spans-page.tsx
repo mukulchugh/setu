@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks';
+import { evidenceSpanChoices } from '../links-history';
 import { parseSpansLocation, spansLocationSearch } from '../spans-location';
 import {
   readSpansArtifact,
@@ -9,6 +10,7 @@ import {
 import type { SpansPhase } from '../spans-types';
 import { Button } from '../ui/button';
 import { useVisiblePoll } from '../use-visible-poll';
+import { LinksRecoveryPanel } from './links-history';
 import { SpansConversation } from './spans-conversation';
 import { SpansDetail } from './spans-detail';
 import { SpansEvidence } from './spans-evidence';
@@ -174,10 +176,13 @@ function RunPage({ runId, onBack }: { runId: string; onBack: () => void }) {
             error={historyError}
             events={history.data?.events ?? []}
             hasMore={false}
+            historyMore={history.data?.hasMore ?? false}
             loading={!(history.data || history.failed)}
+            onLinksChanged={history.refresh}
             onLoadMore={next}
             readArtifact={readSpansArtifact}
             runId={runId}
+            spanChoices={evidenceSpanChoices(run.data?.view ?? {})}
             stale={history.failed && !!history.data}
           />
         </>
@@ -204,6 +209,7 @@ function RunPage({ runId, onBack }: { runId: string; onBack: () => void }) {
           />
         </>
       }
+      links={<LinksRecoveryPanel onChanged={history.refresh} runId={runId} />}
       loading={!(run.data || run.failed)}
       onBack={onBack}
       onRefresh={() => {

@@ -184,15 +184,28 @@ test('every registered Links route is served, and the hook-only operations are n
   expect(
     links.map((route) => `${route.methods[0]} ${route.path}`).sort()
   ).toEqual([
+    'GET /api/links/associations',
+    'GET /api/links/associations/preview',
+    'GET /api/links/evidence/preview',
     'GET /api/links/inbox',
     'GET /api/links/message',
+    'GET /api/links/projection/status',
+    'GET /api/links/recovery',
     'GET /api/links/status',
     'POST /api/links/ack',
+    'POST /api/links/associations/approve',
+    'POST /api/links/associations/revoke',
     'POST /api/links/cancel',
+    'POST /api/links/evidence/attach',
     'POST /api/links/redeliver',
     'POST /api/links/send',
   ]);
   for (const route of links) {
+    // A recovery listing is a valid request with no arguments; it is exercised
+    // against an engine that supports run-linked listing, not here.
+    if (route.path === '/api/links/recovery') {
+      continue;
+    }
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.
     const response = await api.request(route.path, {
       body: route.methods[0] === 'POST' ? '{}' : undefined,

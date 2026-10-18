@@ -330,6 +330,23 @@ test('every Links route has a CLI command and every CLI command has a route', as
       '--attempt',
       'a_1',
     ],
+    ['associations', 'run-1'],
+    ['associate', 'run-1', '--origin', 'local', '--hint', 'h'],
+    [
+      'associate',
+      'run-1',
+      '--origin',
+      'local',
+      '--hint',
+      'h',
+      '--confirmation',
+      'associate:x',
+    ],
+    ['dissociate', 'run-1', '--origin', 'local', '--hint', 'h'],
+    ['evidence', 'run-1', '--message', 'm_1'],
+    ['evidence', 'run-1', '--message', 'm_1', '--confirmation', 'evidence:x'],
+    ['projection', 'run-1'],
+    ['recovery'],
   ];
   const used = new Set();
   for (const argv of commands) {

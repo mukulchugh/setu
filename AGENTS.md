@@ -588,6 +588,12 @@ carry JSON must contain JSON.
 | `links cancel <message>` | none | Retract a message that has not been handed off. |
 | `links ack <repo> <branch>` | `--session <id> --message <message>` | The addressed conversation's user acknowledges a handed-off message. |
 | `links redeliver <repo> <branch>` | `--session <id> --message <message> --attempt <attempt>` | Accept a possible duplicate for a `handoff-unknown` message; the next claim is a new, counted attempt. |
+| `links associate <run>` | `--origin <local\|peer> --hint <hint> [--confirmation <token>]` | Without `--confirmation`, preview. With the reviewed token, approve that origin and hint for the run's current plan generation. |
+| `links dissociate <run>` | `--origin <origin> --hint <hint>` | Withdraw an approval. |
+| `links associations <run>`, `links projection <run>` | none | Read a run's approvals, or how far its history is projected. |
+| `links recovery` | `[--kind delivery\|unassociated] [--run <run>] [--limit <n>] [--after <message>]` | List held, uncertain or unassociated run-linked messages, one bounded page. |
+| `links evidence <run>` | `--message <message> [--span <span>] [--confirmation <token>]` | Preview, then with the token attach the message as evidence. Never accepts a span. |
+| `links project` | `[--spans-root <dir>] [--links-root <dir>] [--max-batches <n>]` | Offline and explicit: read the engine's event log and write redacted, bounded history into the Spans archive. The only command that writes history; no route and no background worker starts it. Safe to repeat or interrupt. |
 | `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
 | `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
 | `admission` | none | Read resource-admission leases and limits. |
@@ -670,9 +676,17 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/inngest/start` | T; start Inngest runtime. | H W M |
 | `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
 | `POST` | `/api/links/ack` | T plus `sessionId`,`messageId`; the addressed conversation's user acknowledges a handed-off message. Not task completion. | H C |
+| `GET` | `/api/links/associations` | `runId`; the origin+hint approvals recorded on that run, each `approved`, `stale` (the plan changed since) or `revoked`. Passive. | H C |
+| `POST` | `/api/links/associations/approve` | `runId`,`origin`,`hint`,`confirmation`; record the local user's approval that messages from that origin naming that hint belong to this run, for its current plan generation. Needs the token from the preview. Not an agent tool. | H C |
+| `GET` | `/api/links/associations/preview` | `runId`,`origin`,`hint`; what would be approved and the review token bound to run, origin, hint and generation. A peer origin is `peer:<key>` (a bare key is taken as that peer) and must be on the engine roster (`LINKS_ORIGIN_UNKNOWN`; `LINKS_ORIGIN_UNVERIFIABLE` when the roster cannot be read). `runId`, `origin` and `hint` that the redactor would change are refused (`LINKS_INVALID`), never stored. | H C |
+| `POST` | `/api/links/associations/revoke` | `runId`,`origin`,`hint`; withdraw an approval. Needs neither the engine nor the roster: it works with the engine down and after the peer was removed. Earlier history stays. | H C |
 | `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
+| `POST` | `/api/links/evidence/attach` | `runId`,`messageId`,`spanId?`,`confirmation`; keep a redacted, bounded copy of an associated message as run evidence (source origin, target revision and digest). It does not accept a span and writes an event only: the run view and revision are untouched. `spanId` is the user's choice among the run's own spans; a span the peer names is never the default. | H C |
+| `GET` | `/api/links/evidence/preview` | `runId`,`messageId`,`spanId?`; the exact redacted record that would be stored and its token. Origin and hint come from the engine's message, never the request. | H C |
 | `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
 | `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
+| `GET` | `/api/links/projection/status` | `runId`; how far each approved association is projected and whether messages are pending, or that the engine is absent, unavailable or not needed. Passive: it never starts a projection. | H C |
+| `GET` | `/api/links/recovery` | `kind?` (`delivery` or `unassociated`), `runId?`,`limit?` (1-200),`afterId?`; a bounded page of held or `handoff-unknown` messages, or of run-linked messages no approval covers, each with why and a path to open it. An item the lookup cannot place says `index-incomplete`, never "unapproved" or "revoked". An old engine answers `LINKS_ENGINE_UPGRADE_REQUIRED`; an unreachable one `LINKS_ENGINE_UNAVAILABLE`, never an empty list. | H C |
 | `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
 | `POST` | `/api/links/send` | T plus `sessionId`,`idempotencyKey`,`body`,`replyTo?`; refused unless the session is running with a verified native conversation. | H C |
 | `GET` | `/api/links/status` | `messageId`; delivery state, reason and attempt count, without the body. `observed` and `storedState` as for inbox. | H C |
@@ -909,6 +923,45 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
   toolchain's cargo; a missing toolchain fails the check). `bun run verify` includes the engine tests and
   the naming check. A development engine is found at `engines/links/target/release/setu-links` or
   `SETU_LINKS_ENGINE`; shipping the built binary is part of the release-lifecycle work.
+
+### Setu Links in Spans history
+
+Engine and archive contract, including the pending engine integration: [docs/links/history.md](docs/links/history.md).
+
+A run-linked exchange appears in that run's Conversation once its origin and hint are approved by the local
+user. The engine stays the only owner of delivery state; the Spans archive keeps a derived, redacted, bounded
+record.
+
+- **Association.** A peer's run reference is only a hint. The user approves an `(origin, hint)` pair for one
+  run and its current plan generation (`links associate`, reviewed token). Origins are namespaced: `local` or
+  an authenticated peer key, so equal hints from different peers never meet. The approval lives in the run
+  view (`linksAssociations`) with an immutable `links.association.*` event; a plan revision makes it stale
+  until approved again. A message can never approve, change a generation, accept a span or complete a run.
+- **Projection.** `links project` reads the engine's `events` operation page by page and commits each page and
+  its cursor in one archive transaction fenced to the run's generation and the approval, so a revocation or
+  plan revision that lands while the engine is answering stops that batch. Event ids are hashes of the engine
+  store, run, message and sequence: replay after a crash or a lost cursor writes the same events, never a
+  duplicate; a changed engine store starts clean. A status change is a new `links.status` event; the message
+  row (`links.message`) is written once. Anything not projected yet is pending, never lost.
+- **Reads are passive.** Status, recovery, associations and previews never write the archive, never build a
+  search index and never start the projection. Search indexes `links.message` text only after
+  `setu spans index`, and shows reduced coverage before then.
+- **Safety.** Peer text is control-stripped, redacted, cut to 4 KiB with a `truncated` flag and rendered as
+  plain text. Recipient checkout and native conversation ids are never projected. Spans planning, history and
+  search work unchanged with Links disabled or the engine absent.
+- **Evidence** is a reference for the run owner: the redacted message artifact plus an event naming source
+  origin, target revision and the artifact digest. History written before the engine's event log existed is
+  marked `backfill` and shown as unknown. Evidence is appended under the same generation-and-approval fence as
+  the projection in one transaction (`commitFencedEvents`), without rewriting the run view or moving its
+  revision.
+- **Stable ids, versions.** A projected event's id never changes and neither does its payload. A change to
+  what is projected is a new event type or a version-qualified id with its own cursor (`parserVersion`),
+  never a rewrite: an existing id with different content is refused and shown as blocked
+  (`LINKS_PROJECTION_CONFLICT`), not skipped. There is no migration framework.
+- **Faults are isolated.** A run that cannot be read is named (`run-unreadable`) and the pass continues with
+  the next run; the cursor always moves on. The Recovery lookup from an (origin, hint) to runs keeps 16 runs
+  per pair and says so (`overflow`); `links project` rebuilds it from every run's approvals, approved runs
+  first.
 
 ### Runtime and dependency-sharing limits
 

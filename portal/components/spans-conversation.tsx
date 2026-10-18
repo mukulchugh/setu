@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import {
+  groupLinksMessages,
+  type SpanChoice,
+  WHOLE_RUN_CHOICES,
+} from '../links-history';
 import type {
   SpansArtifactResult,
   SpansEvent,
@@ -7,6 +12,11 @@ import type {
 import { Section } from '../ui';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
+import {
+  LinksMessageItem,
+  LinksProjectionNotice,
+  LinksStatusOnlyItem,
+} from './links-history';
 
 interface ArtifactSelection {
   artifactId: string;
@@ -384,8 +394,11 @@ export function SpansConversation({
   error,
   stale,
   hasMore,
+  historyMore = false,
+  onLinksChanged,
   onLoadMore,
   readArtifact,
+  spanChoices = WHOLE_RUN_CHOICES,
 }: {
   runId: string;
   events: SpansEvent[];
@@ -393,11 +406,15 @@ export function SpansConversation({
   error: string | null;
   stale: boolean;
   hasMore: boolean;
+  /** More history pages follow this one (separate from the Load more button). */
+  historyMore?: boolean;
+  onLinksChanged?: () => void;
   onLoadMore: () => void;
   readArtifact: (input: {
     runId: string;
     artifactId: string;
   }) => Promise<SpansArtifactResult>;
+  spanChoices?: SpanChoice[];
 }) {
   const [selection, setSelection] = useState<ArtifactSelection | null>(null);
   const requestGeneration = useRef(0);
@@ -421,6 +438,8 @@ export function SpansConversation({
   }, [runId]);
 
   const runEvents = events.filter((event) => event.runId === runId);
+  const items = groupLinksMessages(runEvents, { more: historyMore });
+  const now = Date.now();
   const visibleSelection = selection?.runId === runId ? selection : null;
   async function openArtifact(artifactId: string) {
     if (!ARTIFACT_ID_PATTERN.test(artifactId) || loading) {
@@ -465,6 +484,7 @@ export function SpansConversation({
 
   return (
     <Section title="Conversation and activity">
+      <LinksProjectionNotice quiet runId={runId} />
       {error && (
         <p class="mb-3 text-signal-red text-sm" role="status">
           Could not load the latest conversation events.{' '}
@@ -488,17 +508,40 @@ export function SpansConversation({
           aria-label="Conversation events"
           class="max-h-[70vh] min-w-0 divide-y divide-zinc-200 overflow-auto dark:divide-white/10"
         >
-          {runEvents.map((event) => (
-            <ConversationEvent
-              event={event}
-              key={`${event.sequence}:${event.eventId}`}
-              loading={loading}
-              onDismissArtifact={dismissArtifact}
-              onOpenArtifact={openArtifact}
-              runId={runId}
-              selection={visibleSelection}
-            />
-          ))}
+          {items.map((item) => {
+            if (item.kind === 'links-message') {
+              return (
+                <LinksMessageItem
+                  choices={spanChoices}
+                  key={`${item.row.sequence}:${item.row.eventId}`}
+                  now={now}
+                  onChanged={onLinksChanged ?? (() => undefined)}
+                  row={item.row}
+                  runId={runId}
+                />
+              );
+            }
+            if (item.kind === 'links-status-only') {
+              return (
+                <LinksStatusOnlyItem
+                  entry={item.entry}
+                  key={`${item.event.sequence}:${item.event.eventId}`}
+                  messageId={item.messageId}
+                />
+              );
+            }
+            return (
+              <ConversationEvent
+                event={item.event}
+                key={`${item.event.sequence}:${item.event.eventId}`}
+                loading={loading}
+                onDismissArtifact={dismissArtifact}
+                onOpenArtifact={openArtifact}
+                runId={runId}
+                selection={visibleSelection}
+              />
+            );
+          })}
         </ol>
       )}
       {hasMore && (

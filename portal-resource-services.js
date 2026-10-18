@@ -791,8 +791,22 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/github/runs': { action: 'githubRuns' },
     '/api/github/workflows': { action: 'githubWorkflows' },
     '/api/headless-runs': { action: 'headlessRuns', optional: true },
+    '/api/links/associations': { action: 'linksAssociations', optional: true },
+    '/api/links/associations/preview': {
+      action: 'linksAssociationPreview',
+      optional: true,
+    },
+    '/api/links/evidence/preview': {
+      action: 'linksEvidencePreview',
+      optional: true,
+    },
     '/api/links/inbox': { action: 'linksInbox', optional: true },
     '/api/links/message': { action: 'linksShow', optional: true },
+    '/api/links/projection/status': {
+      action: 'linksProjectionStatus',
+      optional: true,
+    },
+    '/api/links/recovery': { action: 'linksRecovery', optional: true },
     '/api/links/status': { action: 'linksStatus', optional: true },
     '/api/mcp-actions': { action: 'mcpActions', input: {} },
     '/api/operations': {
@@ -852,7 +866,10 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/headless-runs/resume': 'headlessResume',
     '/api/headless-runs/start': 'headlessStart',
     '/api/links/ack': 'linksAck',
+    '/api/links/associations/approve': 'linksAssociationApprove',
+    '/api/links/associations/revoke': 'linksAssociationRevoke',
     '/api/links/cancel': 'linksCancel',
+    '/api/links/evidence/attach': 'linksEvidenceAttach',
     '/api/links/redeliver': 'linksRedeliver',
     '/api/links/send': 'linksSend',
     '/api/mcp-actions/invoke': 'invokeMcpAction',

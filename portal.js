@@ -3649,6 +3649,7 @@ export async function createPortalRuntime(options = {}) {
       (options.linksTarget ?? b205Target)(repo, name),
     root: options.linksRoot,
     sessions: { list: () => managedAgents.listSessions({}) },
+    spansRoot: options.spansRoot,
   });
   // Live execution is off unless the configuration turns it on; it then shares
   // this portal's admission, setup records and registered-target resolution.

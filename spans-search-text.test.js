@@ -220,3 +220,77 @@ test('artifact text uses actual UTF-8 encoded bytes for lone surrogates', () => 
   const { textForEvent } = selector(artifactResult({ text }));
   expect(codeOf(() => textForEvent(messageEvent()))).toBe('artifact-too-large');
 });
+
+// ---------------------------------------------------------------------------
+// links.* events: only the bounded, already redacted message text is searchable.
+// ---------------------------------------------------------------------------
+
+const linksMessage = (payload = {}) => ({
+  eventId: 'links.message:abc',
+  payload: {
+    createdAt: 1,
+    kind: 'message',
+    messageId: 'm_1',
+    origin: 'peer-A',
+    projectionVersion: 1,
+    recipient: { provider: 'claude-code', sessionId: 'secretish-session' },
+    replyTo: null,
+    runHint: 'hint-words',
+    size: 20,
+    spanHint: null,
+    summary: 'summary must not be indexed',
+    text: 'which migration runs first',
+    title: 'title must not be indexed',
+    truncated: false,
+    ...payload,
+  },
+  runId: 'run-a',
+  sequence: 3,
+  type: 'links.message',
+});
+
+test('a projected Links message is searchable by its text alone', () => {
+  const { calls, textForEvent } = selector();
+  expect(textForEvent(linksMessage())).toBe('which migration runs first');
+  // Never an artifact read, and no other field is prose.
+  expect(calls).toEqual([]);
+});
+
+test('Links status, association and evidence events add no search text', () => {
+  const { textForEvent } = selector();
+  for (const type of [
+    'links.status',
+    'links.association.approved',
+    'links.association.revoked',
+    'links.evidence.attached',
+  ]) {
+    expect(
+      textForEvent({
+        ...linksMessage({ summary: 'x', text: 'status words' }),
+        type,
+      })
+    ).toBe('');
+  }
+});
+
+test('a Links message is bounded to the archive text limit in UTF-8 bytes', () => {
+  const { textForEvent } = selector();
+  expect(textForEvent(linksMessage({ text: 'é'.repeat(2048) }))).toHaveLength(
+    2048
+  );
+  expect(
+    codeOf(() => textForEvent(linksMessage({ text: 'é'.repeat(2049) })))
+  ).toBe('links-event-shape');
+});
+
+test('a malformed Links message is refused rather than indexed as empty', () => {
+  const { textForEvent } = selector();
+  for (const text of [undefined, null, 7, ['a'], { a: 'b' }]) {
+    expect(codeOf(() => textForEvent(linksMessage({ text })))).toBe(
+      'links-event-shape'
+    );
+  }
+  expect(
+    codeOf(() => textForEvent({ ...linksMessage(), payload: 'not an object' }))
+  ).toBe('links-event-shape');
+});

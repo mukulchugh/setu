@@ -55,6 +55,10 @@ const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
 const listOf = (check) => (value) => Array.isArray(value) && value.every(check);
+const either =
+  (...checks) =>
+  (value) =>
+    checks.some((check) => check(value));
 const exactly = (spec) => (value) =>
   isObject(value) &&
   Object.keys(value).every((key) => Object.hasOwn(spec, key)) &&
@@ -67,6 +71,9 @@ const DELIVERY_STATES = new Set([
   'handoff-unknown',
   'held',
   'queued',
+  // A message the sender's own outbox could not hand to the peer. It is a
+  // failure to deliver and is never shown as delivered.
+  'rejected',
 ]);
 const messageFields = {
   attempt_id: maybe(isText),
@@ -92,6 +99,39 @@ const messageFields = {
   stored_state: (value) => DELIVERY_STATES.has(value),
   updated_at: count,
 };
+// One persisted change of a message, from the engine's append-only event log.
+// Nullable fields are present as null, and an unknown field is refused like
+// everywhere else. `origin` is 'local' or the authenticated peer key and never
+// a display label; the recipient carries no checkout.
+const eventMessage = exactly({
+  body: isText,
+  created_at: count,
+  kind: isText,
+  origin: isText,
+  recipient: exactly({ provider: isText, session_hint: isText }),
+  reply_to: maybe(isText),
+  run_hint: maybe(isText),
+  sender: exactly({ kind: isText }),
+  size: count,
+  span_hint: maybe(isText),
+});
+const eventFields = {
+  at: count,
+  attempt_id: maybe(isText),
+  attempts: count,
+  backfill: flag,
+  cancel: isText,
+  expires_at: count,
+  first: flag,
+  message: eventMessage,
+  message_id: isText,
+  reason: maybe(isText),
+  redeliveries: count,
+  remote_state: maybe(isText),
+  seq: count,
+  stage: maybe(isText),
+  state: (value) => DELIVERY_STATES.has(value),
+};
 const statusOf = { message_id: isText, state: isText };
 const RESULT_SHAPES = {
   acknowledge: exactly(statusOf),
@@ -111,13 +151,34 @@ const RESULT_SHAPES = {
     text: isText,
   }),
   confirm: exactly({ confirmed: listOf(isText), superseded: listOf(isText) }),
+  events: exactly({
+    events: listOf(exactly(eventFields)),
+    has_more: flag,
+    head: count,
+    next: count,
+    store_id: maybe(isText),
+  }),
   health: exactly({
     engine_version: isText,
     protocol: isText,
     schema_version: count,
     store: isText,
   }),
-  list: exactly({ messages: listOf(exactly(messageFields)) }),
+  // The baseline listing, or the run-linked one: each message may also carry
+  // its origin, and a page may say where the next one starts.
+  list: either(
+    exactly({ messages: listOf(exactly(messageFields)) }),
+    exactly({
+      has_more: flag,
+      messages: listOf(exactly({ ...messageFields, origin: isText })),
+      next_after: maybe(isText),
+    })
+  ),
+  // Read loosely: the roster's own fields are the transport's to define.
+  peer_list: (value) =>
+    isObject(value) &&
+    Array.isArray(value.peers) &&
+    value.peers.every((peer) => isObject(peer) && isText(peer.peer_id)),
   reconcile: exactly({ held: listOf(isText), released: listOf(isText) }),
   redeliver: exactly(statusOf),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
