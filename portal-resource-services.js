@@ -786,11 +786,19 @@ export async function dispatchPortalResourceRoute(services, request) {
   }
   const getRoutes = {
     '/api/agent-sessions': { action: 'agentSessions', optional: true },
-    '/api/attention': { action: 'attention', optional: true },
+    '/api/attention': {
+      action: 'attention',
+      input: {
+        ...query,
+        ...(query.limit === undefined ? {} : { limit: Number(query.limit) }),
+      },
+      optional: true,
+    },
     '/api/dependency-sharing': { action: 'dependencyViews' },
     '/api/github/runs': { action: 'githubRuns' },
     '/api/github/workflows': { action: 'githubWorkflows' },
     '/api/headless-runs': { action: 'headlessRuns', optional: true },
+    '/api/links/capabilities': { action: 'linksCapabilities', optional: true },
     '/api/links/directory': { action: 'linksDirectory', optional: true },
     '/api/links/inbox': { action: 'linksInbox', optional: true },
     '/api/links/message': { action: 'linksShow', optional: true },
@@ -855,9 +863,12 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/headless-runs/resume': 'headlessResume',
     '/api/headless-runs/start': 'headlessStart',
     '/api/links/ack': 'linksAck',
+    '/api/links/attention/open': 'linksAttentionOpen',
     '/api/links/cancel': 'linksCancel',
     '/api/links/redeliver': 'linksRedeliver',
     '/api/links/send': 'linksSend',
+    '/api/links/send-now': 'linksSendNow',
+    '/api/links/share/attention': 'linksShareAttention',
     '/api/links/share/disable': 'linksShareDisable',
     '/api/links/share/enable': 'linksShareEnable',
     '/api/mcp-actions/invoke': 'invokeMcpAction',

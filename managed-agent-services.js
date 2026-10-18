@@ -1484,15 +1484,65 @@ export function createManagedAgentServices({
     return { events, ok: true };
   }
 
+  // The session still runs exactly the conversation the caller meant, read now, inside the target lock.
+  const holdsConversation = (session, expected) => {
+    const binding = session?.nativeConversation;
+    return (
+      !session?.bindingInvalid &&
+      binding?.provider === expected?.provider &&
+      binding?.id === expected?.nativeId
+    );
+  };
+
+  // `expectConversation` ({ provider, nativeId }) makes the focus exact: if the session's conversation is
+  // anything else when the lock is held, nothing is focused. Callers without it keep today's behavior.
   async function focus({
     repo,
     name,
     sessionId,
     checkoutIdentity,
+    expectConversation,
     source,
   } = {}) {
     const operationId = `terminal-focus-${id()}`;
     const outcomeSource = validSource(source) ? source : serviceSource;
+    // Records the outcome as a focus operation and returns it with the operation id.
+    const settle = async (outcome, forTarget) => {
+      const recording = await event({
+        code: outcome.code,
+        id: operationId,
+        kind: 'terminal-focus',
+        source: outcomeSource,
+        state: outcome.ok ? 'completed' : 'failed',
+        target: forTarget,
+      });
+      return {
+        ...outcome,
+        operationId,
+        ...(recording.ok ? {} : { recording }),
+      };
+    };
+    // Refusals that come before any terminal is touched.
+    const preflight = (selected) => {
+      if (Object.hasOwn(selected, 'error')) {
+        return selected.error;
+      }
+      if (
+        expectConversation !== undefined &&
+        !holdsConversation(selected.session, expectConversation)
+      ) {
+        return failure(
+          'CONVERSATION_CHANGED',
+          'The session no longer runs the conversation this was meant for'
+        );
+      }
+      return selected.session.terminal?.kind === 'ghostty'
+        ? null
+        : failure(
+            'GHOSTTY_TERMINAL_UNAVAILABLE',
+            'This session was not launched with an exact Ghostty terminal mapping'
+          );
+    };
     try {
       return await withTargetResult({ name, repo }, async () => {
         const selected = await sessionForTarget({
@@ -1501,73 +1551,28 @@ export function createManagedAgentServices({
           repo,
           sessionId,
         });
-        if (Object.hasOwn(selected, 'error')) {
-          const recording = await event({
-            code: selected.error.code,
-            id: operationId,
-            kind: 'terminal-focus',
-            source: outcomeSource,
-            state: 'failed',
-            target: { name, repo },
-          });
-          return {
-            ...selected.error,
-            operationId,
-            ...(recording.ok ? {} : { recording }),
-          };
-        }
-        if (selected.session.terminal?.kind !== 'ghostty') {
-          const outcome = failure(
-            'GHOSTTY_TERMINAL_UNAVAILABLE',
-            'This session was not launched with an exact Ghostty terminal mapping'
+        const refusal = preflight(selected);
+        if (refusal) {
+          return await settle(
+            refusal,
+            Object.hasOwn(selected, 'error')
+              ? { name, repo }
+              : selected.resolved
           );
-          const recording = await event({
-            code: outcome.code,
-            id: operationId,
-            kind: 'terminal-focus',
-            source: outcomeSource,
-            state: 'failed',
-            target: selected.resolved,
-          });
-          return {
-            ...outcome,
-            operationId,
-            ...(recording.ok ? {} : { recording }),
-          };
         }
-        const outcome = await attention.returnToTerminal(sessionId);
-        const recording = await event({
-          code: outcome.code,
-          id: operationId,
-          kind: 'terminal-focus',
-          source: outcomeSource,
-          state: outcome.ok ? 'completed' : 'failed',
-          target: selected.resolved,
-        });
-        return {
-          ...outcome,
-          operationId,
-          ...(recording.ok ? {} : { recording }),
-        };
+        return await settle(
+          await attention.returnToTerminal(sessionId),
+          selected.resolved
+        );
       });
     } catch {
-      const outcome = failure(
-        'TARGET_LOCK_FAILED',
-        'The selected worktree could not be locked'
+      return await settle(
+        failure(
+          'TARGET_LOCK_FAILED',
+          'The selected worktree could not be locked'
+        ),
+        { name, repo }
       );
-      const recording = await event({
-        code: outcome.code,
-        id: operationId,
-        kind: 'terminal-focus',
-        source: outcomeSource,
-        state: 'failed',
-        target: { name, repo },
-      });
-      return {
-        ...outcome,
-        operationId,
-        ...(recording.ok ? {} : { recording }),
-      };
     }
   }
 

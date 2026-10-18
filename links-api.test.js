@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { runCli } from './cli.js';
 import { createLinksClient } from './links-client.js';
 import { ensureEngine } from './links-engine-fixture.js';
+import { canonicalCheckout } from './links-service.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { createPortalRuntime } from './portal.js';
 import { PORTAL_API_ROUTES } from './portal-routes.js';
@@ -80,7 +81,7 @@ async function portal(root, sessions = [baseSession], extra = {}) {
     linksEngine: extra.linksEngine ?? ENGINE,
     linksRoot: join(root, 'links'),
     linksTarget: (repo, name) =>
-      repo === 'repo' && name === 'topic'
+      repo === 'repo' && (name === 'topic' || name === 'other')
         ? { checkoutIdentity, name, repo }
         : null,
     managedAgents: {
@@ -88,7 +89,9 @@ async function portal(root, sessions = [baseSession], extra = {}) {
       listSessions:
         extra.listSessions ?? (() => Promise.resolve({ ok: true, sessions })),
       recover: () => Promise.resolve(),
+      ...extra.managedAgents,
     },
+    ...(extra.initializeMcp ? { initializeMcp: extra.initializeMcp } : {}),
     observeProcess: () => Promise.resolve({ state: 'unknown' }),
     port: 43_211,
     ...(extra.registry
@@ -214,20 +217,28 @@ test('every registered Links route is served, and the hook-only operations are n
   expect(
     links.map((route) => `${route.methods[0]} ${route.path}`).sort()
   ).toEqual([
+    'GET /api/links/capabilities',
     'GET /api/links/directory',
     'GET /api/links/inbox',
     'GET /api/links/message',
     'GET /api/links/share/status',
     'GET /api/links/status',
     'POST /api/links/ack',
+    'POST /api/links/attention/open',
     'POST /api/links/cancel',
     'POST /api/links/redeliver',
     'POST /api/links/send',
+    'POST /api/links/send-now',
+    'POST /api/links/share/attention',
     'POST /api/links/share/disable',
     'POST /api/links/share/enable',
   ]);
   // Listing everything shared is a complete request; every other route needs its target.
-  const listings = new Set(['/api/links/directory', '/api/links/share/status']);
+  const listings = new Set([
+    '/api/links/capabilities',
+    '/api/links/directory',
+    '/api/links/share/status',
+  ]);
   for (const route of links) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.
     const response = await api.request(route.path, {
@@ -241,7 +252,13 @@ test('every registered Links route is served, and the hook-only operations are n
         : { code: 'LINKS_INVALID', ok: false }
     );
   }
-  for (const hookOnly of ['claim', 'confirm']) {
+  for (const hookOnly of [
+    'claim',
+    'confirm',
+    'attention',
+    'attention/send',
+    'attention/raise',
+  ]) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.
     const response = await api.request(`/api/links/${hookOnly}`, {
       body: '{}',
@@ -908,4 +925,542 @@ test('removing a project whose registered name the engine cannot hold still work
     });
     expect(Object.hasOwn(api.state.read('projects'), name)).toBe(false);
   }
+});
+
+// ---- attention requests and Send now over the front doors ----
+
+const checkoutOf = canonicalCheckout(checkoutIdentity);
+const NO_ATTENTION_ENTRY = /wake|sendNow|attentionOpen|attentionSend|raise/i;
+
+// The engine's own operation, standing in for the session tools that will call the trusted ingress. Nothing
+// reachable over HTTP, the CLI or MCP can do this.
+async function raiseThroughEngine(
+  root,
+  key,
+  body = 'the build needs you',
+  { hint = 'session-1', native = 'native-a' } = {}
+) {
+  const client = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: ENGINE,
+  });
+  return await client.call('attention_send', {
+    body,
+    idempotency_key: key,
+    project: 'repo',
+    recipient: {
+      checkout: checkoutOf,
+      native_id: native,
+      provider: 'claude-code',
+      session_hint: hint,
+    },
+    sender: { id: 'session-other', kind: 'session' },
+  });
+}
+
+async function optIn(api) {
+  const review = await api.post('/api/links/share/attention', {
+    enabled: true,
+    repo: 'repo',
+  });
+  expect(review).toMatchObject({
+    code: 'LINKS_CONFIRMATION_REQUIRED',
+    ok: false,
+  });
+  return await api.post('/api/links/share/attention', {
+    confirmation: review.confirmation.token,
+    enabled: true,
+    repo: 'repo',
+  });
+}
+
+function focusing() {
+  const calls = [];
+  return {
+    calls,
+    managedAgents: {
+      focus: (input) => {
+        calls.push(input);
+        return Promise.resolve({
+          action: 'focus',
+          ok: true,
+          sessionId: input.sessionId,
+        });
+      },
+      listAttention: () =>
+        Promise.resolve({
+          events: [
+            {
+              at: 1,
+              expiresAt: 2,
+              kind: 'permission',
+              provider: 'claude-code',
+              sessionId: 'session-1',
+              state: 'permission',
+            },
+          ],
+          ok: true,
+        }),
+    },
+  };
+}
+
+test('attention is reviewed and enabled over HTTP, listed beside provider events, and opened through the exact focus', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const api = await portal(root, [baseSession], {
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  // Off by default: the engine refuses a request until the person enabled it.
+  expect((await raiseThroughEngine(root, 'k0')).code).toBe(
+    'LINKS_ATTENTION_NOT_ENABLED'
+  );
+  expect(await optIn(api)).toMatchObject({
+    changed: true,
+    ok: true,
+    policy: { attention: true },
+  });
+
+  const raised = await raiseThroughEngine(root, 'k1');
+  expect(raised.ok).toBe(true);
+  const listed = await api.get('/api/attention');
+  expect(listed.events.map((event) => event.source ?? 'provider')).toEqual([
+    'provider',
+    'links',
+  ]);
+  const entry = listed.events.find((event) => event.source === 'links');
+  expect(entry).toMatchObject({
+    id: raised.result.attention_id,
+    message: 'the build needs you',
+    open: { available: true },
+    sender: { id: 'session-other', kind: 'session' },
+    target: { name: 'topic', repo: 'repo' },
+  });
+  expect(entry.sessionId).toBeUndefined();
+  expect(listed.links.notifications.groups).toHaveLength(1);
+  expect(
+    (
+      await api.get(`/api/attention${query({ name: 'other', repo: 'repo' })}`)
+    ).events.filter((event) => event.source === 'links')
+  ).toEqual([]);
+
+  const opened = await api.post('/api/links/attention/open', {
+    attentionId: entry.id,
+  });
+  expect(opened).toMatchObject({
+    action: 'focus',
+    ok: true,
+    sessionId: 'session-1',
+  });
+  expect(hooks.calls).toHaveLength(1);
+  expect(hooks.calls[0]).toMatchObject({
+    expectConversation: { nativeId: 'native-a', provider: 'claude-code' },
+    name: 'topic',
+    repo: 'repo',
+    sessionId: 'session-1',
+  });
+  expect(hooks.calls[0].source).toBeDefined();
+});
+
+test('the same request cannot be opened once its conversation was replaced, and nothing is focused', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  let sessions = [baseSession];
+  const api = await portal(root, [baseSession], {
+    listSessions: () => Promise.resolve({ ok: true, sessions }),
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  await optIn(api);
+  const raised = await raiseThroughEngine(root, 'k1');
+  sessions = [{ ...baseSession, nativeConversation: bound('native-new') }];
+  expect(
+    await api.post('/api/links/attention/open', {
+      attentionId: raised.result.attention_id,
+    })
+  ).toMatchObject({ code: 'LINKS_CONVERSATION_REPLACED', ok: false });
+  sessions = [{ ...baseSession, state: 'ended' }];
+  expect(
+    await api.post('/api/links/attention/open', {
+      attentionId: raised.result.attention_id,
+    })
+  ).toMatchObject({ code: 'LINKS_SESSION_ENDED', ok: false });
+  expect(hooks.calls).toEqual([]);
+});
+
+test('reading the attention list or the capabilities creates no store and sends no notification', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const api = await portal(root, [baseSession], {
+    managedAgents: hooks.managedAgents,
+  });
+  expect(await api.get('/api/attention')).toMatchObject({
+    links: { state: 'ok' },
+    ok: true,
+  });
+  expect(await api.get('/api/links/capabilities')).toMatchObject({
+    ok: true,
+    wake: { available: false, code: 'LINKS_WAKE_UNAVAILABLE' },
+  });
+  expect(existsSync(join(root, 'links'))).toBe(false);
+  expect(hooks.calls).toEqual([]);
+});
+
+test('Send now answers the same stable code over HTTP and the CLI, and starts nothing', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const api = await portal(root, [baseSession], {
+    managedAgents: hooks.managedAgents,
+  });
+  const body = { ...target, messageId: 'm_1' };
+  const http = await api.post('/api/links/send-now', body);
+  expect(http).toMatchObject({
+    code: 'LINKS_WAKE_UNAVAILABLE',
+    ok: false,
+    reason: 'no-verified-mechanism',
+  });
+
+  const out = [];
+  const original = console.log;
+  const originalError = console.error;
+  console.log = (text) => out.push(String(text));
+  console.error = () => undefined;
+  let code;
+  try {
+    code = await runCli(
+      [
+        'links',
+        'send-now',
+        'repo',
+        'topic',
+        '--session',
+        'session-1',
+        '--message',
+        'm_1',
+        '--json',
+      ],
+      {
+        request: async ({ body: requestBody, method, path }) =>
+          (
+            await api.request(path, {
+              body:
+                requestBody === undefined
+                  ? undefined
+                  : JSON.stringify(requestBody),
+              headers: { 'content-type': 'application/json' },
+              method,
+            })
+          ).json(),
+      }
+    );
+  } finally {
+    console.log = original;
+    console.error = originalError;
+  }
+  expect(code).toBe(1);
+  expect(JSON.parse(out.join('\n'))).toMatchObject({
+    code: 'LINKS_WAKE_UNAVAILABLE',
+    ok: false,
+  });
+  expect(hooks.calls).toEqual([]);
+  expect(existsSync(join(root, 'links'))).toBe(false);
+  // A body that names a principal, a tool or a flag is not a wake request, it is an invalid one.
+  for (const extra of [
+    { principal: { kind: 'session' } },
+    { wake: true },
+    { tool: 'send_session_message' },
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each refusal is checked against the same portal.
+    const refused = await api.post('/api/links/send-now', {
+      ...body,
+      ...extra,
+    });
+    expect(refused).toMatchObject({ code: 'LINKS_INVALID', ok: false });
+  }
+});
+
+test('the CLI reviews, enables and switches off attention and opens a request', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const api = await portal(root, [baseSession], {
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  const cli = async (argv) => {
+    const out = [];
+    const original = console.log;
+    const originalError = console.error;
+    console.log = (text) => out.push(String(text));
+    console.error = () => undefined;
+    try {
+      const code = await runCli([...argv, '--json'], {
+        request: async ({ body, method, path }) =>
+          (
+            await api.request(path, {
+              body: body === undefined ? undefined : JSON.stringify(body),
+              headers: { 'content-type': 'application/json' },
+              method,
+            })
+          ).json(),
+      });
+      return { code, result: JSON.parse(out.join('\n')) };
+    } finally {
+      console.log = original;
+      console.error = originalError;
+    }
+  };
+  const review = await cli(['links', 'share', 'attention', 'repo', 'on']);
+  expect(review.code).toBe(1);
+  expect(review.result).toMatchObject({ code: 'LINKS_CONFIRMATION_REQUIRED' });
+  const on = await cli([
+    'links',
+    'share',
+    'attention',
+    'repo',
+    'on',
+    '--confirmation',
+    review.result.confirmation.token,
+  ]);
+  expect(on).toMatchObject({ code: 0, result: { changed: true, ok: true } });
+
+  const raised = await raiseThroughEngine(root, 'k1');
+  const listed = await cli(['attention', 'list']);
+  expect(listed.code).toBe(0);
+  expect(listed.result.events.some((event) => event.source === 'links')).toBe(
+    true
+  );
+  const opened = await cli([
+    'links',
+    'attention',
+    'open',
+    raised.result.attention_id,
+  ]);
+  expect(opened).toMatchObject({
+    code: 0,
+    result: { action: 'focus', ok: true },
+  });
+
+  const off = await cli(['links', 'share', 'attention', 'repo', 'off']);
+  expect(off).toMatchObject({ code: 0, result: { changed: true, ok: true } });
+  expect((await raiseThroughEngine(root, 'k2')).code).toBe(
+    'LINKS_ATTENTION_NOT_ENABLED'
+  );
+});
+
+// One real MCP tools/call through the server the portal initialised with its production dependencies.
+async function mcpCall(name, argumentsObject = {}) {
+  const response = await handleMcpRequest(
+    new Request('http://localhost:2999/mcp', {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: { arguments: argumentsObject, name },
+      }),
+      headers: {
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+        host: 'localhost:2999',
+      },
+      method: 'POST',
+    })
+  );
+  return await response.text();
+}
+
+test('an agent reading attention over MCP sees who and when, never the message, and no tool opens or wakes', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  let deps;
+  const api = await portal(root, [baseSession], {
+    // The portal's own dependencies, handed to the real MCP server exactly as production does.
+    initializeMcp: (given) => {
+      deps = given;
+      initMcpServer(given);
+    },
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  await optIn(api);
+  await raiseThroughEngine(root, 'k1', 'SECRET-MESSAGE-TEXT');
+  const called = await mcpCall('list_attention');
+  expect(called).toContain('session-other');
+  expect(called).toContain('links-attention');
+  expect(called).not.toContain('SECRET-MESSAGE-TEXT');
+  // The same through the tool with a worktree filter.
+  const filtered = await mcpCall('list_attention', {
+    name: 'topic',
+    repo: 'repo',
+  });
+  expect(filtered).toContain('session-other');
+  expect(filtered).not.toContain('SECRET-MESSAGE-TEXT');
+  // The portal's own reader does carry it.
+  expect(JSON.stringify(await api.get('/api/attention'))).toContain(
+    'SECRET-MESSAGE-TEXT'
+  );
+  // No dependency handed to MCP can open a request, send now, or raise one.
+  for (const name of Object.keys(deps)) {
+    expect(name).not.toMatch(NO_ATTENTION_ENTRY);
+  }
+});
+
+test('over HTTP and the CLI, a request behind many newer ones for another worktree is reachable and paging is exact', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const other = {
+    ...baseSession,
+    id: 'session-2',
+    name: 'other',
+    nativeConversation: bound('native-b'),
+  };
+  const api = await portal(root, [baseSession, other], {
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  await optIn(api);
+  const mine = await raiseThroughEngine(root, 'mine', 'for topic');
+  for (let n = 0; n < 5; n += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: The requests arrive one after another.
+    await raiseThroughEngine(root, `o${n}`, `for other ${n}`, {
+      hint: 'session-2',
+      native: 'native-b',
+    });
+  }
+  const linksOf = (listed) =>
+    listed.events.filter((event) => event.source === 'links');
+
+  // The asked-about worktree's first page holds its request, though five newer ones belong elsewhere.
+  const scoped = await api.get(
+    `/api/attention${query({ limit: 2, name: 'topic', repo: 'repo' })}`
+  );
+  expect(linksOf(scoped).map((event) => event.id)).toEqual([
+    mine.result.attention_id,
+  ]);
+  expect(scoped.links).toMatchObject({ hasMore: false, state: 'ok' });
+
+  // The unscoped list pages by cursor; the provider's event is listed once, with the first page.
+  const ids = [];
+  let before;
+  let provider = 0;
+  for (let page = 0; page < 5; page += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each page needs the cursor of the one before.
+    const listed = await api.get(
+      `/api/attention${query({ limit: 2, ...(before ? { before } : {}) })}`
+    );
+    provider += listed.events.filter(
+      (event) => event.source !== 'links'
+    ).length;
+    ids.push(...linksOf(listed).map((event) => event.id));
+    if (!listed.links.hasMore) {
+      break;
+    }
+    before = listed.links.next;
+  }
+  expect(ids).toHaveLength(6);
+  expect(new Set(ids).size).toBe(6);
+  expect(provider).toBe(1);
+  expect(await api.get(`/api/attention${query({ limit: 'x' })}`)).toMatchObject(
+    {
+      code: 'LINKS_INVALID',
+      ok: false,
+    }
+  );
+
+  // The CLI pages the same way: the second page by the first page's cursor is the page HTTP gives.
+  const firstPage = await api.get(`/api/attention${query({ limit: 2 })}`);
+  const cursor = firstPage.links.next;
+  const second = await api.get(
+    `/api/attention${query({ before: cursor, limit: 2 })}`
+  );
+  const out = [];
+  const original = console.log;
+  console.log = (text) => out.push(String(text));
+  try {
+    const code = await runCli(
+      ['attention', 'list', '--limit', '2', '--before', cursor, '--json'],
+      {
+        request: async ({ body, method, path }) =>
+          (
+            await api.request(path, {
+              body: body === undefined ? undefined : JSON.stringify(body),
+              headers: { 'content-type': 'application/json' },
+              method,
+            })
+          ).json(),
+      }
+    );
+    expect(code).toBe(0);
+  } finally {
+    console.log = original;
+  }
+  const paged = JSON.parse(out.join('\n'));
+  expect(linksOf(paged).map((event) => event.id)).toEqual(
+    linksOf(second).map((event) => event.id)
+  );
+  expect(linksOf(paged)).toHaveLength(2);
+  expect(
+    linksOf(paged).some((event) =>
+      linksOf(firstPage)
+        .map((e) => e.id)
+        .includes(event.id)
+    )
+  ).toBe(false);
+  expect(paged.events.every((event) => event.source === 'links')).toBe(true);
+});
+
+test('a worktree with very many sessions is listed completely, and one too large to name says so instead of being cut', async () => {
+  const root = workspace();
+  const hooks = focusing();
+  const crowd = (count, prefix) =>
+    Array.from({ length: count }, (_, n) => ({
+      ...baseSession,
+      id: `${prefix}${n}`,
+      name: 'other',
+      nativeConversation: bound(`native-${prefix}${n}`),
+    }));
+  // 300 sessions in one worktree, the request addressed to the last of them.
+  const api = await portal(root, [baseSession, ...crowd(300, 's')], {
+    managedAgents: hooks.managedAgents,
+  });
+  await enableOver(api);
+  await optIn(api);
+  await raiseThroughEngine(root, 'last', 'for the last of many', {
+    hint: 's299',
+    native: 'native-s299',
+  });
+  const scoped = await api.get(
+    `/api/attention${query({ name: 'other', repo: 'repo' })}`
+  );
+  expect(
+    scoped.events
+      .filter((event) => event.source === 'links')
+      .map((event) => event.message)
+  ).toEqual(['for the last of many']);
+  expect(JSON.stringify(scoped)).not.toContain('scopeLimited');
+
+  // So many that naming them would exceed the engine's request bound: said plainly, never the first few.
+  const huge = await portal(
+    workspace(),
+    [baseSession, ...crowd(9000, 'x'.repeat(118))],
+    {
+      managedAgents: hooks.managedAgents,
+    }
+  );
+  const refused = await huge.get(
+    `/api/attention${query({ name: 'other', repo: 'repo' })}`
+  );
+  expect(refused.ok).toBe(true);
+  expect(refused.links).toMatchObject({
+    code: 'LINKS_SCOPE_TOO_LARGE',
+    state: 'unavailable',
+  });
+  expect(refused.links.error).toContain('setu attention list');
+  expect(refused.events.filter((event) => event.source === 'links')).toEqual(
+    []
+  );
+  // The unscoped list is the recovery and leaves nothing out.
+  expect((await huge.get('/api/attention')).links).toMatchObject({
+    state: 'ok',
+  });
 });

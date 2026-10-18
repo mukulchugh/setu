@@ -10,6 +10,7 @@ import fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { createLinksAttention } from './links-attention.js';
 import { createLinksClient } from './links-client.js';
 import { ensureEngine } from './links-engine-fixture.js';
 import { createLinksService } from './links-service.js';
@@ -146,6 +147,12 @@ export async function turnFixture({
   const reused = new Set();
   const launched = [];
   const calls = [];
+  // Every terminal automation the portal asked for, every admission it granted and every engine operation it
+  // made, so a test can say what a feature did NOT do.
+  const scripts = [];
+  const admissions = [];
+  const engineCalls = [];
+  const attentionHooks = {};
   let clock = 1000;
   let nextLaunch;
   let ingressUrl;
@@ -191,7 +198,8 @@ export async function turnFixture({
     // Lets a test move the world while the engine call is in flight, as a concurrent portal request would.
     const watched = {
       async call(op, args) {
-        await engineHooks.before?.(op);
+        engineCalls.push({ args, op });
+        await engineHooks.before?.(op, args);
         const outcome = await client.call(op, args);
         await engineHooks.after?.(op, outcome);
         return outcome;
@@ -214,8 +222,9 @@ export async function turnFixture({
     };
     const managed = createManagedAgentServices({
       admission: {
-        admit: ({ operationId, ...rest }) =>
-          Promise.resolve({
+        admit: ({ operationId, ...rest }) => {
+          admissions.push(operationId);
+          return Promise.resolve({
             lease: {
               acquiredAt: 1,
               kind: rest.kind,
@@ -224,7 +233,8 @@ export async function turnFixture({
               target: rest.target,
             },
             ok: true,
-          }),
+          });
+        },
         release: () => Promise.resolve({ ok: true }),
       },
       clearInterval() {
@@ -267,11 +277,13 @@ export async function turnFixture({
       }),
       registrationAttempts: 1,
       resolveTarget,
-      runAppleScript: () =>
-        Promise.resolve({
+      runAppleScript: (script) => {
+        scripts.push(script);
+        return Promise.resolve({
           availability: 'available',
           stdout: `SETU:OK:${uuid}`,
-        }),
+        });
+      },
       runtimeDir: root,
       setInterval: () => 1,
       signal: (pid) => {
@@ -289,10 +301,25 @@ export async function turnFixture({
       },
       token: () => nextLaunch.token,
     });
-    return { client, links, managed, workspaceState };
+    // The attention composition the portal builds: the same module, the real services, and a seam just before
+    // the focus effect where a test can move the world.
+    const attention = createLinksAttention({
+      focus: async (input) => {
+        await attentionHooks.beforeFocus?.(input);
+        return await managed.focus(input);
+      },
+      links,
+      listProvider: (input) => managed.listAttention(input),
+    });
+    return { attention, client, links, managed, workspaceState };
   }
 
   const fixture = {
+    admissions,
+    get attention() {
+      return current.attention;
+    },
+    attentionHooks,
     calls,
     checkouts,
     dataDir,
@@ -301,6 +328,7 @@ export async function turnFixture({
       alive.delete(pid);
       return await current.managed.reconcileSessions();
     },
+    engineCalls,
     engineHooks,
     exit(pid) {
       alive.delete(pid);
@@ -409,6 +437,7 @@ export async function turnFixture({
     async runGeneratedHook(sessionId, options) {
       return await fixture.spawnHook(sessionId, options).done;
     },
+    scripts,
     send({ sessionId, body, key, name = 'topic' }) {
       return current.links.send({
         body,

@@ -277,3 +277,172 @@ test('a send whose reply was lost is retried under the same key to exactly one m
   const inbox = await healthy.call('list', { session_hint: 'session-1' });
   expect(inbox.result.messages).toHaveLength(1);
 });
+
+const attentionItem = {
+  admitted: true,
+  attention_id: 'att_1',
+  body: 'look',
+  created_at: 5,
+  project: 'repo',
+  recipient,
+  sender: { id: 'sender-session', kind: 'session' },
+};
+const attentionPage = {
+  has_more: false,
+  items: [{ ...attentionItem, group_key: 'g', notifying: true }],
+  next_before: null,
+  notifications: {
+    groups: [
+      {
+        count: 1,
+        count_complete: true,
+        first_at: 5,
+        group_key: 'g',
+        item_ids: ['att_1'],
+        last_at: 5,
+        latest_attention_id: 'att_1',
+        project: 'repo',
+        recipient_session_hint: 'session-1',
+        sender: { id: 'sender-session', kind: 'session' },
+      },
+    ],
+    suppressed: 0,
+  },
+};
+
+test('attention replies are believed only in their exact shapes', async () => {
+  for (const [op, result] of [
+    ['attention_send', { attention_id: 'att_1', replayed: false }],
+    ['attention_list', attentionPage],
+    ['attention_show', attentionItem],
+    [
+      'share_attention',
+      {
+        changed: true,
+        policy: {
+          attention: true,
+          interrupt: false,
+          owner: 'Mukul',
+          receive: true,
+          scope: 'ps_x',
+          version: 1,
+          visibility: true,
+        },
+        project: 'repo',
+      },
+    ],
+  ]) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
+    expect(await answering(result).call(op, {})).toEqual({ ok: true, result });
+  }
+  const wrong = [
+    ['attention_send', { attention_id: 'att_1' }],
+    ['attention_send', { attention_id: 'att_1', replayed: 'no' }],
+    [
+      'attention_list',
+      { ...attentionPage, items: [{ attention_id: 'att_1' }] },
+    ],
+    ['attention_list', { ...attentionPage, has_more: 'no' }],
+    [
+      'attention_list',
+      {
+        ...attentionPage,
+        notifications: { groups: [{ count: 1 }], suppressed: 0 },
+      },
+    ],
+    ['attention_list', { ...attentionPage, extra: true }],
+    ['attention_show', { ...attentionItem, sender: { kind: 'user' } }],
+    ['attention_show', { ...attentionItem, extra: 1 }],
+    ['share_attention', { changed: true, project: 'repo' }],
+  ];
+  for (const [op, result] of wrong) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each child returns one independent protocol fixture.
+    const outcome = await answering(result).call(op, {});
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain('unusable reply');
+  }
+});
+
+test('a lost attention mutation is unknown and says how to settle it; reads are only unavailable', async () => {
+  const { root, cleanup } = temporaryLinksRoot();
+  cleanups.push(cleanup);
+  const client = createLinksClient({
+    dataDir: join(root, 'links'),
+    enginePath: join(root, 'absent'),
+  });
+  const sent = await client.call('attention_send', {});
+  expect(sent.code).toBe('LINKS_OUTCOME_UNKNOWN');
+  expect(sent.error).toContain('same idempotency key');
+  const opt = await client.call('share_attention', {});
+  expect(opt.code).toBe('LINKS_OUTCOME_UNKNOWN');
+  expect(opt.error).toContain('sharing status');
+  for (const op of ['attention_list', 'attention_show', 'wake']) {
+    // biome-ignore lint/performance/noAwaitInLoops: One missing engine serves every operation.
+    expect((await client.call(op, {})).code).toBe('LINKS_ENGINE_UNAVAILABLE');
+  }
+});
+
+test('attention and a wake refusal travel through the real engine under their own stable codes', async () => {
+  const { client } = realClient();
+  expect(
+    await client.call('share_enable', { owner: 'Mukul', project: 'repo' })
+  ).toMatchObject({ ok: true });
+  const request = {
+    body: 'look',
+    idempotency_key: 'a1',
+    project: 'repo',
+    recipient,
+    sender: { id: 'sender-session', kind: 'session' },
+  };
+  expect(await client.call('attention_send', request)).toMatchObject({
+    code: 'LINKS_ATTENTION_NOT_ENABLED',
+    ok: false,
+  });
+  // Enabling names the scope that was reviewed.
+  expect(
+    await client.call('share_attention', { enabled: true, project: 'repo' })
+  ).toMatchObject({ code: 'LINKS_REQUEST_INVALID', ok: false });
+  const status = await client.call('share_status', { project: 'repo' });
+  const { scope } = status.result.projects[0].policy;
+  expect(
+    await client.call('share_attention', {
+      enabled: true,
+      project: 'repo',
+      scope: 'ps_00000000000000000000000000000000',
+    })
+  ).toMatchObject({ code: 'LINKS_SCOPE_CHANGED', ok: false });
+  expect(
+    await client.call('share_attention', {
+      enabled: true,
+      project: 'repo',
+      scope,
+    })
+  ).toMatchObject({ ok: true, result: { changed: true } });
+  const sent = await client.call('attention_send', request);
+  expect(sent).toMatchObject({ ok: true, result: { replayed: false } });
+  const listed = await client.call('attention_list', {});
+  expect(listed.result.items).toHaveLength(1);
+  expect(listed.result.notifications.groups[0].count).toBe(1);
+  expect(
+    await client.call('attention_show', {
+      attention_id: sent.result.attention_id,
+    })
+  ).toMatchObject({ ok: true, result: { body: 'look' } });
+
+  expect(
+    await client.call('wake', {
+      message_id: 'm_1',
+      principal: { id: 'sender-session', kind: 'session' },
+    })
+  ).toMatchObject({ code: 'LINKS_WAKE_NOT_AUTHORIZED', ok: false });
+  expect(
+    await client.call('wake', {
+      message_id: 'm_1',
+      principal: { kind: 'user' },
+    })
+  ).toMatchObject({
+    code: 'LINKS_WAKE_UNAVAILABLE',
+    details: { reason: 'no-verified-mechanism' },
+    ok: false,
+  });
+});

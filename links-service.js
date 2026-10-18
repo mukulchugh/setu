@@ -231,6 +231,150 @@ function redeliveryReview(message) {
   };
 }
 
+// ── attention and wake ──────────────────────────────────────────────────────────────────────────────────
+// What enabling attention for a project means. It is shown before the person confirms, and the token covers
+// it, so what they confirm is what the engine then admits.
+const ATTENTION_EFFECT =
+  'Sessions in this project may add items to your attention list that name the sending session and carry a short message (at most 1 KiB). An item never wakes an agent, answers a permission request, grants permission or runs work, and it is not delivered to any agent. If you withdraw the share and share the project again, requests from the last 15 minutes that are still retained may notify again once you opt in; older ones never do.';
+const ATTENTION_TERMS = Object.freeze({
+  effect: ATTENTION_EFFECT,
+  limits: { bodyBytes: 1024 },
+  never: ['wake', 'permission', 'work', 'agent delivery'],
+});
+// Wake is unavailable until a mechanism is shown, with evidence, to start a turn in an idle session exactly.
+// Until then every caller gets this one answer, whether or not the engine can be reached.
+const WAKE_UNAVAILABLE = Object.freeze({
+  code: 'LINKS_WAKE_UNAVAILABLE',
+  error:
+    'Send now is unavailable: no supported mechanism has been shown to start a turn in an idle session. The message stays queued and is handed over at the session’s next normal turn.',
+  reason: 'no-verified-mechanism',
+});
+const MAX_ATTENTION_REQUEST_CHARS = 4096;
+const MAX_ATTENTION_PAGE = 100;
+// The engine refuses a request larger than this (its protocol bound), so a worktree view that would need more
+// to name its sessions is said to be too large, never cut to the first few.
+const MAX_ENGINE_REQUEST_BYTES = 1024 * 1024;
+
+// Strict input with a few non-string fields. Anything outside the lists is refused.
+function strictFields(
+  input,
+  { strings = [], optional = [], booleans = [], numbers = [] }
+) {
+  if (!(input && typeof input === 'object' && !Array.isArray(input))) {
+    return null;
+  }
+  const allowed = new Set([
+    ...strings,
+    ...optional,
+    ...booleans,
+    ...numbers,
+    'source',
+  ]);
+  if (Object.keys(input).some((key) => !allowed.has(key))) {
+    return null;
+  }
+  const good =
+    strings.every(
+      (key) => typeof input[key] === 'string' && input[key].length > 0
+    ) &&
+    optional.every(
+      (key) => input[key] === undefined || typeof input[key] === 'string'
+    ) &&
+    booleans.every((key) => typeof input[key] === 'boolean') &&
+    numbers.every(
+      (key) => input[key] === undefined || Number.isSafeInteger(input[key])
+    );
+  return good ? input : null;
+}
+
+const ATTENTION_QUERY_KEYS = new Set([
+  'before',
+  'limit',
+  'name',
+  'repo',
+  'source',
+  'withMessage',
+]);
+const isNamed = (value) =>
+  value === undefined || (typeof value === 'string' && value.length > 0);
+
+// A list request is a few optional, bounded fields and nothing else.
+function validAttentionQuery(input) {
+  return (
+    typeof input === 'object' &&
+    !Array.isArray(input) &&
+    Object.keys(input).every((key) => ATTENTION_QUERY_KEYS.has(key)) &&
+    ['before', 'name', 'repo'].every((key) => isNamed(input[key])) &&
+    (input.withMessage === undefined ||
+      typeof input.withMessage === 'boolean') &&
+    (input.limit === undefined ||
+      (Number.isSafeInteger(input.limit) &&
+        input.limit >= 1 &&
+        input.limit <= MAX_ATTENTION_PAGE))
+  );
+}
+
+// The worktree an entry belongs under: where its conversation runs now, else where its session was.
+function homeOf(where) {
+  const home = where.ok ? where.session : where.home;
+  return home ? { name: home.name, repo: home.repo } : null;
+}
+
+// The sessions a worktree filter names, or null for no filter.
+function worktreeSessions(input, records) {
+  if (input.repo === undefined && input.name === undefined) {
+    return null;
+  }
+  return records
+    .filter(
+      (record) =>
+        (input.repo === undefined || record.repo === input.repo) &&
+        (input.name === undefined || record.name === input.name)
+    )
+    .map((record) => record.id);
+}
+
+const emptyAttention = () => ({
+  entries: [],
+  hasMore: false,
+  next: null,
+  notifications: { groups: [], suppressed: 0 },
+  ok: true,
+});
+
+// One retained request in the shape the existing attention list shows. It has no session id of its own, so
+// the session-keyed focus can never be taken for it.
+function attentionEntry(item, { group, target, where, withMessage }) {
+  return {
+    admitted: item.admitted,
+    at: item.created_at,
+    // Which counted chain this request is in (none when it is older than the window) and whether that chain is
+    // shown as notifying; the count is the chain's, present while the chain is among the groups shown.
+    group: {
+      key: item.group_key,
+      notifying: item.notifying,
+      ...(group
+        ? { count: group.count, countComplete: group.count_complete }
+        : {}),
+    },
+    id: item.attention_id,
+    kind: 'links-attention',
+    ...(withMessage ? { message: item.body } : {}),
+    open: where.ok
+      ? { available: true }
+      : { available: false, code: where.code, reason: where.error },
+    project: item.project,
+    provider: item.recipient.provider,
+    sender: item.sender,
+    session: null,
+    source: 'links',
+    state: 'links-attention',
+    // A request no managed session can be tied to is kept and listed, but has no target to guess at.
+    target,
+    ...(target ? {} : { unresolved: true }),
+  };
+}
+
 export function createLinksService({
   client,
   defaultOwner = () => undefined,
@@ -966,6 +1110,401 @@ export function createLinksService({
     return { failed, published };
   }
 
+  // ── attention ──────────────────────────────────────────────────────────────────────────────────────
+
+  // Turning attention on is the person's reviewed choice; turning it off is immediate. The engine keeps the
+  // policy; this only asks for the confirmation and hands the engine what was confirmed.
+  async function shareAttention(raw) {
+    const input = strictFields(raw, {
+      booleans: ['enabled'],
+      optional: ['confirmation'],
+      strings: ['repo'],
+    });
+    if (!(input && isRepoName(input.repo))) {
+      return invalid();
+    }
+    if (!input.enabled) {
+      const off = await client.call('share_attention', {
+        enabled: false,
+        project: input.repo,
+      });
+      return off.ok
+        ? {
+            changed: off.result.changed,
+            ok: true,
+            policy: publicPolicy(off.result.policy),
+            project: input.repo,
+          }
+        : off;
+    }
+    const standing = await client.call('share_status', { project: input.repo });
+    if (!standing.ok) {
+      return standing;
+    }
+    const [current] = standing.result.projects;
+    if (current.state === 'invalid') {
+      return { ...publicStanding(current), ok: false };
+    }
+    if (current.state !== 'enabled') {
+      return failure(
+        'LINKS_NOT_SHARED',
+        'Share the project first; attention requests are only for a shared project.'
+      );
+    }
+    if (current.policy.attention) {
+      return {
+        changed: false,
+        ok: true,
+        policy: publicPolicy(current.policy),
+        project: input.repo,
+      };
+    }
+    const digest = createHash('sha256')
+      .update(canonical(ATTENTION_TERMS))
+      .digest('hex');
+    const confirmation = {
+      effect: ATTENTION_EFFECT,
+      never: [...ATTENTION_TERMS.never],
+      project: input.repo,
+      token: `attention:${input.repo};scope:${current.policy.scope};terms:${digest}`,
+    };
+    if (input.confirmation !== confirmation.token) {
+      return {
+        ...failure(
+          'LINKS_CONFIRMATION_REQUIRED',
+          'Nothing has changed. Review what attention requests can do; only the user may confirm, and an agent must not.'
+        ),
+        confirmation,
+      };
+    }
+    const on = await client.call('share_attention', {
+      enabled: true,
+      project: input.repo,
+      // What was reviewed: the engine refuses it if the sharing was withdrawn and made again meanwhile.
+      scope: current.policy.scope,
+    });
+    return on.ok
+      ? {
+          changed: on.result.changed,
+          ok: true,
+          policy: publicPolicy(on.result.policy),
+          project: input.repo,
+        }
+      : on;
+  }
+
+  // Where an attention item's conversation is now, from the managed records alone: the record whose current
+  // verified binding is exactly that conversation in that checkout. A record that replaced it, ended, or sits
+  // in another checkout is a reason, never a fallback target.
+  async function locate(item, records, targetOf) {
+    const { recipient } = item;
+    // An ended record keeps the binding it had, and an exact resume binds the same conversation to a new
+    // record; the live holder is the one that counts, and an ended one only explains a refusal.
+    const holders = records.filter(
+      (record) =>
+        record.nativeConversation?.state === 'bound' &&
+        record.nativeConversation.provider === recipient.provider &&
+        record.nativeConversation.id === recipient.native_id
+    );
+    const holder =
+      holders.find((record) => record.state !== 'ended') ?? holders[0];
+    const hinted = records.find(
+      (record) => record.id === recipient.session_hint
+    );
+    const home = holder ?? hinted ?? null;
+    const refuse = (code, error) => ({ code, error, home, ok: false });
+    if (!holder) {
+      if (!hinted) {
+        return refuse(
+          'LINKS_SESSION_NOT_FOUND',
+          'No managed session holds this conversation'
+        );
+      }
+      return hinted.state === 'ended'
+        ? refuse('LINKS_SESSION_ENDED', 'The session has ended')
+        : refuse(
+            'LINKS_CONVERSATION_REPLACED',
+            'The session now runs a different conversation'
+          );
+    }
+    if (holder.state === 'ended') {
+      return refuse('LINKS_SESSION_ENDED', 'The session has ended');
+    }
+    if (holder.state !== 'running' || holder.ownership !== 'owned') {
+      return refuse(
+        'LINKS_SESSION_NOT_RUNNING',
+        'The session is not verifiably running'
+      );
+    }
+    const target = await targetOf(holder);
+    if (
+      !target ||
+      target.ok === false ||
+      canonical(target.checkoutIdentity) !== recipient.checkout ||
+      canonical(holder.checkoutIdentity) !== recipient.checkout
+    ) {
+      return refuse(
+        'LINKS_CHECKOUT_CHANGED',
+        'The session belongs to a replaced checkout'
+      );
+    }
+    return { home, ok: true, session: holder };
+  }
+
+  const targetCache = () => {
+    const known = new Map();
+    return (record) => {
+      const key = `${record.repo}\u0000${record.name}`;
+      if (!known.has(key)) {
+        known.set(
+          key,
+          Promise.resolve(
+            resolveTarget({ name: record.name, repo: record.repo })
+          ).catch(() => null)
+        );
+      }
+      return known.get(key);
+    };
+  };
+
+  async function managedRecords() {
+    const listed = await sessions.list();
+    return listed?.ok === true && Array.isArray(listed.sessions)
+      ? { ok: true, records: listed.sessions }
+      : failure(
+          'LINKS_SESSIONS_UNAVAILABLE',
+          'The managed sessions could not be read'
+        );
+  }
+
+  const publicGroup = (group) => ({
+    count: group.count,
+    countComplete: group.count_complete,
+    firstAt: group.first_at,
+    itemIds: group.item_ids,
+    key: group.group_key,
+    lastAt: group.last_at,
+    latestId: group.latest_attention_id,
+    project: group.project,
+    recipientSessionId: group.recipient_session_hint,
+    sender: group.sender,
+  });
+
+  // The attention list's Links entries, in the shape the existing attention list shows. Passive: it reads
+  // the engine and the managed records and writes nothing, so a GET can never notify anyone.
+  async function attentionList(raw = {}) {
+    const input = raw ?? {};
+    if (!validAttentionQuery(input)) {
+      return invalid();
+    }
+    // The message is the person's: a reader that is not the person's own view must ask for it by name.
+    const withMessage = input.withMessage === true;
+    const managed = await managedRecords();
+    if (!managed.ok) {
+      return managed;
+    }
+    // A worktree's view is the requests addressed to the sessions that worktree has had, asked of the engine
+    // so a page is that worktree's page; it is not a page of everything filtered afterwards.
+    const hints = worktreeSessions(input, managed.records);
+    if (hints?.length === 0) {
+      return emptyAttention();
+    }
+    if (
+      hints &&
+      JSON.stringify(hints).length > MAX_ENGINE_REQUEST_BYTES - 4096
+    ) {
+      return failure(
+        'LINKS_SCOPE_TOO_LARGE',
+        'This worktree has had too many sessions to list its requests at once. List them without a worktree (setu attention list), where nothing is left out.'
+      );
+    }
+    const outcome = await client.call('attention_list', {
+      limit: input.limit ?? MAX_ATTENTION_PAGE,
+      ...(input.before === undefined ? {} : { before_id: input.before }),
+      ...(hints ? { session_hints: hints } : {}),
+    });
+    if (!outcome.ok) {
+      return outcome;
+    }
+    const targetOf = targetCache();
+    const byKey = new Map(
+      outcome.result.notifications.groups.map((group) => [
+        group.group_key,
+        group,
+      ])
+    );
+    const entries = [];
+    for (const item of outcome.result.items) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each entry resolves its target with a per-read cache.
+      const where = await locate(item, managed.records, targetOf);
+      entries.push(
+        attentionEntry(item, {
+          group: byKey.get(item.group_key),
+          target: homeOf(where),
+          where,
+          withMessage,
+        })
+      );
+    }
+    return {
+      entries,
+      hasMore: outcome.result.has_more,
+      next: outcome.result.next_before,
+      notifications: {
+        groups: outcome.result.notifications.groups.map(publicGroup),
+        suppressed: outcome.result.notifications.suppressed,
+      },
+      ok: true,
+      // A worktree with more sessions than one read can name is shown for the newest-listed ones only.
+    };
+  }
+
+  // The focus request for one item, only if its exact conversation is the one a managed session runs now.
+  // The caller still hands it to the existing focus action, which verifies again at the effect.
+  async function attentionTarget(raw) {
+    const input = strictInput(raw, ['attentionId']);
+    if (!(input && idPattern.test(input.attentionId))) {
+      return invalid();
+    }
+    const shown = await client.call('attention_show', {
+      attention_id: input.attentionId,
+    });
+    if (!shown.ok) {
+      return shown;
+    }
+    const managed = await managedRecords();
+    if (!managed.ok) {
+      return managed;
+    }
+    const where = await locate(shown.result, managed.records, targetCache());
+    if (!where.ok) {
+      return failure(where.code, where.error);
+    }
+    const { session } = where;
+    return {
+      focus: {
+        checkoutIdentity: session.checkoutIdentity,
+        expectConversation: {
+          nativeId: shown.result.recipient.native_id,
+          provider: shown.result.recipient.provider,
+        },
+        name: session.name,
+        repo: session.repo,
+        sessionId: session.id,
+      },
+      ok: true,
+    };
+  }
+
+  // The ingress the session tools will call after they authenticate the caller. It has no route, tool or
+  // command: it trusts the caller identity it is given, so nothing unauthenticated may reach it.
+  async function attentionSendExact(raw) {
+    const input = raw;
+    const caller = input?.caller;
+    if (
+      !(
+        input &&
+        typeof input === 'object' &&
+        Object.keys(input).sort().join() === 'body,caller,idempotencyKey,to' &&
+        typeof input.body === 'string' &&
+        input.body.length > 0 &&
+        typeof input.idempotencyKey === 'string' &&
+        input.idempotencyKey.length > 0 &&
+        input.idempotencyKey.length <= 128 &&
+        typeof input.to === 'string' &&
+        idPattern.test(input.to) &&
+        caller &&
+        typeof caller === 'object' &&
+        Object.keys(caller).join() === 'sessionId' &&
+        typeof caller.sessionId === 'string' &&
+        idPattern.test(caller.sessionId)
+      )
+    ) {
+      return invalid();
+    }
+    if (input.body.length > MAX_ATTENTION_REQUEST_CHARS) {
+      return failure(
+        'LINKS_ATTENTION_TOO_LARGE',
+        'An attention request is a short note'
+      );
+    }
+    const managed = await managedRecords();
+    if (!managed.ok) {
+      return managed;
+    }
+    const from = managed.records.find(
+      (record) => record.id === caller.sessionId
+    );
+    const to = managed.records.find((record) => record.id === input.to);
+    if (!(from && to)) {
+      return failure(
+        'LINKS_SESSION_NOT_FOUND',
+        'No managed session matches this request'
+      );
+    }
+    const resolved = await recipientOf(
+      { name: to.name, repo: to.repo, sessionId: to.id },
+      { strict: true }
+    );
+    if (!resolved.ok) {
+      return resolved;
+    }
+    if (from.repo !== to.repo) {
+      return failure(
+        'LINKS_PROJECT_MISMATCH',
+        'Attention requests stay inside one shared project'
+      );
+    }
+    const outcome = await client.call('attention_send', {
+      body: input.body,
+      idempotency_key: input.idempotencyKey,
+      project: to.repo,
+      recipient: resolved.recipient,
+      sender: { id: caller.sessionId, kind: 'session' },
+    });
+    if (outcome.ok) {
+      return {
+        attentionId: outcome.result.attention_id,
+        ok: true,
+        replayed: outcome.result.replayed,
+      };
+    }
+    return outcome.code === 'LINKS_OUTCOME_UNKNOWN'
+      ? { ...outcome, idempotencyKey: input.idempotencyKey }
+      : outcome;
+  }
+
+  // ── Send now ───────────────────────────────────────────────────────────────────────────────────────
+  // The receiving user's choice, as the engine's gate sees it. The principal is never taken from the caller:
+  // this service is the local user's front door, and nothing here can name another principal.
+  async function sendNow(raw) {
+    const input = strictInput(raw, [...nameFields, 'messageId']);
+    if (!(input && idPattern.test(input.messageId))) {
+      return invalid();
+    }
+    const outcome = await client.call('wake', {
+      message_id: input.messageId,
+      principal: { kind: 'user' },
+    });
+    // Whatever the engine said (including nothing at all), no wake happened and none is possible now.
+    return outcome.code === 'LINKS_WAKE_NOT_AUTHORIZED'
+      ? outcome
+      : { ...WAKE_UNAVAILABLE, ok: false };
+  }
+
+  function capabilities() {
+    return {
+      attention: { notification: 'in-app' },
+      ok: true,
+      wake: {
+        available: false,
+        code: WAKE_UNAVAILABLE.code,
+        error: WAKE_UNAVAILABLE.error,
+        reason: WAKE_UNAVAILABLE.reason,
+      },
+    };
+  }
+
   // Operations for the authenticated provider hook only. The caller has already proved which exact
   // conversation it speaks for and passes that tuple; nothing here looks a session up by its ID, so a
   // conversation bound after authentication can neither receive nor confirm this one's mail. They have no
@@ -1055,7 +1594,11 @@ export function createLinksService({
 
   return Object.freeze({
     ack,
+    attentionList,
+    attentionSendExact,
+    attentionTarget,
     cancel,
+    capabilities,
     claim,
     claimExact,
     confirm,
@@ -1066,6 +1609,8 @@ export function createLinksService({
     reconcileExact,
     redeliver,
     send,
+    sendNow,
+    shareAttention,
     shareDisable,
     shareEnable,
     shareStatus,

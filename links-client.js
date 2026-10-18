@@ -10,6 +10,8 @@ const MAX_REPLY_BYTES = 2 * 1024 * 1024;
 // others are resolved by looking at the message, and none of them ever requeues anything by itself.
 const RECOVERY = {
   acknowledge: 'Check the message status; acknowledging again is safe.',
+  attention_send:
+    'Check the attention list, or repeat the request with the same idempotency key.',
   cancel: 'Check the message status; cancelling again is safe.',
   claim:
     'Anything it claimed is now handoff-unknown and is not delivered again unless redelivery is explicitly requested. Check the message status.',
@@ -22,6 +24,8 @@ const RECOVERY = {
     'Check the message status before deciding whether to redeliver again.',
   resume: 'Repeating it is safe.',
   send: 'Check the inbox, or repeat the send with the same idempotency key.',
+  share_attention:
+    'Check the sharing status before confirming again; attention requests are admitted only if the status says so.',
   share_disable:
     'Check the sharing status; disabling again is safe, and sharing stays on until it is confirmed disabled.',
   share_enable:
@@ -133,9 +137,59 @@ const messageFields = {
   stored_state: (value) => DELIVERY_STATES.has(value),
   updated_at: count,
 };
+// Who raised an attention request: a local session by its id. A user or a peer is not a sender here.
+const attentionSender = exactly({
+  id: isText,
+  kind: (value) => value === 'session',
+});
+const attentionFields = {
+  admitted: flag,
+  attention_id: isText,
+  body: isText,
+  created_at: count,
+  project: maybe(isText),
+  recipient: exactly({
+    checkout: isText,
+    native_id: isText,
+    provider: isText,
+    session_hint: isText,
+  }),
+  sender: attentionSender,
+};
+// One request on its own carries no notification state; a listed one names its counted chain (none when it
+// is older than the window) and says whether that chain is shown as notifying.
+const attentionItem = exactly(attentionFields);
+const listedAttentionItem = exactly({
+  ...attentionFields,
+  group_key: maybe(isText),
+  notifying: flag,
+});
+const attentionGroup = exactly({
+  count,
+  count_complete: flag,
+  first_at: count,
+  group_key: isText,
+  item_ids: listOf(isText),
+  last_at: count,
+  latest_attention_id: isText,
+  project: maybe(isText),
+  recipient_session_hint: isText,
+  sender: attentionSender,
+});
 const statusOf = { message_id: isText, state: isText };
 const RESULT_SHAPES = {
   acknowledge: exactly(statusOf),
+  attention_list: exactly({
+    has_more: flag,
+    items: listOf(listedAttentionItem),
+    next_before: maybe(isText),
+    notifications: exactly({
+      groups: listOf(attentionGroup),
+      suppressed: count,
+    }),
+  }),
+  attention_send: exactly({ attention_id: isText, replayed: flag }),
+  attention_show: attentionItem,
   cancel: exactly(statusOf),
   claim: exactly({
     attempt_id: maybe(isText),
@@ -184,6 +238,11 @@ const RESULT_SHAPES = {
   redeliver: exactly(statusOf),
   resume: exactly({ moved: listOf(isText), released: listOf(isText) }),
   send: exactly({ message_id: isText, replayed: flag, state: isText }),
+  share_attention: exactly({
+    changed: flag,
+    policy: policyShape,
+    project: isText,
+  }),
   share_disable: exactly({
     held: listOf(isText),
     project: isText,

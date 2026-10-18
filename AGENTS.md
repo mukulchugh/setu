@@ -591,13 +591,17 @@ carry JSON must contain JSON.
 | `links share enable <repo>` | `--owner <label> --confirmation <token>` | Share one project. The first call changes nothing and returns the exact public fields (owner, task, reachability, freshness, session ID) with a token; only the user passes that token back. Needs the running portal. |
 | `links share disable <repo>` | none | Withdraw sharing: the project leaves the directory and other principals are refused. |
 | `links share status [<repo>]` | none | The sharing policy of one project, or of every project that has one. |
+| `links share attention <repo> on\|off` | `--confirmation <token>` | Opt a shared project in to, or out of, attention requests. `on` first returns the effect and a token and changes nothing; `--confirmation` enables. `off` is immediate. |
+| `links attention open <attention>` | none | Focus the exact current managed conversation and terminal a request was addressed to; reports an ended, replaced or moved target and focuses nothing else. |
+| `links send-now <repo> <branch>` | `--session <id> --message <message>` | Always `LINKS_WAKE_UNAVAILABLE` (no verified mechanism); starts nothing. |
+| `links capabilities` | none | What Links can do now; states that Send now is unavailable and why. |
 | `links directory [<repo>]` | none | Managed sessions of shared projects with owner, task, reachability and freshness. |
 | `links redeliver <repo> <branch>` | `--session <id> --message <message> --attempt <attempt>` | Accept a possible duplicate for a `handoff-unknown` message; the next claim is a new, counted attempt. |
 | `caches prepare <repo> <branch>` | none | Produce an exact generated-cache cleanup manifest. |
 | `caches execute <repo> <branch>` | `--manifest <id> --confirmation <token>` or `--retry <file\|->` | Execute only the reviewed manifest. A partial result returns `retryId`; retry identity contains `manifestId` and `retryId`. |
 | `admission` | none | Read resource-admission leases and limits. |
 | `setup-progress [list [repo branch]]` | `retry <repo> <branch> --checkout <file\|-> --attempt <id>` | Read durable setup or retry an exact attempt and identity. |
-| `attention [list [repo branch]]` | `focus <repo> <branch> --session <id> --checkout <file\|->` | Read normalized attention or focus an exact verified terminal. |
+| `attention [list [repo branch]]` | `--limit <n> --before <cursor>`; `focus <repo> <branch> --session <id> --checkout <file\|->` | Read normalized attention or focus an exact verified terminal. Links requests page by `links.next` (an older page lists only requests, never the provider events again). |
 | `headless list [repo branch]` | none | Read bounded headless-run records without prompts/output. |
 | `headless start <repo> <branch>` | `--prompt-file <file\|->`, `--model`, `--budget`, `--wall-clock-ms`, `--output-bytes` | Start bounded Claude Code headless work. Budget is at most 2 USD, wall clock at most one hour, output at most 64 KiB. No headless turn limit is defined. |
 | `headless resume <repo> <branch>` | `--run <id> --prompt-file <file\|->`, `--model`, `--budget`, `--wall-clock-ms`, `--output-bytes` | Resume the exact bounded Claude Code run. The same budget, wall-clock, and output limits apply. |
@@ -648,7 +652,7 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/agent-sessions/end` | T plus `sessionId`,`checkoutIdentity`; end only after owned PID/process-start identity is proven. | H W C M |
 | `POST` | `/api/agent-sessions/resume` | T plus `nativeId`,`confirmation?`; the receiving user's reviewed resume of one native Claude conversation under a new managed record. Without the exact token it returns `RESUME_CONFIRMATION_REQUIRED` and launches nothing. | H C |
 | `GET` | `/api/agents` | List installed agent CLIs. | H W R |
-| `GET` | `/api/attention` | `repo?`,`name?`; list normalized attention events. | H W C M |
+| `GET` | `/api/attention` | `repo?`,`name?`,`limit?` (1-100),`before?` (the `links.next` cursor); list normalized attention events. Provider hook events keep their shape; Links attention requests join them as entries with `source:'links'`, `kind:'links-attention'`, `sender`, `message`, `group`, `admitted`, `open` and no `sessionId`, and `links` reports the Links part (`state:'ok'` with `notifications`, or `unavailable` with a code while provider events still list). Passive: reading creates no store and notifies no one. A reader gets no `message` unless it asks for it by name: only the portal's own view (HTTP, UI, CLI) does, and the generic MCP reader never does. A `before` page lists only Links requests (the provider events are in the first page, once). With `repo`/`name`, the page is that worktree's own: the engine is asked for the requests addressed to the sessions that worktree has had. An entry no managed session can be tied to has `target: null` and `unresolved: true`; it is in the unscoped list only, with `open` unavailable. | H W C M |
 | `POST` | `/api/attention/focus` | T plus `sessionId`,`checkoutIdentity`; focus only through an exact Ghostty terminal mapping. | H W C M |
 | `POST` | `/api/attention/hook` | Trusted provider hook payload only, with the per-launch capability; unsupported payload remains unknown. A `UserPromptSubmit` payload is a Links turn request, or with `report:{attemptId}` the hook's report that it wrote the context; it never becomes an attention item. | H W |
 | `POST` | `/api/convex/deploy` | T plus `target`,`expectedContext`; current preflight/binding required. | H W |
@@ -676,11 +680,15 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/inngest/start` | T; start Inngest runtime. | H W M |
 | `POST` | `/api/inngest/stop` | T; stop Inngest runtime. | H W M |
 | `POST` | `/api/links/ack` | T plus `sessionId`,`messageId`; the addressed conversation's user acknowledges a handed-off message. Not task completion. | H C |
+| `POST` | `/api/links/attention/open` | `attentionId`; focus the exact current managed conversation and terminal the request was addressed to, through the existing focus action with a conversation guard. Refuses an ended, replaced, moved or unknown target (`LINKS_SESSION_ENDED`, `LINKS_CONVERSATION_REPLACED`, `LINKS_CHECKOUT_CHANGED`, `LINKS_SESSION_NOT_RUNNING`, `LINKS_SESSION_NOT_FOUND`; `CONVERSATION_CHANGED` if it changes before the effect) and focuses nothing else. Focus itself fails with the existing `GHOSTTY_*` / `TERMINAL_FOCUS_*` codes. | H W C |
 | `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
+| `GET` | `/api/links/capabilities` | No input; passive and constant. `wake.available` is `false` with `LINKS_WAKE_UNAVAILABLE` and reason `no-verified-mechanism`; `attention.notification` is `in-app`. | H C |
 | `GET` | `/api/links/directory` | `repo?`; entries `{project,sessionId,owner,task,taskAt,taskStale,activityAt,reachability{state,reason},observedAt,stale}` of shared projects' managed sessions, and `problems` for a project whose policy cannot be read. Passive. | H C |
 | `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
 | `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
 | `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
+| `POST` | `/api/links/send-now` | T plus `sessionId`,`messageId`; always `LINKS_WAKE_UNAVAILABLE` (no verified mechanism). Takes no principal, tool or flag. Starts nothing, types nothing, takes no claim and bypasses no admission. | H C |
+| `POST` | `/api/links/share/attention` | `repo`,`enabled`,`confirmation?`; enabling returns `LINKS_CONFIRMATION_REQUIRED` with the effect and a token bound to the project's current scope, and only that token enables. Switching off is immediate and needs none. | H C |
 | `POST` | `/api/links/share/disable` | `repo`; removes the policy and presence, holds mail from other principals. | H C |
 | `POST` | `/api/links/share/enable` | `repo`,`owner?`,`confirmation?`; without the reviewed token it returns `LINKS_CONFIRMATION_REQUIRED` and the field list, and changes nothing. | H C |
 | `GET` | `/api/links/share/status` | `repo?`; policy state `enabled`, `disabled` or `invalid` (with recovery). Passive. | H C |
@@ -919,8 +927,8 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
   task, reachability, freshness, session ID) and what is never shared (transcripts, paths, environment,
   provider context) with a token; nothing is stored until the user passes that token back. The engine
   (`sharing_policies`, `presence`; schema 2, migrated by the first write) is the only holder of the policy
-  and the presence. Visibility and receiving are granted; interrupting an agent and raising attention are
-  recorded off. The local user's own mail never needs sharing. Any other principal (a `session` sender,
+  and the presence. Visibility and receiving are granted; interrupting an agent is recorded off and raising
+  attention is off until the user opts the project in (see Attention requests and Send now). The local user's own mail never needs sharing. Any other principal (a `session` sender,
   `{kind:'session', id}`; a peer is not yet a sender) is admitted only by a readable policy for the
   message's project, checked on send and again on claim; an unreadable or unknown-version policy admits
   nobody for that project (`LINKS_POLICY_INVALID`; recover with `share disable`, then enable again). Mail
@@ -959,6 +967,62 @@ never opens its database. Engine state lives in `~/.local/share/setu/links` (dir
   toolchain's cargo; a missing toolchain fails the check). `bun run verify` includes the engine tests and
   the naming check. A development engine is found at `engines/links/target/release/setu-links` or
   `SETU_LINKS_ENGINE`; shipping the built binary is part of the release-lifecycle work.
+
+#### Attention requests and Send now (#13)
+
+A session in a shared project can ask the receiving person to look at it. This is a notification to the
+person, not mail: it is never delivered to any agent, never wakes one, never answers a provider permission
+request and grants no permission to run work. The Links engine retains every accepted request (a `messages`
+row of kind `attention` with no delivery row, so claim, inbox, status, cancel, acknowledge and redeliver
+cannot see it). No provider hook can create one: requests enter only through the engine's `attention_send`,
+whose caller is the trusted service, and no hook payload field, HTTP route, CLI command or MCP tool reaches it.
+
+- **Opt-in.** Attention is off for a shared project until the user reviews and enables it:
+  `setu links share attention <repo> on` returns the effect and a token (bound to the project's scope);
+  `--confirmation <token>` enables, and the engine checks in the same write that the sharing is still the one
+  that was reviewed (`SCOPE_CHANGED` if it was withdrawn and made again meanwhile). `off` is immediate and
+  needs no scope. Enabling the share again keeps the choice; a
+  withdrawal and a new share start with it off and a new scope. The engine admits a request only from a
+  session, only for a project whose readable policy has attention on, checked on read and again in the
+  write transaction (`NOT_SHARED`, `POLICY_INVALID`, `ATTENTION_NOT_ENABLED`). A user or a peer is not an
+  attention sender yet (`SENDER_UNSUPPORTED`). A request must say something (a blank one is
+  `ATTENTION_BODY_INVALID`). Requests carry no scope: after a withdrawal, a new share and a new opt-in, a
+  retained request still inside the 15-minute notification window may notify again, and an older one never
+  does (the review says so; this is a retention choice, not a new policy epoch).
+- **Retention versus notification.** Every accepted request is kept (text at most 1 KiB, plain printable
+  text only; per sender and conversation at most 200 and per conversation at most 1000 in 24 h, beyond which
+  a request is refused with `ATTENTION_RATE_LIMITED` and not stored). A notification is a group, one
+  *chain*: requests from one session to one conversation each less than five minutes after the last, so two
+  chains separated by a pause are two groups with two keys. Every listed request names its own chain
+  (`group.key`), says whether that chain is shown as notifying, and carries the chain's count while it is
+  among the groups shown; a request older than the 24 h window is in no counted chain and never notifies. A group notifies while its newest
+  request is under 15 minutes old and its project still admits attention; at most 20 groups notify and the
+  rest are counted (`suppressed`). Counts and membership come from every request in the window, not the page or the ids a group lists
+  (a group lists at most 50 ids; `countComplete: false` says a chain reaches back past what was counted).
+  Requests are paged newest-first by a cursor that names a request (`links.next`), so a new arrival never
+  shifts a page; the older page is an explicit action (CLI `--before`, the UI's "Load older requests"), and a
+  page with nothing to show but more behind it says so instead of "No attention events". A worktree's view is
+  filtered by the engine on every session that worktree has had, not after paging (if naming them would exceed
+  the engine's request bound the view is `LINKS_SCOPE_TOO_LARGE` with the unscoped list as recovery, never a
+  truncated list). An unresolved request (no managed session can be tied to it) is in
+  the unscoped list only. "Notify" means a flagged group in
+  the attention list: Setu sends no system notification. Routine messages and FYIs are not attention
+  requests and never notify. Reads are passive; nothing is written by reading.
+- **Opening.** `setu links attention open <id>` / `POST /api/links/attention/open` focuses the managed
+  record whose current verified binding is exactly that provider conversation in that checkout, through the
+  existing focus action; the action re-checks the conversation inside its own target lock
+  (`CONVERSATION_CHANGED`) and the terminal and checkout at the effect. An ended, replaced or moved target is
+  reported and nothing else is focused. An exact reviewed resume under a new record is the same conversation
+  and opens there. `POST /api/attention/focus` is unchanged and is not how a request is opened.
+- **Send now is unavailable.** No supported mechanism has been shown to start a turn in an idle managed
+  session, so `setu links send-now` / `POST /api/links/send-now` answer `LINKS_WAKE_UNAVAILABLE` (reason
+  `no-verified-mechanism`) and the message stays queued for the session's next normal turn. The engine's
+  `wake` gate refuses any principal but the local user (`WAKE_NOT_AUTHORIZED`) before reading a store, and
+  even the local user gets `WAKE_UNAVAILABLE`. No tool, MCP entry or message text can ask for it; the one
+  terminal text path (`deliver`, a paste without Enter for review findings) is not a wake and is not used
+  by Links. The unavailability is a statement about missing evidence, not a claim that no mechanism can
+  exist. Pending, not built: the session-tool and peer senders, and the engine's sender-generation fence
+  they need.
 
 #### Natural-turn delivery (managed Claude, #10)
 

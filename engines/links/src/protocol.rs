@@ -2,7 +2,7 @@
 
 use crate::{
     args::{Args, Fail},
-    mailbox, sharing,
+    attention, mailbox, sharing,
     store::{SCHEMA_VERSION, Store},
 };
 use serde_json::{Value, json};
@@ -125,6 +125,20 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
             }
             sharing::disable(&mut Store::open_or_create(data_dir)?, project)
         }
+        "share_attention" => {
+            let request = sharing::parse_attention(args)?;
+            // Without a readable policy there is nothing to change, and an opt-in must not be what creates,
+            // migrates or repairs a store.
+            match reader(data_dir)? {
+                Some(store) => match sharing::standing(&store.db, store.version, request.project())? {
+                    sharing::Standing::Valid(..) => {}
+                    sharing::Standing::Invalid(reason) => return Err(sharing::invalid_policy(request.project(), reason)),
+                    sharing::Standing::Absent => return Err(sharing::not_shared(request.project())),
+                },
+                None => return Err(sharing::not_shared(request.project())),
+            }
+            sharing::set_attention(&mut Store::open_or_create(data_dir)?, request)
+        }
         "presence_publish" => {
             let request = sharing::parse_publish(args)?;
             // Presence exists only for a shared project, so with no store there is nothing to publish into.
@@ -138,6 +152,19 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
         "status" => mailbox::status(reader(data_dir)?.as_ref(), args),
         "show" => mailbox::show(reader(data_dir)?.as_ref(), args),
         "list" => mailbox::list(reader(data_dir)?.as_ref(), args),
+        "attention_send" => {
+            let request = attention::parse_send(args)?;
+            // Refused on a read first, so a refusal creates, migrates and writes nothing; the write checks again.
+            match reader(data_dir)? {
+                Some(store) => attention::admit(&store.db, store.version, request.project())?,
+                None => return Err(sharing::not_shared(request.project())),
+            }
+            attention::send(&mut Store::open_or_create(data_dir)?, request)
+        }
+        "attention_list" => attention::list(reader(data_dir)?.as_ref(), args),
+        "attention_show" => attention::show(reader(data_dir)?.as_ref(), args),
+        // Never touches a store: the gate decides before any is opened.
+        "wake" => attention::wake(args),
         "health" => {
             args.finish()?;
             Ok(json!({
