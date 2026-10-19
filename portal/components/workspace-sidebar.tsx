@@ -7,6 +7,7 @@ import {
   tablerArrowUp,
   tablerCircle,
   tablerCurrencyDollar,
+  tablerFileText,
   tablerHelpCircle,
   tablerLayoutGrid,
   tablerMenu2,
@@ -110,6 +111,7 @@ function SidebarLink({
 const PAGES: [string, string, string][] = [
   ['/inventory', 'Inventory', tablerStack2.path],
   ['/spans', 'Spans', tablerStack2.path],
+  ['/links', 'Links', tablerFileText.path],
   ['/ports', 'Active ports', tablerPlug.path],
   ['/costs', 'Costs', tablerCurrencyDollar.path],
   ['/archived', 'Archived', tablerArchive.path],

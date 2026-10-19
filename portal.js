@@ -5901,6 +5901,7 @@ export async function createPortalRuntime(options = {}) {
           '/costs': indexPage,
           '/help': indexPage,
           '/inventory': indexPage,
+          '/links': indexPage,
           '/ports': indexPage,
           '/repo/:repo': indexPage,
           '/settings': indexPage,

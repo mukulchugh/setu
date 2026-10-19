@@ -283,7 +283,8 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     served = 0,
     stopped = 0,
     migrations = 0,
-    routed = 0;
+    routed = 0,
+    routes;
   const before = process.listenerCount('SIGTERM');
   const fx = await fixture({
     computeWorktrees: async () => [],
@@ -317,8 +318,10 @@ test('explicit startup binds one injected server and dispose removes its hooks a
       migrations += 1;
     },
     serve: (options) => {
+      const { port, routes: serverRoutes } = options;
       served += 1;
-      expect(options.port).toBe(43_210);
+      expect(port).toBe(43_210);
+      routes = serverRoutes;
       return {
         stop: () => {
           stopped += 1;
@@ -339,6 +342,7 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     expect(served).toBe(0);
     await Promise.all([fx.portal.start(), fx.portal.start()]);
     expect([served, migrations, routed]).toEqual([1, 1, 1]);
+    expect(routes['/links']).toBeDefined();
     // Log retention, memory ceilings, idle timeouts and the Links presence round.
     expect(timers.size).toBe(4);
     expect(process.listenerCount('SIGTERM')).toBe(before + 1);

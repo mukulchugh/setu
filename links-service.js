@@ -218,6 +218,7 @@ const publicMessage = (row) => ({
   },
   redeliveries: row.redeliveries,
   replyTo: row.reply_to ?? null,
+  runHint: row.run_hint ?? null,
   sender: { ...row.sender },
   size: row.size,
   state: row.state,

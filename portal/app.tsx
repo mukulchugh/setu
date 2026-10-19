@@ -34,6 +34,7 @@ import {
   VercelIcon,
 } from './components/icons';
 import { InventoryPage } from './components/inventory-page';
+import { LinksPage } from './components/links-page';
 import { LiveLog, LogModal } from './components/logs';
 import { Pagination } from './components/pagination';
 import { PortsPage } from './components/ports-page';
@@ -342,6 +343,7 @@ type Route =
   | { page: 'archived' }
   | { page: 'inventory' }
   | { page: 'costs' }
+  | { page: 'links' }
   | { page: 'spans'; runId?: string };
 
 const WORKTREE_ROUTE_PATTERN = /^\/worktree\/([^/]+)\/(.+)$/;
@@ -349,6 +351,9 @@ const REPOSITORY_ROUTE_PATTERN = /^\/repo\/([^/]+)$/;
 const BRANCH_TREE_PATH_PATTERN = /\/tree\/.*$/;
 
 function parseRoute(pathname: string): Route {
+  if (pathname === '/links') {
+    return { page: 'links' };
+  }
   if (pathname === '/spans') {
     return { page: 'spans' };
   }
@@ -5715,6 +5720,9 @@ function App() {
   }
 
   const pageContent = (() => {
+    if (route.page === 'links') {
+      return <LinksPage onBack={() => navigate('/')} projects={projects} />;
+    }
     if (route.page === 'spans') {
       return (
         <SpansPage
