@@ -14,6 +14,19 @@ const defaultEngine = join(
 
 export const PRESENCE_INTERVAL_MS = 30_000;
 
+// Lifecycle operations cannot create a mailbox. Check its engine-owned file before the client can start a process.
+export function absentUnlessMailbox(root, call) {
+  const mailboxFile = join(root, MAILBOX_FILE);
+  return (input) =>
+    existsSync(mailboxFile)
+      ? call(input)
+      : Promise.resolve({
+          code: 'LINKS_STORE_ABSENT',
+          error: 'No mailbox exists yet.',
+          ok: false,
+        });
+}
+
 // The task a session is working on, as that session wrote it in its own worktree's active writer claim, with
 // the claim's own heartbeat as the time it was last refreshed. A claim held by any other session is not this
 // session's task. An expired claim still shows its task, with its own old heartbeat, so the directory marks it
@@ -106,20 +119,6 @@ export function createLinksRuntime({
   timeoutMs,
   timers = { clearInterval, setInterval },
 } = {}) {
-  // Neither lifecycle call may start a process while the mailbox file does not exist: that is checked synchronously,
-  // before anything is launched, against the file itself and not its directory (which can exist without a mailbox:
-  // identity, transport state, a first write that failed). Nothing opens the database to ask. A call that finds no
-  // file is simply not told, so a publication that could be stalled outside the engine never exists before the
-  // mailbox does. (The engine repeats the check, so a race after this one cannot create a store either.)
-  const mailboxFile = join(root, MAILBOX_FILE);
-  const absentUnlessMailbox = (call) => (input) =>
-    existsSync(mailboxFile)
-      ? call(input)
-      : Promise.resolve({
-          code: 'LINKS_STORE_ABSENT',
-          error: 'No mailbox exists yet.',
-          ok: false,
-        });
   const service = createLinksService({
     client: createLinksClient({ dataDir: root, enginePath, timeoutMs }),
     defaultOwner: () => {
@@ -147,8 +146,8 @@ export function createLinksRuntime({
     // For the managed session authority only (see portal.js): the one way a binding reaches the engine. It is
     // kept out of the route composition exactly like `delivery`, so nothing a caller can reach writes a snapshot.
     lifecycle: Object.freeze({
-      invalidate: absentUnlessMailbox(service.invalidateBinding),
-      publish: absentUnlessMailbox(service.publishBinding),
+      invalidate: absentUnlessMailbox(root, service.invalidateBinding),
+      publish: absentUnlessMailbox(root, service.publishBinding),
     }),
     linksAck: service.ack,
     // Pieces of the attention list and the exact open, composed with the managed-session services in

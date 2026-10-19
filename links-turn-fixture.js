@@ -13,6 +13,7 @@ import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { createLinksAttention } from './links-attention.js';
 import { createLinksClient } from './links-client.js';
 import { ensureEngine } from './links-engine-fixture.js';
+import { absentUnlessMailbox } from './links-runtime.js';
 import { createLinksService } from './links-service.js';
 import { createManagedAgentServices } from './managed-agent-services.js';
 import { createOperationEvents } from './operation-events.js';
@@ -232,11 +233,11 @@ export async function turnFixture({
       claimExact: callLog('claimExact', links.claimExact),
       confirmExact: callLog('confirmExact', links.confirmExact),
     };
-    // The managed authority's one way to the engine: the Links service's lifecycle operations, exactly as the
-    // portal composes them. A test's recording wrapper, if it brought one, sits in front and forwards to this.
+    // The managed authority's one way to the engine: the same guarded Links lifecycle the portal composes. A
+    // test's recording wrapper, if it brought one, sits in front and forwards to this.
     const realLifecycle = {
-      invalidate: links.invalidateBinding,
-      publish: links.publishBinding,
+      invalidate: absentUnlessMailbox(dataDir, links.invalidateBinding),
+      publish: absentUnlessMailbox(dataDir, links.publishBinding),
     };
     if (lifecycle) {
       lifecycle.forward = realLifecycle;

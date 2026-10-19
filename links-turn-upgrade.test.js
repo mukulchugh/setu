@@ -93,6 +93,9 @@ test('an earlier-schema mailbox is read passively, then upgraded by the first tu
     token,
   });
   const record = (await f.sessions())['session-a'];
+  // The fixture composes the runtime's synchronous lifecycle guard: binding publication records its retry but
+  // starts no engine operation until the seeded mailbox exists.
+  expect(f.engineCalls).toEqual([]);
   const path = seedEarlierStore(f.dataDir, {
     checkout: canonicalCheckout(record.checkoutIdentity),
     nativeId: 'native-a',
