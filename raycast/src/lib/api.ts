@@ -65,6 +65,99 @@ export type ActionResult = {
   [key: string]: unknown;
 };
 
+export type LinksTarget = { repo: string; name: string; sessionId: string };
+
+export type ManagedSession = {
+  id: string;
+  name: string;
+  repo: string;
+  nativeConversation?: { provider?: string; state?: string } | null;
+  ownership?: string;
+  state?: string;
+  tool?: string;
+};
+
+export type LinksMessage = {
+  attemptId: string | null;
+  attempts: number;
+  body?: string;
+  createdAt: number;
+  expiresAt: number;
+  messageId: string;
+  reason: string | null;
+  recipient: {
+    currentSessionId: string;
+    nativeId: string;
+    provider: string;
+    sessionId: string;
+  };
+  redeliveries: number;
+  replyTo: string | null;
+  sender: { id?: string; kind: string };
+  size: number;
+  state: string;
+  storedState: string;
+  updatedAt: number;
+  observed?: boolean;
+  runHint?: string | null;
+};
+
+export type LinksDirectoryEntry = {
+  activityAt: number | null;
+  observedAt: number;
+  owner: string;
+  project: string;
+  reachability: { reason?: string | null; state: string };
+  sessionId: string;
+  stale: boolean;
+  task: string | null;
+  taskAt: number | null;
+  taskStale: boolean;
+};
+
+export type LinksPolicy = {
+  attention: boolean;
+  interrupt: boolean;
+  owner: string;
+  receive: boolean;
+  visibility: boolean;
+};
+
+export type LinksConfirmation = {
+  fields?: { field: string; keys: string[]; meaning: string }[];
+  never?: string[];
+  owner?: string;
+  permissions?: Record<string, boolean>;
+  project?: string;
+  effect?: string;
+  token?: string;
+};
+
+export type LinksInboxResult = LinksResult & {
+  messages?: LinksMessage[];
+  observed?: boolean;
+};
+
+export type LinksDirectoryResult = LinksResult & {
+  entries?: LinksDirectoryEntry[];
+  problems?: { code: string; project: string; reason: string; recovery?: string }[];
+  staleAfterMs?: number;
+};
+
+export type LinksShareStatusResult = LinksResult & {
+  projects?: (LinksResult & { registered?: boolean; shared?: boolean })[];
+  registered?: boolean;
+  shared?: boolean;
+};
+
+export type LinksResult = ActionResult & {
+  confirmation?: LinksConfirmation;
+  messageId?: string;
+  policy?: LinksPolicy;
+  project?: string;
+  state?: string;
+};
+
 export type PendingRemoval = {
   operationId: string;
   repo: string;
@@ -139,11 +232,289 @@ async function post(
   }
 }
 
+// Links mutations are never replayed by Raycast. A lost response has the
+// service's stable unknown-outcome code, so the caller can preserve a send's
+// exact idempotency key or inspect the current message before deciding.
+async function postLinks<T extends LinksResult>(
+  path: string,
+  body: Record<string, unknown>,
+): Promise<T> {
+  const uncertain = (): T =>
+    ({
+      code: "LINKS_OUTCOME_UNKNOWN",
+      error: "Outcome not confirmed. Refresh before deciding whether to retry.",
+      networkUncertain: true,
+      ok: false,
+    }) as T;
+  let res: Response;
+  try {
+    res = await fetch(`${portalUrl()}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-setu-source": "raycast" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+      redirect: "error",
+    });
+  } catch {
+    return uncertain();
+  }
+  try {
+    const result = await res.json();
+    if (!isLinksResult(result) || (!res.ok && result.ok))
+      return uncertain();
+    return result as T;
+  } catch {
+    return uncertain();
+  }
+}
+
+function linksQuery(path: string, values: Record<string, string | undefined>) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined) query.set(key, value);
+  }
+  const text = query.toString();
+  return text ? `${path}?${text}` : path;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const isText = (value: unknown): value is string => typeof value === "string";
+const isNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+function invalidLinksResponse(): LinksResult {
+  return {
+    code: "LINKS_RESPONSE_INVALID",
+    error: "The local Links response was malformed. Refresh before acting.",
+    ok: false,
+  };
+}
+
+function isPolicy(value: unknown): value is LinksPolicy {
+  return (
+    isRecord(value) &&
+    isText(value.owner) &&
+    ["attention", "interrupt", "receive", "visibility"].every(
+      (key) => typeof value[key] === "boolean",
+    )
+  );
+}
+
+function isConfirmation(value: unknown): value is LinksConfirmation {
+  if (!isRecord(value)) return false;
+  return (
+    (value.token === undefined || isText(value.token)) &&
+    (value.project === undefined || isText(value.project)) &&
+    (value.owner === undefined || isText(value.owner)) &&
+    (value.effect === undefined || isText(value.effect)) &&
+    (value.never === undefined || Array.isArray(value.never)) &&
+    (value.fields === undefined || Array.isArray(value.fields)) &&
+    (value.permissions === undefined || isRecord(value.permissions))
+  );
+}
+
+function isLinksResult(value: unknown): value is LinksResult {
+  return (
+    isRecord(value) &&
+    typeof value.ok === "boolean" &&
+    (value.code === undefined || isText(value.code)) &&
+    (value.error === undefined || isText(value.error)) &&
+    (value.project === undefined || isText(value.project)) &&
+    (value.state === undefined || isText(value.state)) &&
+    (value.messageId === undefined || isText(value.messageId)) &&
+    (value.policy === undefined || isPolicy(value.policy)) &&
+    (value.confirmation === undefined || isConfirmation(value.confirmation))
+  );
+}
+
+function isMessage(value: unknown): value is LinksMessage & LinksResult {
+  if (!isLinksResult(value) || !value.ok) return isLinksResult(value);
+  const recipient = value.recipient;
+  const sender = value.sender;
+  if (!isRecord(recipient) || !isRecord(sender)) return false;
+  return (
+    [
+      "attempts",
+      "createdAt",
+      "expiresAt",
+      "redeliveries",
+      "size",
+      "updatedAt",
+    ].every((key) => isNumber(value[key])) &&
+    ["messageId", "state", "storedState"].every((key) => isText(value[key])) &&
+    (value.attemptId === null || isText(value.attemptId)) &&
+    (value.reason === null || isText(value.reason)) &&
+    (value.replyTo === null || isText(value.replyTo)) &&
+    (value.body === undefined || isText(value.body)) &&
+    (value.runHint === undefined || value.runHint === null || isText(value.runHint)) &&
+    (value.observed === undefined || typeof value.observed === "boolean") &&
+    isText(sender.kind) &&
+    (sender.id === undefined || isText(sender.id)) &&
+    ["currentSessionId", "nativeId", "provider", "sessionId"].every((key) =>
+      isText(recipient[key]),
+    )
+  );
+}
+
+function isDirectoryEntry(value: unknown): value is LinksDirectoryEntry {
+  return (
+    isRecord(value) &&
+    isRecord(value.reachability) &&
+    ["owner", "project", "sessionId"].every((key) => isText(value[key])) &&
+    ["observedAt"].every((key) => isNumber(value[key])) &&
+    (value.activityAt === null || isNumber(value.activityAt)) &&
+    (value.task === null || isText(value.task)) &&
+    (value.taskAt === null || isNumber(value.taskAt)) &&
+    typeof value.stale === "boolean" &&
+    typeof value.taskStale === "boolean" &&
+    isText(value.reachability.state) &&
+    (value.reachability.reason === undefined || value.reachability.reason === null || isText(value.reachability.reason))
+  );
+}
+
+function isInbox(value: unknown): value is LinksInboxResult {
+  return (
+    isLinksResult(value) &&
+    (!value.ok ||
+      ((value.messages === undefined || (Array.isArray(value.messages) && value.messages.every(isMessage))) &&
+        (value.observed === undefined || typeof value.observed === "boolean")))
+  );
+}
+
+function isDirectory(value: unknown): value is LinksDirectoryResult {
+  return (
+    isLinksResult(value) &&
+    (!value.ok ||
+      ((value.entries === undefined || (Array.isArray(value.entries) && value.entries.every(isDirectoryEntry))) &&
+        (value.problems === undefined ||
+          (Array.isArray(value.problems) &&
+            value.problems.every(
+              (problem) =>
+                isRecord(problem) &&
+                ["code", "project", "reason"].every((key) => isText(problem[key])) &&
+                (problem.recovery === undefined || isText(problem.recovery)),
+            ))) &&
+        (value.staleAfterMs === undefined || isNumber(value.staleAfterMs))))
+  );
+}
+
+function isManagedSession(value: unknown): value is ManagedSession {
+  return (
+    isRecord(value) &&
+    ["id", "name", "repo"].every((key) => isText(value[key])) &&
+    (value.tool === undefined || isText(value.tool)) &&
+    (value.state === undefined || isText(value.state)) &&
+    (value.ownership === undefined || isText(value.ownership)) &&
+    (value.nativeConversation === undefined ||
+      value.nativeConversation === null ||
+      (isRecord(value.nativeConversation) &&
+        (value.nativeConversation.provider === undefined || isText(value.nativeConversation.provider)) &&
+        (value.nativeConversation.state === undefined || isText(value.nativeConversation.state))))
+  );
+}
+
+function isShareStatus(value: unknown): value is LinksShareStatusResult {
+  const project = (entry: unknown) =>
+    isLinksResult(entry) &&
+    isRecord(entry) &&
+    (entry.shared === undefined || typeof entry.shared === "boolean") &&
+    (entry.registered === undefined || typeof entry.registered === "boolean");
+  return (
+    isLinksResult(value) &&
+    (!value.ok || value.projects === undefined || (Array.isArray(value.projects) && value.projects.every(project)))
+  );
+}
+
+async function getLinks<T extends LinksResult>(
+  path: string,
+  valid: (value: unknown) => value is T,
+): Promise<T> {
+  const value = await get<unknown>(path);
+  return valid(value) ? value : (invalidLinksResponse() as T);
+}
+
 export const listWorktrees = () => get<Worktree[]>("/api/worktrees");
 export const listProjects = () => get<Project[]>("/api/projects");
 export const listAgents = () => get<Agent[]>("/api/agents");
 export const listPorts = () => get<Port[]>("/api/ports");
 export const getStatus = () => get<PortalStatus>("/api/status");
+export const listManagedSessions = () =>
+  getLinks(
+    "/api/agent-sessions",
+    (value): value is LinksResult & { sessions?: ManagedSession[] } =>
+      isLinksResult(value) &&
+      (!value.ok || value.sessions === undefined || (Array.isArray(value.sessions) && value.sessions.every(isManagedSession))),
+  );
+export const linksDirectory = () =>
+  getLinks("/api/links/directory", isDirectory);
+export const linksInbox = (target: LinksTarget, state?: string) =>
+  getLinks(
+    linksQuery("/api/links/inbox", { ...target, state }),
+    isInbox,
+  );
+export const linksMessage = (messageId: string) =>
+  getLinks<LinksMessage & LinksResult>(
+    linksQuery("/api/links/message", { messageId }),
+    isMessage,
+  );
+export const linksStatus = (messageId: string) =>
+  getLinks<LinksMessage & LinksResult>(
+    linksQuery("/api/links/status", { messageId }),
+    isMessage,
+  );
+export const linksCapabilities = () =>
+  getLinks(
+    "/api/links/capabilities",
+    (value): value is LinksResult & {
+    attention?: { notification?: string };
+    wake?: { available: boolean; code?: string; error?: string; reason?: string };
+  } =>
+      isLinksResult(value) && (() => {
+        const attention = value.attention;
+        const wake = value.wake;
+        return !value.ok ||
+          ((attention === undefined ||
+            (isRecord(attention) &&
+              (attention.notification === undefined || isText(attention.notification)))) &&
+            (wake === undefined ||
+              (isRecord(wake) &&
+                typeof wake.available === "boolean" &&
+                ["code", "error", "reason"].every(
+                  (key) => wake[key] === undefined || isText(wake[key]),
+                ))));
+      })(),
+  );
+export const linksShareStatus = (repo?: string) =>
+  getLinks(linksQuery("/api/links/share/status", { repo }), isShareStatus);
+export const linksSend = (input: LinksTarget & {
+  body: string;
+  idempotencyKey: string;
+  replyTo?: string;
+}) => postLinks<LinksResult>("/api/links/send", input);
+export const linksAck = (input: LinksTarget & { messageId: string }) =>
+  postLinks<LinksResult>("/api/links/ack", input);
+export const linksCancel = (messageId: string) =>
+  postLinks<LinksResult>("/api/links/cancel", { messageId });
+export const linksRedeliver = (input: LinksTarget & {
+  attemptId: string;
+  messageId: string;
+  confirmation?: string;
+}) => postLinks<LinksResult>("/api/links/redeliver", input);
+export const linksSendNow = (input: LinksTarget & { messageId: string }) =>
+  postLinks<LinksResult>("/api/links/send-now", input);
+export const linksShareEnable = (input: {
+  repo: string;
+  owner?: string;
+  confirmation?: string;
+}) => postLinks<LinksResult>("/api/links/share/enable", input);
+export const linksShareDisable = (repo: string) =>
+  postLinks<LinksResult>("/api/links/share/disable", { repo });
+export const linksShareAttention = (input: {
+  repo: string;
+  enabled: boolean;
+  confirmation?: string;
+}) => postLinks<LinksResult>("/api/links/share/attention", input);
 
 // Kills whatever's listening on the port directly (or, for a container-
 // backed worktree, routes through the real container stop path — same
@@ -184,6 +555,7 @@ export const removeWorktree = (
   });
 
 export const portalRecoveryUrl = () => `${portalUrl()}/#pending-cleanup`;
+export const portalLinksUrl = () => `${portalUrl()}/links`;
 
 export const openTool = (repo: string, name: string, tool: string) =>
   post("/api/open", { repo, name, tool });
