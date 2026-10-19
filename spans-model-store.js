@@ -76,6 +76,8 @@ const messages = Object.freeze({
   SPANS_MODEL_CLOSED: 'Spans model store is closed.',
   SPANS_MODEL_CORRUPT: 'Spans model store failed an integrity check.',
   SPANS_MODEL_EVENT_REFUSED: 'Spans event was refused; nothing was committed.',
+  SPANS_MODEL_FENCE_STALE:
+    'Spans run fence is stale; the run or its approval changed.',
   SPANS_MODEL_GENERATION_INVALID:
     'Spans view generation must equal the expected generation or advance it by one.',
   SPANS_MODEL_INVALID: 'Invalid spans model request.',
@@ -329,6 +331,19 @@ function normalizeCursorKey(input) {
   return request && isSourceKey(request) ? request : undefined;
 }
 
+// An import may be fenced to one run: it commits only while that run is at this
+// plan generation and its view still holds this association as approved for it.
+// Exactly these three fields; nothing generic.
+function normalizeFence(input) {
+  const fence = pick(input, ['associationId', 'generation', 'runId']);
+  return fence &&
+    isIdentifier(fence.associationId) &&
+    isIdentifier(fence.runId) &&
+    isCount(fence.generation)
+    ? fence
+    : undefined;
+}
+
 // The digest binds both offsets and the exact events, so only a byte-identical
 // retry of the same batch can be recognised as a duplicate.
 function batchDigest(json, expectedOffset, nextOffset) {
@@ -342,14 +357,18 @@ function batchDigest(json, expectedOffset, nextOffset) {
 // nextOffset may equal expectedOffset only for an empty batch or one holding
 // source gaps and their identity checkpoint. Other events require advancing bytes.
 function normalizeImport(input) {
-  const request = pick(input, [
-    'events',
-    'expectedOffset',
-    'nextOffset',
-    'parserVersion',
-    'sourceGeneration',
-    'sourceId',
-  ]);
+  const request = pick(
+    input,
+    [
+      'events',
+      'expectedOffset',
+      'nextOffset',
+      'parserVersion',
+      'sourceGeneration',
+      'sourceId',
+    ],
+    ['fence']
+  );
   if (
     !(
       request &&
@@ -361,7 +380,13 @@ function normalizeImport(input) {
   ) {
     return;
   }
-  const batch = normalizeBatch(request.events);
+  const fence =
+    request.fence === undefined ? undefined : normalizeFence(request.fence);
+  if (request.fence !== undefined && !fence) {
+    return;
+  }
+  // A fenced batch may only write to the run it is fenced to.
+  const batch = normalizeBatch(request.events, fence?.runId);
   if (!batch) {
     return;
   }
@@ -379,12 +404,23 @@ function normalizeImport(input) {
     digest: batchDigest(batch.json, expectedOffset, nextOffset),
     events: batch.copies,
     expectedOffset,
+    fence,
     nextOffset,
     parserVersion,
     sourceGeneration: request.sourceGeneration,
     sourceId: request.sourceId,
     zeroProgress,
   };
+}
+
+function normalizeFencedEvents(input) {
+  const request = pick(input, ['events', 'fence']);
+  const fence = request ? normalizeFence(request.fence) : undefined;
+  if (!(fence && Array.isArray(request.events) && request.events.length > 0)) {
+    return;
+  }
+  const batch = normalizeBatch(request.events, fence.runId);
+  return batch ? { events: batch.copies, fence } : undefined;
 }
 
 function normalizeList(input) {
@@ -644,13 +680,13 @@ function prepareStatements(db) {
       ),
       listRuns: prepare(
         `SELECT run_id, revision, generation FROM spans_views WHERE run_id > ?
-        AND (? = 'all' OR CASE lower(replace(json_extract(view_json, '$.state'), '_', ' '))
+        AND (? = 'all' OR CASE lower(replace((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.state') END), '_', ' '))
           WHEN 'planned' THEN 'planned' WHEN 'ready' THEN 'planned'
           WHEN 'completed' THEN 'past' WHEN 'failed' THEN 'past' WHEN 'cancelled' THEN 'past'
           WHEN 'running' THEN 'live' WHEN 'waiting for you' THEN 'live' WHEN 'paused' THEN 'live'
           WHEN 'recovery required' THEN 'live' WHEN 'blocked' THEN 'live' ELSE 'unknown' END = ?)
-        AND instr(lower(run_id || ' ' || coalesce(json_extract(view_json, '$.goal'), '') || ' ' ||
-          coalesce(json_extract(view_json, '$.owner'), '') || ' ' || coalesce(json_extract(view_json, '$.project'), '')), lower(?)) > 0
+        AND instr(lower(run_id || ' ' || coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.goal') END), '') || ' ' ||
+          coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.owner') END), '') || ' ' || coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.project') END), '')), lower(?)) > 0
         ORDER BY run_id ASC LIMIT ?`
       ),
       owned,
@@ -857,6 +893,27 @@ export function createSpansModelStore(options) {
     });
   }
 
+  // Runs in whatever transaction (or read) the caller is in, so the answer
+  // cannot change between this check and the commit that follows it.
+  const fenceHolds = (fence) => {
+    const state = viewState(statements.selectView.get(fence.runId));
+    if (!state.exists || state.generation !== fence.generation) {
+      return false;
+    }
+    const view = decodeDocument(state.viewJson, 'view-json');
+    const all = Object.hasOwn(view, 'linksAssociations')
+      ? view.linksAssociations
+      : undefined;
+    const association =
+      isPlainObject(all) && Object.hasOwn(all, fence.associationId)
+        ? all[fence.associationId]
+        : undefined;
+    return (
+      isPlainObject(association) &&
+      association.status === 'approved' &&
+      association.generation === fence.generation
+    );
+  };
   function commitImport(raw) {
     const request = attempt(() => normalizeImport(raw));
     if (!request) {
@@ -874,6 +931,9 @@ export function createSpansModelStore(options) {
     // write lock and leaves the cursor and the events exactly as they were.
     if (request.zeroProgress && request.events.length === 0) {
       return read(() => {
+        if (request.fence && !fenceHolds(request.fence)) {
+          return refusal('SPANS_MODEL_FENCE_STALE');
+        }
         const cursor = selectCursor();
         return cursor.offset === request.expectedOffset
           ? { duplicate: false, offset: cursor.offset, ok: true }
@@ -881,6 +941,10 @@ export function createSpansModelStore(options) {
       });
     }
     return atomic((box) => {
+      // Before the replay check too: a stale fence never reports success.
+      if (request.fence && !fenceHolds(request.fence)) {
+        refuse(box, refusal('SPANS_MODEL_FENCE_STALE'));
+      }
       const cursor = selectCursor();
       // Only the most recent batch can be recognised; anything earlier is
       // unknown history and may not advance the cursor.
@@ -910,6 +974,23 @@ export function createSpansModelStore(options) {
           : request.digest
       );
       return { duplicate: false, offset: request.nextOffset, ok: true };
+    });
+  }
+
+  // Events only, under the same fence an import uses, in one write
+  // transaction: the run view, its revision and its generation are not
+  // touched, and an approval withdrawn or a plan revised first stops it.
+  function commitFencedEvents(raw) {
+    const request = attempt(() => normalizeFencedEvents(raw));
+    if (!request) {
+      return refusal('SPANS_MODEL_INVALID');
+    }
+    return atomic((box) => {
+      if (!fenceHolds(request.fence)) {
+        refuse(box, refusal('SPANS_MODEL_FENCE_STALE'));
+      }
+      appendAll(box, request.events);
+      return { appended: request.events.length, ok: true };
     });
   }
 
@@ -1019,6 +1100,7 @@ export function createSpansModelStore(options) {
         ? { ok: true }
         : refusal('SPANS_MODEL_UNAVAILABLE');
     },
+    commitFencedEvents,
     commitImport,
     commitRun,
     listRuns,

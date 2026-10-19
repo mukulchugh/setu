@@ -139,7 +139,7 @@ fn a_migration_killed_before_its_commit_leaves_the_old_store_whole_and_the_retry
     assert_eq!(deposit(&engine, "k1")["error"]["code"], "NOT_SHARED");
 
     engine.ok("share_enable", json!({ "project": "repo", "owner": "Mukul" }));
-    assert_eq!(user_version(&engine), 3);
+    assert_eq!(user_version(&engine), 4);
     assert_eq!(engine.ok("show", json!({ "message_id": "m_old" }))["state"], "queued");
 }
 
@@ -148,7 +148,7 @@ fn a_migration_killed_after_its_commit_is_complete_and_keeps_every_message() {
     let engine = Engine::new();
     version_one_store(&engine);
     killed(&engine, "send", send_args(LEGACY_KEY, LEGACY_BODY, "native-a"), "migrate:after-commit");
-    assert_eq!(user_version(&engine), 3);
+    assert_eq!(user_version(&engine), 4);
     assert_eq!(engine.ok("show", json!({ "message_id": "m_old" }))["body"], LEGACY_BODY);
     // The retry of the interrupted send finds the old message.
     assert_eq!(engine.ok("send", send_args(LEGACY_KEY, LEGACY_BODY, "native-a"))["message_id"], "m_old");
@@ -247,6 +247,6 @@ fn an_upgrade_killed_before_it_commits_leaves_a_usable_earlier_store_and_a_retry
     engine.ok("reconcile", json!({ "recipient": recipient("native-a") }));
     let db = rusqlite::Connection::open(engine.dir.join("mailbox.sqlite3")).unwrap();
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(engine.ok("status", json!({ "message_id": "m_1" }))["locator"], "session-1");
 }

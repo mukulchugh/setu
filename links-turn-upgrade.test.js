@@ -93,6 +93,9 @@ test('an earlier-schema mailbox is read passively, then upgraded by the first tu
     token,
   });
   const record = (await f.sessions())['session-a'];
+  // The fixture composes the runtime's synchronous lifecycle guard: binding publication records its retry but
+  // starts no engine operation until the seeded mailbox exists.
+  expect(f.engineCalls).toEqual([]);
   const path = seedEarlierStore(f.dataDir, {
     checkout: canonicalCheckout(record.checkoutIdentity),
     nativeId: 'native-a',
@@ -118,9 +121,9 @@ test('an earlier-schema mailbox is read passively, then upgraded by the first tu
   const turn = await f.turn('session-a', { nativeId: 'native-a', token });
   expect(turn.stdout).toContain('sent before the upgrade');
   expect(await f.stateOf('m_old')).toBe('handed-off');
-  // The turn publishes its binding before it claims, and that write is what migrates the mailbox (to the
-  // transport schema, which includes the directory schema before it).
-  expect(userVersion(path)).toBe(3);
+  // The turn publishes its binding before it claims, and that write migrates the mailbox to schema 4,
+  // the current transport schema after the directory schema.
+  expect(userVersion(path)).toBe(4);
   expect(
     (await f.turn('session-a', { nativeId: 'native-a', token })).stdout
   ).toBe('');

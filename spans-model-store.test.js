@@ -1267,3 +1267,300 @@ test('closeStatements finalizes every owned statement, repeats safely and closes
     }).code
   ).toBe('SPANS_MODEL_CLOSED');
 });
+
+// ---------------------------------------------------------------------------
+// Run fence on imports: a projection batch is committed only while the run is
+// at the approved plan generation AND still carries the approved association.
+// The check shares the batch's write transaction, so a concurrent revision or
+// revocation cannot slip between the check and the commit.
+// ---------------------------------------------------------------------------
+
+const fenceKey = {
+  parserVersion: 'links-projection-1',
+  sourceGeneration: 0,
+  sourceId: 'links-assoc-1',
+};
+const approvedView = (generation, patch = {}) => ({
+  generation,
+  linksAssociations: {
+    'assoc-1': { generation, status: 'approved', ...patch },
+  },
+});
+const fenced = (events, expectedOffset, nextOffset, fence = {}) => ({
+  ...fenceKey,
+  events,
+  expectedOffset,
+  fence: { associationId: 'assoc-1', generation: 0, runId: 'run-1', ...fence },
+  nextOffset,
+});
+
+function openFenced(view = approvedView(0)) {
+  const opened = open();
+  expect(commit(opened.model, 'run-1', 0, 0, view).ok).toBe(true);
+  return opened;
+}
+
+const cursorOf = (model) => model.readSourceCursor(fenceKey);
+
+test('a fenced import commits events and cursor while the association is approved at that generation', () => {
+  const { db, model } = openFenced();
+
+  expect(model.commitImport(fenced([ev('run-1', 'f1')], 0, 7))).toEqual({
+    duplicate: false,
+    offset: 7,
+    ok: true,
+  });
+  expect(eventIds(db)).toEqual(['f1']);
+  expect(cursorOf(model)).toMatchObject({ found: true, offset: 7 });
+  // The run view is untouched by a projection.
+  expect(model.readRun({ runId: 'run-1' })).toMatchObject({
+    generation: 0,
+    revision: 1,
+  });
+});
+
+test('a fenced import is refused whole once the plan generation moved, with no event and no cursor', () => {
+  const { db, model } = openFenced();
+  expect(
+    commit(model, 'run-1', 1, 0, { ...approvedView(0), generation: 1 }).ok
+  ).toBe(true);
+
+  const result = model.commitImport(fenced([ev('run-1', 'f1')], 0, 7));
+  expect(result).toMatchObject({ code: 'SPANS_MODEL_FENCE_STALE', ok: false });
+  expect(eventIds(db)).toEqual([]);
+  expect(cursorOf(model).found).toBe(false);
+  // Naming the old generation is also stale; naming the new one still needs an
+  // association approved for that generation.
+  expect(
+    model.commitImport(fenced([ev('run-1', 'f1')], 0, 7, { generation: 1 }))
+      .code
+  ).toBe('SPANS_MODEL_FENCE_STALE');
+});
+
+test('a fenced import is refused when the association is revoked, replaced, absent or the run unknown', () => {
+  const cases = [
+    approvedView(0, { status: 'revoked' }),
+    approvedView(0, { generation: 1 }),
+    { generation: 0 },
+    {
+      generation: 0,
+      linksAssociations: { other: { generation: 0, status: 'approved' } },
+    },
+    { generation: 0, linksAssociations: 'approved' },
+    { generation: 0, linksAssociations: { 'assoc-1': 'approved' } },
+  ];
+  for (const view of cases) {
+    const { db, model } = openFenced(view);
+    expect(model.commitImport(fenced([ev('run-1', 'f1')], 0, 7)).code).toBe(
+      'SPANS_MODEL_FENCE_STALE'
+    );
+    expect(eventIds(db)).toEqual([]);
+    expect(cursorOf(model).found).toBe(false);
+  }
+  const { model } = open();
+  expect(model.commitImport(fenced([ev('run-1', 'f1')], 0, 7)).code).toBe(
+    'SPANS_MODEL_FENCE_STALE'
+  );
+});
+
+test('revoking after a committed batch stops the next batch and an exact replay never reports approval', () => {
+  const { db, model } = openFenced();
+  const batch = fenced([ev('run-1', 'f1')], 0, 7);
+  expect(model.commitImport(batch).ok).toBe(true);
+  expect(
+    commit(model, 'run-1', 1, 0, approvedView(0, { status: 'revoked' })).ok
+  ).toBe(true);
+
+  expect(model.commitImport(batch).code).toBe('SPANS_MODEL_FENCE_STALE');
+  expect(model.commitImport(fenced([ev('run-1', 'f2')], 7, 9)).code).toBe(
+    'SPANS_MODEL_FENCE_STALE'
+  );
+  expect(eventIds(db)).toEqual(['f1']);
+  expect(cursorOf(model).offset).toBe(7);
+});
+
+test('a fenced cursor-only advance works under a valid fence and is refused, without writing, under a stale one', () => {
+  const { model } = openFenced();
+  expect(model.commitImport(fenced([], 0, 40))).toEqual({
+    duplicate: false,
+    offset: 40,
+    ok: true,
+  });
+  expect(cursorOf(model)).toMatchObject({ found: true, offset: 40 });
+  // The no-progress path stays a plain read yet cannot report stale approval.
+  expect(model.commitImport(fenced([], 40, 40))).toMatchObject({
+    offset: 40,
+    ok: true,
+  });
+  expect(
+    commit(model, 'run-1', 1, 0, approvedView(0, { status: 'revoked' })).ok
+  ).toBe(true);
+  expect(model.commitImport(fenced([], 40, 40)).code).toBe(
+    'SPANS_MODEL_FENCE_STALE'
+  );
+  expect(model.commitImport(fenced([], 40, 50)).code).toBe(
+    'SPANS_MODEL_FENCE_STALE'
+  );
+  expect(cursorOf(model).offset).toBe(40);
+});
+
+test('a fence is exact: malformed fences and events for another run are invalid and write nothing', () => {
+  const { db, model } = openFenced();
+  const bad = [
+    { ...fenced([ev('run-1', 'f1')], 0, 7), fence: null },
+    fenced([ev('run-1', 'f1')], 0, 7, { extra: true }),
+    fenced([ev('run-1', 'f1')], 0, 7, { associationId: '' }),
+    fenced([ev('run-1', 'f1')], 0, 7, { generation: -1 }),
+    fenced([ev('run-1', 'f1')], 0, 7, { runId: 'bad id' }),
+    fenced([ev('run-2', 'f1')], 0, 7),
+    fenced([ev('run-1', 'f1'), ev('run-2', 'f2')], 0, 7),
+  ];
+  for (const input of bad) {
+    expect(model.commitImport(input).code).toBe('SPANS_MODEL_INVALID');
+  }
+  expect(eventIds(db)).toEqual([]);
+  expect(cursorOf(model).found).toBe(false);
+});
+
+test('a refused event inside a fenced batch leaves the cursor and earlier inserts behind', () => {
+  const { db, model } = openFenced();
+  expect(model.commitImport(fenced([ev('run-1', 'f1')], 0, 7)).ok).toBe(true);
+  const refused = fenced(
+    [ev('run-1', 'f2'), ev('run-1', 'f1', { changed: true })],
+    7,
+    9
+  );
+  expect(model.commitImport(refused)).toMatchObject({
+    code: 'SPANS_MODEL_EVENT_REFUSED',
+    ok: false,
+  });
+  expect(eventIds(db)).toEqual(['f1']);
+  expect(cursorOf(model).offset).toBe(7);
+});
+
+test('an import without a fence behaves exactly as before', () => {
+  const { db, model } = open();
+  expect(
+    model.commitImport({
+      ...fenceKey,
+      events: [ev('run-9', 'plain')],
+      expectedOffset: 0,
+      nextOffset: 3,
+    }).ok
+  ).toBe(true);
+  expect(eventIds(db)).toEqual(['plain']);
+});
+
+test('listing runs survives a row whose view is not valid JSON, so one bad run cannot hide the rest', () => {
+  const { db, model } = open();
+  expect(
+    commit(model, 'run-a', 0, 0, { generation: 0, goal: 'alpha' }).ok
+  ).toBe(true);
+  expect(commit(model, 'run-b', 0, 0, { generation: 0, goal: 'beta' }).ok).toBe(
+    true
+  );
+  db.run(
+    "UPDATE spans_views SET view_json = '{not json' WHERE run_id = 'run-a'"
+  );
+
+  const all = model.listRuns({});
+  expect(all.ok).toBe(true);
+  expect(all.runs.map((run) => run.runId)).toEqual(['run-a', 'run-b']);
+  // Filters still work on the healthy rows; the bad row simply never matches them.
+  expect(
+    model.listRuns({ query: 'beta' }).runs.map((run) => run.runId)
+  ).toEqual(['run-b']);
+  expect(model.listRuns({ phase: 'planned' }).ok).toBe(true);
+  // Reading the bad run itself is still a refusal, never silent data.
+  expect(model.readRun({ runId: 'run-a' }).ok).toBe(false);
+  expect(model.readRun({ runId: 'run-b' }).ok).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Fenced event append: events only, no view write, no revision bump.
+// ---------------------------------------------------------------------------
+
+test('a fenced append writes its events and leaves the run view, revision and generation untouched', () => {
+  const { db, model } = openFenced();
+  const before = model.readRun({ runId: 'run-1' });
+  expect(
+    model.commitFencedEvents({
+      events: [ev('run-1', 'g1'), ev('run-1', 'g2')],
+      fence: { associationId: 'assoc-1', generation: 0, runId: 'run-1' },
+    })
+  ).toEqual({ appended: 2, ok: true });
+  expect(eventIds(db)).toEqual(['g1', 'g2']);
+  expect(model.readRun({ runId: 'run-1' })).toEqual(before);
+});
+
+test('a fenced append is refused whole when the run moved, the approval was withdrawn or the run is unknown', () => {
+  const fence = { associationId: 'assoc-1', generation: 0, runId: 'run-1' };
+  const moved = openFenced();
+  expect(
+    commit(moved.model, 'run-1', 1, 0, { ...approvedView(0), generation: 1 }).ok
+  ).toBe(true);
+  expect(
+    moved.model.commitFencedEvents({ events: [ev('run-1', 'g1')], fence }).code
+  ).toBe('SPANS_MODEL_FENCE_STALE');
+  expect(eventIds(moved.db)).toEqual([]);
+
+  const revoked = openFenced(approvedView(0, { status: 'revoked' }));
+  expect(
+    revoked.model.commitFencedEvents({ events: [ev('run-1', 'g1')], fence })
+      .code
+  ).toBe('SPANS_MODEL_FENCE_STALE');
+  expect(eventIds(revoked.db)).toEqual([]);
+
+  const { model } = open();
+  expect(
+    model.commitFencedEvents({ events: [ev('run-1', 'g1')], fence }).code
+  ).toBe('SPANS_MODEL_FENCE_STALE');
+});
+
+test('a fenced append that loses a race to a revocation writes nothing, and one that wins is kept', () => {
+  const { db, model } = openFenced();
+  const fence = { associationId: 'assoc-1', generation: 0, runId: 'run-1' };
+  expect(
+    model.commitFencedEvents({ events: [ev('run-1', 'g1')], fence }).ok
+  ).toBe(true);
+  expect(
+    commit(model, 'run-1', 1, 0, approvedView(0, { status: 'revoked' })).ok
+  ).toBe(true);
+  expect(
+    model.commitFencedEvents({ events: [ev('run-1', 'g2')], fence }).code
+  ).toBe('SPANS_MODEL_FENCE_STALE');
+  expect(eventIds(db)).toEqual(['g1']);
+});
+
+test('an identical retry is accepted, a conflicting one refuses the whole append', () => {
+  const { db, model } = openFenced();
+  const fence = { associationId: 'assoc-1', generation: 0, runId: 'run-1' };
+  const first = { events: [ev('run-1', 'g1', { n: 1 })], fence };
+  expect(model.commitFencedEvents(first).ok).toBe(true);
+  expect(model.commitFencedEvents(first).ok).toBe(true);
+  expect(eventIds(db)).toEqual(['g1']);
+  expect(
+    model.commitFencedEvents({
+      events: [ev('run-1', 'g2'), ev('run-1', 'g1', { n: 2 })],
+      fence,
+    })
+  ).toMatchObject({ code: 'SPANS_MODEL_EVENT_REFUSED', ok: false });
+  expect(eventIds(db)).toEqual(['g1']);
+});
+
+test('a fenced append is exact: it needs a fence and events for that run only', () => {
+  const { db, model } = openFenced();
+  const fence = { associationId: 'assoc-1', generation: 0, runId: 'run-1' };
+  for (const input of [
+    { events: [ev('run-1', 'g1')] },
+    { fence },
+    { events: [], fence },
+    { events: [ev('run-2', 'g1')], fence },
+    { events: [ev('run-1', 'g1')], extra: 1, fence },
+    { events: [ev('run-1', 'g1')], fence: { ...fence, extra: true } },
+    { events: [ev('run-1', 'g1')], fence: { ...fence, generation: -1 } },
+  ]) {
+    expect(model.commitFencedEvents(input).code).toBe('SPANS_MODEL_INVALID');
+  }
+  expect(eventIds(db)).toEqual([]);
+});

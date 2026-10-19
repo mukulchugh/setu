@@ -217,15 +217,23 @@ test('every registered Links route is served, and the hook-only operations are n
   expect(
     links.map((route) => `${route.methods[0]} ${route.path}`).sort()
   ).toEqual([
+    'GET /api/links/associations',
+    'GET /api/links/associations/preview',
     'GET /api/links/capabilities',
     'GET /api/links/directory',
+    'GET /api/links/evidence/preview',
     'GET /api/links/inbox',
     'GET /api/links/message',
+    'GET /api/links/projection/status',
+    'GET /api/links/recovery',
     'GET /api/links/share/status',
     'GET /api/links/status',
     'POST /api/links/ack',
+    'POST /api/links/associations/approve',
+    'POST /api/links/associations/revoke',
     'POST /api/links/attention/open',
     'POST /api/links/cancel',
+    'POST /api/links/evidence/attach',
     'POST /api/links/redeliver',
     'POST /api/links/send',
     'POST /api/links/send-now',
@@ -233,11 +241,15 @@ test('every registered Links route is served, and the hook-only operations are n
     'POST /api/links/share/disable',
     'POST /api/links/share/enable',
   ]);
+  expect(new Set(links.map((route) => `${route.methods[0]} ${route.path}`)).size).toBe(
+    links.length
+  );
   // Listing everything shared is a complete request; every other route needs its target.
   const listings = new Set([
     '/api/links/capabilities',
     '/api/links/directory',
     '/api/links/share/status',
+    '/api/links/recovery',
   ]);
   for (const route of links) {
     // biome-ignore lint/performance/noAwaitInLoops: Requests share one portal.

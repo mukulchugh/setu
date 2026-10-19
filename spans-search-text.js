@@ -8,6 +8,7 @@
 
 export const SPANS_SEARCH_TEXT_LIMITS = Object.freeze({
   artifactBytes: 4_194_304,
+  linksTextBytes: 4096,
   textBytes: 4_194_304,
 });
 
@@ -112,6 +113,24 @@ function artifactTextFor(event, payload, readArtifact) {
   return decodeArtifactText(artifact, payload);
 }
 
+// A projected Links message carries its own bounded, already redacted text and
+// nothing else is prose: hints, origin, ids and states are never indexed. A
+// message whose text is not within the bound is refused, not indexed as empty,
+// so a coverage page never claims text it did not read.
+function linksText(event, payload) {
+  if (event.type !== 'links.message') {
+    return '';
+  }
+  const text = isPlainObject(payload) ? ownString(payload, 'text') : undefined;
+  if (
+    text === undefined ||
+    utf8ByteLength(text) > SPANS_SEARCH_TEXT_LIMITS.linksTextBytes
+  ) {
+    return refuse('links-event-shape');
+  }
+  return text;
+}
+
 /**
  * Build the `textForEvent` callback for createSpansSearch. `readArtifact` is a
  * synchronous reader with the createSpansArtifacts().read contract; it is
@@ -128,6 +147,9 @@ export function createSpansSearchText({ readArtifact } = {}) {
   }
   return function textForEvent(event) {
     const payload = event?.payload;
+    if (typeof event?.type === 'string' && event.type.startsWith('links.')) {
+      return linksText(event, payload);
+    }
     if (!isPlainObject(payload)) {
       return '';
     }

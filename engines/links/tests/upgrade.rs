@@ -90,7 +90,7 @@ fn the_first_write_upgrades_in_place_and_keeps_every_message_and_state() {
     // A reconcile that restores the held message is a write: it upgrades first.
     let outcome = engine.ok("reconcile", json!({ "recipient": recipient("native-a") }));
     assert_eq!(outcome["released"], json!([held]));
-    assert_eq!(version(&engine), 3);
+    assert_eq!(version(&engine), 4);
 
     assert_eq!(state(&engine, queued)["state"], "queued");
     assert_eq!(state(&engine, held)["state"], "queued");
@@ -112,7 +112,7 @@ fn an_upgraded_store_supports_resume_and_the_upgrade_happens_once() {
     let outcome = engine.ok("resume", json!({ "recipient": elsewhere, "from": ["session-1"] }));
     assert_eq!(outcome["moved"].as_array().unwrap().len(), 3);
     assert_eq!(state(&engine, queued)["locator"], "session-2");
-    assert_eq!(version(&engine), 3);
+    assert_eq!(version(&engine), 4);
 
     let db = Connection::open(database(&engine)).unwrap();
     let columns: i64 = db
@@ -122,14 +122,14 @@ fn an_upgraded_store_supports_resume_and_the_upgrade_happens_once() {
     drop(db);
     // Another write changes nothing about the schema.
     engine.ok("reconcile", json!({ "recipient": recipient("native-a") }));
-    assert_eq!(version(&engine), 3);
+    assert_eq!(version(&engine), 4);
 }
 
 #[test]
 fn a_send_to_an_earlier_store_upgrades_it_and_the_new_message_is_queued_beside_the_old() {
     let (engine, [queued, ..]) = earlier_store();
     let id = engine.ok("send", send_args("fresh", "new body", "native-a"))["message_id"].as_str().unwrap().to_string();
-    assert_eq!(version(&engine), 3);
+    assert_eq!(version(&engine), 4);
     assert_eq!(state(&engine, &id)["state"], "queued");
     assert_eq!(state(&engine, queued)["state"], "queued");
 }
@@ -147,7 +147,7 @@ fn engines_started_together_on_an_earlier_store_upgrade_it_once_and_all_succeed(
     for handle in handles {
         assert!(handle.join().unwrap());
     }
-    assert_eq!(version(&engine), 3);
+    assert_eq!(version(&engine), 4);
     for id in ids {
         assert!(state(&engine, id)["state"].is_string());
     }
@@ -157,7 +157,7 @@ fn engines_started_together_on_an_earlier_store_upgrade_it_once_and_all_succeed(
 fn a_newer_store_is_still_refused_and_left_untouched() {
     let (engine, _) = earlier_store();
     let db = Connection::open(database(&engine)).unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
+    db.pragma_update(None, "user_version", 5).unwrap();
     drop(db);
     let before = fs::read(database(&engine)).unwrap();
     assert_eq!(engine.err("reconcile", json!({ "recipient": recipient("native-a") })), "SCHEMA_UNSUPPORTED");

@@ -2,7 +2,7 @@
 
 use crate::{
     args::{Args, Fail},
-    attention, binding, daemon, mailbox, peers, sharing,
+    attention, binding, daemon, history, mailbox, peers, sharing,
     store::{SCHEMA_VERSION, Store},
 };
 use serde_json::{Value, json};
@@ -211,6 +211,7 @@ fn dispatch(data_dir: &Path, request: Value) -> Result<Value, Fail> {
         "status" => mailbox::status(reader(data_dir)?.as_ref(), args),
         "show" => mailbox::show(reader(data_dir)?.as_ref(), args),
         "list" => mailbox::list(reader(data_dir)?.as_ref(), args),
+        "events" => history::events(reader(data_dir)?.as_ref(), args),
         "attention_send" => {
             let request = attention::parse_send(args)?;
             // Refused on a read first, so a refusal creates, migrates and writes nothing; the write checks again.
