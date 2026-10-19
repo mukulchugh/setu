@@ -20,7 +20,7 @@ fn reads_never_create_a_store() {
     engine.ok("send", send_args("k1", "hello", "native-a"));
     let health = engine.ok("health", json!({}));
     assert_eq!(health["store"], "ready");
-    assert_eq!(health["schema_version"], 3);
+    assert_eq!(health["schema_version"], 4);
 }
 
 #[test]

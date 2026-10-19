@@ -8,11 +8,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 /// The first schema that has sharing policy and presence; a store before it reads as having none.
 pub const SHARING_SCHEMA: i64 = 2;
 /// The first schema with the peer transport tables (outbox, inbound, peers, grants, binding snapshots).
 pub const TRANSPORT_SCHEMA: i64 = 3;
+pub const HISTORY_SCHEMA: i64 = 4;
 const DATABASE: &str = "mailbox.sqlite3";
 
 const SCHEMA_V1: &str = "
@@ -119,6 +120,7 @@ fn private_dir(dir: &Path, create: bool) -> Result<(), Fail> {
 
 /// Every mutation ends here, so every one can be killed on either side of its commit.
 pub fn commit(tx: rusqlite::Transaction, op: &str) -> Result<(), Fail> {
+    crate::history::flush(&tx)?;
     util::fault(&format!("{op}:before-commit"));
     tx.commit()?;
     util::fault(&format!("{op}:after-commit"));
@@ -158,9 +160,10 @@ impl Store {
         db.execute_batch("BEGIN IMMEDIATE")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         let steps: &[&str] = match version {
-            0 => &[SCHEMA_V1, MIGRATION_1_TO_2, migrate::TO_3],
-            1 => &[MIGRATION_1_TO_2, migrate::TO_3],
-            2 => &[migrate::TO_3],
+            0 => &[SCHEMA_V1, MIGRATION_1_TO_2, migrate::TO_3, migrate::TO_4],
+            1 => &[MIGRATION_1_TO_2, migrate::TO_3, migrate::TO_4],
+            2 => &[migrate::TO_3, migrate::TO_4],
+            3 => &[migrate::TO_4],
             SCHEMA_VERSION => &[],
             _ => {
                 let _ = db.execute_batch("ROLLBACK");

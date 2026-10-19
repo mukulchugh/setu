@@ -684,8 +684,16 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/links/cancel` | `messageId`; retract a queued or held message. Refused once handed to a conversation. | H C |
 | `GET` | `/api/links/capabilities` | No input; passive and constant. `wake.available` is `false` with `LINKS_WAKE_UNAVAILABLE` and reason `no-verified-mechanism`; `attention.notification` is `in-app`. | H C |
 | `GET` | `/api/links/directory` | `repo?`; entries `{project,sessionId,owner,task,taskAt,taskStale,activityAt,reachability{state,reason},observedAt,stale}` of shared projects' managed sessions, and `problems` for a project whose policy cannot be read. Passive. | H C |
+| `GET` | `/api/links/associations` | `runId`; passive list of that run's Links associations. | H C |
+| `GET` | `/api/links/associations/preview` | `runId`,`origin`,`hint`; passive association review. The origin must be local or a current peer. | H C |
+| `POST` | `/api/links/associations/approve` | `runId`,`origin`,`hint`,`confirmation`; writes the reviewed association and its lookup index in one archive transaction. The exact preview token is required; a stale/mismatched review must be previewed again. | H C |
+| `POST` | `/api/links/associations/revoke` | `runId`,`origin`,`hint`; writes a revocation, including when the peer or engine is unavailable. A plan race returns a recoverable current status. | H C |
+| `POST` | `/api/links/evidence/attach` | `runId`,`messageId`,`spanId?`,`confirmation`; writes the reviewed immutable evidence artifact and fenced archive event. The message supplies its own origin and hint; an invalid or stale fence requires a new preview. | H C |
+| `GET` | `/api/links/evidence/preview` | `runId`,`messageId`,`spanId?`; passive evidence review from the engine's message and current approved association. | H C |
 | `GET` | `/api/links/inbox` | T plus `sessionId`,`state?`; messages addressed to that session, newest last, without bodies. `observed` says whether the current binding was compared; each message has `state` (effective) and `storedState`. | H C |
 | `GET` | `/api/links/message` | `messageId`; one message with its body. | H C |
+| `GET` | `/api/links/projection/status` | `runId`; passive projection status. It writes no archive or index and starts no projection. | H C |
+| `GET` | `/api/links/recovery` | `kind?` (`delivery` or `unassociated`),`limit?` (1-200),`afterId?`,`runId?`; passive bounded recovery listing. An old engine reports upgrade required rather than an empty page. | H C |
 | `POST` | `/api/links/redeliver` | T plus `sessionId`,`messageId`,`attemptId`,`confirmation?`; the first request returns a review token for the exact message, current unknown attempt and recipient; submit that token only after the receiving user confirms a possible duplicate. Not an agent tool. | H C |
 | `POST` | `/api/links/send-now` | T plus `sessionId`,`messageId`; always `LINKS_WAKE_UNAVAILABLE` (no verified mechanism). Takes no principal, tool or flag. Starts nothing, types nothing, takes no claim and bypasses no admission. | H C |
 | `POST` | `/api/links/share/attention` | `repo`,`enabled`,`confirmation?`; enabling returns `LINKS_CONFIRMATION_REQUIRED` with the effect and a token bound to the project's current scope, and only that token enables. Switching off is immediate and needs none. | H C |

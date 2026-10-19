@@ -446,6 +446,39 @@ test('a send whose reply was lost is retried under the same key to exactly one m
   expect(inbox.result.messages).toHaveLength(1);
 });
 
+test('history events stay under the real client reply cap with escaped bodies and page exactly once', async () => {
+  const { client } = realClient();
+  const body = '\u0001\\"'.repeat(2730);
+  const expected = [];
+  for (let index = 0; index < 150; index += 1) {
+    // biome-ignore lint/performance/noAwaitInLoops: Each send creates one distinct durable event.
+    const sent = await client.call('send', {
+      ...sendArgs(),
+      body,
+      idempotency_key: `escaped-history-${index}`,
+      recipient: { ...recipient, native_id: `native-${index % 2}` },
+    });
+    expect(sent.ok).toBe(true);
+    expected.push(sent.result.message_id);
+  }
+
+  const seen = [];
+  let after = 0;
+  for (;;) {
+    // biome-ignore lint/performance/noAwaitInLoops: The cursor from each page is the next request.
+    const page = await client.call('events', { after, limit: 200 });
+    expect(page.ok).toBe(true);
+    seen.push(...page.result.events.map((event) => event.message_id));
+    if (!page.result.has_more) {
+      expect(page.result.next).toBeGreaterThanOrEqual(page.result.head);
+      break;
+    }
+    expect(page.result.next).toBeGreaterThan(after);
+    after = page.result.next;
+  }
+  expect(seen).toEqual(expected);
+});
+
 const PEER = 'a'.repeat(64);
 const PUBLIC_KEY = /^[0-9a-f]{64}$/;
 

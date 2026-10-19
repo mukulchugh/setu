@@ -396,6 +396,12 @@ pub fn show(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
     };
     project(&mut value, observed.as_ref());
     project_policy(store, &mut value, &mut Default::default())?;
+    let origin_sender = match value["sender"]["kind"].as_str() {
+        Some("peer") => format!("peer:{}", value["sender"]["id"].as_str().unwrap_or_default()),
+        Some("session") => format!("session:{}", value["sender"]["id"].as_str().unwrap_or_default()),
+        _ => "user".to_string(),
+    };
+    value["origin"] = json!(crate::history::origin(&origin_sender)?);
     Ok(value)
 }
 
@@ -409,26 +415,85 @@ fn outbound(db: &rusqlite::Connection, id: &str, with_body: bool) -> Result<Valu
 
 /// Messages addressed to one managed session (by its locator hint), newest last, without bodies.
 pub fn list(store: Option<&Store>, mut args: Args) -> Result<Value, Fail> {
-    let session = args.string("session_hint", 128)?;
+    let session = args.optional_string("session_hint", 128)?;
     let state = args.optional_string("state", 32)?;
+    let origin = args.optional_string("origin", 69)?;
+    let run_hint = args.optional_string("run_hint", 128)?;
+    let has_run_hint = args.optional_boolean("has_run_hint")?;
+    let states = args.optional_array("states", 16)?.map(|values| values.into_iter().map(|value| match value {
+        Value::String(state) if matches!(state.as_str(), "queued" | "held" | "handoff-unknown" | "handed-off" | "acknowledged" | "expired" | "cancelled" | "rejected") => Ok(state),
+        _ => Err(Fail::new("REQUEST_INVALID", "field `states` is missing or invalid")),
+    }).collect::<Result<Vec<_>, _>>()).transpose()?;
+    let limit = args.optional_count("limit", 1, 200, "FIELD_TOO_LARGE")?;
+    let after_id = args.optional_string("after_id", 128)?;
     let observed = parse_observed(&mut args)?;
     args.finish()?;
+    let extended = origin.is_some() || run_hint.is_some() || has_run_hint || states.is_some() || limit.is_some() || after_id.is_some();
+    if state.is_some() && states.is_some() { return Err(Fail::new("REQUEST_INVALID", "state and states cannot be combined")); }
+    if run_hint.is_some() != origin.is_some() { return Err(Fail::new("REQUEST_INVALID", "run_hint requires origin")); }
+    if let Some(origin) = origin.as_deref() { crate::history::requested_origin(origin)?; }
+    if !extended {
+        let session = session.ok_or_else(|| Fail::new("REQUEST_INVALID", "field `session_hint` is missing or invalid"))?;
+        let Some(store) = store else { return Ok(json!({ "messages": [] })) };
+        let found = if store.version >= 2 { "(m.session_hint = ?1 OR d.locator = ?1)" } else { "m.session_hint = ?1" };
+        let mut statement = store.db.prepare(&format!("{} WHERE {found} ORDER BY m.created_at, m.id", view_sql(store.version)))?;
+        let now = util::now_ms();
+        let rows = statement.query_map(params![session, now], |row| row_json(row, false))?;
+        let mut messages = Vec::new();
+        let mut cache = Default::default();
+        for row in rows {
+            let mut row = row?;
+            project(&mut row, observed.as_ref());
+            project_policy(store, &mut row, &mut cache)?;
+            if state.as_deref().is_none_or(|wanted| row["state"] == wanted) { messages.push(row); }
+        }
+        return Ok(json!({ "messages": messages }));
+    }
+    if session.is_none() && run_hint.is_none() && !has_run_hint && states.as_ref().is_none_or(Vec::is_empty) {
+        return Err(Fail::new("REQUEST_INVALID", "a list selector is required"));
+    }
     let Some(store) = store else { return Ok(json!({ "messages": [] })) };
-    let found = if store.version >= 2 { "(m.session_hint = ?1 OR d.locator = ?1)" } else { "m.session_hint = ?1" };
-    let mut statement = store.db.prepare(&format!("{} WHERE {found} ORDER BY m.created_at, m.id", view_sql(store.version)))?;
+    let states = states.unwrap_or_default();
+    if states.is_empty() && state.is_some() { return Err(Fail::new("REQUEST_INVALID", "field `states` is missing or invalid")); }
+    let mut clauses = vec!["m.kind != 'attention'".to_string()];
+    if session.is_some() { clauses.push(if store.version >= 2 { "(m.session_hint = ?1 OR d.locator = ?1)".into() } else { "m.session_hint = ?1".into() }); }
+    if let Some(origin) = origin.as_deref() {
+        clauses.push(if origin == "local" { "(m.sender = 'user' OR m.sender LIKE 'session:%')".into() } else { "m.sender = ?2".into() });
+    }
+    if run_hint.is_some() { clauses.push("m.run_hint = ?3".into()); }
+    if has_run_hint { clauses.push("m.run_hint IS NOT NULL".into()); }
+    if after_id.is_some() { clauses.push("m.id > ?4".into()); }
+    let joins = if store.version >= TRANSPORT_SCHEMA { "LEFT JOIN deliveries d ON d.message_id=m.id LEFT JOIN outbox o ON o.message_id=m.id" } else { "JOIN deliveries d ON d.message_id=m.id" };
+    let query = format!("SELECT m.id FROM messages m {joins} WHERE {} ORDER BY m.id LIMIT ?5", clauses.join(" AND "));
+    let mut statement = store.db.prepare(&query)?;
     let now = util::now_ms();
-    let rows = statement.query_map(params![session, now], |row| row_json(row, false))?;
+    let ids = statement.query_map(params![session, origin, run_hint, after_id, limit.unwrap_or(100) + 1], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut messages = Vec::new();
     let mut cache = Default::default();
-    for row in rows {
-        let mut row = row?;
+    let wanted = limit.unwrap_or(100) as usize;
+    let mut scanned_after = None;
+    for id in ids.iter().take(wanted) {
+        scanned_after = Some(id.clone());
+        let mut row = match view(&store.db, store.version, id, now) {
+            Ok(value) => value,
+            Err(fail) if fail.code == "MESSAGE_NOT_FOUND" && store.version >= TRANSPORT_SCHEMA => outbound(&store.db, id, false)?,
+            Err(fail) => return Err(fail),
+        };
         project(&mut row, observed.as_ref());
-        project_policy(store, &mut row, &mut cache)?;
-        if state.as_deref().is_none_or(|wanted| row["state"] == wanted) {
+        if row.get("transport").is_none() { project_policy(store, &mut row, &mut cache)?; }
+        row.as_object_mut().map(|fields| fields.remove("body"));
+        let sender = match row["sender"]["kind"].as_str() {
+            Some("peer") => format!("peer:{}", row["sender"]["id"].as_str().unwrap_or_default()),
+            Some("session") => format!("session:{}", row["sender"]["id"].as_str().unwrap_or_default()),
+            _ => "user".to_string(),
+        };
+        row["origin"] = json!(crate::history::origin(&sender)?);
+        if states.is_empty() || row["state"].as_str().is_some_and(|state| states.iter().any(|wanted| wanted == state)) {
             messages.push(row);
         }
     }
-    Ok(json!({ "messages": messages }))
+    let next_after = if states.is_empty() { messages.last().map(|message| message["message_id"].clone()) } else { scanned_after.map(Value::String) };
+    Ok(json!({ "messages": messages, "has_more": ids.len() > wanted, "next_after": next_after }))
 }
 
 /// Delivery state without the body.
@@ -475,7 +540,7 @@ pub fn maintain(store: &mut Store) -> Result<(), Fail> {
     let tx = store.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     expire_due(&tx, now)?;
     transport_upkeep(&tx, store.version, now)?;
-    tx.commit()?;
+    commit(tx, "maintain")?;
     Ok(())
 }
 

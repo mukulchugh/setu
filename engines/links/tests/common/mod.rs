@@ -441,8 +441,9 @@ impl Engine {
             .unwrap();
         let mut all = serde_json::Map::new();
         for table in tables {
-            let mut statement = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2")).unwrap();
-            let columns = statement.column_count();
+            let columns = db.prepare(&format!("SELECT * FROM {table}")).unwrap().column_count();
+            let order = if columns > 1 { " ORDER BY 1, 2" } else { " ORDER BY 1" };
+            let mut statement = db.prepare(&format!("SELECT * FROM {table}{order}")).unwrap();
             let rows: Vec<Value> = statement
                 .query_map([], |row| {
                     Ok(Value::Array((0..columns).map(|i| match row.get_ref(i).unwrap() {

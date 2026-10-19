@@ -4,6 +4,7 @@ pub mod authz;
 pub mod binding;
 pub mod daemon;
 pub mod frame;
+pub mod history;
 pub mod inbound;
 pub mod mailbox;
 pub mod migrate;

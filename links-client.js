@@ -72,6 +72,8 @@ function unavailable(op, reason) {
 // The shape of every successful result the service reads. A reply whose envelope is right but whose
 // result is not is as untrustworthy as one with a wrong envelope.
 const isText = (value) => typeof value === 'string';
+const isCanonicalOrigin = (value) =>
+  value === 'local' || /^peer:[0-9a-f]{64}$/.test(value);
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
@@ -171,6 +173,16 @@ const messageFields = {
   stored_state: (value) => DELIVERY_STATES.has(value),
   updated_at: count,
 };
+// History's extended list was introduced before transport added the local-only
+// locator and project fields, so its baseline wire reply remains accepted.
+const historyMessageFields = {
+  attempt_id: maybe(isText), attempts: count, created_at: count,
+  expires_at: count, kind: isText, message_id: isText, reason: maybe(isText),
+  recipient: messageFields.recipient, redeliveries: count, reply_to: maybe(isText),
+  run_hint: maybe(isText), sender: exactly({ kind: isText }), size: count,
+  span_hint: maybe(isText), state: (value) => DELIVERY_STATES.has(value),
+  stored_state: (value) => DELIVERY_STATES.has(value), updated_at: count,
+};
 // `observed_match` is the engine's own answer to "is this message addressed to the conversation I passed as
 // `observed`", true or false, or null when none was passed. Callers must ask the engine rather than compare tuples:
 // mail from a peer is stored under an opaque address the engine alone can match.
@@ -222,7 +234,7 @@ const eventMessage = exactly({
   body: isText,
   created_at: count,
   kind: isText,
-  origin: isText,
+  origin: isCanonicalOrigin,
   recipient: exactly({ provider: isText, session_hint: isText }),
   reply_to: maybe(isText),
   run_hint: maybe(isText),
@@ -330,9 +342,15 @@ const RESULT_SHAPES = {
   identity: exactly({ peer_id: isText }),
   list: either(
     exactly({ messages: listOf(exactly(messageFields, optionalMessageFields)) }),
+    exactly({ messages: listOf(exactly(historyMessageFields)) }),
     exactly({
       has_more: flag,
-      messages: listOf(exactly({ ...messageFields, origin: isText }, optionalMessageFields)),
+      messages: listOf(exactly({ ...messageFields, origin: isCanonicalOrigin }, optionalMessageFields)),
+      next_after: maybe(isText),
+    }),
+    exactly({
+      has_more: flag,
+      messages: listOf(exactly({ ...historyMessageFields, origin: isCanonicalOrigin })),
       next_after: maybe(isText),
     })
   ),
@@ -390,7 +408,10 @@ const RESULT_SHAPES = {
     released: listOf(isText),
   }),
   share_status: exactly({ projects: listOf(projectStanding) }),
-  show: exactly({ ...messageFields, body: isText }, optionalMessageFields),
+  show: exactly(
+    { ...messageFields, body: isText },
+    { ...optionalMessageFields, origin: isCanonicalOrigin }
+  ),
   status: exactly(messageFields, optionalMessageFields),
   sweep: exactly({ expired: listOf(isText) }),
   transport_status: exactly(

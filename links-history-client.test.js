@@ -41,6 +41,34 @@ const message = (patch = {}) => ({
   updated_at: 1,
   ...patch,
 });
+const PEER_ORIGIN = `peer:${'a'.repeat(64)}`;
+const INVALID_ORIGINS = [
+  'a'.repeat(64),
+  `peer:${'A'.repeat(64)}`,
+  'peer A',
+  'unknown',
+];
+
+const peer = (patch = {}) => ({
+  addresses: ['127.0.0.1:443'],
+  created_at: 1,
+  grants: [{ capability: 'receive', scope: { id: 'ps_1', kind: 'project' } }],
+  label: 'peer A',
+  peer_id: 'peer-A',
+  published: [
+    {
+      recipient: {
+        checkout: 'c',
+        native_id: 'n',
+        provider: 'claude-code',
+        session_hint: 's',
+      },
+      scope: 'ps_1',
+      session_hint: 's',
+    },
+  ],
+  ...patch,
+});
 
 describe('list', () => {
   test('keeps accepting the baseline reply', async () => {
@@ -51,7 +79,7 @@ describe('list', () => {
   test('accepts the run-linked listing: origin per message and a page cursor', async () => {
     const reply = await replying({
       has_more: true,
-      messages: [message({ origin: 'peer-A' })],
+      messages: [message({ origin: PEER_ORIGIN })],
       next_after: 'm_1',
     }).call('list', { has_run_hint: true, limit: 50 });
     expect(reply).toMatchObject({ ok: true, result: { next_after: 'm_1' } });
@@ -63,6 +91,11 @@ describe('list', () => {
       { has_more: true, messages: [message()] },
       { messages: [message()], next_after: 7 },
       { messages: [message({ origin: 5 })] },
+      ...INVALID_ORIGINS.map((origin) => ({
+        has_more: false,
+        messages: [message({ origin })],
+        next_after: null,
+      })),
     ]) {
       // biome-ignore lint/performance/noAwaitInLoops: Each reply is its own child process.
       const reply = await replying(result).call('list', {});
@@ -75,22 +108,41 @@ describe('list', () => {
 });
 
 describe('peer_list', () => {
-  test('is read loosely: peers with an id, whatever else the roster carries', async () => {
-    const reply = await replying({
-      peers: [{ label: 'a', peer_id: 'peer-A' }],
-    }).call('peer_list', {});
+  test('accepts the full current roster contract', async () => {
+    const reply = await replying({ peers: [peer()] }).call('peer_list', {});
     expect(reply).toMatchObject({ ok: true });
   });
 
-  test('refuses a roster without peer ids', async () => {
-    const reply = await replying({ peers: [{ label: 'a' }] }).call(
-      'peer_list',
-      {}
-    );
-    expect(reply).toMatchObject({
-      code: 'LINKS_ENGINE_UNAVAILABLE',
-      ok: false,
-    });
+  test('refuses roster peers outside that contract', async () => {
+    const { addresses: _addresses, ...withoutAddresses } = peer();
+    for (const result of [
+      { peers: [peer({ unexpected: true })] },
+      { peers: [withoutAddresses] },
+      {
+        peers: [
+          peer({ grants: [{ capability: 1, scope: { kind: 'project' } }] }),
+        ],
+      },
+      {
+        peers: [
+          peer({
+            published: [
+              {
+                recipient: { checkout: 'c', provider: 'claude-code', session_hint: 's' },
+                scope: 'ps_1',
+                session_hint: 's',
+              },
+            ],
+          }),
+        ],
+      },
+    ]) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each reply is its own child process.
+      expect(await replying(result).call('peer_list', {})).toMatchObject({
+        code: 'LINKS_ENGINE_UNAVAILABLE',
+        ok: false,
+      });
+    }
   });
 });
 
@@ -107,7 +159,7 @@ describe('events', () => {
       body: 'b',
       created_at: 1,
       kind: 'message',
-      origin: `peer:${'a'.repeat(64)}`,
+      origin: PEER_ORIGIN,
       recipient: { provider: 'claude-code', session_hint: 's' },
       reply_to: null,
       run_hint: 'run-1',
@@ -160,8 +212,45 @@ describe('events', () => {
       page([event({ stage: 'pending', state: 'queued' })])
     ).call('events', {});
     expect(reply.result.events[0].message.origin).toBe(
-      `peer:${'a'.repeat(64)}`
+      PEER_ORIGIN
     );
+  });
+
+  test('refuses noncanonical event origins', async () => {
+    for (const origin of INVALID_ORIGINS) {
+      const result = event();
+      result.message = { ...result.message, origin };
+      // biome-ignore lint/performance/noAwaitInLoops: Each reply is its own child process.
+      expect(await replying(page([result])).call('events', {})).toMatchObject({
+        code: 'LINKS_ENGINE_UNAVAILABLE',
+        ok: false,
+      });
+    }
+  });
+});
+
+describe('show', () => {
+  const shown = (patch = {}) => ({
+    ...message({ locator: 'loc_1', project: null }),
+    body: 'b',
+    ...patch,
+  });
+
+  test('keeps a baseline reply optional while accepting a canonical origin', async () => {
+    expect(await replying(shown()).call('show', {})).toMatchObject({ ok: true });
+    expect(
+      await replying(shown({ origin: PEER_ORIGIN })).call('show', {})
+    ).toMatchObject({ ok: true });
+  });
+
+  test('refuses noncanonical optional origins', async () => {
+    for (const origin of INVALID_ORIGINS) {
+      // biome-ignore lint/performance/noAwaitInLoops: Each reply is its own child process.
+      expect(await replying(shown({ origin })).call('show', {})).toMatchObject({
+        code: 'LINKS_ENGINE_UNAVAILABLE',
+        ok: false,
+      });
+    }
   });
 });
 

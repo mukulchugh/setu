@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createLinksClient } from './links-client.js';
+import { ensureEngine, temporaryLinksRoot } from './links-engine-fixture.js';
 import { createLinksHistoryService } from './links-history-service.js';
 import {
   createFakeEngine,
@@ -13,6 +15,7 @@ import { createSpansDrafts } from './spans-drafts.js';
 import { openSpansStore } from './spans-store.js';
 
 const LINKS_CODE = /^LINKS_/;
+const ENGINE = ensureEngine();
 const roots = [];
 afterEach(() => {
   for (const root of roots.splice(0)) {
@@ -654,6 +657,70 @@ describe('projection through the service', () => {
       (await service.projectionStatus({ runId: 'run-1' })).associations[0]
         .pending
     ).toBe(false);
+  });
+
+  test('the real engine projects an approved archive once across restart and gives a replacement store a new cursor', async () => {
+    const spansRoot = archive();
+    const first = temporaryLinksRoot();
+    const second = temporaryLinksRoot();
+    roots.push(first.root, second.root);
+    const send = (client, key) =>
+      client.call('send', {
+        body: 'real engine history',
+        idempotency_key: key,
+        project: 'repo',
+        recipient: {
+          checkout: '{"path":"/work/repo","incarnation":"c1"}',
+          native_id: 'native-a',
+          provider: 'claude-code',
+          session_hint: 'session-1',
+        },
+        run_hint: 'run-1',
+        sender: { kind: 'user' },
+      });
+    const firstClient = createLinksClient({
+      dataDir: join(first.root, 'links'),
+      enginePath: ENGINE,
+    });
+    expect((await send(firstClient, 'real-history-1')).ok).toBe(true);
+    const service = createLinksHistoryService({ client: firstClient, spansRoot });
+    expect((await approveOver(service)).ok).toBe(true);
+    expect(await service.project({ maxBatches: 5 })).toMatchObject({
+      complete: true,
+      ok: true,
+    });
+    const projected = eventsOf(spansRoot).filter((event) =>
+      event.type.startsWith('links.')
+    );
+    expect(projected.map((event) => event.type)).toEqual([
+      'links.association.approved',
+      'links.message',
+      'links.status',
+    ]);
+    const projectedIds = projected
+      .filter(
+        (event) => event.type === 'links.message' || event.type === 'links.status'
+      )
+      .map((event) => event.eventId);
+    const restarted = createLinksHistoryService({ client: firstClient, spansRoot });
+    expect((await restarted.project({ maxBatches: 5 })).complete).toBe(true);
+    expect(
+      eventsOf(spansRoot)
+        .filter((event) => event.type === 'links.message' || event.type === 'links.status')
+        .map((event) => event.eventId)
+    ).toEqual(projectedIds);
+
+    const secondClient = createLinksClient({
+      dataDir: join(second.root, 'links'),
+      enginePath: ENGINE,
+    });
+    expect((await send(secondClient, 'real-history-2')).ok).toBe(true);
+    expect(
+      (await createLinksHistoryService({ client: secondClient, spansRoot }).project({
+        maxBatches: 5,
+      })).complete
+    ).toBe(true);
+    expect(eventsOf(spansRoot).filter((event) => event.type === 'links.message')).toHaveLength(2);
   });
 });
 

@@ -8,7 +8,6 @@ export const PORTAL_API_ROUTES = Object.freeze([
   { methods: ['POST'], path: '/api/links/associations/approve' },
   { methods: ['GET'], path: '/api/links/associations/preview' },
   { methods: ['POST'], path: '/api/links/associations/revoke' },
-  { methods: ['POST'], path: '/api/links/cancel' },
   { methods: ['POST'], path: '/api/links/evidence/attach' },
   { methods: ['GET'], path: '/api/links/evidence/preview' },
   { methods: ['GET'], path: '/api/links/inbox' },

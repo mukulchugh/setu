@@ -53,7 +53,7 @@ fn a_schema_1_store_migrates_to_the_current_schema_and_keeps_its_mail() {
     let engine = Engine::new();
     schema_1_store(&engine);
 
-    assert_eq!(engine.ok("health", json!({}))["schema_version"], 3);
+    assert_eq!(engine.ok("health", json!({}))["schema_version"], 4);
     // Reading a store this engine cannot read yet must not have been the thing that changed it.
     let shown = engine.ok("show", json!({ "message_id": "m_old" }));
     assert_eq!(shown["body"], "written by schema 1");
@@ -64,7 +64,7 @@ fn a_schema_1_store_migrates_to_the_current_schema_and_keeps_its_mail() {
     let claimed = engine.ok("claim", json!({ "recipient": recipient("native-a") }));
     assert_eq!(claimed["messages"].as_array().unwrap().len(), 2);
     assert_eq!(claimed["messages"][0]["message_id"], "m_old");
-    assert_eq!(Connection::open(engine.dir.join("mailbox.sqlite3")).unwrap().pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 3);
+    assert_eq!(Connection::open(engine.dir.join("mailbox.sqlite3")).unwrap().pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
 }
 
 #[test]
@@ -150,8 +150,12 @@ fn a_schema_2_store_migrates_to_3_keeping_its_mail_and_enabling_the_transport() 
     // The first write migrates; the old mail is intact and the new tables work.
     let real = iroh::SecretKey::from_bytes(&[9u8; 32]).public().to_string();
     engine.ok("peer_add", json!({ "peer_id": real, "label": "laptop", "addresses": [] }));
-    assert_eq!(version_of(&engine), 3);
+    assert_eq!(version_of(&engine), 4);
     assert_eq!(engine.ok("peer_list", json!({}))["peers"].as_array().unwrap().len(), 1);
+    let events = engine.ok("events", json!({}));
+    assert_eq!(events["events"][0]["message_id"], "m_old");
+    assert_eq!(events["events"][0]["backfill"], true);
+    assert_eq!(events["events"][0]["first"], true);
     assert_eq!(engine.ok("claim", json!({ "recipient": recipient("native-a") }))["messages"][0]["message_id"], "m_old");
 }
 
@@ -166,7 +170,7 @@ fn a_schema_2_migration_killed_before_its_commit_leaves_schema_2_and_the_retry_s
     assert!(!status.success());
     assert_eq!(version_of(&engine), 2, "a killed migration must leave schema 2");
     engine.ok("send", send_args("k-new", "after", "native-a"));
-    assert_eq!(version_of(&engine), 3);
+    assert_eq!(version_of(&engine), 4);
 }
 
 #[test]
@@ -178,7 +182,7 @@ fn reads_of_a_version_1_store_work_report_nothing_shared_and_change_nothing() {
     assert_eq!(engine.ok("show", json!({ "message_id": "m_old" }))["body"], "written before sharing");
     assert_eq!(engine.ok("share_status", json!({ "project": "repo" }))["projects"][0]["state"], "absent");
     assert_eq!(engine.ok("directory", json!({}))["entries"], json!([]));
-    assert_eq!(engine.ok("health", json!({}))["schema_version"], 3);
+    assert_eq!(engine.ok("health", json!({}))["schema_version"], 4);
     assert_eq!(engine.ok("share_disable", json!({ "project": "repo" }))["removed"], false);
     assert_eq!(std::fs::read(engine.dir.join("mailbox.sqlite3")).unwrap(), before);
     assert_eq!(Connection::open(engine.dir.join("mailbox.sqlite3")).unwrap().pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 1);
@@ -194,7 +198,7 @@ fn the_first_write_migrates_and_keeps_every_message_and_its_state() {
 
     engine.ok("share_enable", json!({ "project": "repo", "owner": "Mukul" }));
     let db = Connection::open(engine.dir.join("mailbox.sqlite3")).unwrap();
-    assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 3);
+    assert_eq!(db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 4);
     drop(db);
 
     let old = engine.ok("show", json!({ "message_id": "m_old" }));

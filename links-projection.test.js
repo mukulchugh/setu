@@ -742,6 +742,50 @@ describe('failures are reported, not hidden', () => {
     expect(types(store)).toEqual([]);
   });
 
+  test('a misrouted page is blocked atomically before any archive import', async () => {
+    const peer = `peer:${'a'.repeat(64)}`;
+    for (const records of [
+      [['m_bad', engineMessage({ origin: peer })]],
+      [['m_bad', engineMessage({ run_hint: 'other-run' })]],
+      [
+        ['m_good', engineMessage()],
+        ['m_bad', engineMessage({ origin: peer, run_hint: 'other-run' })],
+      ],
+    ]) {
+      const actual = createFakeEngine();
+      for (const [messageId, message] of records) {
+        actual.record(messageId, message, 'queued');
+      }
+      const engine = {
+        events: ({ after, limit }) => actual.events({ after, limit }),
+      };
+      const { associations, drafts, projection, store } = fixture({ engine });
+      newRun(drafts);
+      approve(associations);
+
+      // biome-ignore lint/performance/noAwaitInLoops: Each malformed engine has its own archive.
+      const result = await projection.runOnce({ maxBatches: 5 });
+      expect(result.associations[0]).toMatchObject({
+        code: 'LINKS_EVENT_INVALID',
+        pending: true,
+        state: 'blocked',
+      });
+      expect(types(store)).toEqual([]);
+      expect(cursorOffset(store)).toBe(0);
+    }
+  });
+
+  test('a correctly filtered page still projects unchanged', async () => {
+    const { associations, drafts, engine, projection, store } = fixture();
+    newRun(drafts);
+    engine.record('m_1', engineMessage(), 'queued');
+    approve(associations);
+
+    await projection.runOnce({ maxBatches: 5 });
+    expect(types(store)).toEqual(['links.message', 'links.status']);
+    expect(cursorOffset(store)).toBe(1);
+  });
+
   test('an event id that already exists with different content blocks the association and skips nothing', async () => {
     const { associations, drafts, engine, projection, store } = fixture();
     newRun(drafts);
@@ -897,6 +941,30 @@ describe('projection status is passive and honest', () => {
       engine: 'unavailable',
       ok: true,
     });
+  });
+
+  test('does not report a misrouted page as healthy', async () => {
+    const actual = createFakeEngine();
+    actual.record(
+      'm_bad',
+      engineMessage({ origin: `peer:${'a'.repeat(64)}`, run_hint: 'other-run' }),
+      'queued'
+    );
+    const engine = {
+      events: ({ after, limit }) => actual.events({ after, limit }),
+    };
+    const { associations, drafts, projection, store } = fixture({ engine });
+    newRun(drafts);
+    approve(associations);
+
+    expect(await projection.status({ runId: 'run-1' })).toMatchObject({
+      associations: [],
+      code: 'LINKS_EVENT_INVALID',
+      engine: 'unavailable',
+      ok: true,
+    });
+    expect(types(store)).toEqual([]);
+    expect(cursorOffset(store)).toBe(0);
   });
 
   test('refuses an unknown or malformed run and an unknown run is not an empty answer', async () => {

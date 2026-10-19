@@ -800,8 +800,6 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/headless-runs': { action: 'headlessRuns', optional: true },
     '/api/links/capabilities': { action: 'linksCapabilities', optional: true },
     '/api/links/directory': { action: 'linksDirectory', optional: true },
-    '/api/links/inbox': { action: 'linksInbox', optional: true },
-    '/api/links/message': { action: 'linksShow', optional: true },
     '/api/links/share/status': { action: 'linksShareStatus', optional: true },
     '/api/links/associations': { action: 'linksAssociations', optional: true },
     '/api/links/associations/preview': {

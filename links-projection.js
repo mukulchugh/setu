@@ -101,6 +101,8 @@ export function createLinksProjection({
       const mapped = mapEngineBatch({
         events: page.events,
         expectedOffset: offset,
+        expectedOrigin: association.origin,
+        expectedRunHint: association.hint,
         next: page.next,
         runId: association.runId,
         storeId,
@@ -277,6 +279,23 @@ export function createLinksProjection({
         const page = await readPage(association, row.projectedThrough, 1);
         if (page?.ok !== true) {
           return { associations: [], engine: 'unavailable', ok: true };
+        }
+        const mapped = mapEngineBatch({
+          events: page.events,
+          expectedOffset: row.projectedThrough,
+          expectedOrigin: association.origin,
+          expectedRunHint: association.hint,
+          next: page.next,
+          runId: association.runId,
+          storeId: probe.store_id,
+        });
+        if (mapped.ok !== true) {
+          return {
+            associations: [],
+            code: mapped.code,
+            engine: 'unavailable',
+            ok: true,
+          };
         }
         row.pending = page.events.length > 0 || page.has_more === true;
       }

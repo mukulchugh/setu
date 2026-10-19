@@ -228,6 +228,8 @@ function mapOne(storeId, runId, event) {
 export function mapEngineBatch({
   events,
   expectedOffset,
+  expectedOrigin,
+  expectedRunHint,
   next,
   runId,
   storeId,
@@ -246,6 +248,15 @@ export function mapEngineBatch({
     const mapped = [];
     let previous = expectedOffset;
     for (const event of events) {
+      if (
+        (expectedOrigin !== undefined || expectedRunHint !== undefined) &&
+        (typeof expectedOrigin !== 'string' ||
+          typeof expectedRunHint !== 'string' ||
+          event?.message?.origin !== expectedOrigin ||
+          event?.message?.run_hint !== expectedRunHint)
+      ) {
+        return bad();
+      }
       const seq = count(event?.seq);
       if (seq <= previous || seq > MAX_SAFE) {
         return bad();
