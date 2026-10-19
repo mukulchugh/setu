@@ -4,7 +4,6 @@ import {
   ActionPanel,
   Alert,
   Color,
-  Cache,
   Detail,
   Form,
   Icon,
@@ -58,6 +57,7 @@ import {
   validRedeliveryReview,
   validShareReview,
   createSendController,
+  freshMessageMutationSource,
   messageMutationEligibility,
   refreshAfterSuccess,
 } from "./lib/links-controller";
@@ -72,7 +72,6 @@ const draftCacheKey = (target: Target) =>
   `${target.repo}\u0000${target.name}\u0000${target.sessionId}`;
 const recoveryStorageKey = (target: Target) =>
   `setu-links-pending-send:${draftCacheKey(target)}`;
-const legacyUncertainSendCache = new Cache({ namespace: "setu-links-uncertain-sends" });
 
 function storedDraft(target: Target, raw: string | undefined): SendDraft | undefined {
   if (raw === undefined) return undefined;
@@ -103,13 +102,7 @@ const sendController = createSendController({
     const key = recoveryStorageKey(target);
     const stored = await LocalStorage.getItem<string>(key);
     const draft = storedDraft(target, stored);
-    if (draft || stored !== undefined) return draft;
-    // Carry one previous release's unresolved record into durable storage.
-    const legacy = storedDraft(target, legacyUncertainSendCache.get(draftCacheKey(target)));
-    if (!legacy) return undefined;
-    await LocalStorage.setItem(key, JSON.stringify(legacy));
-    legacyUncertainSendCache.remove(draftCacheKey(target));
-    return legacy;
+    return draft;
   },
   async remove(draft) {
     const current = await this.get(draft);
@@ -248,12 +241,19 @@ function SendForm({ target, revalidate, replyTo }: { target: Target; revalidate:
         result = { code: "LINKS_OUTCOME_UNKNOWN", ok: false };
       }
     } finally {
-      const settled = await sendController.finish(submitted, result);
-      if (!settled)
-        setRecoveryError("The send outcome is known, but Raycast could not clear its recovery record. Keep the original key if you retry.");
-      await recovery.revalidate();
-      setRecoveryVersion((version) => version + 1);
-      setSubmitting(false);
+      try {
+        const settled = await sendController.finish(submitted, result);
+        if (!settled)
+          setRecoveryError("The send outcome is known, but Raycast could not clear its recovery record. Keep the original key if you retry.");
+      } finally {
+        try {
+          await recovery.revalidate();
+        } catch {
+          setRecoveryError("Raycast could not refresh recovery storage. The original intent remains available for explicit recovery.");
+        }
+        setRecoveryVersion((version) => version + 1);
+        setSubmitting(false);
+      }
     }
     if (result.ok) {
       // A response for an older draft may never clear text written while it was in flight.
@@ -357,7 +357,7 @@ function MessageDetail({ target, messageId, revalidate }: { target: Target; mess
   const message = detail.data?.ok ? detail.data : lastMessage;
   const status = state.data?.ok ? state.data : lastStatus;
   const current = message ?? status;
-  const freshCurrent = detail.data?.ok ? detail.data : state.data?.ok ? state.data : undefined;
+  const freshCurrent = freshMessageMutationSource(detail, state);
   const mutations = messageMutationEligibility(freshCurrent);
   const failure = readFailure(detail.data, detail.error) ?? readFailure(state.data, state.error);
   const [mutating, setMutating] = useState(false);

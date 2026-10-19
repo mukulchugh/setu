@@ -189,6 +189,39 @@ export function messageMutationEligibility(message: {
   };
 }
 
+type MessageMutationRead = {
+  data?: {
+    attemptId: string | null;
+    messageId: string;
+    ok: boolean;
+    state: string;
+  };
+  error?: unknown;
+  isLoading?: boolean;
+};
+
+export function freshMessageMutationSource(
+  detail: MessageMutationRead,
+  status: MessageMutationRead,
+) {
+  const message = detail.data;
+  const currentStatus = status.data;
+  if (
+    detail.error ||
+    status.error ||
+    detail.isLoading ||
+    status.isLoading ||
+    !message?.ok ||
+    !currentStatus?.ok ||
+    message.messageId !== currentStatus.messageId ||
+    message.state !== currentStatus.state ||
+    message.attemptId !== currentStatus.attemptId
+  ) {
+    return undefined;
+  }
+  return message;
+}
+
 export function validRedeliveryReview(
   review: Partial<RedeliveryReview> | undefined,
   target: LinksTarget,

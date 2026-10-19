@@ -5,6 +5,7 @@ import {
   createSendController,
   deliveryEligibility,
   directoryReachability,
+  freshMessageMutationSource,
   messageMutationEligibility,
   newSendDraft,
   refreshAfterSuccess,
@@ -358,4 +359,14 @@ test("delivery UI never calls a Codex, unreachable, or stale target ready", () =
   expect(directoryReachability({ stale: false, reachability: { reason: "provider-unverified", state: "unreachable" } })).toContain("Unavailable");
   expect(messageMutationEligibility({ attemptId: "a1", state: "handoff-unknown" })).toEqual({ acknowledge: false, cancel: false, redeliver: "a1" });
   expect(messageMutationEligibility(undefined)).toEqual({ acknowledge: false, cancel: false, redeliver: undefined });
+});
+
+test("a failed refresh never turns retained message data into a mutation source", () => {
+  const retained = { attemptId: null, messageId: "m1", ok: true, state: "handed-off" };
+  expect(
+    freshMessageMutationSource(
+      { data: retained, error: new Error("refresh failed"), isLoading: false },
+      { data: retained, isLoading: false },
+    ),
+  ).toBeUndefined();
 });
