@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Action,
   ActionPanel,
@@ -9,6 +9,7 @@ import {
   Form,
   Icon,
   List,
+  LocalStorage,
   Toast,
   confirmAlert,
   showToast,
@@ -57,6 +58,7 @@ import {
   validRedeliveryReview,
   validShareReview,
   createSendController,
+  messageMutationEligibility,
   refreshAfterSuccess,
 } from "./lib/links-controller";
 
@@ -66,35 +68,56 @@ function newKey(): string {
   return `raycast-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-const uncertainSendCache = new Cache({ namespace: "setu-links-uncertain-sends" });
 const draftCacheKey = (target: Target) =>
   `${target.repo}\u0000${target.name}\u0000${target.sessionId}`;
-const sendController = createSendController({
-  get(target) {
-    const raw = uncertainSendCache.get(draftCacheKey(target));
-    if (!raw) return undefined;
-    try {
-      const draft = JSON.parse(raw) as Partial<SendDraft>;
-      return (
-        typeof draft.body === "string" &&
-        typeof draft.idempotencyKey === "string" &&
-        draft.repo === target.repo &&
-        draft.name === target.name &&
-        draft.sessionId === target.sessionId
-      )
-        ? { ...target, body: draft.body, idempotencyKey: draft.idempotencyKey, ...(typeof draft.replyTo === "string" ? { replyTo: draft.replyTo } : {}) }
-        : undefined;
-    } catch {
-      return undefined;
+const recoveryStorageKey = (target: Target) =>
+  `setu-links-pending-send:${draftCacheKey(target)}`;
+const legacyUncertainSendCache = new Cache({ namespace: "setu-links-uncertain-sends" });
+
+function storedDraft(target: Target, raw: string | undefined): SendDraft | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const draft = JSON.parse(raw) as Partial<SendDraft>;
+    if (
+      typeof draft.body === "string" &&
+      typeof draft.idempotencyKey === "string" &&
+      draft.repo === target.repo &&
+      draft.name === target.name &&
+      draft.sessionId === target.sessionId
+    ) {
+      return {
+        ...target,
+        body: draft.body,
+        idempotencyKey: draft.idempotencyKey,
+        ...(typeof draft.replyTo === "string" ? { replyTo: draft.replyTo } : {}),
+      };
     }
+  } catch {
+    // An unreadable record must block sends until the user can recover it.
+  }
+  throw new Error("Links recovery record is unreadable");
+}
+
+const sendController = createSendController({
+  async get(target) {
+    const key = recoveryStorageKey(target);
+    const stored = await LocalStorage.getItem<string>(key);
+    const draft = storedDraft(target, stored);
+    if (draft || stored !== undefined) return draft;
+    // Carry one previous release's unresolved record into durable storage.
+    const legacy = storedDraft(target, legacyUncertainSendCache.get(draftCacheKey(target)));
+    if (!legacy) return undefined;
+    await LocalStorage.setItem(key, JSON.stringify(legacy));
+    legacyUncertainSendCache.remove(draftCacheKey(target));
+    return legacy;
   },
-  remove(draft) {
-    const key = draftCacheKey(draft);
-    const current = this.get(draft);
-    if (current && sameSendIntent(current, draft)) uncertainSendCache.remove(key);
+  async remove(draft) {
+    const current = await this.get(draft);
+    if (current && sameSendIntent(current, draft))
+      await LocalStorage.removeItem(recoveryStorageKey(draft));
   },
-  set(draft) {
-    uncertainSendCache.set(draftCacheKey(draft), JSON.stringify(draft));
+  async set(draft) {
+    await LocalStorage.setItem(recoveryStorageKey(draft), JSON.stringify(draft));
   },
 });
 
@@ -168,13 +191,23 @@ ${codeBody}
 
 function SendForm({ target, revalidate, replyTo }: { target: Target; revalidate: () => Promise<unknown>; replyTo?: string }) {
   const [draft, setDraft] = useState<SendDraft>(() =>
-    sendController.recovered(target) ?? { ...newSendDraft(target, newKey()), ...(replyTo ? { replyTo } : {}) },
+    ({ ...newSendDraft(target, newKey()), ...(replyTo ? { replyTo } : {}) }),
   );
   const [bodyError, setBodyError] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
   const [recoveryVersion, setRecoveryVersion] = useState(0);
   const [recoveryError, setRecoveryError] = useState<string>();
-  const recovered = sendController.recovered(target);
+  const recovery = useCachedPromise(
+    (repo, name, sessionId) => sendController.recovered({ repo, name, sessionId }),
+    [target.repo, target.name, target.sessionId],
+    { keepPreviousData: false },
+  );
+  const recovered = recovery.data?.available ? recovery.data.draft : undefined;
+  const recoveryUnavailable = recovery.isLoading || recovery.error || !recovery.data?.available;
+
+  useEffect(() => {
+    if (recovered && !draft.body && !draft.replyTo) setDraft(recovered);
+  }, [draft.body, draft.replyTo, recovered]);
 
   const change = (change: Pick<SendDraft, "body" | "replyTo">) =>
     setDraft((current) => sendController.change(current, change, newKey()));
@@ -184,7 +217,11 @@ function SendForm({ target, revalidate, replyTo }: { target: Target; revalidate:
       setBodyError("A message body is required");
       return;
     }
-    const started = sendController.begin(intent);
+    if (recoveryUnavailable) {
+      setRecoveryError("Raycast cannot confirm recovery storage. Nothing was sent; retry recovery storage first.");
+      return;
+    }
+    const started = await sendController.begin(intent);
     if (!started.ok) {
       setRecoveryError(
         started.reason === "in-flight"
@@ -211,9 +248,10 @@ function SendForm({ target, revalidate, replyTo }: { target: Target; revalidate:
         result = { code: "LINKS_OUTCOME_UNKNOWN", ok: false };
       }
     } finally {
-      const settled = sendController.finish(submitted, result);
+      const settled = await sendController.finish(submitted, result);
       if (!settled)
         setRecoveryError("The send outcome is known, but Raycast could not clear its recovery record. Keep the original key if you retry.");
+      await recovery.revalidate();
       setRecoveryVersion((version) => version + 1);
       setSubmitting(false);
     }
@@ -248,17 +286,19 @@ function SendForm({ target, revalidate, replyTo }: { target: Target; revalidate:
     <Form
       navigationTitle="Send Links Message"
       actions={<ActionPanel>
-        {!submitting && (!recovered || sameSendIntent(recovered, draft)) && <Action.SubmitForm title={recovered ? "Retry Unconfirmed Send" : "Queue Message"} onSubmit={() => submit()} />}
+        {!submitting && !recoveryUnavailable && (!recovered || sameSendIntent(recovered, draft)) && <Action.SubmitForm title={recovered ? "Retry Unconfirmed Send" : "Queue Message"} onSubmit={() => submit()} />}
         {!submitting && recovered && !sameSendIntent(recovered, draft) && <>
           <Action title="Restore Original Unknown Send" onAction={() => { setDraft(recovered); setRecoveryError(undefined); }} />
           <Action title="Retry Original Unknown Send" onAction={() => submit(recovered)} />
         </>}
+        {recoveryUnavailable && <Action title="Retry Recovery Storage" onAction={() => recovery.revalidate()} />}
       </ActionPanel>}
     >
       <Form.Description title="Recipient" text={`${target.repo}/${target.name} · ${target.sessionId}`} />
       <Form.Description title="Delivery" text="The service verifies the current owned, running binding when it sends. This does not wake a session." />
       {draft.replyTo && <Form.Description title="Reply to" text={draft.replyTo} />}
       {recovered && <Form.Description title="Unconfirmed send" text={sameSendIntent(recovered, draft) ? `Original intent retained for explicit same-key retry. ${recoveryVersion > 0 ? "It was not sent automatically." : ""}` : "This changed draft cannot queue while the original outcome is unconfirmed. Restore or retry the original intent first."} />}
+      {recoveryUnavailable && <Form.Description title="Send recovery" text={recovery.isLoading ? "Checking durable recovery storage before enabling sends." : "Recovery storage is unavailable. Retry before sending; no message was queued."} />}
       {recoveryError && <Form.Description title="Send recovery" text={recoveryError} />}
       <Form.TextArea
         id="body"
@@ -317,6 +357,8 @@ function MessageDetail({ target, messageId, revalidate }: { target: Target; mess
   const message = detail.data?.ok ? detail.data : lastMessage;
   const status = state.data?.ok ? state.data : lastStatus;
   const current = message ?? status;
+  const freshCurrent = detail.data?.ok ? detail.data : state.data?.ok ? state.data : undefined;
+  const mutations = messageMutationEligibility(freshCurrent);
   const failure = readFailure(detail.data, detail.error) ?? readFailure(state.data, state.error);
   const [mutating, setMutating] = useState(false);
   const refreshCurrent = async () => {
@@ -333,13 +375,13 @@ function MessageDetail({ target, messageId, revalidate }: { target: Target; mess
     } finally { setMutating(false); }
   }
 
-  async function redeliver() {
-    if (!current?.attemptId || mutating) return;
+  async function redeliver(attemptId: string) {
+    if (mutating) return;
     setMutating(true);
     try {
-      const reviewed = await linksRedeliver({ ...target, attemptId: current.attemptId, messageId });
+      const reviewed = await linksRedeliver({ ...target, attemptId, messageId });
       if (reviewed.code === "LINKS_CONFIRMATION_REQUIRED") {
-        push(<RedeliveryReviewView target={target} messageId={messageId} attemptId={current.attemptId} review={reviewed.confirmation ?? {}} revalidate={refreshCurrent} />);
+        push(<RedeliveryReviewView target={target} messageId={messageId} attemptId={attemptId} review={reviewed.confirmation ?? {}} revalidate={refreshCurrent} />);
         return;
       }
       await resultToast("Redelivery review", reviewed);
@@ -354,9 +396,9 @@ function MessageDetail({ target, messageId, revalidate }: { target: Target; mess
         <ActionPanel>
           <ActionPanel.Section>
             {current && <Action.Push title="Reply" target={<SendForm target={target} replyTo={messageId} revalidate={refreshCurrent} />} />}
-            {current?.state === "handed-off" && !mutating && <Action title="Acknowledge" onAction={() => mutate("Acknowledged", () => linksAck({ ...target, messageId }))} />}
-            {current?.state === "handoff-unknown" && current.attemptId && <Action title="Review Redelivery" style={Action.Style.Destructive} onAction={redeliver} />}
-            {(["queued", "held"] as string[]).includes(current?.state ?? "") && <Action title="Cancel Message" style={Action.Style.Destructive} onAction={async () => {
+            {mutations.acknowledge && !mutating && <Action title="Acknowledge" onAction={() => mutate("Acknowledged", () => linksAck({ ...target, messageId }))} />}
+            {mutations.redeliver && <Action title="Review Redelivery" style={Action.Style.Destructive} onAction={() => redeliver(mutations.redeliver!)} />}
+            {mutations.cancel && <Action title="Cancel Message" style={Action.Style.Destructive} onAction={async () => {
               if (await confirmAlert({ title: "Cancel this message?", message: "Only queued or held mail can be retracted.", primaryAction: { title: "Cancel", style: Alert.ActionStyle.Destructive } })) {
                 await mutate("Cancelled", () => linksCancel(messageId));
               }

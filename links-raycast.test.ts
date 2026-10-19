@@ -5,6 +5,7 @@ import {
   createSendController,
   deliveryEligibility,
   directoryReachability,
+  messageMutationEligibility,
   newSendDraft,
   refreshAfterSuccess,
   safeFailureMessage,
@@ -36,6 +37,11 @@ const selected = {
   tool: "claude-code",
 };
 const target = { name: "topic", repo: "repo", sessionId: "session-1" };
+
+async function recovered(controller: ReturnType<typeof createSendController>) {
+  const recovery = await controller.recovered(target);
+  return recovery.available ? recovery.draft : undefined;
+}
 
 function serviceWith(outcomes: { code?: string; error?: string; ok: boolean; result?: Record<string, unknown> }[]) {
   const calls: { args: unknown; op: string }[] = [];
@@ -69,7 +75,7 @@ test("the controller saves the exact intent before the real service reaches its 
   const service = createLinksService({
     client: { call: async (op: string, args: unknown) => {
       calls.push({ args, op });
-      expect(createSendController({ get: (recipient) => stored.get(recipient.sessionId), remove: () => {}, set: () => {} }).recovered(target)).toEqual(original);
+      expect(await recovered(createSendController({ get: (recipient) => stored.get(recipient.sessionId), remove: () => {}, set: () => {} }))).toEqual(original);
       return { code: "LINKS_OUTCOME_UNKNOWN", error: "unknown", ok: false };
     } },
     resolveTarget: async ({ name, repo }: { name: string; repo: string }) =>
@@ -77,24 +83,24 @@ test("the controller saves the exact intent before the real service reaches its 
     sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
   });
 
-  expect(controller.begin(original)).toEqual({ ok: true });
+  expect(await controller.begin(original)).toEqual({ ok: true });
   const beforeResponse = createSendController({
     get: (recipient) => stored.get(recipient.sessionId),
     remove: () => {},
     set: () => {},
   });
-  expect(beforeResponse.recovered(target)).toEqual(original);
-  controller.finish(original, await service.send(original));
-  expect(controller.recovered(target)).toEqual(original);
+  expect(await recovered(beforeResponse)).toEqual(original);
+  await controller.finish(original, await service.send(original));
+  expect(await recovered(controller)).toEqual(original);
 
   const changed = controller.change(original, { body: "new intent" }, "new-key");
   expect(changed.idempotencyKey).toBe("new-key");
-  expect(controller.recovered(target)).toEqual(original);
-  expect(controller.begin(changed)).toEqual({ ok: false, pending: original, reason: "unresolved" });
+  expect(await recovered(controller)).toEqual(original);
+  expect(await controller.begin(changed)).toEqual({ ok: false, pending: original, reason: "unresolved" });
   expect(calls).toHaveLength(1);
-  expect(controller.begin(original)).toEqual({ ok: true });
-  controller.finish(original, { ok: false });
-  expect(controller.recovered(target)).toBeUndefined();
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, { ok: false });
+  expect(await recovered(controller)).toBeUndefined();
   expect(calls[0]).toMatchObject({
     args: expect.objectContaining({ body: "private message", idempotency_key: "exact-key", project: "repo", sender: { kind: "user" } }),
     op: "send",
@@ -118,13 +124,13 @@ test("the original same-key retry is the only allowed follow-up effect after an 
     { ok: true, result: { message_id: "m1", replayed: false, state: "queued" } },
   ]);
 
-  expect(controller.begin(original)).toEqual({ ok: true });
-  controller.finish(original, await service.send(original));
-  expect(controller.begin(changed)).toEqual({ ok: false, pending: original, reason: "unresolved" });
-  expect(controller.begin(original)).toEqual({ ok: true });
-  controller.finish(original, await service.send(original));
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, await service.send(original));
+  expect(await controller.begin(changed)).toEqual({ ok: false, pending: original, reason: "unresolved" });
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, await service.send(original));
   expect(calls.filter((call) => call.op === "send")).toHaveLength(2);
-  expect(controller.recovered(target)).toBeUndefined();
+  expect(await recovered(controller)).toBeUndefined();
 });
 
 test("a definitive refusal clears only its matching pending intent, and storage failures never send", async () => {
@@ -139,11 +145,11 @@ test("a definitive refusal clears only its matching pending intent, and storage 
   const controller = createSendController(store);
   const original = { ...newSendDraft(target, "exact-key"), body: "private message" };
   const changed = controller.change(original, { body: "changed" }, "changed-key");
-  expect(controller.begin(original)).toEqual({ ok: true });
-  controller.finish(changed, { code: "LINKS_SESSION_NOT_FOUND", ok: false });
-  expect(controller.recovered(target)).toEqual(original);
-  controller.finish(original, { code: "LINKS_SESSION_NOT_FOUND", ok: false });
-  expect(controller.recovered(target)).toBeUndefined();
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(changed, { code: "LINKS_SESSION_NOT_FOUND", ok: false });
+  expect(await recovered(controller)).toEqual(original);
+  await controller.finish(original, { code: "LINKS_SESSION_NOT_FOUND", ok: false });
+  expect(await recovered(controller)).toBeUndefined();
 
   let engineCalls = 0;
   const service = createLinksService({
@@ -153,9 +159,9 @@ test("a definitive refusal clears only its matching pending intent, and storage 
     sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
   });
   const broken = createSendController({ get: () => undefined, remove: () => {}, set: () => { throw new Error("cache unavailable"); } });
-  if (broken.begin(original).ok) await service.send(original);
+  if ((await broken.begin(original)).ok) await service.send(original);
   expect(engineCalls).toBe(0);
-  expect(broken.recovered(target)).toBeUndefined();
+  expect(await recovered(broken)).toBeUndefined();
 });
 
 test("an unexpected injected-engine call error releases the in-flight gate and retains its possible outcome", async () => {
@@ -172,12 +178,113 @@ test("an unexpected injected-engine call error releases the in-flight gate and r
       name === "topic" && repo === "repo" ? { checkoutIdentity: selected.checkoutIdentity, name, repo } : null,
     sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
   });
-  expect(controller.begin(original)).toEqual({ ok: true });
+  expect(await controller.begin(original)).toEqual({ ok: true });
   await expect(service.send(original)).rejects.toThrow("connection reset after request");
-  controller.finish(original, { code: "LINKS_OUTCOME_UNKNOWN", ok: false });
-  expect(controller.recovered(target)).toEqual(original);
-  expect(controller.begin(original)).toEqual({ ok: true });
-  controller.finish(original, { code: "LINKS_OUTCOME_UNKNOWN", ok: false });
+  await controller.finish(original, { code: "LINKS_OUTCOME_UNKNOWN", ok: false });
+  expect(await recovered(controller)).toEqual(original);
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, { code: "LINKS_OUTCOME_UNKNOWN", ok: false });
+});
+
+test("delayed durable persistence keeps concurrent submits singleflight before the service effect", async () => {
+  const stored = new Map<string, ReturnType<typeof newSendDraft>>();
+  let persist!: () => void;
+  const persisted = new Promise<void>((resolve) => { persist = resolve; });
+  const controller = createSendController({
+    get: (recipient) => stored.get(recipient.sessionId),
+    remove: (draft) => { stored.delete(draft.sessionId); },
+    set: async (draft) => {
+      await persisted;
+      stored.set(draft.sessionId, draft);
+    },
+  });
+  const original = { ...newSendDraft(target, "exact-key"), body: "private message" };
+  const first = controller.begin(original);
+  expect(await controller.begin(original)).toEqual({ ok: false, reason: "in-flight" });
+  persist();
+  expect(await first).toEqual({ ok: true });
+  const { calls, service } = serviceWith([{ code: "LINKS_OUTCOME_UNKNOWN", ok: false }]);
+  await controller.finish(original, await service.send(original));
+  expect(calls.filter((call) => call.op === "send")).toHaveLength(1);
+  expect(await recovered(controller)).toEqual(original);
+});
+
+test("rejected durable reads or writes prevent the real service effect", async () => {
+  let engineCalls = 0;
+  const service = createLinksService({
+    client: { call: async () => { engineCalls += 1; return { ok: true, result: { message_id: "m1", replayed: false, state: "queued" } }; } },
+    resolveTarget: async ({ name, repo }: { name: string; repo: string }) =>
+      name === "topic" && repo === "repo" ? { checkoutIdentity: selected.checkoutIdentity, name, repo } : null,
+    sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
+  });
+  const original = { ...newSendDraft(target, "exact-key"), body: "private message" };
+  for (const [store, unavailable] of [
+    [{ get: () => { throw new Error("read failed"); }, remove: () => {}, set: () => {} }, true],
+    [{ get: () => undefined, remove: () => {}, set: () => { throw new Error("write failed"); } }, false],
+  ]) {
+    const controller = createSendController(store);
+    if ((await controller.begin(original)).ok) await service.send(original);
+    expect((await controller.recovered(target)).available).toBe(unavailable ? false : true);
+  }
+  expect(engineCalls).toBe(0);
+});
+
+test("a fresh controller restores the original durable intent while the first request has no response", async () => {
+  const stored = new Map<string, ReturnType<typeof newSendDraft>>();
+  const store = {
+    get: (recipient: typeof target) => stored.get(recipient.sessionId),
+    remove: (draft: ReturnType<typeof newSendDraft>) => { stored.delete(draft.sessionId); },
+    set: (draft: ReturnType<typeof newSendDraft>) => { stored.set(draft.sessionId, draft); },
+  };
+  const original = { ...newSendDraft(target, "exact-key"), body: "private message" };
+  const first = createSendController(store);
+  expect(await first.begin(original)).toEqual({ ok: true });
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredEngine = new Promise<void>((resolve) => { entered = resolve; });
+  const response = new Promise<{ ok: boolean; result: Record<string, unknown> }>((resolve) => { release = () => resolve({ ok: true, result: { message_id: "m1", replayed: false, state: "queued" } }); });
+  const service = createLinksService({
+    client: { call: async () => { entered(); return response; } },
+    resolveTarget: async ({ name, repo }: { name: string; repo: string }) =>
+      name === "topic" && repo === "repo" ? { checkoutIdentity: selected.checkoutIdentity, name, repo } : null,
+    sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
+  });
+  const request = service.send(original);
+  await enteredEngine;
+  expect(await recovered(createSendController(store))).toEqual(original);
+  release();
+  await first.finish(original, await request);
+});
+
+test("an exact retry has one idempotent engine effect", async () => {
+  const stored = new Map<string, ReturnType<typeof newSendDraft>>();
+  const store = {
+    get: (recipient: typeof target) => stored.get(recipient.sessionId),
+    remove: (draft: ReturnType<typeof newSendDraft>) => { stored.delete(draft.sessionId); },
+    set: (draft: ReturnType<typeof newSendDraft>) => { stored.set(draft.sessionId, draft); },
+  };
+  const controller = createSendController(store);
+  const original = { ...newSendDraft(target, "exact-key"), body: "private message" };
+  const effects = new Set<string>();
+  let calls = 0;
+  const service = createLinksService({
+    client: { call: async (_op: string, args: { idempotency_key: string }) => {
+      effects.add(args.idempotency_key);
+      calls += 1;
+      return calls === 1
+        ? { code: "LINKS_OUTCOME_UNKNOWN", ok: false }
+        : { ok: true, result: { message_id: "m1", replayed: true, state: "queued" } };
+    } },
+    resolveTarget: async ({ name, repo }: { name: string; repo: string }) =>
+      name === "topic" && repo === "repo" ? { checkoutIdentity: selected.checkoutIdentity, name, repo } : null,
+    sessions: { list: async () => ({ ok: true, sessions: [selected] }) },
+  });
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, await service.send(original));
+  expect(await controller.begin(original)).toEqual({ ok: true });
+  await controller.finish(original, await service.send(original));
+  expect(calls).toBe(2);
+  expect(effects).toEqual(new Set(["exact-key"]));
 });
 
 test("editing a draft or changing its target creates a new intent instead of a same-key retry", () => {
@@ -249,4 +356,6 @@ test("delivery UI never calls a Codex, unreachable, or stale target ready", () =
   expect(deliveryEligibility({ ...target, tool: "claude-code", ownership: "unknown", state: "running", nativeConversation: { state: "bound" } }).available).toBe(false);
   expect(directoryReachability({ stale: true, reachability: { state: "reachable" } })).toBe("Unknown (stale)");
   expect(directoryReachability({ stale: false, reachability: { reason: "provider-unverified", state: "unreachable" } })).toContain("Unavailable");
+  expect(messageMutationEligibility({ attemptId: "a1", state: "handoff-unknown" })).toEqual({ acknowledge: false, cancel: false, redeliver: "a1" });
+  expect(messageMutationEligibility(undefined)).toEqual({ acknowledge: false, cancel: false, redeliver: undefined });
 });

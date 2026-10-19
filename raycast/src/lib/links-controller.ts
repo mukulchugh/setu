@@ -34,9 +34,9 @@ export type AttentionReview = {
 };
 
 export type DraftStore = {
-  get: (target: LinksTarget) => SendDraft | undefined;
-  remove: (draft: SendDraft) => void;
-  set: (draft: SendDraft) => void;
+  get: (target: LinksTarget) => SendDraft | undefined | Promise<SendDraft | undefined>;
+  remove: (draft: SendDraft) => void | Promise<void>;
+  set: (draft: SendDraft) => void | Promise<void>;
 };
 
 export type SendBegin =
@@ -46,6 +46,10 @@ export type SendBegin =
       pending?: SendDraft;
       reason: "in-flight" | "storage-failed" | "unresolved";
     };
+
+export type RecoveredSend =
+  | { available: true; draft: SendDraft | undefined }
+  | { available: false };
 
 export type DeliverySession = LinksTarget & {
   nativeConversation?: { provider?: string; state?: string } | null;
@@ -67,28 +71,35 @@ export function createSendController(store: DraftStore) {
     `${target.repo}\u0000${target.name}\u0000${target.sessionId}`;
 
   return {
-    begin(draft: SendDraft) {
+    async begin(draft: SendDraft) {
       const key = targetKey(draft);
       if (submitting.has(key)) return { ok: false, reason: "in-flight" } as SendBegin;
+      submitting.add(key);
+      let started = false;
       try {
-        const pending = store.get(draft);
+        const pending = await store.get(draft);
         if (pending && !sameSendIntent(pending, draft))
           return { ok: false, pending, reason: "unresolved" } as SendBegin;
         // Keep the exact intent before the effect, so navigation or a lost
         // response cannot replace the key needed for an explicit retry.
-        if (!pending) store.set(draft);
-        submitting.add(key);
+        if (!pending) await store.set(draft);
+        started = true;
         return { ok: true } as SendBegin;
       } catch {
         return { ok: false, reason: "storage-failed" } as SendBegin;
+      } finally {
+        if (!started) submitting.delete(key);
       }
     },
     change(draft: SendDraft, change: Pick<SendDraft, "body" | "replyTo">, nextKey: string) {
       return changeSendDraft(draft, change, nextKey);
     },
-    finish(draft: SendDraft, outcome: { code?: string; ok: boolean }) {
+    async finish(draft: SendDraft, outcome: { code?: string; ok: boolean }) {
       try {
-        if (outcome.code !== "LINKS_OUTCOME_UNKNOWN") store.remove(draft);
+        if (outcome.code !== "LINKS_OUTCOME_UNKNOWN") {
+          const pending = await store.get(draft);
+          if (pending && sameSendIntent(pending, draft)) await store.remove(draft);
+        }
         return true;
       } catch {
         return false;
@@ -96,11 +107,11 @@ export function createSendController(store: DraftStore) {
         submitting.delete(targetKey(draft));
       }
     },
-    recovered(target: LinksTarget) {
+    async recovered(target: LinksTarget): Promise<RecoveredSend> {
       try {
-        return store.get(target);
+        return { available: true, draft: await store.get(target) };
       } catch {
-        return undefined;
+        return { available: false };
       }
     },
   };
@@ -162,6 +173,20 @@ export function directoryReachability(entry: {
       ? `Unavailable: ${entry.reachability.reason}`
       : "Unavailable";
   return "Reachable";
+}
+
+export function messageMutationEligibility(message: {
+  attemptId: string | null;
+  state: string;
+} | undefined) {
+  return {
+    acknowledge: message?.state === "handed-off",
+    cancel: message?.state === "queued" || message?.state === "held",
+    redeliver:
+      message?.state === "handoff-unknown" && message.attemptId
+        ? message.attemptId
+        : undefined,
+  };
 }
 
 export function validRedeliveryReview(
