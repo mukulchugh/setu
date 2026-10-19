@@ -38,6 +38,13 @@
       "subtitle": "Setu",
       "description": "See every process listening in Setu's tracked port range and kill one",
       "mode": "view"
+    },
+    {
+      "name": "links",
+      "title": "Links",
+      "subtitle": "Setu",
+      "description": "Read and manage local Setu Links mail, presence, and project sharing",
+      "mode": "view"
     }
   ],
   "tools": [
