@@ -1948,22 +1948,27 @@ export async function createPortalRuntime(options = {}) {
       withTarget: (target, task) => portalState.withTargets([target], task),
     });
 
+  // Named so a refused update can say what to stop instead of a bare code.
+  function supportingWorkBlockers() {
+    return [
+      !configReconciled && 'installed config not yet reconciled',
+      removals.pending().length > 0 && 'worktree removal pending',
+      memoryCheckRunning && 'memory check running',
+      !!raycastDev && 'Raycast dev running',
+      (!!tunnelProc || activeTunnelMap.size > 0) && 'shared tunnel active',
+      tunnelTeardownUnknown && 'tunnel teardown unconfirmed',
+      mcpHasOwnedWork() && 'portal MCP client connections open',
+      inngestProcs.size > 0 && 'Inngest running',
+      triggerProcs.size > 0 && 'Trigger running',
+      convexDevProcs.size > 0 && 'Convex dev running',
+      sidecarProcs.size > 0 && 'custom sidecar running',
+    ].filter(Boolean);
+  }
   function supportingWorkActive() {
-    return (
-      !configReconciled ||
-      removals.pending().length > 0 ||
-      memoryCheckRunning ||
-      !!raycastDev ||
-      !!tunnelProc ||
-      tunnelTeardownUnknown ||
-      activeTunnelMap.size > 0 ||
-      mcpHasOwnedWork() ||
-      [inngestProcs, triggerProcs, convexDevProcs, sidecarProcs].some(
-        (map) => map.size > 0
-      )
-    );
+    return supportingWorkBlockers().length > 0;
   }
   let updateControl = createPortalUpdateControl({
+    describeBlockers: supportingWorkBlockers,
     hasSupportingWork: supportingWorkActive,
     lifecycle,
     processIdentity: {},
@@ -5807,6 +5812,7 @@ export async function createPortalRuntime(options = {}) {
       // Held work stays held; the portal still starts.
     });
     updateControl = createPortalUpdateControl({
+      describeBlockers: supportingWorkBlockers,
       hasSupportingWork: supportingWorkActive,
       lifecycle,
       processIdentity: await (options.observeProcess ?? observeProcessIdentity)(
