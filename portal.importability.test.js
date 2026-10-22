@@ -97,6 +97,45 @@ function mcpInitializeRequest(port, host = `localhost:${port}`) {
   });
 }
 
+test.each(['idle', 'owned', 'unknown'])(
+  'update cutover preserves installer ownership and named blockers: %s',
+  async (state) => {
+    const fx = await fixture({
+      port: 43_210,
+      setupInstallProcesses: {
+        close() {
+          /* This fixture owns no processes. */
+        },
+        hasOwnedWork() {
+          if (state === 'unknown') {
+            throw new Error('installer observation unreadable');
+          }
+          return state === 'owned';
+        },
+      },
+    });
+    try {
+      const capabilities = await (
+        await fx.request('/api/update/capabilities')
+      ).json();
+      const result = await (
+        await fx.request('/api/update/quiesce', capabilities)
+      ).json();
+      expect(result.ok).toBe(state === 'idle');
+      if (state !== 'idle') {
+        expect(result).toMatchObject({ code: 'OWNED_WORK_ACTIVE', ok: false });
+        expect(result.blockers).toContain(
+          state === 'owned'
+            ? 'dependency installer work active'
+            : 'supporting work state unreadable'
+        );
+      }
+    } finally {
+      await fx.dispose();
+    }
+  }
+);
+
 test('a child import under an empty HOME is inert and exits without a configuration file', async () => {
   const home = mkdtempSync(join(tmpdir(), 'setu-portal-import-'));
   const script = `
