@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { validAgentSessionRecord } from './agent-sessions.js';
 import {
+  createDependencyFileService,
+  validateDependencyFileInput,
+} from './dependency-file-service.js';
+import {
+  dependencySharingDisabledReason,
   dependencySharingForTarget,
   inspectDependencyView,
   repairDependencyView,
@@ -12,12 +17,14 @@ import { createMcpActions } from './mcp-actions.js';
 import { createOperationEvents } from './operation-events.js';
 import { createPortalWiring } from './portal-wiring.js';
 import { createResourceAdmission } from './resource-admission.js';
+import { createSetupProgress } from './setup-progress.js';
 import { createSharedCacheCatalog } from './shared-cache-catalog.js';
 import { dispatchSpansExecutionRoute } from './spans-execution-routes.js';
 import { createWorkspaceStorage } from './workspace-storage.js';
 import { createWorktreeCache } from './worktree-cache.js';
 
 const failure = (code, error) => ({ code, error, ok: false });
+const dependencyOperationIdPattern = /^[a-f0-9]{64}$/;
 const object = (value) =>
   value && typeof value === 'object' && !Array.isArray(value);
 function same(left, right) {
@@ -107,19 +114,26 @@ export function createPortalResourceServices({
   claims,
   command,
   config,
+  containerMode,
+  dependencyFileEngineFactory,
+  dependencyFileNative,
   entries,
   githubTarget,
   gitHead,
   hostHealth,
   lifecycle,
   mcpTools,
-  nativeRuntime = async () => 'dead',
+  nativeRuntime,
   now = Date.now,
   operationId = () => crypto.randomUUID(),
   randomId = () => crypto.randomUUID(),
+  resourceAdmission,
   resolveTarget,
+  setupAuthority,
+  setupProgress,
   state,
   trackedPaths,
+  withSetupRecoveryTarget,
 } = {}) {
   if (
     !(
@@ -137,7 +151,13 @@ export function createPortalResourceServices({
   }
 
   const events = createOperationEvents({ now, state });
-  const admission = createResourceAdmission({ hostHealth, now, state });
+  const admission =
+    resourceAdmission ?? createResourceAdmission({ hostHealth, now, state });
+  const dependencySetupProgress =
+    setupProgress ??
+    createSetupProgress({ newAttemptId: randomId, now, state });
+  const hasNativeRuntimeObservation = typeof nativeRuntime === 'function';
+  const readNativeRuntime = nativeRuntime ?? (async () => 'dead');
   const manifestMap = (document) => {
     if (
       !object(document) ||
@@ -171,6 +191,7 @@ export function createPortalResourceServices({
   };
   const catalog = createSharedCacheCatalog({
     readConfig: config,
+    readDependencyFiles: async () => state.read('dependencyFiles'),
     readDependencyViews: async () => state.read('dependencyViews'),
     readRegistry: async () =>
       (await entries()).map((row) => ({ checkout: row.wtDir })),
@@ -301,15 +322,7 @@ export function createPortalResourceServices({
     return { state: 'clear' };
   }
 
-  function lifecycleRuntime(target) {
-    const life = lifecycle?.snapshot?.(target.key);
-    if (life?.phase === 'unknown') {
-      return { state: 'unknown' };
-    }
-    if (life?.phase === 'queued') {
-      return { queued: true, state: 'stopped' };
-    }
-    const operation = lifecycle?.operationStatus?.(target.key);
+  function runtimeFromOperation(operation) {
     if (operation?.phase === 'unknown') {
       return { state: 'unknown' };
     }
@@ -322,12 +335,30 @@ export function createPortalResourceServices({
     ) {
       return { state: 'active' };
     }
-    if (!life?.reserved) {
-      return null;
+    return null;
+  }
+
+  function lifecycleRuntime(target) {
+    let life;
+    let operation;
+    try {
+      life = lifecycle?.snapshot?.(target.key);
+      operation = lifecycle?.operationStatus?.(target.key);
+    } catch {
+      return { state: 'unknown' };
     }
-    return life.phase === 'queued'
-      ? { queued: true, state: 'stopped' }
-      : { state: 'active' };
+    const fromSnapshot = runtimeFromOperation(life);
+    if (fromSnapshot) {
+      return fromSnapshot;
+    }
+    if (life && life.phase !== 'stopped') {
+      return { state: 'unknown' };
+    }
+    const fromOperation = runtimeFromOperation(operation);
+    if (fromOperation) {
+      return fromOperation;
+    }
+    return life?.reserved ? { state: 'active' } : null;
   }
 
   function persistedRuntime(target) {
@@ -359,12 +390,19 @@ export function createPortalResourceServices({
       : { queued: false, state: 'stopped' };
   }
 
-  async function runtime(target) {
+  const noNativeObservation = Symbol('no-native-observation');
+  async function runtime(target, nativeObservation = noNativeObservation) {
     const lifecycleState = lifecycleRuntime(target);
     if (lifecycleState) {
       return lifecycleState;
     }
-    const native = await nativeRuntime(target);
+    const native =
+      nativeObservation === noNativeObservation
+        ? await readNativeRuntime(target)
+        : nativeObservation;
+    if (!['alive', 'dead', 'unknown'].includes(native)) {
+      return { state: 'unknown' };
+    }
     if (native === 'unknown') {
       return { state: 'unknown' };
     }
@@ -373,6 +411,691 @@ export function createPortalResourceServices({
     }
     return persistedRuntime(target);
   }
+
+  function dependencyFileFailure(code, error) {
+    return Object.assign(new Error(error), { code, publicMessage: error });
+  }
+
+  function validSetupRecordTarget(recordTarget, identity) {
+    const validIdentity =
+      (typeof identity === 'string' && identity.length > 0) ||
+      (object(identity) && Object.keys(identity).length > 0);
+    return (
+      object(recordTarget) &&
+      typeof recordTarget.repo === 'string' &&
+      typeof recordTarget.name === 'string' &&
+      validIdentity
+    );
+  }
+
+  function validSetupRecordOutcome(record) {
+    return (
+      ['running', 'completed', 'failed', 'unknown'].includes(record.state) &&
+      (record.attemptId === undefined ||
+        (typeof record.attemptId === 'string' &&
+          record.attemptId.length > 0)) &&
+      ((record.state === 'running' && record.outcome === null) ||
+        (['completed', 'failed', 'unknown'].includes(record.state) &&
+          record.outcome === record.state))
+    );
+  }
+
+  function validSetupProgressRecord(record) {
+    const { checkoutIdentity: identity, target: recordTarget } = record ?? {};
+    return (
+      object(record) &&
+      validSetupRecordTarget(recordTarget, identity) &&
+      typeof record.logLocation === 'string' &&
+      typeof record.stage === 'string' &&
+      Number.isFinite(record.startedAt) &&
+      Number.isFinite(record.updatedAt) &&
+      validSetupRecordOutcome(record)
+    );
+  }
+
+  function setupRecordStateForTarget(target, record) {
+    if (
+      record.target.repo !== target.repo ||
+      record.target.name !== target.name
+    ) {
+      return null;
+    }
+    if (!same(record.checkoutIdentity, target.checkoutIdentity)) {
+      return 'unknown';
+    }
+    return ['running', 'unknown'].includes(record.state) ? record.state : null;
+  }
+
+  function setupObservation(target) {
+    let document;
+    try {
+      document = state.read('setupProgress');
+    } catch {
+      return { state: 'unknown' };
+    }
+    if (!object(document)) {
+      return { state: 'unknown' };
+    }
+    const { records } = document;
+    if (records === undefined) {
+      return { state: 'clear' };
+    }
+    if (!object(records)) {
+      return { state: 'unknown' };
+    }
+    for (const record of Object.values(records)) {
+      if (!validSetupProgressRecord(record)) {
+        return { state: 'unknown' };
+      }
+      const recordState = setupRecordStateForTarget(target, record);
+      if (recordState === 'unknown') {
+        return { state: 'unknown' };
+      }
+      if (recordState === 'running') {
+        return { state: 'active' };
+      }
+    }
+    return { state: 'clear' };
+  }
+
+  function containerModeObservation(target) {
+    if (typeof containerMode === 'function') {
+      return Promise.resolve()
+        .then(() => containerMode(target))
+        .then((value) => {
+          if (value === 'bare' || value === false) {
+            return { state: 'bare' };
+          }
+          if (value === 'container' || value === true) {
+            return { state: 'container' };
+          }
+          if (value === 'unknown' || value?.state === 'unknown') {
+            return { state: 'unknown' };
+          }
+          if (value?.state === 'bare' || value?.state === 'container') {
+            return { state: value.state };
+          }
+          return { state: 'unknown' };
+        })
+        .catch(() => ({ state: 'unknown' }));
+    }
+    try {
+      const observed = lifecycle?.snapshot?.(target.key);
+      if (typeof observed?.launchSpec?.container === 'boolean') {
+        return Promise.resolve({
+          state: observed.launchSpec.container ? 'container' : 'bare',
+        });
+      }
+    } catch {
+      return Promise.resolve({ state: 'unknown' });
+    }
+    return Promise.resolve({ state: 'unknown' });
+  }
+
+  function validSetupEnrollmentContext(target, setupContext) {
+    return (
+      object(setupContext) &&
+      [true, false].includes(setupContext.installerSettled) &&
+      typeof setupContext.attemptId === 'string' &&
+      setupContext.attemptId.length > 0 &&
+      typeof setupContext.admissionOperationId === 'string' &&
+      setupContext.admissionOperationId.length > 0 &&
+      same(setupContext.target, { name: target.name, repo: target.repo }) &&
+      same(setupContext.checkoutIdentity, target.checkoutIdentity)
+    );
+  }
+
+  function findMatchingSetupRecord(setupContext, permittedStages) {
+    let document;
+    try {
+      document = state.read('setupProgress');
+    } catch {
+      return null;
+    }
+    if (!(object(document) && object(document.records))) {
+      return null;
+    }
+    const matches = Object.values(document.records).filter(
+      (record) =>
+        object(record) &&
+        record.attemptId === setupContext.attemptId &&
+        same(record.target, setupContext.target)
+    );
+    if (
+      matches.length !== 1 ||
+      matches[0].state !== 'running' ||
+      matches[0].outcome !== null ||
+      !permittedStages.includes(matches[0].stage) ||
+      !same(matches[0].checkoutIdentity, setupContext.checkoutIdentity)
+    ) {
+      return null;
+    }
+    return matches[0];
+  }
+
+  function hasSetupLifecycleOwner(target, setupContext) {
+    let operation;
+    try {
+      operation = lifecycle?.operationStatus?.(target.key);
+      if (
+        !(operation?.kind === 'setup' && operation.phase === 'running') &&
+        typeof setupAuthority === 'function'
+      ) {
+        operation = setupAuthority(target, setupContext);
+      }
+    } catch {
+      return false;
+    }
+    return operation?.kind === 'setup' && operation.phase === 'running';
+  }
+
+  function setupEnrollmentRecord(target, setupContext) {
+    if (!validSetupEnrollmentContext(target, setupContext)) {
+      return null;
+    }
+    const permittedStages =
+      setupContext.installerSettled === false
+        ? ['dependency-enrollment-preflight']
+        : ['dependency-enrollment'];
+    const record = findMatchingSetupRecord(setupContext, permittedStages);
+    if (!(record && hasSetupLifecycleOwner(target, setupContext))) {
+      return null;
+    }
+    return record;
+  }
+
+  function setupRecoveryRecord(
+    target,
+    setupContext,
+    recoveryId,
+    recoveryAttemptId
+  ) {
+    const validRecoveryId =
+      typeof recoveryId === 'string' &&
+      dependencyOperationIdPattern.test(recoveryId);
+    const validAttemptId =
+      typeof recoveryAttemptId === 'string' && recoveryAttemptId.length > 0;
+    if (
+      !(
+        validSetupEnrollmentContext(target, setupContext) &&
+        (validRecoveryId || validAttemptId)
+      )
+    ) {
+      return null;
+    }
+    const record = uniqueSetupRecoveryRecord(setupContext);
+    if (!record) {
+      return null;
+    }
+    const enrollment = record.dependencyEnrollment;
+    const commonBinding = hasUnknownSetupEnrollmentBinding(
+      record,
+      setupContext,
+      enrollment
+    );
+    if (validAttemptId) {
+      return commonBinding &&
+        recoveryAttemptId === record.attemptId &&
+        sameEnrollmentBase(enrollment, setupContext.recoveryEnrollment) &&
+        !Object.hasOwn(enrollment, 'operationId') &&
+        !Object.hasOwn(enrollment, 'planId')
+        ? record
+        : null;
+    }
+    return ((record.state === 'unknown' && record.outcome === 'unknown') ||
+      (record.state === 'completed' && record.outcome === 'completed')) &&
+      same(record.checkoutIdentity, setupContext.checkoutIdentity) &&
+      object(enrollment) &&
+      enrollment.version === 1 &&
+      enrollment.installerSettled === true &&
+      enrollment.admissionOperationId === setupContext.admissionOperationId &&
+      enrollment.operationId === recoveryId &&
+      enrollment.planId === recoveryId
+      ? record
+      : null;
+  }
+
+  function sameEnrollmentBase(left, right) {
+    if (!(object(left) && object(right))) {
+      return false;
+    }
+    const {
+      operationId: _leftOperationId,
+      planId: _leftPlanId,
+      ...leftBase
+    } = left;
+    const {
+      operationId: _rightOperationId,
+      planId: _rightPlanId,
+      ...rightBase
+    } = right;
+    return same(leftBase, rightBase);
+  }
+
+  function uniqueSetupRecoveryRecord(setupContext) {
+    let document;
+    try {
+      document = state.read('setupProgress');
+    } catch {
+      return null;
+    }
+    if (!(object(document) && object(document.records))) {
+      return null;
+    }
+    const matches = Object.values(document.records).filter(
+      (candidate) =>
+        object(candidate) &&
+        candidate.attemptId === setupContext.attemptId &&
+        same(candidate.target, setupContext.target)
+    );
+    if (matches.length !== 1) {
+      return null;
+    }
+    return matches[0];
+  }
+
+  function hasUnknownSetupEnrollmentBinding(record, setupContext, enrollment) {
+    return (
+      record.state === 'unknown' &&
+      record.outcome === 'unknown' &&
+      String(record.stage ?? '').startsWith('dependency-enrollment') &&
+      record.attemptId === setupContext.attemptId &&
+      same(record.checkoutIdentity, setupContext.checkoutIdentity) &&
+      object(enrollment) &&
+      enrollment.version === 1 &&
+      enrollment.installerSettled === true &&
+      enrollment.admissionOperationId === setupContext.admissionOperationId &&
+      typeof enrollment.bunVersion === 'string' &&
+      enrollment.bunVersion.length > 0
+    );
+  }
+
+  function refuseDependencyFile(code, message) {
+    throw dependencyFileFailure(code, message);
+  }
+
+  async function resolvedDependencyTarget(target) {
+    let fresh;
+    try {
+      fresh = await resolveTarget(target.repo, target.name);
+    } catch {
+      refuseDependencyFile(
+        'CHECKOUT_IDENTITY_UNKNOWN',
+        'Checkout identity could not be verified'
+      );
+    }
+    if (!fresh) {
+      refuseDependencyFile(
+        'WORKTREE_NOT_FOUND',
+        'No registered worktree matches this request'
+      );
+    }
+    if (fresh.ok === false) {
+      const identityUnknown = fresh.code === 'CHECKOUT_IDENTITY_UNKNOWN';
+      refuseDependencyFile(
+        identityUnknown ? fresh.code : 'WORKTREE_NOT_FOUND',
+        identityUnknown
+          ? 'Checkout identity could not be verified'
+          : 'No registered worktree matches this request'
+      );
+    }
+    if (
+      fresh.checkoutIdentity?.known !== true ||
+      !same(fresh.checkoutIdentity, target.checkoutIdentity) ||
+      fresh.wtDir !== target.wtDir ||
+      fresh.repoDir !== target.repoDir ||
+      fresh.port !== target.port ||
+      fresh.key !== `${target.repo}/${target.name}`
+    ) {
+      refuseDependencyFile(
+        'CHECKOUT_IDENTITY_CHANGED',
+        'The registered checkout changed during this operation'
+      );
+    }
+    return fresh;
+  }
+
+  function assertRegisteredDependencyTarget(target) {
+    let ports;
+    try {
+      ports = state.read('ports');
+    } catch {
+      refuseDependencyFile(
+        'REGISTRATION_UNKNOWN',
+        'Worktree registration could not be verified'
+      );
+    }
+    if (!Array.isArray(ports)) {
+      refuseDependencyFile(
+        'REGISTRATION_UNKNOWN',
+        'Worktree registration could not be verified'
+      );
+    }
+    const registration = ports.find((row) => row?.key === target.key);
+    if (!registration) {
+      refuseDependencyFile(
+        'WORKTREE_NOT_FOUND',
+        'No registered worktree matches this request'
+      );
+    }
+    if (
+      registration.repo !== target.repo ||
+      registration.name !== target.name ||
+      registration.port !== target.port
+    ) {
+      refuseDependencyFile(
+        'REGISTRATION_UNKNOWN',
+        'Worktree registration could not be verified'
+      );
+    }
+  }
+
+  async function assertDependencyFileWriterClear(fresh) {
+    const owner = await ownership(fresh);
+    if (!object(owner) || owner.state === 'unknown') {
+      refuseDependencyFile('WRITER_UNKNOWN', 'Writer ownership is unresolved');
+    }
+    if (owner.state !== 'clear') {
+      refuseDependencyFile(
+        'ACTIVE_WRITER',
+        'A writer claim is active on this worktree'
+      );
+    }
+  }
+
+  async function nativeRuntimeState(fresh) {
+    if (!hasNativeRuntimeObservation) {
+      refuseDependencyFile(
+        'RUNTIME_UNKNOWN',
+        'Native runtime ownership is unresolved'
+      );
+    }
+    try {
+      return await readNativeRuntime(fresh);
+    } catch {
+      refuseDependencyFile(
+        'RUNTIME_UNKNOWN',
+        'Native runtime ownership is unresolved'
+      );
+    }
+  }
+
+  function assertSetupInstallerStopped(enrollment, nativeState) {
+    if (enrollment && nativeState !== 'dead') {
+      refuseDependencyFile(
+        nativeState === 'unknown' ? 'RUNTIME_UNKNOWN' : 'ACTIVE_RUNTIME',
+        'Installer process settlement is not confirmed'
+      );
+    }
+  }
+
+  async function assertDependencyFileRuntime(target, fresh, enrollment) {
+    const nativeState = await nativeRuntimeState(fresh);
+    if (!['dead', 'alive', 'unknown'].includes(nativeState)) {
+      refuseDependencyFile(
+        'RUNTIME_UNKNOWN',
+        'Native runtime ownership is unresolved'
+      );
+    }
+    assertSetupInstallerStopped(enrollment, nativeState);
+    const activity = enrollment
+      ? persistedRuntime(fresh)
+      : await runtime(fresh, nativeState);
+    if (!object(activity) || activity.state === 'unknown') {
+      refuseDependencyFile(
+        'RUNTIME_UNKNOWN',
+        'Runtime ownership is unresolved'
+      );
+    }
+    if (activity.queued === true || activity.state === 'queued') {
+      refuseDependencyFile('TARGET_QUEUED', 'Worktree is queued to start');
+    }
+    if (activity.state !== 'stopped') {
+      const operation = lifecycle?.operationStatus?.(target.key);
+      const phaseName =
+        operation?.phase ?? lifecycle?.snapshot?.(target.key)?.phase;
+      let code = 'ACTIVE_RUNTIME';
+      if (['admitting', 'starting'].includes(phaseName)) {
+        code = 'TARGET_STARTING';
+      } else if (['stopping', 'restarting'].includes(phaseName)) {
+        code = 'TARGET_STOPPING';
+      }
+      refuseDependencyFile(
+        code,
+        'A dev server or runtime is active on this worktree'
+      );
+    }
+  }
+
+  function assertDependencyFileSetupClear(fresh, enrollment) {
+    const setup = enrollment ? { state: 'active' } : setupObservation(fresh);
+    if (setup.state === 'unknown') {
+      refuseDependencyFile(
+        'SETUP_UNKNOWN',
+        'Worktree setup ownership is unresolved'
+      );
+    }
+    if (!enrollment && setup.state !== 'clear') {
+      refuseDependencyFile('SETUP_ACTIVE', 'Worktree setup is still active');
+    }
+  }
+
+  function validateAdmissionLease(lease) {
+    if (!object(lease) || (!object(lease.target) && lease.target !== null)) {
+      refuseDependencyFile(
+        'ADMISSION_STATE_UNKNOWN',
+        'Resource admission state is unreadable'
+      );
+    }
+    if (lease.target === null) {
+      if (lease.ownership !== 'confirmed' || lease.recoveryRequired) {
+        refuseDependencyFile(
+          'ADMISSION_STATE_UNKNOWN',
+          'Resource admission ownership is unresolved'
+        );
+      }
+      refuseDependencyFile(
+        'ACTIVE_ADMISSION',
+        'An unscoped admitted operation is active'
+      );
+    }
+  }
+
+  function hasTargetAdmissionLease(lease, target) {
+    return (
+      lease.target?.repo === target.repo && lease.target?.name === target.name
+    );
+  }
+
+  function isExactSetupAdmissionLease(
+    lease,
+    enrollment,
+    setupContext,
+    alreadySeen
+  ) {
+    return (
+      enrollment &&
+      lease.kind === 'install' &&
+      lease.operationId === setupContext.admissionOperationId &&
+      !alreadySeen &&
+      lease.ownership === 'confirmed' &&
+      lease.recoveryRequired === false
+    );
+  }
+
+  function assertAdmissionLeaseForTarget(
+    lease,
+    target,
+    enrollment,
+    setupContext,
+    setupLeaseSeen
+  ) {
+    validateAdmissionLease(lease);
+    if (hasTargetAdmissionLease(lease, target)) {
+      if (lease.ownership !== 'confirmed' || lease.recoveryRequired) {
+        refuseDependencyFile(
+          'ADMISSION_STATE_UNKNOWN',
+          'Resource admission ownership is unresolved'
+        );
+      }
+      if (
+        isExactSetupAdmissionLease(
+          lease,
+          enrollment,
+          setupContext,
+          setupLeaseSeen
+        )
+      ) {
+        return true;
+      }
+      refuseDependencyFile(
+        'ACTIVE_ADMISSION',
+        'Another admitted operation owns this worktree'
+      );
+    }
+    if (enrollment && lease.kind === 'install') {
+      refuseDependencyFile(
+        'ACTIVE_ADMISSION',
+        'Another dependency installer owns admission'
+      );
+    }
+    return false;
+  }
+
+  async function assertDependencyFileAdmission(
+    target,
+    enrollment,
+    setupContext,
+    recoveryOperationId
+  ) {
+    const admitted = await admission
+      .status()
+      .catch(() =>
+        refuseDependencyFile(
+          'ADMISSION_STATE_UNKNOWN',
+          'Resource admission state is unreadable'
+        )
+      );
+    if (admitted?.ok !== true || !Array.isArray(admitted.leases)) {
+      refuseDependencyFile(
+        'ADMISSION_STATE_UNKNOWN',
+        'Resource admission state is unreadable'
+      );
+    }
+    let setupLeaseSeen = false;
+    for (const lease of admitted.leases) {
+      setupLeaseSeen =
+        assertAdmissionLeaseForTarget(
+          lease,
+          target,
+          enrollment,
+          setupContext,
+          setupLeaseSeen
+        ) || setupLeaseSeen;
+    }
+    const completedSetupLeaseReleased =
+      enrollment?.state === 'completed' &&
+      enrollment.dependencyEnrollment?.operationId === recoveryOperationId;
+    if (enrollment && !setupLeaseSeen && !completedSetupLeaseReleased) {
+      refuseDependencyFile(
+        'ADMISSION_STATE_UNKNOWN',
+        'The setup admission lease could not be confirmed'
+      );
+    }
+  }
+
+  async function assertDependencyFileMode(fresh) {
+    const mode = await containerModeObservation(fresh);
+    if (mode.state === 'unknown') {
+      refuseDependencyFile(
+        'CONTAINER_MODE_UNKNOWN',
+        'Worktree runtime mode could not be verified'
+      );
+    }
+    if (mode.state === 'container') {
+      refuseDependencyFile(
+        'CONTAINER_MODE_UNSUPPORTED',
+        'Dependency file sharing requires a bare worktree'
+      );
+    }
+  }
+
+  async function assertLatestDependencyIdentity(target, fresh) {
+    let latest;
+    try {
+      latest = await resolveTarget(target.repo, target.name);
+    } catch {
+      refuseDependencyFile(
+        'CHECKOUT_IDENTITY_UNKNOWN',
+        'Checkout identity could not be verified'
+      );
+    }
+    if (
+      latest?.checkoutIdentity?.known !== true ||
+      !same(latest.checkoutIdentity, fresh.checkoutIdentity) ||
+      latest.wtDir !== fresh.wtDir ||
+      latest.key !== target.key ||
+      latest.port !== target.port ||
+      latest.repoDir !== target.repoDir
+    ) {
+      refuseDependencyFile(
+        'CHECKOUT_IDENTITY_CHANGED',
+        'The registered checkout changed during this operation'
+      );
+    }
+  }
+
+  async function assertDependencyFileMutable(target, details = {}) {
+    const setupPhase = ['enroll-fresh', 'enroll-preflight'].includes(
+      details.phase
+    );
+    const setupRecovery =
+      ['apply', 'recover', 'enroll-fresh'].includes(details.phase) &&
+      (details.recoveryOperationId || details.recoveryAttemptId)
+        ? setupRecoveryRecord(
+            target,
+            details.setupContext,
+            details.recoveryOperationId,
+            details.recoveryAttemptId
+          )
+        : null;
+    const enrollment =
+      setupRecovery ??
+      (setupPhase ? setupEnrollmentRecord(target, details.setupContext) : null);
+    if (setupPhase && !enrollment) {
+      refuseDependencyFile(
+        'DEPENDENCY_FILE_SETUP_CONTEXT_INVALID',
+        'Fresh enrollment requires the matching active setup attempt and confirmed installer settlement'
+      );
+    }
+    const fresh = await resolvedDependencyTarget(target);
+    await assertRegisteredDependencyTarget(target);
+    await assertDependencyFileWriterClear(fresh);
+    await assertDependencyFileRuntime(target, fresh, enrollment);
+    assertDependencyFileSetupClear(fresh, enrollment);
+    await assertDependencyFileAdmission(
+      target,
+      enrollment,
+      details.setupContext,
+      details.recoveryOperationId
+    );
+    await assertDependencyFileMode(fresh);
+    await assertLatestDependencyIdentity(target, fresh);
+  }
+
+  const dependencyFiles = createDependencyFileService({
+    admission,
+    assertMutable: assertDependencyFileMutable,
+    config,
+    engineFactory: dependencyFileEngineFactory,
+    native: dependencyFileNative,
+    now,
+    randomId,
+    resolveTarget,
+    setupProgress: dependencySetupProgress,
+    state,
+    withSetupRecoveryTarget,
+  });
 
   const cache = createWorktreeCache({
     checkoutIdentity: (target) =>
@@ -430,13 +1153,23 @@ export function createPortalResourceServices({
   async function dependencyFor(target) {
     let sharing;
     let document;
+    let reason;
     try {
+      const currentConfig = await config();
       sharing = dependencySharingForTarget(
-        await config(),
+        currentConfig,
         target.repo,
         target.name
       );
       document = state.read('dependencyViews');
+      if (!sharing?.enabled) {
+        reason = await dependencySharingDisabledReason(
+          currentConfig,
+          target.repo,
+          target.name,
+          target.wtDir
+        );
+      }
     } catch {
       return failure(
         'DEPENDENCY_VIEW_STATE_CORRUPT',
@@ -444,7 +1177,7 @@ export function createPortalResourceServices({
       );
     }
     if (!sharing?.enabled) {
-      return { enabled: false, ok: true, state: 'disabled' };
+      return { enabled: false, ok: true, reason, state: 'disabled' };
     }
     if (
       !object(document) ||
@@ -518,7 +1251,21 @@ export function createPortalResourceServices({
         if (view.ok === false) {
           return view;
         }
-        rows.push({ ...view, name: row.name, repo: row.repo });
+        let dependencyFileStatus;
+        try {
+          dependencyFileStatus = await dependencyFiles.status(target);
+        } catch {
+          dependencyFileStatus = failure(
+            'DEPENDENCY_FILE_STATUS_UNKNOWN',
+            'Dependency file status could not be confirmed'
+          );
+        }
+        rows.push({
+          ...view,
+          dependencyFiles: dependencyFileStatus,
+          name: row.name,
+          repo: row.repo,
+        });
       }
       return { ok: true, views: rows };
     },
@@ -539,6 +1286,7 @@ export function createPortalResourceServices({
       },
     },
     dependency,
+    dependencyFiles,
     events,
     github,
     mcpActions,
@@ -547,7 +1295,13 @@ export function createPortalResourceServices({
     registeredTarget: resolveTarget,
     storage,
   });
-  return Object.freeze({ ...services, admission, events, storage });
+  return Object.freeze({
+    ...services,
+    admission,
+    dependencyFiles,
+    events,
+    storage,
+  });
 }
 
 // Search answers carry a status so clients can tell "restart pagination" (409)
@@ -751,6 +1505,17 @@ async function dispatchSpansPlanning(services, request, url, response) {
   }
 }
 
+function dispatchPortalResourceGet(services, url, routes, read, response) {
+  const searchAction = SPANS_SEARCH_ROUTES[url.pathname];
+  if (searchAction) {
+    return dispatchSpansSearch(services, searchAction, url, response);
+  }
+  const route = routes[url.pathname];
+  return route && (!route.optional || services[route.action])
+    ? read(route.action, route.input)
+    : null;
+}
+
 export async function dispatchPortalResourceRoute(services, request) {
   const url = new URL(request.url);
   const query = Object.fromEntries(url.searchParams);
@@ -798,14 +1563,13 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/github/runs': { action: 'githubRuns' },
     '/api/github/workflows': { action: 'githubWorkflows' },
     '/api/headless-runs': { action: 'headlessRuns', optional: true },
-    '/api/links/capabilities': { action: 'linksCapabilities', optional: true },
-    '/api/links/directory': { action: 'linksDirectory', optional: true },
-    '/api/links/share/status': { action: 'linksShareStatus', optional: true },
     '/api/links/associations': { action: 'linksAssociations', optional: true },
     '/api/links/associations/preview': {
       action: 'linksAssociationPreview',
       optional: true,
     },
+    '/api/links/capabilities': { action: 'linksCapabilities', optional: true },
+    '/api/links/directory': { action: 'linksDirectory', optional: true },
     '/api/links/evidence/preview': {
       action: 'linksEvidencePreview',
       optional: true,
@@ -817,6 +1581,7 @@ export async function dispatchPortalResourceRoute(services, request) {
       optional: true,
     },
     '/api/links/recovery': { action: 'linksRecovery', optional: true },
+    '/api/links/share/status': { action: 'linksShareStatus', optional: true },
     '/api/links/status': { action: 'linksStatus', optional: true },
     '/api/mcp-actions': { action: 'mcpActions', input: {} },
     '/api/operations': {
@@ -853,17 +1618,41 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/workspace-storage': { action: 'workspaceStorage', input: {} },
   };
   if (request.method === 'GET') {
-    const searchAction = SPANS_SEARCH_ROUTES[url.pathname];
-    if (searchAction) {
-      return dispatchSpansSearch(services, searchAction, url, response);
-    }
-    const route = getRoutes[url.pathname];
-    return route && (!route.optional || services[route.action])
-      ? read(route.action, route.input)
-      : null;
+    return dispatchPortalResourceGet(services, url, getRoutes, read, response);
   }
   if (request.method !== 'POST') {
     return null;
+  }
+  const dependencyFileRoutes = {
+    '/api/dependency-sharing/apply': ['apply', 'dependencyApply'],
+    '/api/dependency-sharing/prepare': ['prepare', 'dependencyPrepare'],
+    '/api/dependency-sharing/prepare-release': [
+      'prepareRelease',
+      'dependencyPrepareRelease',
+    ],
+    '/api/dependency-sharing/recover': ['recover', 'dependencyRecover'],
+    '/api/dependency-sharing/release': ['release', 'dependencyRelease'],
+  };
+  const dependencyFileRoute = dependencyFileRoutes[url.pathname];
+  if (dependencyFileRoute) {
+    const body = await request.json().catch(() => null);
+    const parsed = validateDependencyFileInput(dependencyFileRoute[0], body);
+    if (!parsed.ok) {
+      return response(parsed, 400);
+    }
+    if (typeof services[dependencyFileRoute[1]] !== 'function') {
+      return response(
+        {
+          code: 'DEPENDENCY_FILE_SERVICE_UNAVAILABLE',
+          error: 'Dependency file sharing is unavailable',
+          ok: false,
+        },
+        503
+      );
+    }
+    return response(
+      await services[dependencyFileRoute[1]]({ ...parsed.value, source })
+    );
   }
   const routes = {
     '/api/agent-sessions/end': 'endAgentSession',
@@ -877,9 +1666,9 @@ export async function dispatchPortalResourceRoute(services, request) {
     '/api/headless-runs/resume': 'headlessResume',
     '/api/headless-runs/start': 'headlessStart',
     '/api/links/ack': 'linksAck',
-    '/api/links/attention/open': 'linksAttentionOpen',
     '/api/links/associations/approve': 'linksAssociationApprove',
     '/api/links/associations/revoke': 'linksAssociationRevoke',
+    '/api/links/attention/open': 'linksAttentionOpen',
     '/api/links/cancel': 'linksCancel',
     '/api/links/evidence/attach': 'linksEvidenceAttach',
     '/api/links/redeliver': 'linksRedeliver',

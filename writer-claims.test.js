@@ -9,12 +9,14 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import {
   checkWriter,
@@ -29,11 +31,9 @@ import {
   writerWorktree,
 } from './writer-claims.js';
 
-// Everything, including HOME, Git objects, subprocess logs and temp files,
-// stays under this checkout. No real Setu config, worktrees or services.
-const cache = join(import.meta.dir, 'node_modules/.cache');
-mkdirSync(cache, { recursive: true });
-const root = mkdtempSync(join(cache, 'writer-claims-test-'));
+// HOME, Git objects, logs and temporary files share one isolated canonical
+// fixture root, without writing through the installed dependency lookup.
+const root = realpathSync(mkdtempSync(join(tmpdir(), 'writer-claims-test-')));
 const cli = join(import.meta.dir, 'cli.js');
 const realGit = Bun.which('git');
 const originalEnv = { ...process.env };

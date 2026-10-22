@@ -9,7 +9,7 @@ import {
 import { createLinksProjection } from './links-projection.js';
 import { openSpansStore } from './spans-store.js';
 
-const [, , root, count, killAt = 'never', killOn = '1'] = process.argv;
+const [, , root, count, killAt = 'never', killOn = '1', mode] = process.argv;
 const die = () => process.kill(process.pid, 'SIGKILL');
 const seen = { commit: 0, probe: 0 };
 
@@ -25,12 +25,26 @@ const associations = createLinksAssociations({
 const projection = createLinksProjection({
   associations,
   engine: {
-    events(args) {
+    async events(args) {
       seen.probe += 1;
       if (killAt === 'read' && seen.probe === Number(killOn)) {
         die();
       }
-      return engine.events(args);
+      const page = await engine.events(args);
+      if (mode === 'pause-reads' && args.limit !== 1) {
+        const continueReading = new Promise((resolve) => {
+          process.stdin.once('data', resolve);
+        });
+        console.log(
+          JSON.stringify({
+            after: args.after,
+            count: page.events.length,
+            type: 'read-ready',
+          })
+        );
+        await continueReading;
+      }
+      return page;
     },
   },
   store: {

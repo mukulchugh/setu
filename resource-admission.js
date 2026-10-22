@@ -47,6 +47,12 @@ function sameTarget(a, b) {
 
 const sameOwner = (a, b) =>
   a.pid === b.pid && a.processStart === b.processStart;
+const sameLease = (a, b) =>
+  a.operationId === b.operationId &&
+  a.acquiredAt === b.acquiredAt &&
+  a.kind === b.kind &&
+  sameTarget(a.target, b.target) &&
+  sameOwner(a.owner, b.owner);
 
 function policy(limits = {}) {
   const maxManagedSessions = Number(
@@ -412,6 +418,122 @@ export function createResourceAdmission({
     }
   }
 
+  async function recoverLease(leaseInput) {
+    const lease = copyLease(leaseInput);
+    if (!(dependenciesValid && configured && lease)) {
+      return refusal(
+        'LEASE_MISMATCH',
+        'The admission lease does not match a managed operation.'
+      );
+    }
+
+    // Recovery hands off one existing lease; it does not re-run admission.
+    let current;
+    try {
+      current = copyLease(
+        state.read(ADMISSION_DOCUMENT)?.leases?.[lease.operationId]
+      );
+    } catch {
+      return refusal(
+        'ADMISSION_STATE_UNKNOWN',
+        'Resource admission state is unreadable; the lease was retained.'
+      );
+    }
+    if (!(current && sameLease(current, lease))) {
+      return refusal(
+        current ? 'LEASE_MISMATCH' : 'LEASE_NOT_FOUND',
+        'The admission lease does not match the current operation.'
+      );
+    }
+
+    const callerOwner = await currentOwner();
+    if (!callerOwner) {
+      return refusal(
+        'OWNER_IDENTITY_UNKNOWN',
+        'The recovery owner could not be confirmed; the lease was retained.'
+      );
+    }
+
+    async function oldOwnerIsRecoverable() {
+      try {
+        const observed = await observeProcess(lease.owner.pid);
+        if (observed?.state === 'absent') {
+          return true;
+        }
+        return (
+          observed?.state === 'alive' &&
+          observed.processId === lease.owner.pid &&
+          typeof observed.processStartIdentity === 'string' &&
+          observed.processStartIdentity.length > 0 &&
+          observed.processStartIdentity !== lease.owner.processStart
+        );
+      } catch {
+        return false;
+      }
+    }
+
+    const sameAsCaller = sameOwner(lease.owner, callerOwner);
+    if (!(sameAsCaller || (await oldOwnerIsRecoverable()))) {
+      return refusal(
+        'LEASE_OWNER_NOT_RECOVERABLE',
+        'The previous lease owner is alive or could not be confirmed; the lease was retained.'
+      );
+    }
+
+    let result;
+    try {
+      await state.update(ADMISSION_DOCUMENT, async (document) => {
+        const leases = leasesFrom(document);
+        if (!leases) {
+          result = refusal(
+            'ADMISSION_STATE_UNKNOWN',
+            'Resource admission state is unreadable; the lease was retained.'
+          );
+          return document;
+        }
+        const stored = leases[lease.operationId];
+        if (!(stored && sameLease(stored, lease))) {
+          result = refusal(
+            stored ? 'LEASE_MISMATCH' : 'LEASE_NOT_FOUND',
+            'The admission lease changed during recovery; it was retained.'
+          );
+          return document;
+        }
+
+        // Repeat both incarnation proofs within the serialized state update.
+        const confirmedCaller = await currentOwner();
+        if (!(confirmedCaller && sameOwner(confirmedCaller, callerOwner))) {
+          result = refusal(
+            'OWNER_IDENTITY_UNKNOWN',
+            'The recovery owner changed during recovery; the lease was retained.'
+          );
+          return document;
+        }
+        if (!(sameAsCaller || (await oldOwnerIsRecoverable()))) {
+          result = refusal(
+            'LEASE_OWNER_NOT_RECOVERABLE',
+            'The previous lease owner is alive or could not be confirmed; the lease was retained.'
+          );
+          return document;
+        }
+
+        const transferred = { ...stored, owner: confirmedCaller };
+        leases[lease.operationId] = transferred;
+        result = Object.freeze({
+          lease: await view(transferred, observeProcess),
+          ok: true,
+        });
+        return writeLeases(leases);
+      });
+      return result;
+    } catch {
+      return refusal(
+        'ADMISSION_STATE_UNKNOWN',
+        'Resource admission state could not be updated; the lease was retained.'
+      );
+    }
+  }
+
   async function status() {
     if (!(dependenciesValid && configured)) {
       return refusal(
@@ -443,5 +565,5 @@ export function createResourceAdmission({
     }
   }
 
-  return Object.freeze({ admit, release, status });
+  return Object.freeze({ admit, recoverLease, release, status });
 }

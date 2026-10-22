@@ -43,6 +43,7 @@ jobs:
         run: |
           VERSION=$(sed -n 's/^channel = "\(.*\)"/\1/p' engines/links/rust-toolchain.toml)
           rustup toolchain install "$VERSION" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$VERSION" >> "$GITHUB_ENV"
           echo "SETU_LINKS_CARGO=$(rustup which --toolchain "$VERSION" cargo)" >> "$GITHUB_ENV"
 
       - uses: oven-sh/setup-bun@v2
@@ -67,6 +68,9 @@ jobs:
           bun test ./links-client.test.js ./links-service.test.js ./links-api.test.js ./links-cli.test.js
           ./links-engine-boundary.test.js ./links-naming-check.test.js ./links-engine.test.js
           ./links-packaging.test.js ./cli.test.js ./portal-routes.test.js ./portal.docs.test.js
+
+      - name: Full JavaScript and TypeScript regression suite
+        run: bun run test
 
       - run: bun links-naming-check.js
 

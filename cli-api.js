@@ -12,11 +12,15 @@ function queryString(values) {
 }
 
 async function portalFetch({ method, path, body, headers }) {
+  let timeoutMs = method === 'GET' ? 5000 : 30_000;
+  if (method === 'POST' && path.startsWith('/api/dependency-sharing/')) {
+    timeoutMs = 60 * 60 * 1000;
+  }
   const response = await fetch(`http://localhost:${PORTAL_PORT}${path}`, {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     headers,
     method,
-    signal: AbortSignal.timeout(method === 'GET' ? 5000 : 30_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   let result;
   try {

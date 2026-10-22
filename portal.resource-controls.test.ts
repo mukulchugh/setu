@@ -8,6 +8,7 @@ import {
   confirmationToken,
   createReviewGeneration,
   dependencyRepairPlan,
+  dependencyViewReason,
   handoffFindings,
   linksOpenBody,
   linksOpenReason,
@@ -300,6 +301,21 @@ test('dependency repair displays the returned command only as an unexecuted plan
   });
   expect(dependencyRepairPlan({ ...result, ok: false })).toBeNull();
   expect(dependencyRepairPlan({ ...result, executed: true })).toBeNull();
+});
+
+test('dependency view reason is optional plain text and ignores malformed values', () => {
+  const reason =
+    'Sharing is unavailable for this worktree. <b>Review status</b>.';
+  expect(
+    dependencyViewReason({ enabled: false, state: 'disabled' })
+  ).toBeNull();
+  expect(dependencyViewReason({ reason })).toBe(reason);
+  expect(dependencyViewReason({ reason: '' })).toBeNull();
+  expect(dependencyViewReason({ reason: '   ' })).toBeNull();
+  expect(dependencyViewReason({ reason: { message: 'not plain text' } })).toBe(
+    null
+  );
+  expect(dependencyViewReason(null)).toBeNull();
 });
 
 test('GitHub review takes the module-issued refusal token and dispatches only after confirmation', async () => {

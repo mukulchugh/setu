@@ -663,8 +663,13 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/create` | `{repo,name,tunnel?}`; create worktree and durable setup. | H W M R |
 | `GET` | `/api/custom-agents` | Read configured custom agent entries. | H W |
 | `POST` | `/api/custom-agents` | Replace reviewed custom agent entries. | H W |
-| `GET` | `/api/dependency-sharing` | No input; read dependency-sharing views. | H W C M |
+| `GET` | `/api/dependency-sharing` | T query optional; read configured views and one target's file-operation status. | H W C M |
+| `POST` | `/api/dependency-sharing/apply` | T plus `planId`,`confirmation`,`operationId?`; apply or resume the exact reviewed file plan. | H W C M |
+| `POST` | `/api/dependency-sharing/prepare` | T; prepare an immutable existing-checkout conversion review. | H W C M |
+| `POST` | `/api/dependency-sharing/prepare-release` | T plus `operationId`; prepare a separate retained-original release review. | H W C M |
+| `POST` | `/api/dependency-sharing/recover` | T plus `operationId`; reconcile that operation without automatic overwrite or deletion. | H W C M |
 | `POST` | `/api/dependency-sharing/repair` | T; return repair plan only, never convert a view. | H W C M |
+| `POST` | `/api/dependency-sharing/release` | T plus `releaseId`,`confirmation`; remove only originals from the exact release review. | H W C M |
 | `POST` | `/api/dependency-sharing/verify` | T; verify one view. | H W C M |
 | `GET` | `/api/deploy/preflight` | T plus `provider`,`target`; read fresh deployment context. | H W |
 | `GET` | `/api/diff` | T query; read base and worktree diff. | H W C M |
@@ -813,6 +818,11 @@ checkout identity. `review token` means preflight first and no edited input.
 | `inspect_workspace_storage` | T, optional `storeId` | Explicitly inspect a server-known root. |
 | `list_operations`, `get_resource_admission` | optional target filters; none | Read outcomes/admission. |
 | `list_dependency_sharing` | T | Read one dependency-sharing view. |
+| `prepare_dependency_sharing` | T | Prepare the exact dependency-file conversion review. |
+| `apply_dependency_sharing` | T plus `planId`,`confirmation`,`operationId?` | Apply or resume the reviewed file plan. |
+| `recover_dependency_sharing` | T plus `operationId` | Reconcile the same recorded file operation. |
+| `prepare_dependency_release` | T plus `operationId` | Review retained originals for a separate release. |
+| `release_dependency_originals` | T plus `releaseId`,`confirmation` | Release only the exact reviewed originals. |
 | `verify_dependency_sharing`, `plan_dependency_repair` | T | Verify one view or return a repair plan only. |
 | `list_shared_caches` | none | Read shared-cache catalog. |
 | `list_agent_sessions`, `end_agent_session` | target filters; T, `sessionId`, identity | Read sessions or end one only after owned process identity verification. |
@@ -1170,12 +1180,28 @@ and Raycast typecheck require the root dependencies `typescript`, `@raycast/api`
 `node_modules` symlink. Raycast itself is a manual local action:
 `cd raycast && bun install && bunx ray develop`.
 
-Native dependency sharing is source/fixture verified only for Bun 1.3.14 on
-macOS arm64, an explicitly opted-in fresh checkout, `[install] linker =
-"isolated"`, and a private 0700 store outside the workspace. Hoisted or
-unspecified linkers are explicitly incompatible. No production rollout has happened.
-An existing `node_modules` is never replaced automatically. Dependency repair
-currently returns a plan. APFS copy-on-write and directory-size observations are
-observations, not a guarantee of physical reclaim. No server, browser,
-container, provider, or native-app acceptance was run for this documentation
-change.
+Shared package downloads and installed dependency views are separate. Native
+installed-store views are source/fixture verified only for Bun 1.3.14 on macOS
+arm64, an explicitly opted-in fresh checkout, `[install] linker = "isolated"`,
+and a private 0700 store outside the workspace. That native global-store path
+refuses hoisted or unspecified linkers. The separate hoisted file-sharing workflow
+uses the same central store with independent CoW file clones and requires the
+explicit native helper build, runtime guards, exact plan confirmation and separate
+original-release review described in docs/dependency-sharing.md. No real checkout
+conversion or physical reclaim is established by source changes.
+New hoisted plans use version 2 canonical keys for content, size, mode, owner and
+extended attributes, excluding per-checkout timestamps from reuse identity only.
+Staging restores the target timestamps and verifies full metadata before exchange.
+Saved version 1 plans retain their original timestamp-bound keys and recovery IDs.
+Compatible dependency closures may reuse targets, while
+workspace, patched, and trusted packages can remain local; package name and
+version alone do not establish compatibility. No production rollout has
+happened. An existing `node_modules` view is refused and is never replaced
+automatically. Dependency repair returns a plan only. Directory-size and APFS
+copy-on-write observations do not establish physical savings. Container and
+live application behavior have not been verified.
+
+
+When running dependency-sharing regression tests under another Bun version, set
+`SETU_TEST_DEPENDENCY_BUN` to a verified Bun 1.3.14 executable. The sharing
+fixtures use the invoking executable by default and never install a runtime.

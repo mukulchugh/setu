@@ -1,6 +1,11 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
+  createDependencyReceipt,
+  inspectDependencyReadiness,
+  observeDependencyInstallInputs,
+} from './dependency-readiness.js';
+import {
   inspectDependencyView,
   recordDependencyConsumer,
   sharedDependencyInstall,
@@ -9,6 +14,7 @@ import { assertStorageHeadroom } from './host-health.js';
 
 const worktreePathPattern = /^worktree (.+)$/m;
 const worktreeBranchPattern = /^branch refs\/heads\/(.+)$/m;
+const HOISTED_ENROLLMENT_STAGE = 'dependency-enrollment';
 
 function dependencyInstallCommand(wtDir, exists) {
   if (exists(join(wtDir, 'package.json'))) {
@@ -166,6 +172,29 @@ export async function beginSetupAttempt({
   if (current.state === 'completed') {
     return { completed: true, record: current };
   }
+  if (
+    current.state === 'unknown' &&
+    current.stage?.startsWith(HOISTED_ENROLLMENT_STAGE)
+  ) {
+    const operationId = current.stage
+      .slice(`${HOISTED_ENROLLMENT_STAGE}-unknown:`.length)
+      .trim()
+      .slice(0, 128);
+    const error = setupError(
+      'DEPENDENCY_ENROLLMENT_RECONCILIATION_REQUIRED',
+      'Fresh hoisted setup already completed its install; reconcile the recorded dependency enrollment before retrying setup'
+    );
+    error.recovery = {
+      dependencySharing: {
+        ...(current.stage.startsWith(`${HOISTED_ENROLLMENT_STAGE}-unknown:`) &&
+        operationId
+          ? { operationId }
+          : {}),
+        setupId: current.attemptId,
+      },
+    };
+    throw error;
+  }
   if (current.state === 'running') {
     throw setupError(
       'SETUP_ALREADY_RUNNING',
@@ -243,7 +272,7 @@ async function setupStage(progress, setup, stage) {
   );
 }
 
-async function setupFinish(progress, setup, outcome) {
+async function setupFinish(progress, setup, outcome, dependencyReceipt) {
   if (!(progress && setup)) {
     return;
   }
@@ -251,7 +280,43 @@ async function setupFinish(progress, setup, outcome) {
     await progress.finish({
       attemptId: setup.record.attemptId,
       checkoutIdentity: setup.record.checkoutIdentity,
+      ...(dependencyReceipt ? { dependencyReceipt } : {}),
       outcome,
+      target: setup.record.target,
+    })
+  );
+}
+
+async function setupBindEnrollment(
+  progress,
+  setup,
+  admissionOperationId,
+  bunVersion,
+  installInputs
+) {
+  if (typeof progress?.bindEnrollment !== 'function') {
+    throw setupError(
+      'DEPENDENCY_ENROLLMENT_BINDING_UNAVAILABLE',
+      'Durable setup progress cannot bind dependency enrollment to this install'
+    );
+  }
+  if (typeof admissionOperationId !== 'string' || !admissionOperationId) {
+    throw setupError(
+      'SETUP_ADMISSION_ID_REQUIRED',
+      'Fresh hoisted setup requires its exact admission operation id'
+    );
+  }
+  requireProgress(
+    await progress.bindEnrollment({
+      attemptId: setup.record.attemptId,
+      checkoutIdentity: setup.record.checkoutIdentity,
+      dependencyEnrollment: {
+        admissionOperationId,
+        bunVersion,
+        installerSettled: true,
+        ...(installInputs === undefined ? {} : { installInputs }),
+        version: 1,
+      },
       target: setup.record.target,
     })
   );
@@ -259,6 +324,435 @@ async function setupFinish(progress, setup, outcome) {
 
 function setupFailure(progress, setup, outcome) {
   return setupFinish(progress, setup, outcome);
+}
+
+function requireHoistedFinalizer(finalize, target, progress, setup) {
+  if (typeof finalize !== 'function') {
+    throw setupError(
+      'DEPENDENCY_ENROLLMENT_UNAVAILABLE',
+      'Fresh hoisted setup requires the unified dependency enrollment service'
+    );
+  }
+  const setupTarget = setup?.record?.target;
+  if (
+    !(
+      setupTarget &&
+      typeof setupTarget.repo === 'string' &&
+      setupTarget.repo &&
+      typeof setupTarget.name === 'string' &&
+      setupTarget.name
+    ) ||
+    (target && !sameValue(target, setupTarget)) ||
+    !(progress && setup?.record) ||
+    typeof setup.record.attemptId !== 'string' ||
+    !setup.record.attemptId ||
+    setup.record.state !== 'running' ||
+    setup.record.checkoutIdentity === undefined ||
+    setup.record.checkoutIdentity === null
+  ) {
+    throw setupError(
+      'SETUP_COORDINATION_INVALID',
+      'Fresh hoisted setup requires a durable target-owned setup attempt'
+    );
+  }
+}
+
+function finalizationRecovery(error) {
+  const result = error?.result;
+  const recovery = {};
+  const operationId =
+    (typeof result?.operationId === 'string' && result.operationId) ||
+    (typeof error?.operationId === 'string' && error.operationId);
+  const code =
+    (typeof result?.code === 'string' && result.code) ||
+    (typeof error?.code === 'string' && error.code);
+  const state =
+    (typeof result?.state === 'string' && result.state) ||
+    (typeof error?.state === 'string' && error.state);
+  if (operationId || code || state) {
+    recovery.dependencySharing = {
+      ...(code ? { code: code.slice(0, 96) } : {}),
+      ...(operationId ? { operationId: operationId.slice(0, 128) } : {}),
+      ...(state ? { state: state.slice(0, 48) } : {}),
+    };
+  }
+  return recovery;
+}
+
+function freshHoistedSetupContext(
+  target,
+  setup,
+  admissionOperationId,
+  installerSettled
+) {
+  return {
+    admissionOperationId: admissionOperationId ?? null,
+    attemptId: setup.record.attemptId,
+    checkoutIdentity: setup.record.checkoutIdentity,
+    installerSettled,
+    target: { name: target.name, repo: target.repo },
+  };
+}
+
+async function preflightFreshHoisted(
+  prepare,
+  finalize,
+  target,
+  setup,
+  admissionOperationId
+) {
+  const preflight = prepare ?? finalize?.preflight;
+  if (typeof preflight !== 'function') {
+    throw setupError(
+      'DEPENDENCY_ENROLLMENT_UNAVAILABLE',
+      'Fresh hoisted setup requires dependency enrollment capability preflight before installation'
+    );
+  }
+  const result = await preflight(
+    { name: target.name, repo: target.repo },
+    freshHoistedSetupContext(target, setup, admissionOperationId, false)
+  );
+  if (result?.ok !== true) {
+    throw setupError(
+      result?.code ?? 'DEPENDENCY_ENROLLMENT_UNAVAILABLE',
+      result?.error ??
+        'Dependency enrollment capability preflight did not confirm availability'
+    );
+  }
+}
+
+async function prepareFreshHoistedEnrollment({
+  admissionOperationId,
+  finalize,
+  prepare,
+  progress,
+  setup,
+  target,
+}) {
+  requireHoistedFinalizer(finalize, target, progress, setup);
+  if (typeof progress?.bindEnrollment !== 'function') {
+    throw setupError(
+      'DEPENDENCY_ENROLLMENT_BINDING_UNAVAILABLE',
+      'Durable setup progress cannot bind dependency enrollment to this install'
+    );
+  }
+  if (typeof admissionOperationId !== 'string' || !admissionOperationId) {
+    throw setupError(
+      'SETUP_ADMISSION_ID_REQUIRED',
+      'Fresh hoisted setup requires its exact admission operation id'
+    );
+  }
+  await setupStage(progress, setup, 'dependency-enrollment-preflight');
+  await preflightFreshHoisted(
+    prepare,
+    finalize,
+    setup.record.target,
+    setup,
+    admissionOperationId
+  );
+}
+
+async function finishDependencyInstall({
+  admissionOperationId,
+  bunVersion,
+  finalize,
+  installInputs,
+  progress,
+  setup,
+  shared,
+  state,
+  sharing,
+  wtDir,
+}) {
+  if (shared?.strategy === 'hoisted-cow') {
+    try {
+      await setupStage(progress, setup, HOISTED_ENROLLMENT_STAGE);
+      await setupBindEnrollment(
+        progress,
+        setup,
+        admissionOperationId,
+        bunVersion,
+        installInputs
+      );
+      await finalizeFreshHoisted(
+        finalize,
+        setup.record.target,
+        setup,
+        admissionOperationId
+      );
+      const document = state?.read?.('dependencyFiles');
+      const summary =
+        document?.views?.[
+          `${setup.record.target.repo}/${setup.record.target.name}`
+        ];
+      if (!summary) {
+        throw setupError(
+          'DEPENDENCY_VIEW_UNKNOWN',
+          'Completed dependency enrollment has no authoritative view summary'
+        );
+      }
+      return { dependencyFiles: summary };
+    } catch (error) {
+      throw await unknownFinalizationOutcome(progress, setup, error);
+    }
+  } else if (shared) {
+    try {
+      await recordDependencyConsumer(
+        state,
+        wtDir,
+        sharingForSetup(sharing, state),
+        shared
+      );
+    } catch (error) {
+      throw await preserveKnownFailure(progress, setup, error);
+    }
+  }
+  return {};
+}
+
+async function finishCompletedSetup(progress, setup, dependencyReceipt) {
+  const currentRecord = progress.get(setup.record.target);
+  const { dependencyEnrollment } = currentRecord ?? {};
+  if (dependencyEnrollment) {
+    const { operationId } = dependencyEnrollment;
+    if (
+      typeof operationId !== 'string' ||
+      typeof progress.finishEnrollment !== 'function'
+    ) {
+      throw setupError(
+        'DEPENDENCY_ENROLLMENT_BINDING_REQUIRED',
+        'Completed dependency enrollment requires its durable operation binding'
+      );
+    }
+    try {
+      requireProgress(
+        await progress.finishEnrollment({
+          attemptId: setup.record.attemptId,
+          checkoutIdentity: setup.record.checkoutIdentity,
+          ...(dependencyReceipt ? { dependencyReceipt } : {}),
+          operationId,
+          target: setup.record.target,
+        })
+      );
+    } catch (cause) {
+      const error = setupError(
+        'DEPENDENCY_ENROLLMENT_COMPLETION_UNKNOWN',
+        'Dependency enrollment completed, but setup completion was not durably confirmed'
+      );
+      error.operationId = operationId;
+      error.cause = cause;
+      throw await unknownFinalizationOutcome(progress, setup, error);
+    }
+  } else {
+    await setupFinish(progress, setup, 'completed', dependencyReceipt);
+  }
+}
+
+async function completeDependencySetup({
+  bunVersion,
+  dependencyFiles,
+  installInputs,
+  progress,
+  receiptEligible = true,
+  setup,
+  sharing,
+  state,
+  wtDir,
+}) {
+  if (!(progress && setup)) {
+    return true;
+  }
+  let dependencyReceipt;
+  if (receiptEligible) {
+    try {
+      const receipt = await createDependencyReceipt({
+        attemptId: setup.record.attemptId,
+        bunVersion,
+        checkoutIdentity: setup.record.checkoutIdentity,
+        ...(dependencyFiles ? { dependencyFiles, sharing: undefined } : {}),
+        installInputs,
+        sharing: dependencyFiles ? undefined : sharing,
+        state,
+        wtDir,
+      });
+      if (receipt.ok) {
+        dependencyReceipt = receipt.receipt;
+      }
+    } catch {
+      // Installation and enrollment already completed; a receipt failure leaves
+      // readiness unverified without rewriting that known outcome.
+    }
+  }
+  await finishCompletedSetup(progress, setup, dependencyReceipt);
+  if (!dependencyReceipt) {
+    return false;
+  }
+  const record = progress.get(setup.record.target);
+  const readiness = await inspectDependencyReadiness({
+    bunVersion,
+    checkoutIdentity: setup.record.checkoutIdentity,
+    ...(dependencyFiles ? { dependencyFiles, sharing: undefined } : {}),
+    record,
+    sharing: dependencyFiles ? undefined : sharing,
+    state,
+    wtDir,
+  });
+  return readiness.ok === true && readiness.checkCurrent();
+}
+
+async function completedSetupIsReady({
+  setup,
+  progress,
+  sharing,
+  state,
+  wtDir,
+}) {
+  if (!(progress && setup?.record)) {
+    return true;
+  }
+  const record = progress.get(setup.record.target);
+  let dependencyFiles;
+  if (record?.dependencyReceipt?.dependencyFiles) {
+    try {
+      const document = state?.read?.('dependencyFiles');
+      dependencyFiles =
+        document?.version === 1 &&
+        document?.views &&
+        typeof document.views === 'object'
+          ? (document.views[
+              `${setup.record.target.repo}/${setup.record.target.name}`
+            ] ?? null)
+          : null;
+    } catch {
+      dependencyFiles = null;
+    }
+    if (!dependencyFiles) {
+      return false;
+    }
+  } else {
+    dependencyFiles = undefined;
+  }
+  const readiness = await inspectDependencyReadiness({
+    bunVersion:
+      record?.dependencyReceipt?.bunVersion ??
+      record?.dependencyEnrollment?.bunVersion ??
+      Bun.version,
+    checkoutIdentity: setup.record.checkoutIdentity,
+    ...(dependencyFiles ? { dependencyFiles, sharing: undefined } : {}),
+    record,
+    sharing: dependencyFiles ? undefined : sharing,
+    state,
+    wtDir,
+  });
+  return readiness.ok === true && readiness.checkCurrent();
+}
+
+async function captureBunInstallInputs(wtDir, bunVersion) {
+  try {
+    const observed = await observeDependencyInstallInputs({
+      bunVersion,
+      wtDir: realpathSync(wtDir),
+    });
+    return observed.ok ? observed.inputs : undefined;
+  } catch {
+    // The install result remains useful even when the pre-install snapshot is
+    // unavailable; readiness then stays unverified because no receipt is made.
+  }
+}
+
+function bunVersionForInstall(bunInstaller, shared) {
+  if (!bunInstaller) {
+    return;
+  }
+  return shared?.bunVersion ?? Bun.version;
+}
+
+async function finalizeFreshHoisted(
+  finalize,
+  target,
+  setup,
+  admissionOperationId
+) {
+  const setupContext = freshHoistedSetupContext(
+    target,
+    setup,
+    admissionOperationId,
+    true
+  );
+  let result;
+  try {
+    result = await finalize(
+      { name: target.name, repo: target.repo },
+      setupContext
+    );
+  } catch (cause) {
+    const error = setupError(
+      'DEPENDENCY_ENROLLMENT_FAILED',
+      'Unified dependency enrollment did not confirm completion'
+    );
+    const details =
+      cause && (typeof cause === 'object' || typeof cause === 'function')
+        ? cause
+        : {};
+    error.operationId = details.operationId;
+    error.state = details.state;
+    error.result = details.result;
+    error.cause = cause;
+    throw error;
+  }
+  if (
+    result?.ok !== true ||
+    result.state !== 'completed' ||
+    result.queued === true ||
+    [
+      'conflict',
+      'partial',
+      'prepared',
+      'released',
+      'running',
+      'unknown',
+    ].includes(result.state)
+  ) {
+    const error = setupError(
+      result?.code ?? 'DEPENDENCY_ENROLLMENT_FAILED',
+      result?.error ??
+        'Unified dependency enrollment did not confirm completion'
+    );
+    error.operationId = result?.operationId;
+    error.state = result?.state;
+    error.result = result;
+    throw error;
+  }
+  return result;
+}
+
+async function unknownFinalizationOutcome(progress, setup, cause) {
+  const recovery = finalizationRecovery(cause);
+  const operationId = recovery.dependencySharing?.operationId;
+  let stageError;
+  try {
+    await setupStage(
+      progress,
+      setup,
+      operationId
+        ? `${HOISTED_ENROLLMENT_STAGE}-unknown:${operationId}`
+        : `${HOISTED_ENROLLMENT_STAGE}-unknown`
+    );
+  } catch (stageFailure) {
+    stageError = stageFailure;
+  }
+  const error = await unknownOutcome(
+    progress,
+    setup,
+    'Unified dependency enrollment outcome is unconfirmed; retry the recorded enrollment after recovery'
+  );
+  if (Object.keys(recovery).length) {
+    error.recovery = { ...error.recovery, ...recovery };
+  }
+  if (stageError) {
+    addRecovery(error, stageError);
+  }
+  return error;
 }
 
 async function preserveKnownFailure(progress, setup, error) {
@@ -280,7 +774,19 @@ async function unknownOutcome(progress, setup, message) {
   return error;
 }
 
-function requireFreshSharedView(view, sharing, wtDir) {
+function requireFreshSharedView(
+  view,
+  sharing,
+  wtDir,
+  refreshDependencies = false
+) {
+  if (
+    refreshDependencies &&
+    view?.ok === true &&
+    view.state === 'shared and healthy'
+  ) {
+    return;
+  }
   let checkout;
   try {
     checkout = realpathSync(wtDir);
@@ -378,6 +884,142 @@ export async function withSetupAdmission({
   }
 }
 
+async function prepareSetupInstall({
+  admissionOperationId,
+  assertStorage,
+  assertStoreStorage,
+  bunInstaller,
+  command,
+  finalizeHoistedDependencySharing,
+  prepareHoistedDependencySharing,
+  progress,
+  refreshDependencies,
+  res,
+  setup,
+  sharing,
+  state,
+  target,
+}) {
+  try {
+    await setupStage(progress, setup, 'storage-check');
+    await assertStorage(res.wtDir);
+    let shared;
+    if (bunInstaller && sharing?.enabled) {
+      const resolvedSharing = sharingForSetup(sharing, state);
+      const view = await inspectDependencyView(res.wtDir, resolvedSharing);
+      await setupStage(progress, setup, `dependency-view:${view.state}`);
+      requireFreshSharedView(
+        view,
+        resolvedSharing,
+        res.wtDir,
+        refreshDependencies
+      );
+      shared = await sharedDependencyInstall(
+        res.wtDir,
+        resolvedSharing,
+        assertStoreStorage,
+        { refreshOwnedView: refreshDependencies }
+      );
+      if (shared?.strategy === 'hoisted-cow') {
+        await prepareFreshHoistedEnrollment({
+          admissionOperationId,
+          finalize: finalizeHoistedDependencySharing,
+          prepare: prepareHoistedDependencySharing,
+          progress,
+          setup,
+          target,
+        });
+      }
+    }
+    const selectedBunVersion = bunVersionForInstall(bunInstaller, shared);
+    const installInputs = selectedBunVersion
+      ? await captureBunInstallInputs(res.wtDir, selectedBunVersion)
+      : undefined;
+    const installCommand = shared?.command ?? command;
+    await setupStage(progress, setup, 'installing');
+    return { installCommand, installInputs, shared };
+  } catch (error) {
+    throw await preserveKnownFailure(progress, setup, error);
+  }
+}
+
+async function finishOwnedSetupInstall({
+  admissionOperationId,
+  bunInstaller,
+  closeFailed,
+  code,
+  context,
+  finalizeHoistedDependencySharing,
+  installInputs,
+  progress,
+  proc,
+  setup,
+  sharing,
+  shared,
+  state,
+  stopProcess,
+  wtDir,
+}) {
+  try {
+    await stopProcess({
+      ownedGroup: true,
+      pid: proc.pid,
+      ...(proc.setupOwnerId ? { setupOwnerId: proc.setupOwnerId } : {}),
+    });
+  } catch {
+    // biome-ignore lint/style/useErrorCause: Preserve the unknown process outcome contract.
+    throw await unknownOutcome(
+      progress,
+      setup,
+      'Setup process group exit is unconfirmed; admission remains blocked'
+    );
+  }
+  if (code !== 0 || proc.signalCode) {
+    throw await preserveKnownFailure(
+      progress,
+      setup,
+      new Error(
+        'Dependency installation failed; inspect the setup log before retrying'
+      )
+    );
+  }
+  if (closeFailed) {
+    throw await preserveKnownFailure(
+      progress,
+      setup,
+      new Error(
+        'Dependency installation finished but its setup log descriptor could not be closed'
+      )
+    );
+  }
+  const enrollment = await finishDependencyInstall({
+    admissionOperationId,
+    bunVersion: bunVersionForInstall(bunInstaller, shared),
+    finalize: finalizeHoistedDependencySharing,
+    installInputs,
+    progress,
+    setup,
+    shared,
+    sharing,
+    state,
+    wtDir,
+  });
+  context.ready = await completeDependencySetup({
+    bunVersion: bunVersionForInstall(bunInstaller, shared),
+    dependencyFiles: enrollment.dependencyFiles,
+    installInputs,
+    progress,
+    receiptEligible: bunInstaller && installInputs !== undefined,
+    setup,
+    sharing:
+      shared?.strategy === 'isolated'
+        ? sharingForSetup(sharing, state)
+        : undefined,
+    state,
+    wtDir,
+  });
+}
+
 export async function startWorktreeSetupInstall(
   context,
   {
@@ -395,6 +1037,10 @@ export async function startWorktreeSetupInstall(
     checkoutIdentity,
     logLocation,
     setupAttempt,
+    refreshDependencies = false,
+    prepareHoistedDependencySharing,
+    finalizeHoistedDependencySharing,
+    admissionOperationId,
   }
 ) {
   const { res } = context;
@@ -404,7 +1050,7 @@ export async function startWorktreeSetupInstall(
     port: res.port,
     setup: setupState,
   });
-  let command = dependencyInstallCommand(res.wtDir, exists);
+  const command = dependencyInstallCommand(res.wtDir, exists);
   const setup = await resolveSetupAttempt({
     checkoutIdentity,
     logLocation,
@@ -413,35 +1059,43 @@ export async function startWorktreeSetupInstall(
     target,
   });
   if (setup?.completed) {
-    context.ready = true;
-    return setupResult('ready');
+    context.ready = await completedSetupIsReady({
+      progress,
+      setup,
+      sharing: sharing?.enabled ? sharingForSetup(sharing, state) : undefined,
+      state,
+      wtDir: res.wtDir,
+    });
+    return setupResult(context.ready ? 'ready' : 'unverified');
   }
   if (!command) {
     await setupStage(progress, setup, 'no-dependencies');
-    await setupFinish(progress, setup, 'completed');
-    context.ready = true;
-    return setupResult('ready');
+    context.ready = await completeDependencySetup({
+      bunVersion: Bun.version,
+      progress,
+      setup,
+      state,
+      wtDir: res.wtDir,
+    });
+    return setupResult(context.ready ? 'ready' : 'unverified');
   }
-  let shared;
-  try {
-    await setupStage(progress, setup, 'storage-check');
-    await assertStorage(res.wtDir);
-    if (command[0] === 'bun' && sharing?.enabled) {
-      const resolvedSharing = sharingForSetup(sharing, state);
-      const view = await inspectDependencyView(res.wtDir, resolvedSharing);
-      await setupStage(progress, setup, `dependency-view:${view.state}`);
-      requireFreshSharedView(view, resolvedSharing, res.wtDir);
-      shared = await sharedDependencyInstall(
-        res.wtDir,
-        resolvedSharing,
-        assertStoreStorage
-      );
-    }
-    command = shared?.command ?? command;
-    await setupStage(progress, setup, 'installing');
-  } catch (error) {
-    throw await preserveKnownFailure(progress, setup, error);
-  }
+  const bunInstaller = command[0] === 'bun';
+  const prepared = await prepareSetupInstall({
+    admissionOperationId,
+    assertStorage,
+    assertStoreStorage,
+    bunInstaller,
+    command,
+    finalizeHoistedDependencySharing,
+    prepareHoistedDependencySharing,
+    progress,
+    refreshDependencies,
+    res,
+    setup,
+    sharing,
+    state,
+    target,
+  });
   let fd;
   try {
     fd = openLog();
@@ -451,25 +1105,15 @@ export async function startWorktreeSetupInstall(
   let proc,
     closeFailed = false;
   try {
-    proc = spawn(
-      [
-        'zsh',
-        '-c',
-        'mise trust "$PWD" 2>/dev/null; exec "$@"',
-        'setu-setup',
-        command[0],
-        ...command[1],
-      ],
-      {
-        cwd: res.wtDir,
-        ...(shared ? { env: shared.env } : {}),
-        detached: true,
-        stderr: fd,
-        stdin: 'ignore',
-        stdout: fd,
-        timeout: 15 * 60 * 1000,
-      }
-    );
+    proc = spawn([prepared.installCommand[0], ...prepared.installCommand[1]], {
+      cwd: res.wtDir,
+      ...(prepared.shared?.env ? { env: prepared.shared.env } : {}),
+      detached: true,
+      stderr: fd,
+      stdin: 'ignore',
+      stdout: fd,
+      timeout: 15 * 60 * 1000,
+    });
   } catch (error) {
     try {
       closeLog(fd);
@@ -494,50 +1138,24 @@ export async function startWorktreeSetupInstall(
     }
   }
   const completion = proc.exited.then(
-    async (code) => {
-      try {
-        await stopProcess({ ownedGroup: true, pid: proc.pid });
-      } catch {
-        // biome-ignore lint/style/useErrorCause: The existing unknown-outcome contract intentionally withholds process-stop details from setup callers.
-        throw await unknownOutcome(
-          progress,
-          setup,
-          'Setup process group exit is unconfirmed; admission remains blocked'
-        );
-      }
-      if (code !== 0 || proc.signalCode) {
-        throw await preserveKnownFailure(
-          progress,
-          setup,
-          new Error(
-            'Dependency installation failed; inspect the setup log before retrying'
-          )
-        );
-      }
-      if (closeFailed) {
-        throw await preserveKnownFailure(
-          progress,
-          setup,
-          new Error(
-            'Dependency installation finished but its setup log descriptor could not be closed'
-          )
-        );
-      }
-      if (shared) {
-        try {
-          await recordDependencyConsumer(
-            state,
-            res.wtDir,
-            sharingForSetup(sharing, state),
-            shared
-          );
-        } catch (error) {
-          throw await preserveKnownFailure(progress, setup, error);
-        }
-      }
-      await setupFinish(progress, setup, 'completed');
-      context.ready = true;
-    },
+    (code) =>
+      finishOwnedSetupInstall({
+        admissionOperationId,
+        bunInstaller,
+        closeFailed,
+        code,
+        context,
+        finalizeHoistedDependencySharing,
+        installInputs: prepared.installInputs,
+        proc,
+        progress,
+        setup,
+        shared: prepared.shared,
+        sharing,
+        state,
+        stopProcess,
+        wtDir: res.wtDir,
+      }),
     async () => {
       throw await unknownOutcome(
         progress,
@@ -565,6 +1183,9 @@ export async function installWorktreeDependencies(
     logLocation,
     setup: suppliedSetup,
     setupAttempt,
+    prepareHoistedDependencySharing,
+    finalizeHoistedDependencySharing,
+    admissionOperationId,
   }
 ) {
   let command = dependencyInstallCommand(wtDir, exists);
@@ -588,10 +1209,18 @@ export async function installWorktreeDependencies(
   }
   if (!command) {
     await setupStage(progress, setup, 'no-dependencies');
-    await setupFinish(progress, setup, 'completed');
+    await completeDependencySetup({
+      bunVersion: Bun.version,
+      progress,
+      setup,
+      state,
+      wtDir,
+    });
     return { installed: false };
   }
+  const bunInstaller = command[0] === 'bun';
   let shared, result;
+  let installInputs;
   try {
     await setupStage(progress, setup, 'storage-check');
     await assertStorage(wtDir);
@@ -605,13 +1234,29 @@ export async function installWorktreeDependencies(
         resolvedSharing,
         assertStoreStorage
       );
+      if (shared?.strategy === 'hoisted-cow') {
+        await prepareFreshHoistedEnrollment({
+          admissionOperationId,
+          finalize: finalizeHoistedDependencySharing,
+          prepare: prepareHoistedDependencySharing,
+          progress,
+          setup,
+          target,
+        });
+      }
+    }
+    if (command[0] === 'bun') {
+      installInputs = await captureBunInstallInputs(
+        wtDir,
+        bunVersionForInstall(bunInstaller, shared)
+      );
     }
     command = shared?.command ?? command;
     await setupStage(progress, setup, 'installing');
     result = run(...command, {
       cwd: wtDir,
       stdio,
-      ...(shared ? { env: shared.env } : {}),
+      ...(shared?.env ? { env: shared.env } : {}),
     });
   } catch (error) {
     throw await preserveKnownFailure(progress, setup, error);
@@ -632,19 +1277,32 @@ export async function installWorktreeDependencies(
       )
     );
   }
-  if (shared) {
-    try {
-      await recordDependencyConsumer(
-        state,
-        wtDir,
-        sharingForSetup(sharing, state),
-        shared
-      );
-    } catch (error) {
-      throw await preserveKnownFailure(progress, setup, error);
-    }
-  }
-  await setupFinish(progress, setup, 'completed');
+  const enrollment = await finishDependencyInstall({
+    admissionOperationId,
+    bunVersion: bunVersionForInstall(bunInstaller, shared),
+    finalize: finalizeHoistedDependencySharing,
+    installInputs,
+    progress,
+    setup,
+    shared,
+    sharing,
+    state,
+    wtDir,
+  });
+  await completeDependencySetup({
+    bunVersion: bunVersionForInstall(bunInstaller, shared),
+    dependencyFiles: enrollment.dependencyFiles,
+    installInputs,
+    progress,
+    receiptEligible: bunInstaller && installInputs !== undefined,
+    setup,
+    sharing:
+      shared?.strategy === 'isolated'
+        ? sharingForSetup(sharing, state)
+        : undefined,
+    state,
+    wtDir,
+  });
   return { installed: true };
 }
 
@@ -661,9 +1319,12 @@ export async function createAndInstallWorktree({
   admission,
   operationId,
   progress,
+  sharing,
   checkoutIdentity,
   logLocation,
   withTarget,
+  finalizeHoistedDependencySharing,
+  prepareHoistedDependencySharing,
 }) {
   const target = { name, repo };
   const lock = withTarget ?? ((_, task) => state.withTargets([target], task));
@@ -671,50 +1332,21 @@ export async function createAndInstallWorktree({
     admission,
     operationId,
     target,
-    task: async () => {
-      const created = await create({ tunnel: false });
-      const identity = checkoutIdentity
-        ? await checkoutIdentity(created.wtDir)
-        : undefined;
-      const setup = await beginSetupAttempt({
-        checkoutIdentity: identity,
+    task: async ({ lease }) =>
+      installCreatedWorktree({
+        admissionOperationId: lease?.operationId ?? operationId ?? null,
+        checkoutIdentity,
+        create,
+        finalizeHoistedDependencySharing,
+        install,
         logLocation,
+        name,
+        prepareHoistedDependencySharing,
         progress,
+        sharing,
+        state,
         target,
-      });
-      if (setup?.completed) {
-        return { ...created, setup: 'ready' };
-      }
-      try {
-        await install(created.wtDir, {
-          checkoutIdentity: identity,
-          logLocation,
-          progress,
-          setup,
-          target,
-        });
-        // Legacy collaborators may not know about durable setup records yet.
-        // Finish their known, synchronous result here; the current installer
-        // has already completed its own record, so it is left untouched.
-        if (progress && setup && progress.get(target)?.state === 'running') {
-          await setupFinish(progress, setup, 'completed');
-        }
-      } catch (error) {
-        try {
-          if (progress && setup && progress.get(target)?.state === 'running') {
-            await setupFailure(
-              progress,
-              setup,
-              error?.code === 'OPERATION_UNKNOWN' ? 'unknown' : 'failed'
-            );
-          }
-        } catch (persistenceError) {
-          addRecovery(error, persistenceError);
-        }
-        throw error;
-      }
-      return created;
-    },
+      }),
     withTarget: lock,
   });
   if (result?.ok === false) {
@@ -725,11 +1357,79 @@ export async function createAndInstallWorktree({
   }
   // A durable completed retry is validation only.  It must not move the
   // shared tunnel away from a later owner.
-  if (result?.setup === 'ready') {
+  if (['ready', 'unverified'].includes(result?.setup)) {
     return result;
   }
   const pubDom = await enableTunnel();
   return { ...result, pubDom };
+}
+
+async function installCreatedWorktree({
+  admissionOperationId,
+  checkoutIdentity,
+  create,
+  finalizeHoistedDependencySharing,
+  install,
+  logLocation,
+  prepareHoistedDependencySharing,
+  progress,
+  sharing,
+  state,
+  target,
+}) {
+  const created = await create({ tunnel: false });
+  const identity = checkoutIdentity
+    ? await checkoutIdentity(created.wtDir)
+    : undefined;
+  const setup = await beginSetupAttempt({
+    checkoutIdentity: identity,
+    logLocation,
+    progress,
+    target,
+  });
+  if (setup?.completed) {
+    const ready = await completedSetupIsReady({
+      progress,
+      setup,
+      sharing: sharing?.enabled ? sharingForSetup(sharing, state) : undefined,
+      state,
+      wtDir: created.wtDir,
+    });
+    return { ...created, setup: ready ? 'ready' : 'unverified' };
+  }
+  try {
+    await install(created.wtDir, {
+      checkoutIdentity: identity,
+      logLocation,
+      progress,
+      setup,
+      target,
+      ...(finalizeHoistedDependencySharing
+        ? { finalizeHoistedDependencySharing }
+        : {}),
+      ...(prepareHoistedDependencySharing
+        ? { prepareHoistedDependencySharing }
+        : {}),
+      admissionOperationId,
+    });
+    if (progress && setup && progress.get(target)?.state === 'running') {
+      await setupFinish(progress, setup, 'completed');
+    }
+  } catch (error) {
+    try {
+      if (progress && setup && progress.get(target)?.state === 'running') {
+        await setupFailure(
+          progress,
+          setup,
+          error.code === 'OPERATION_UNKNOWN' ? 'unknown' : 'failed'
+        );
+      }
+    } catch (persistenceError) {
+      addRecovery(error, persistenceError);
+    }
+    throw error;
+  }
+  return created;
 }
 
 // Commands are explicit dependencies so setup can be checked without Git,

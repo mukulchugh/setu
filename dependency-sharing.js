@@ -14,6 +14,7 @@ import { assertStorageHeadroom } from './host-health.js';
 
 const exec = promisify(execFile);
 const VERSION = '1.3.14';
+const SHA256 = /^[a-f0-9]{64}$/;
 const DISPOSABLE_PATH =
   /(?:^|\/)(?:node_modules|\.git|\.bun-cache|cache|caches|tmp|temp)(?:\/|$)/i;
 const BUNFIG_COMMENT = /\s+#.*$/;
@@ -99,12 +100,39 @@ async function inspectStoreRoot(root, sharing) {
   if (
     mountPath !== identity.mountPath ||
     mountInfo.dev !== identity.device ||
-    rootInfo.dev !== identity.device ||
-    !(canonicalRoot === mountPath || canonicalRoot.startsWith(mountPath + sep))
+    rootInfo.dev !== identity.device
   ) {
     throw new Error('Dependency store is not on its configured volume');
   }
   return { canonicalRoot, rootInfo };
+}
+
+async function assertPrivateDirectory(path) {
+  const info = await lstat(path);
+  if (
+    !info.isDirectory() ||
+    info.uid !== process.getuid() ||
+    info.mode % 0o1000 !== 0o700 ||
+    (await realpath(path)) !== path
+  ) {
+    throw new Error(
+      'Dependency store must be a private, owned directory without symlinks'
+    );
+  }
+  return info;
+}
+
+function assertStoreOutsideWorkspace(canonicalRoot, workspace) {
+  if (
+    DISPOSABLE_PATH.test(canonicalRoot) ||
+    canonicalRoot === workspace ||
+    canonicalRoot.startsWith(workspace + sep) ||
+    workspace.startsWith(canonicalRoot + sep)
+  ) {
+    throw new Error(
+      'Dependency store must be outside checkouts and outside the managed workspace'
+    );
+  }
 }
 
 async function configuredLinker(checkout) {
@@ -173,6 +201,11 @@ async function consumerMatches(checkout, consumer, linker) {
   );
 }
 
+function hoistedInstallEnvironment() {
+  const { BUN_INSTALL_GLOBAL_STORE: _globalStore, ...env } = process.env;
+  return env;
+}
+
 async function dependencyInstallPlan(
   wtDir,
   sharing,
@@ -195,32 +228,20 @@ async function dependencyInstallPlan(
   if (!checkout.startsWith(workspace + sep)) {
     throw new Error('Checkout must belong to the configured managed workspace');
   }
-  if (
-    canonicalRoot === workspace ||
-    canonicalRoot.startsWith(workspace + sep) ||
-    workspace.startsWith(canonicalRoot + sep)
-  ) {
-    throw new Error(
-      'Dependency store must be outside checkouts and outside the managed workspace'
-    );
-  }
-  async function privateDirectory(path) {
-    const info = await lstat(path);
-    if (
-      !info.isDirectory() ||
-      info.uid !== process.getuid() ||
-      info.mode % 0o1000 !== 0o700 ||
-      (await realpath(path)) !== path
-    ) {
-      throw new Error(
-        'Dependency store must be a private, owned directory without symlinks'
-      );
-    }
-  }
-  await privateDirectory(root);
+  assertStoreOutsideWorkspace(canonicalRoot, workspace);
+  await assertPrivateDirectory(root);
   const linker = await configuredLinker(checkout);
-  if (linker !== 'isolated') {
+  const hoisted = linker === 'hoisted';
+  if (linker !== 'isolated' && !hoisted) {
     throw linkerIncompatibility(linker);
+  }
+  if (hoisted && allowExistingView) {
+    throw Object.assign(
+      new Error(
+        'An existing hoisted dependency view requires a separately reviewed conversion; setup never adopts it'
+      ),
+      { code: 'DEPENDENCY_VIEW_NOT_MANAGED' }
+    );
   }
   if (!allowExistingView) {
     // lstat also rejects dangling dependency-view symlinks; never convert a view.
@@ -240,6 +261,7 @@ async function dependencyInstallPlan(
   if (!lock.isFile() || lock.isSymbolicLink()) {
     throw new Error('Dependency sharing requires a regular bun.lock file');
   }
+  const lockHash = await lockfileHash(checkout);
   const executable = await realpath(sharing.executable);
   const { stdout } = await exec(
     executable,
@@ -258,15 +280,31 @@ async function dependencyInstallPlan(
     );
   }
   await assertStoreStorage(root);
-  const store = join(root, namespaceFor(runtime));
-  if (createStore) {
+  const platformNamespace = namespaceFor(runtime);
+  const store = join(root, platformNamespace);
+  if (!hoisted && createStore) {
     await mkdir(store, { mode: 0o700 }).catch((error) => {
       if (error.code !== 'EEXIST') {
         throw error;
       }
     });
-    await privateDirectory(store);
+    await assertPrivateDirectory(store);
     await assertStoreStorage(store);
+  }
+  if (hoisted) {
+    return {
+      bunVersion: runtime[0],
+      command: [
+        executable,
+        ['install', '--frozen-lockfile', '--linker', 'hoisted'],
+      ],
+      env: hoistedInstallEnvironment(),
+      linker,
+      lockfileHash: lockHash,
+      mode: 'hoisted-cow',
+      namespace: `hoisted/${platformNamespace}`,
+      strategy: 'hoisted-cow',
+    };
   }
   const installArgs = [
     'install',
@@ -279,6 +317,7 @@ async function dependencyInstallPlan(
   ];
   const command = [executable, installArgs];
   return {
+    bunVersion: runtime[0],
     command,
     env: {
       ...process.env,
@@ -286,6 +325,7 @@ async function dependencyInstallPlan(
       ...(linker === 'isolated' ? { BUN_INSTALL_GLOBAL_STORE: '1' } : {}),
     },
     linker: linker ?? 'project-default',
+    lockfileHash: lockHash,
     mode: 'isolated',
     namespace: namespaceFor(runtime),
   };
@@ -358,94 +398,277 @@ export function dependencySharingForTarget(config, repo, name) {
   return resolved;
 }
 
+function disabledReasonForTarget(config, repo, name) {
+  const sharing = config?.dependencySharing;
+  if (sharing === undefined) {
+    return 'Setu has no dependencySharing configuration; sharing is not configured.';
+  }
+  if (Object.hasOwn(sharing, 'enabled') && sharing.enabled === false) {
+    return 'Dependency sharing is explicitly disabled in Setu configuration.';
+  }
+  if (
+    Object.hasOwn(sharing, 'enabled') &&
+    sharing.enabled === true &&
+    Object.hasOwn(sharing, 'targets') &&
+    sharing.targets &&
+    typeof sharing.targets === 'object' &&
+    !Array.isArray(sharing.targets) &&
+    Object.hasOwn(sharing.targets, `${repo}/${name}`) &&
+    sharing.targets[`${repo}/${name}`] === false
+  ) {
+    return 'This worktree is explicitly opted out of dependency sharing.';
+  }
+  return 'This worktree has no enabled dependency-sharing target.';
+}
+
+// Explain a disabled status without changing the checkout or treating the
+// existence of node_modules as evidence that its layout is share-compatible.
+export async function dependencySharingDisabledReason(
+  config,
+  repo,
+  name,
+  checkout
+) {
+  const sharing = dependencySharingForTarget(config, repo, name);
+  if (sharing?.enabled) {
+    return;
+  }
+
+  let reason = disabledReasonForTarget(config, repo, name);
+  let linker;
+  try {
+    linker = await configuredLinker(checkout);
+  } catch {
+    linker = undefined;
+  }
+  if (linker === 'hoisted') {
+    reason +=
+      ' Its bunfig.toml explicitly selects linker = "hoisted". Fresh Setu setup can enroll this linker after its ordinary frozen install; an existing node_modules view is not adopted automatically.';
+  } else if (linker === 'isolated') {
+    reason +=
+      ' Its bunfig.toml selects linker = "isolated", but that does not enable sharing or verify the installed view.';
+  } else if (linker === null) {
+    reason +=
+      ' No explicit Bun linker was observed, so sharing compatibility remains unknown.';
+  } else {
+    reason +=
+      ' The project linker setting could not be read, so sharing compatibility remains unknown.';
+  }
+
+  try {
+    await lstat(join(checkout, 'node_modules'));
+    reason +=
+      ' An existing node_modules entry is present and will be left unchanged; its presence alone does not establish shared-store compatibility.';
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      reason +=
+        ' The existing dependency view could not be inspected, so its state remains unknown.';
+    }
+  }
+  return reason;
+}
+
 // Experimental host-only opt-in. A store is live dependency data, never a
 // disposable package cache. Provision its private root outside worktrees.
+async function refreshDependencyInstallPlan(
+  wtDir,
+  sharing,
+  assertStoreStorage
+) {
+  assertValidSharingFields(sharing);
+  const view = await inspectDependencyView(wtDir, sharing);
+  if (!(view.ok === true && view.state === 'shared and healthy')) {
+    throw Object.assign(
+      new Error(
+        'Dependency refresh requires a healthy Setu-owned shared view; unmanaged or replaced views are never converted'
+      ),
+      { code: 'DEPENDENCY_VIEW_UNSAFE' }
+    );
+  }
+  return dependencyInstallPlan(wtDir, sharing, {
+    allowExistingView: true,
+    assertStoreStorage,
+    createStore: false,
+  });
+}
+
 export function sharedDependencyInstall(
   wtDir,
   sharing,
-  assertStoreStorage = assertStorageHeadroom
+  assertStoreStorage = assertStorageHeadroom,
+  { refreshOwnedView = false } = {}
 ) {
   if (!sharing?.enabled) {
     return null;
+  }
+  if (refreshOwnedView === true) {
+    return refreshDependencyInstallPlan(wtDir, sharing, assertStoreStorage);
   }
   return dependencyInstallPlan(wtDir, sharing, { assertStoreStorage });
 }
 
 async function inspectIsolatedView(virtualStore, expected, consumer) {
-  let entries;
+  let directory;
   try {
-    entries = await readdir(virtualStore, { withFileTypes: true });
+    directory = await lstat(virtualStore);
   } catch (error) {
     if (error.code === 'ENOENT') {
-      return consumer
-        ? 'shared but replaced by an ordinary install'
-        : 'ordinary';
+      return {
+        state: consumer
+          ? 'shared but replaced by an ordinary install'
+          : 'ordinary',
+      };
     }
     throw error;
   }
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    return { state: 'unknown' };
+  }
+  const entries = await readdir(virtualStore, { withFileTypes: true });
   const links = entries.filter((entry) => entry.isSymbolicLink());
   if (!links.length) {
-    return consumer ? 'shared but replaced by an ordinary install' : 'ordinary';
+    return {
+      state: consumer
+        ? 'shared but replaced by an ordinary install'
+        : 'ordinary',
+    };
   }
   const targets = await Promise.all(
-    links.map(async (link) =>
-      realpath(join(virtualStore, link.name)).catch(() => null)
-    )
+    links.map(async (link) => {
+      try {
+        const target = await realpath(join(virtualStore, link.name));
+        return (await stat(target)).isDirectory() ? target : false;
+      } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+          return null;
+        }
+        throw error;
+      }
+    })
   );
   if (targets.some((target) => target === null)) {
-    return 'dangling';
+    return { state: 'dangling' };
   }
-  return targets.every((target) => target.startsWith(expected + sep))
-    ? 'shared and healthy'
-    : 'unknown';
+  if (
+    !targets.every(
+      (target) =>
+        typeof target === 'string' && target.startsWith(expected + sep)
+    )
+  ) {
+    return { state: 'unknown' };
+  }
+  const hasLocalData = entries.some(
+    (entry) => entry.name !== 'node_modules' && !entry.isSymbolicLink()
+  );
+  return {
+    reason: hasLocalData
+      ? 'Observed top-level virtual-store links resolve beneath the configured store namespace, and some dependency data remains local. Package contents and complete dependency closure are not verified. Disk savings are not measured by this check.'
+      : 'Observed top-level virtual-store links resolve beneath the configured store namespace. Package contents and complete dependency closure are not verified. Disk savings are not measured by this check.',
+    state: 'shared and healthy',
+  };
 }
 
 export async function inspectDependencyView(checkout, sharing) {
   let canonical;
   try {
+    assertValidSharingFields(sharing);
     canonical = await realpath(checkout);
+  } catch (error) {
+    return {
+      ok: true,
+      state: error.code === 'ENOENT' ? 'absent' : 'unknown',
+    };
+  }
+  try {
+    const workspace = await realpath(sharing.workspaceRoot);
+    if (!canonical.startsWith(workspace + sep)) {
+      return { ok: true, state: 'unknown' };
+    }
     const { canonicalRoot } = await inspectStoreRoot(
       resolve(sharing.storeRoot),
       sharing
     );
+    assertStoreOutsideWorkspace(canonicalRoot, workspace);
+    await assertPrivateDirectory(resolve(sharing.storeRoot));
     const consumer = consumerFor(canonical, sharing);
     const linker = await configuredLinker(canonical);
-    if (
-      linker !== 'isolated' ||
-      !(await consumerMatches(canonical, consumer, linker))
-    ) {
-      return { ok: true, state: 'unknown' };
+    if (linker === 'hoisted') {
+      return await inspectHoistedView(canonical);
     }
-    const nodeModules = join(canonical, 'node_modules');
-    const view = await lstat(nodeModules);
-    if (view.isSymbolicLink()) {
-      try {
-        await realpath(nodeModules);
-      } catch {
-        return { ok: true, state: 'dangling' };
-      }
-      return { ok: true, state: 'ordinary' };
+    if (linker !== 'isolated') {
+      return {
+        ok: true,
+        reason: linkerIncompatibility(linker).message,
+        state: 'unknown',
+      };
     }
-    if (!view.isDirectory()) {
-      return { ok: true, state: 'ordinary' };
-    }
-    const expected = join(canonicalRoot, consumer.platformNamespace, 'links');
-    const state = await inspectIsolatedView(
-      join(nodeModules, '.bun'),
-      expected,
+    return await inspectIsolatedDependencyView(
+      canonical,
+      canonicalRoot,
       consumer
     );
+  } catch {
+    return { ok: true, state: 'unknown' };
+  }
+}
+
+async function inspectHoistedView(checkout) {
+  try {
+    await lstat(join(checkout, 'node_modules'));
     return {
-      ...(state === 'shared and healthy' ? { mode: 'isolated' } : {}),
       ok: true,
-      state,
+      reason:
+        'Hoisted dependency files are enrolled only after a fresh guarded setup; this existing view remains ordinary until separately reviewed.',
+      state: 'ordinary',
     };
   } catch (error) {
     if (error.code === 'ENOENT') {
       return { ok: true, state: 'absent' };
     }
+    throw error;
+  }
+}
+
+async function inspectIsolatedDependencyView(
+  checkout,
+  canonicalRoot,
+  consumer
+) {
+  if (!(await consumerMatches(checkout, consumer, 'isolated'))) {
     return { ok: true, state: 'unknown' };
   }
+  const nodeModules = join(checkout, 'node_modules');
+  let view;
+  try {
+    view = await lstat(nodeModules);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { ok: true, state: 'absent' };
+    }
+    throw error;
+  }
+  if (view.isSymbolicLink()) {
+    try {
+      await realpath(nodeModules);
+    } catch {
+      return { ok: true, state: 'dangling' };
+    }
+    return { ok: true, state: 'ordinary' };
+  }
+  if (!view.isDirectory()) {
+    return { ok: true, state: 'ordinary' };
+  }
+  const expected = join(canonicalRoot, consumer.platformNamespace, 'links');
+  const inspection = await inspectIsolatedView(
+    join(nodeModules, '.bun'),
+    expected,
+    consumer
+  );
+  return {
+    ...inspection,
+    ...(inspection.state === 'shared and healthy' ? { mode: 'isolated' } : {}),
+    ok: true,
+  };
 }
 
 export async function repairDependencyView(checkout, sharing) {
@@ -474,23 +697,86 @@ export async function repairDependencyView(checkout, sharing) {
   };
 }
 
-export async function recordDependencyConsumer(
-  state,
-  checkout,
-  _sharing,
-  plan
-) {
+export async function recordDependencyConsumer(state, checkout, sharing, plan) {
   if (!(state && typeof state.update === 'function')) {
     throw new Error('Dependency consumer recording requires workspace-state');
   }
+  assertValidSharingFields(sharing);
   const canonical = await realpath(checkout);
+  const workspace = await realpath(sharing.workspaceRoot);
+  if (!canonical.startsWith(workspace + sep)) {
+    throw Object.assign(
+      new Error(
+        'Dependency consumer checkout is outside the configured workspace'
+      ),
+      { code: 'DEPENDENCY_VIEW_CHECKOUT_INVALID' }
+    );
+  }
+  const { canonicalRoot } = await inspectStoreRoot(
+    resolve(sharing.storeRoot),
+    sharing
+  );
+  assertStoreOutsideWorkspace(canonicalRoot, workspace);
+  await assertPrivateDirectory(resolve(sharing.storeRoot));
+  const expectedNamespace = `darwin-arm64-bun-${VERSION}`;
+  const expectedStore = join(canonicalRoot, expectedNamespace);
+  const executable = await realpath(sharing.executable);
+  const expectedCommand = [
+    executable,
+    [
+      'install',
+      '--frozen-lockfile',
+      '--linker',
+      'isolated',
+      '--backend',
+      'copyfile',
+      '--cache-dir',
+      expectedStore,
+    ],
+  ];
+  if (
+    plan?.mode !== 'isolated' ||
+    plan.linker !== 'isolated' ||
+    plan.namespace !== expectedNamespace ||
+    JSON.stringify(plan.command) !== JSON.stringify(expectedCommand) ||
+    plan.env?.BUN_INSTALL_CACHE_DIR !== expectedStore ||
+    plan.env?.BUN_INSTALL_GLOBAL_STORE !== '1' ||
+    typeof plan.lockfileHash !== 'string' ||
+    !SHA256.test(plan.lockfileHash)
+  ) {
+    throw Object.assign(
+      new Error(
+        'Dependency consumer requires the matching isolated install plan'
+      ),
+      { code: 'DEPENDENCY_VIEW_PLAN_INVALID' }
+    );
+  }
+  const linker = await configuredLinker(canonical);
+  if (linker !== 'isolated') {
+    throw Object.assign(linkerIncompatibility(linker), {
+      code: 'DEPENDENCY_VIEW_PLAN_INVALID',
+    });
+  }
+  const lockInfo = await lstat(join(canonical, 'bun.lock'));
+  if (!lockInfo.isFile() || lockInfo.isSymbolicLink()) {
+    throw Object.assign(
+      new Error('Dependency sharing requires a regular bun.lock file'),
+      { code: 'DEPENDENCY_VIEW_PLAN_INVALID' }
+    );
+  }
   const lockHash = await lockfileHash(canonical);
+  if (plan.lockfileHash !== lockHash) {
+    throw Object.assign(
+      new Error('bun.lock changed after the shared install plan was prepared'),
+      { code: 'DEPENDENCY_VIEW_LOCK_CHANGED' }
+    );
+  }
   const record = {
     bunVersion: VERSION,
     checkout: canonical,
-    linkerMode: plan.linker,
+    linkerMode: 'isolated',
     lockfileHash: lockHash,
-    platformNamespace: plan.namespace,
+    platformNamespace: expectedNamespace,
   };
   await state.update('dependencyViews', (current) => {
     const consumers = Object.hasOwn(current ?? {}, 'consumers')

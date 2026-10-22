@@ -254,3 +254,203 @@ test('the composed session lister and end result never expose the capability dig
     expect(text).toContain('native-now');
   }
 });
+
+test('dependency file portal wiring shares target resolution and preserves unknown operation identities', async () => {
+  const digest = 'a'.repeat(64);
+  const calls = [];
+  const { events, wiring } = fixture({
+    dependencyFiles: {
+      apply: (target, input) => {
+        calls.push({ action: 'apply', input, target });
+        return {
+          code: 'DEPENDENCY_FILE_OUTCOME_UNKNOWN',
+          ok: false,
+          operationId: digest,
+          state: 'unknown',
+        };
+      },
+      prepare: (target, input) => {
+        calls.push({ action: 'prepare', input, target });
+        return { ok: true, plan: { id: digest } };
+      },
+      prepareRelease: (target, input) => {
+        calls.push({ action: 'prepareRelease', input, target });
+        return { ok: true, operationId: digest, releaseId: 'b'.repeat(64) };
+      },
+      recover: (target, input) => {
+        calls.push({ action: 'recover', input, target });
+        return { ok: true, operationId: digest, state: 'partial' };
+      },
+      release: (target, input) => {
+        calls.push({ action: 'release', input, target });
+        return { ok: true, releaseId: input.releaseId };
+      },
+      status: (target) => ({ ok: true, state: 'ordinary', target }),
+    },
+  });
+
+  await expect(
+    wiring.dependencyPrepare({ name: 'topic', repo: 'r', source: 'mcp' })
+  ).resolves.toMatchObject({ ok: true, plan: { id: digest } });
+  await expect(
+    wiring.dependencyApply(
+      {
+        confirmation: digest,
+        name: 'topic',
+        planId: digest,
+        repo: 'r',
+        source: 'cli',
+      },
+      'cli'
+    )
+  ).resolves.toMatchObject({
+    code: 'DEPENDENCY_FILE_OUTCOME_UNKNOWN',
+    ok: false,
+    operationId: digest,
+    state: 'unknown',
+  });
+  await expect(
+    wiring.dependencyRecover({
+      name: 'topic',
+      operationId: digest,
+      repo: 'r',
+      source: 'mcp',
+    })
+  ).resolves.toMatchObject({ ok: true, operationId: digest });
+  await expect(
+    wiring.dependencyPrepareRelease({
+      name: 'topic',
+      operationId: digest,
+      repo: 'r',
+      source: 'ui',
+    })
+  ).resolves.toMatchObject({ ok: true, releaseId: 'b'.repeat(64) });
+  await expect(
+    wiring.dependencyRelease({
+      confirmation: 'b'.repeat(64),
+      name: 'topic',
+      releaseId: 'b'.repeat(64),
+      repo: 'r',
+      source: 'ui',
+    })
+  ).resolves.toMatchObject({ ok: true, releaseId: 'b'.repeat(64) });
+
+  expect(calls.map((call) => call.action)).toEqual([
+    'prepare',
+    'apply',
+    'recover',
+    'prepareRelease',
+    'release',
+  ]);
+  expect(calls[1]).toMatchObject({
+    action: 'apply',
+    input: { confirmation: digest, operationId: digest, planId: digest },
+    target: { name: 'topic', repo: 'r' },
+  });
+  expect(
+    events.filter((event) => event.kind === 'dependency-file-apply').at(-1)
+  ).toMatchObject({
+    id: digest,
+    operationId: digest,
+    source: 'cli',
+    state: 'unknown',
+    target: { name: 'topic', repo: 'r' },
+  });
+  expect(
+    events.find((event) => event.kind === 'dependency-file-prepare-release')
+  ).toMatchObject({
+    id: 'operation-1',
+    operationId: digest,
+  });
+});
+
+test('release wiring keeps event identity, release review and owning operation separate', async () => {
+  const releaseId = 'b'.repeat(64);
+  const operationId = 'c'.repeat(64);
+  const { events, wiring } = fixture({
+    dependencyFiles: {
+      apply: async () => ({ ok: true }),
+      prepare: async () => ({ ok: true }),
+      prepareRelease: async () => ({ ok: true }),
+      recover: async () => ({ ok: true }),
+      release: async (_target, input) => ({
+        ok: true,
+        operationId,
+        releaseId: input.releaseId,
+      }),
+      status: async () => ({ ok: true }),
+    },
+  });
+
+  const result = await wiring.dependencyRelease({
+    confirmation: releaseId,
+    name: 'topic',
+    releaseId,
+    repo: 'r',
+    source: 'mcp',
+  });
+  expect(result).toMatchObject({ ok: true, operationId, releaseId });
+  expect(result.operationId).not.toBe(result.releaseId);
+  const event = events.at(-1);
+  expect(event).toMatchObject({
+    id: 'operation-1',
+    kind: 'dependency-file-release',
+    source: 'mcp',
+    target: { name: 'topic', repo: 'r' },
+  });
+  expect(event.id).not.toBe(releaseId);
+  expect(event).not.toHaveProperty('operationId');
+});
+
+test('release wiring does not invent an operation id when the owning operation is unknown', async () => {
+  const releaseId = 'b'.repeat(64);
+  const { events, wiring } = fixture({
+    dependencyFiles: {
+      apply: async () => ({ ok: true }),
+      prepare: async () => ({ ok: true }),
+      prepareRelease: async () => ({ ok: true }),
+      recover: async () => ({ ok: true }),
+      release: () => Promise.reject(new Error('lost before owner lookup')),
+      status: async () => ({ ok: true }),
+    },
+  });
+
+  const result = await wiring.dependencyRelease({
+    confirmation: releaseId,
+    name: 'topic',
+    releaseId,
+    repo: 'r',
+    source: 'mcp',
+  });
+  expect(result).toMatchObject({ ok: false, releaseId });
+  expect(result).not.toHaveProperty('operationId');
+  expect(events.at(-1)).not.toHaveProperty('operationId');
+});
+
+test('dependency file portal wiring rejects path-bearing requests before engine dispatch', async () => {
+  let invoked = false;
+  const { wiring } = fixture({
+    dependencyFiles: {
+      apply: async () => ({ ok: true }),
+      prepare: () => {
+        invoked = true;
+        return { ok: true };
+      },
+      prepareRelease: async () => ({ ok: true }),
+      recover: async () => ({ ok: true }),
+      release: async () => ({ ok: true }),
+      status: async () => ({ ok: true }),
+    },
+  });
+  await expect(
+    wiring.dependencyPrepare({
+      name: 'topic',
+      path: '/tmp/checkout',
+      repo: 'r',
+    })
+  ).resolves.toMatchObject({
+    code: 'DEPENDENCY_FILE_INPUT_INVALID',
+    ok: false,
+  });
+  expect(invoked).toBe(false);
+});

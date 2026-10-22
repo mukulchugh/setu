@@ -7,3 +7,8 @@ node_modules/
 # Setu Links engine build output
 engines/links/target/
 engines/links/target-*/
+
+# Hoisted dependency file helper build output
+engines/dependency-files/target/
+bin/setu-dependency-files
+bin/setu-dependency-files.setu-stage-*

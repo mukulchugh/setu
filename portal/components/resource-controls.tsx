@@ -8,6 +8,7 @@ import { inputCls, Section } from '../ui';
 import { Badge, StatusDot, type Tone } from '../ui/badge';
 import { Button } from '../ui/button';
 import { readJson, useVisiblePoll } from '../use-visible-poll';
+import { DependencyFileControls } from './dependency-file-controls';
 
 export type ResourceResult = Record<string, unknown> & { ok: boolean };
 
@@ -184,6 +185,13 @@ export function dependencyRepairPlan(result: ResourceResult | undefined) {
     Array.isArray(result.command)
     ? { command: result.command, env: result.env, mode: result.mode }
     : null;
+}
+
+export function dependencyViewReason(view: unknown) {
+  if (!isRecord(view) || typeof view.reason !== 'string') {
+    return null;
+  }
+  return view.reason.trim() ? view.reason : null;
 }
 
 export function cleanupExecutionBody(manifestId: string, retryId?: string) {
@@ -571,12 +579,16 @@ function StorageControls({ repo, name, toast }: TargetProps) {
 
 function DependencyControls({ repo, name, toast }: TargetProps) {
   const url = resourceReadUrl('/api/dependency-sharing', repo, name);
-  const read = useVisiblePoll(`dependencies:${repo}/${name}`, null, (signal) =>
-    readResource(url, signal)
+  const [fileActionPending, setFileActionPending] = useState(false);
+  const read = useVisiblePoll(
+    `dependencies:${repo}/${name}`,
+    fileActionPending ? 1500 : null,
+    (signal) => readResource(url, signal)
   );
   const [busy, setBusy] = useState<'verify' | 'repair' | null>(null);
   const [result, setResult] = useState<ResourceResult>();
   const view = read.data?.ok ? array(read.data.views)[0] : undefined;
+  const reason = dependencyViewReason(view);
   const repairPlan = dependencyRepairPlan(result);
   async function act(kind: 'verify' | 'repair') {
     if (busy) {
@@ -613,16 +625,43 @@ function DependencyControls({ repo, name, toast }: TargetProps) {
           <Badge tone={view.enabled === true ? 'emerald' : 'zinc'}>
             {view.enabled === true ? 'enabled' : 'not enabled'}
           </Badge>
-          {view.reason && (
-            <span class="text-zinc-500">{text(view.reason)}</span>
-          )}
         </div>
+      )}
+      {reason && (
+        <p class="mt-1 max-w-prose break-words text-xs text-zinc-500 dark:text-zinc-400">
+          Reason: {reason}
+        </p>
       )}
       {read.data?.ok && !view && (
         <p class="text-xs text-zinc-500">
           No dependency view is recorded for this worktree.
         </p>
       )}
+      <p class="mt-2 max-w-prose text-xs text-zinc-600 dark:text-zinc-400">
+        Shared package downloads and installed dependency views are separate.
+        Isolated views remain limited to explicitly opted-in fresh checkouts.
+        Hoisted file sharing has a separate reviewed flow below.
+      </p>
+      <DeferredDetails label="Dependency-sharing limits">
+        {() => (
+          <div class="max-w-prose space-y-2 text-xs text-zinc-600 dark:text-zinc-400">
+            <p>
+              An existing isolated <code>node_modules</code> view is refused.
+              Isolated sharing requires the isolated linker. Workspace, patched,
+              and trusted packages may remain local; matching a package name and
+              version alone does not establish a compatible dependency graph.
+              Existing hoisted installs are changed only through the exact plan
+              review below.
+            </p>
+            <p>
+              Repair prepares a plan only. The hoisted flow retains original
+              files until a separate release review. Logical clone sizes and
+              retained file sizes do not measure physical savings; container use
+              is not supported for this native file workflow.
+            </p>
+          </div>
+        )}
+      </DeferredDetails>
       <div class="mt-3 flex flex-wrap gap-2">
         <Button
           compact
@@ -641,6 +680,15 @@ function DependencyControls({ repo, name, toast }: TargetProps) {
           {busy === 'repair' ? 'Preparing…' : 'Prepare repair plan'}
         </Button>
       </div>
+      <DependencyFileControls
+        data={read.data}
+        failed={read.failed}
+        name={name}
+        onActionPending={setFileActionPending}
+        onRefresh={read.refresh}
+        repo={repo}
+        toast={toast}
+      />
       {repairPlan && busy !== 'repair' && (
         <pre class="mt-3 max-h-48 overflow-auto whitespace-pre-wrap border border-zinc-200 p-2 font-mono text-[11px] dark:border-zinc-800">
           {JSON.stringify(repairPlan, null, 2)}

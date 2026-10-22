@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  dependencySharingDisabledReason,
   dependencySharingForTarget,
   inspectDependencyView,
   recordDependencyConsumer,
@@ -105,19 +106,32 @@ test('sharing is opt-in and rejects incomplete configuration before inspecting d
   }
 });
 
-test('hoisted projects refuse installed-package sharing without overriding their linker', async () => {
+test('hoisted fresh plans preserve the linker and avoid Bun isolated global-store controls', async () => {
   const f = fixture();
   try {
     writeFileSync(
       join(f.wtDir, 'bunfig.toml'),
       '[install]\nlinker = "hoisted"\n'
     );
-    await expect(
-      sharedDependencyInstall(f.wtDir, f.sharing)
-    ).rejects.toMatchObject({
-      code: 'DEPENDENCY_LINKER_INCOMPATIBLE',
-      message: expect.stringContaining('linker = "hoisted"'),
+    const plan = await sharedDependencyInstall(f.wtDir, f.sharing, () =>
+      Promise.resolve()
+    );
+    expect(plan).toMatchObject({
+      bunVersion: '1.3.14',
+      command: [
+        f.sharing.executable,
+        ['install', '--frozen-lockfile', '--linker', 'hoisted'],
+      ],
+      linker: 'hoisted',
+      mode: 'hoisted-cow',
+      namespace: 'hoisted/darwin-arm64-bun-1.3.14',
+      strategy: 'hoisted-cow',
     });
+    expect(plan.lockfileHash).toMatch(SHA256);
+    expect(plan.env.BUN_INSTALL_GLOBAL_STORE).toBeUndefined();
+    expect(existsSync(join(f.storeRoot, 'darwin-arm64-bun-1.3.14'))).toBe(
+      false
+    );
     expect(existsSync(join(f.wtDir, 'node_modules'))).toBe(false);
   } finally {
     f.dispose();
@@ -207,7 +221,7 @@ test('dependency view inspection proves links, lockfile, store and linker before
       '[install]\nlinker = "hoisted"\n'
     );
     expect((await inspectDependencyView(f.wtDir, sharing)).state).toBe(
-      'unknown'
+      'ordinary'
     );
     writeFileSync(
       join(f.wtDir, 'bunfig.toml'),
@@ -219,6 +233,37 @@ test('dependency view inspection proves links, lockfile, store and linker before
         storeRoot: join(f.dir, 'missing'),
       })
     ).resolves.toMatchObject({ state: 'unknown' });
+  } finally {
+    f.dispose();
+  }
+});
+
+test('shared view status explains local fallbacks without claiming measured disk savings', async () => {
+  const f = fixture();
+  try {
+    const consumer = consumerFor(f);
+    const sharing = {
+      ...f.sharing,
+      consumers: { [consumer.checkout]: consumer },
+    };
+    createSharedView(f, consumer);
+    const store = join(f.wtDir, 'node_modules', '.bun');
+    mkdirSync(join(store, 'node_modules'));
+    const linked = await inspectDependencyView(f.wtDir, sharing);
+    expect(linked.state).toBe('shared and healthy');
+    expect(linked.reason).toContain('Disk savings are not measured');
+    expect(linked.reason).not.toContain('remains local');
+
+    const local = join(store, 'local-package@1.0.0', 'node_modules');
+    mkdirSync(local, { recursive: true });
+    writeFileSync(join(local, 'marker'), 'local dependency data\n');
+    const mixed = await inspectDependencyView(f.wtDir, sharing);
+    expect(mixed.state).toBe('shared and healthy');
+    expect(mixed.reason).toContain('remains local');
+    expect(mixed.reason).toContain('Disk savings are not measured');
+    expect(readFileSync(join(local, 'marker'), 'utf8')).toBe(
+      'local dependency data\n'
+    );
   } finally {
     f.dispose();
   }
@@ -372,7 +417,7 @@ test('consumer completion preserves malformed journal bytes instead of replacing
       workspaceRoot: f.workspace,
     });
     const path = join(f.workspace, '.setu-dependency-views.json');
-    const plan = { linker: 'isolated', namespace: 'darwin-arm64-bun-1.3.14' };
+    const plan = await sharedDependencyInstall(f.wtDir, f.sharing);
     for (const consumers of [
       null,
       [],
@@ -453,7 +498,7 @@ test('one frozen copyfile plan reaches CLI and portal, with independent store st
       '--cache-dir',
       join(f.storeRoot, 'darwin-arm64-bun-1.3.14'),
     ]);
-    expect(calls[1][0].slice(4)).toEqual([executable, ...installArgs]);
+    expect(calls[1][0]).toEqual([executable, ...installArgs]);
     expect(calls[1][1].env).toEqual(options.env);
     expect(options.env.BUN_INSTALL_GLOBAL_STORE).toBe('1');
     expect(storage.filter(([kind]) => kind === 'checkout')).toHaveLength(2);
@@ -574,6 +619,100 @@ test('missing config or explicit enabled:false preserves ordinary setup', () => 
       'feat/topic'
     )
   ).toBeUndefined();
+});
+
+test('disabled diagnostics explain configuration and target opt-outs without changing an existing view', async () => {
+  const f = fixture();
+  try {
+    const nodeModules = join(f.wtDir, 'node_modules');
+    mkdirSync(nodeModules);
+    writeFileSync(join(nodeModules, 'marker.txt'), 'ordinary fixture view\n');
+    const before = readFileSync(join(nodeModules, 'marker.txt'), 'utf8');
+
+    const missing = await dependencySharingDisabledReason(
+      undefined,
+      'r',
+      'feat/topic',
+      f.wtDir
+    );
+    expect(missing).toContain('no dependencySharing configuration');
+    expect(missing).toContain('existing node_modules entry is present');
+    expect(missing).toContain(
+      'presence alone does not establish shared-store compatibility'
+    );
+
+    const disabled = await dependencySharingDisabledReason(
+      { dependencySharing: { enabled: false } },
+      'r',
+      'feat/topic',
+      f.wtDir
+    );
+    expect(disabled).toContain('explicitly disabled in Setu configuration');
+
+    const optedOut = await dependencySharingDisabledReason(
+      {
+        dependencySharing: {
+          enabled: true,
+          executable: '/bun',
+          storeRoot: '/store',
+          targets: { 'r/feat/topic': false },
+          version: '1.3.14',
+        },
+      },
+      'r',
+      'feat/topic',
+      f.wtDir
+    );
+    expect(optedOut).toContain('explicitly opted out');
+    expect(readFileSync(join(nodeModules, 'marker.txt'), 'utf8')).toBe(before);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('disabled diagnostics describe fresh hoisted enrollment and leave existing views untouched', async () => {
+  const f = fixture();
+  try {
+    writeFileSync(
+      join(f.wtDir, 'bunfig.toml'),
+      '[install]\nlinker = "hoisted"\n'
+    );
+    const nodeModules = join(f.wtDir, 'node_modules');
+    mkdirSync(nodeModules);
+    writeFileSync(join(nodeModules, 'marker.txt'), 'private fixture view\n');
+    const before = readFileSync(join(nodeModules, 'marker.txt'), 'utf8');
+
+    const reason = await dependencySharingDisabledReason(
+      undefined,
+      'r',
+      'feat/topic',
+      f.wtDir
+    );
+    expect(reason).toContain('linker = "hoisted"');
+    expect(reason).toContain(
+      'Fresh Setu setup can enroll this linker after its ordinary frozen install'
+    );
+    expect(reason).toContain('will be left unchanged');
+    expect(readFileSync(join(nodeModules, 'marker.txt'), 'utf8')).toBe(before);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('disabled diagnostics retain malformed dependency-sharing config refusals', async () => {
+  const f = fixture();
+  try {
+    await expect(
+      dependencySharingDisabledReason(
+        { dependencySharing: '/store' },
+        'r',
+        'feat/topic',
+        f.wtDir
+      )
+    ).rejects.toThrow('dependencySharing config must be an object');
+  } finally {
+    f.dispose();
+  }
 });
 
 test('a malformed or absent enabled value is rejected rather than silently disabled', () => {
@@ -789,7 +928,7 @@ test('Python and manifest-free setup bypass even an invalid sharing policy', asy
       openLog: () => 3,
       sharing: { enabled: true },
       spawn: (args) => {
-        spawned.push(args.slice(4));
+        spawned.push(args);
         return { exited: Promise.resolve(0), pid: 100 };
       },
       stopProcess: async () => {

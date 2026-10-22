@@ -1,12 +1,22 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
+import { readNativeProcessSnapshot } from './owned-process-group.js';
 import {
   findEscapedDescendants,
   findProcessChildren,
+  inspectProcessGroupRows,
   proveProcessGroupOwnership,
 } from './process-tree.js';
 
 const children = [];
+const nativeProcessTableAvailable = (() => {
+  try {
+    readNativeProcessSnapshot();
+    return true;
+  } catch {
+    return false;
+  }
+})();
 afterEach(() => {
   for (const child of children.splice(0)) {
     child.kill();
@@ -189,15 +199,21 @@ test('a process group is owned only when every member is the root or its proven 
   ).resolves.toEqual({ state: 'unknown' });
 });
 
-test('the native reader can observe an owned harmless child when ps is permitted', async () => {
-  const child = spawn('sleep', ['2']);
-  children.push(child);
-  const result = await findProcessChildren(process.pid, {
-    processStart: undefined,
+if (nativeProcessTableAvailable) {
+  test('the native reader can observe an owned harmless child when ps is permitted', async () => {
+    const child = spawn('sleep', ['2']);
+    children.push(child);
+    const result = await findProcessChildren(process.pid, {
+      processStart: undefined,
+    });
+    expect(result.state).toBe('owned');
+    expect(result.children.some((row) => row.pid === child.pid)).toBe(true);
   });
-  expect(result.state).toBe('owned');
-  expect(result.children.some((row) => row.pid === child.pid)).toBe(true);
-});
+} else {
+  test.skip('native child observation requires ps, denied by this OS sandbox', () => {
+    // The capability probe refused before any child process was started.
+  });
+}
 
 const identityOf = (pid) => ({
   processId: pid,
@@ -205,6 +221,54 @@ const identityOf = (pid) => ({
   state: 'alive',
 });
 const rootStartText = identityOf(10).processStartIdentity;
+
+test('the shared group topology helper rejects foreign group members and roots', () => {
+  const rows = [
+    { groupId: 10, parentPid: 1, pid: 10 },
+    { groupId: 10, parentPid: 10, pid: 11 },
+    { groupId: 12, parentPid: 11, pid: 12 },
+  ];
+  expect(inspectProcessGroupRows(rows, { groupId: 10, pid: 10 })).toMatchObject(
+    {
+      members: [10, 11],
+      state: 'owned',
+    }
+  );
+  expect(
+    inspectProcessGroupRows([...rows, { groupId: 10, parentPid: 1, pid: 99 }], {
+      groupId: 10,
+      pid: 10,
+    })
+  ).toEqual({ state: 'unknown' });
+  expect(
+    inspectProcessGroupRows([{ ...rows[0], groupId: 88 }, ...rows.slice(1)], {
+      groupId: 10,
+      pid: 10,
+    })
+  ).toEqual({ state: 'unknown' });
+});
+
+test('an observed escaped descendant remains tracked after it reparents', async () => {
+  let reads = 0;
+  const result = await proveProcessGroupOwnership(
+    { groupId: 10, pid: 10, processStart: rootStartText },
+    {
+      listProcesses() {
+        reads += 1;
+        return Promise.resolve([
+          { groupId: 10, parentPid: 1, pid: 10 },
+          { groupId: 12, parentPid: reads > 2 ? 1 : 10, pid: 12 },
+        ]);
+      },
+      observeProcess: (pid) => Promise.resolve(identityOf(pid)),
+    }
+  );
+  expect(result).toEqual({
+    escaped: [{ pid: 12, processStart: identityOf(12).processStartIdentity }],
+    members: [10],
+    state: 'owned',
+  });
+});
 
 test('certified children carry the group the process table reported for them', async () => {
   const result = await findProcessChildren(10, {

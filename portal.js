@@ -21,6 +21,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { agentStatus } from './agent.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { getCostsSummary } from './costs.js';
+import { createDependencyFileNative } from './dependency-file-native.js';
 import { dependencySharingForTarget } from './dependency-sharing.js';
 import {
   createDeploymentGuard,
@@ -149,6 +150,7 @@ import {
   claimTunnelOwner,
   createRemovalRouting,
 } from './removal-routing.js';
+import { createSetupInstallProcesses } from './setup-install-process.js';
 import { createSetupProgress } from './setup-progress.js';
 import { createSpansExecutionRuntime } from './spans-execution-runtime.js';
 import { createSpansRuntime } from './spans-runtime.js';
@@ -237,6 +239,7 @@ export async function createPortalRuntime(options = {}) {
   const LOGS = `${WORKSPACE}/logs`;
   const PORT = options.port ?? PORTAL_PORT;
   const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
+  const { setupInstallProcesses = createSetupInstallProcesses() } = options;
 
   const inngestProcs = new Map();
   const triggerProcs = new Map();
@@ -1952,6 +1955,8 @@ export async function createPortalRuntime(options = {}) {
   function supportingWorkBlockers() {
     return [
       !configReconciled && 'installed config not yet reconciled',
+      setupInstallProcesses.hasOwnedWork() &&
+        'dependency installer work active',
       removals.pending().length > 0 && 'worktree removal pending',
       memoryCheckRunning && 'memory check running',
       !!raycastDev && 'Raycast dev running',
@@ -1965,7 +1970,11 @@ export async function createPortalRuntime(options = {}) {
     ].filter(Boolean);
   }
   function supportingWorkActive() {
-    return supportingWorkBlockers().length > 0;
+    try {
+      return supportingWorkBlockers().length > 0;
+    } catch {
+      return true;
+    }
   }
   let updateControl = createPortalUpdateControl({
     describeBlockers: supportingWorkBlockers,
@@ -1990,6 +1999,7 @@ export async function createPortalRuntime(options = {}) {
         }
       },
       dispose: () => {
+        setupInstallProcesses.close();
         runtimeTimers.clearInterval(logRetentionTimer);
         runtimeTimers.clearInterval(memoryCheckTimer);
         runtimeTimers.clearInterval(idleCheckTimer);
@@ -3146,7 +3156,7 @@ export async function createPortalRuntime(options = {}) {
         admission: portalB205.admission,
         operationId: outcome.id,
         target: { name, repo },
-        task: async () => {
+        task: async ({ lease }) => {
           const prepared = await setupContextFor(target, repo, name, tunnel);
           if (prepared.kind === 'ready') {
             return prepared.result;
@@ -3159,18 +3169,23 @@ export async function createPortalRuntime(options = {}) {
           }
 
           const launched = await startWorktreeSetupInstall(context, {
+            admissionOperationId: lease?.operationId,
             assertStorage: () =>
               assertStorageHeadroom(WORKSPACE, readHostHealth),
             checkoutIdentity: context.identity,
             closeLog: closeSync,
             exists: existsSync,
+            finalizeHoistedDependencySharing: (setupTarget, setupContext) =>
+              portalB205.dependencyFiles.enrollFresh(setupTarget, setupContext),
             logLocation: logPath(repo, name, 'setup'),
             openLog: () => openLogFd(repo, name, 'setup'),
+            prepareHoistedDependencySharing: (setupTarget, setupContext) =>
+              portalB205.dependencyFiles.preflight(setupTarget, setupContext),
             progress: setupProgress,
             sharing,
-            spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
+            spawn: setupInstallProcesses.spawn,
             state: b205State,
-            stopProcess: devRuntime.stopProcess,
+            stopProcess: setupInstallProcesses.stopProcess,
             target: { name, repo },
           });
           // biome-ignore lint/suspicious/noUnnecessaryConditions: setup launch is collaborator output and completion is absent for immediate results.
@@ -3469,6 +3484,7 @@ export async function createPortalRuntime(options = {}) {
       return null;
     }
   };
+  const { dependencyFileNative = createDependencyFileNative() } = options;
   const portalB205 = createPortalResourceServices({
     branch: (target) => worktreeBranch(target.repo, target.name),
     callTool: callConnectedMcpTool,
@@ -3476,6 +3492,11 @@ export async function createPortalRuntime(options = {}) {
       listWriterClaims(writerClaimPaths(WORKSPACE), { includeStale: true }),
     command: checkedCommand,
     config: async () => _cfg,
+    containerMode: (target) =>
+      defaultContainerMode(WORKSPACE, target.repo, target.name)
+        ? 'container'
+        : 'bare',
+    dependencyFileNative,
     entries: () =>
       portEntries(WORKSPACE).map((row) => ({
         ...row,
@@ -3517,7 +3538,15 @@ export async function createPortalRuntime(options = {}) {
         }
       }
       const listeners = await listenerObservation.read().catch(() => null);
-      if (!Array.isArray(listeners)) {
+      const observation = listenerObservation.observation();
+      const observationAge = Date.now() - observation.observedAt;
+      if (
+        !Array.isArray(listeners) ||
+        observation.state !== 'ready' ||
+        !Number.isFinite(observationAge) ||
+        observationAge < 0 ||
+        observationAge > 1500
+      ) {
         return 'unknown';
       }
       if (listeners.some((entry) => entry.port === target.port)) {
@@ -3540,6 +3569,10 @@ export async function createPortalRuntime(options = {}) {
         ? { state: result.stdout.trim() ? 'tracked' : 'clean' }
         : { state: 'unknown' };
     },
+    withSetupRecoveryTarget: (target, work) =>
+      lifecycle.resumeUnknownOperation(target, 'setup', () =>
+        b205State.withTargets([target], work)
+      ),
   });
   const operationOutcomes = createPortalOperationOutcomes({
     events: portalB205.events,
@@ -3661,8 +3694,8 @@ export async function createPortalRuntime(options = {}) {
       (options.linksTarget ?? b205Target)(repo, name),
     root: options.linksRoot,
     sessions: { list: () => managedAgents.listSessions({}) },
-    timers: runtimeTimers,
     spansRoot: options.spansRoot,
+    timers: runtimeTimers,
   });
   // Live execution is off unless the configuration turns it on; it then shares
   // this portal's admission, setup records and registered-target resolution.
@@ -3723,6 +3756,37 @@ export async function createPortalRuntime(options = {}) {
     resumeAgentSession: (input) => managedAgents.resume(input),
   });
 
+  async function continueSettledEnrollment(body, fresh, previous, outcome) {
+    if (
+      previous.state !== 'unknown' ||
+      !previous.stage.startsWith('dependency-enrollment')
+    ) {
+      return null;
+    }
+    const continued =
+      typeof portalB205.dependencyFiles.resumeSetupEnrollment === 'function'
+        ? await portalB205.dependencyFiles.resumeSetupEnrollment(
+            { name: fresh.name, repo: fresh.repo },
+            {
+              attemptId: body.attemptId,
+              checkoutIdentity: body.checkoutIdentity,
+            }
+          )
+        : {
+            code: 'DEPENDENCY_ENROLLMENT_RECOVERY_UNAVAILABLE',
+            error:
+              'Enrollment recovery is unavailable; installation was not restarted',
+            ok: false,
+          };
+    const { operationId: _eventFallback, ...settled } =
+      await operationOutcomes.settle(outcome, continued);
+    return {
+      ...settled,
+      eventId: outcome.id,
+      ...(continued.operationId ? { operationId: continued.operationId } : {}),
+    };
+  }
+
   async function retrySetupProgress(body, source = 'portal') {
     if (!setupRecovery.ok) {
       return setupRecovery;
@@ -3756,11 +3820,20 @@ export async function createPortalRuntime(options = {}) {
     let recording = {};
     let result;
     try {
+      const continued = await continueSettledEnrollment(
+        body,
+        fresh,
+        previous,
+        outcome
+      );
+      if (continued !== null) {
+        return continued;
+      }
       result = await withSetupAdmission({
         admission: portalB205.admission,
         operationId,
         target: { name: fresh.name, repo: fresh.repo },
-        task: async () => {
+        task: async ({ lease }) => {
           const locked = await b205Target(body.repo, body.name);
           if (
             !(
@@ -3798,19 +3871,24 @@ export async function createPortalRuntime(options = {}) {
             tunnel: false,
           };
           const launched = await startWorktreeSetupInstall(context, {
+            admissionOperationId: lease?.operationId,
             assertStorage: () =>
               assertStorageHeadroom(WORKSPACE, readHostHealth),
             checkoutIdentity: locked.checkoutIdentity,
             closeLog: closeSync,
             exists: existsSync,
+            finalizeHoistedDependencySharing: (setupTarget, setupContext) =>
+              portalB205.dependencyFiles.enrollFresh(setupTarget, setupContext),
             logLocation: logPath(locked.repo, locked.name, 'setup'),
             openLog: () => openLogFd(locked.repo, locked.name, 'setup'),
+            prepareHoistedDependencySharing: (setupTarget, setupContext) =>
+              portalB205.dependencyFiles.preflight(setupTarget, setupContext),
             progress: setupProgress,
             setupAttempt: accepted.record,
             sharing: dependencySharingForTarget(_cfg, locked.repo, locked.name),
-            spawn: (args, spawnOptions) => Bun.spawn(args, spawnOptions),
+            spawn: setupInstallProcesses.spawn,
             state: b205State,
-            stopProcess: devRuntime.stopProcess,
+            stopProcess: setupInstallProcesses.stopProcess,
             target: { name: locked.name, repo: locked.repo },
           });
           // biome-ignore lint/suspicious/noUnnecessaryConditions: setup launch is collaborator output and completion is absent for immediate results.
@@ -5720,6 +5798,12 @@ export async function createPortalRuntime(options = {}) {
       createPr: (repo, name) => createPr(repo, name, 'mcp'),
       createWorktree: (repo, name, tunnel) =>
         createWorktree(repo, name, tunnel, 'mcp'),
+      dependencyApply: (input) => portalB205.dependencyApply(input),
+      dependencyPrepare: (input) => portalB205.dependencyPrepare(input),
+      dependencyPrepareRelease: (input) =>
+        portalB205.dependencyPrepareRelease(input),
+      dependencyRecover: (input) => portalB205.dependencyRecover(input),
+      dependencyRelease: (input) => portalB205.dependencyRelease(input),
       dependencyRepair: (input) => portalB205.dependencyRepair(input),
       dependencyVerify: (input) => portalB205.dependencyVerify(input),
       dependencyViews: (input) => portalB205.dependencyViews(input),
@@ -5945,6 +6029,7 @@ export async function createPortalRuntime(options = {}) {
   }
 
   async function dispose() {
+    setupInstallProcesses.close();
     disposed = true;
     for (const [event, listener] of processHooks) {
       process.off(event, listener);
@@ -5975,7 +6060,13 @@ export async function createPortalRuntime(options = {}) {
       await linksPresence.dispose();
       await managedAgents.dispose();
     } finally {
-      await boundServer?.stop(true);
+      try {
+        if (!options.dependencyFileNative) {
+          await dependencyFileNative.close();
+        }
+      } finally {
+        await boundServer?.stop(true);
+      }
     }
   }
 

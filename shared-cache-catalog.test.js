@@ -1,5 +1,11 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSharedCacheCatalog } from './shared-cache-catalog.js';
@@ -77,4 +83,173 @@ test('catalog keeps an unreadable configured cache and marks consumers incomplet
       },
     ],
   });
+});
+
+test('catalog canonicalizes checkout aliases before publishing consumers', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-cache-catalog-alias-'));
+  try {
+    const checkout = join(root, 'checkout');
+    const alias = join(root, 'checkout-alias');
+    const store = join(root, 'store');
+    mkdirSync(checkout);
+    mkdirSync(store);
+    symlinkSync(checkout, alias);
+    const catalog = createSharedCacheCatalog({
+      readConfig: async () => ({
+        dependencySharing: { storeRoot: store },
+      }),
+      readDependencyViews: async () => ({
+        consumers: {
+          alias: { checkout: alias },
+          original: { checkout },
+        },
+      }),
+      readRegistry: async () => [
+        { caches: [{ kind: 'package-store', path: store }], checkout: alias },
+      ],
+    });
+
+    const result = await catalog.list();
+    expect(result.stores).toHaveLength(1);
+    expect(result.stores[0]).toMatchObject({
+      consumers: [realpathSync(checkout)],
+      incomplete: false,
+    });
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test('catalog refuses a relative configured store root instead of resolving it from cwd', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({ dependencySharing: { storeRoot: './cache' } }),
+    readRegistry: async () => [],
+  });
+  await expect(catalog.list()).rejects.toThrow(
+    'Shared cache storeRoot must be an absolute path'
+  );
+});
+
+test('catalog refuses malformed explicit shared-cache rows instead of omitting them', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({
+      sharedCaches: [{ kind: 'download-cache', path: './downloads' }],
+    }),
+    readRegistry: async () => [],
+  });
+  await expect(catalog.list()).rejects.toThrow(
+    'Shared cache entries must have an absolute path and valid kind'
+  );
+});
+
+test('catalog marks a store incomplete when configured consumer metadata is malformed', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({
+      dependencySharing: { storeRoot: '/configured/store' },
+    }),
+    readDependencyViews: async () => ({
+      consumers: {
+        known: { checkout: '/work/known' },
+        unknown: { checkout: '../relative-checkout' },
+      },
+    }),
+    readRegistry: async () => [],
+    realpathPath: async (path) => path,
+  });
+  await expect(catalog.list()).resolves.toMatchObject({
+    ok: true,
+    stores: [
+      {
+        consumers: ['/work/known'],
+        incomplete: true,
+      },
+    ],
+  });
+});
+
+test('catalog retains unreadable consumer metadata without certifying a complete inventory', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({
+      dependencySharing: { storeRoot: '/configured/store' },
+    }),
+    readDependencyViews: async () => ({
+      consumers: { one: { checkout: '/work/denied' } },
+    }),
+    readRegistry: async () => [],
+    realpathPath: (path) => {
+      if (path === '/work/denied') {
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      }
+      return path;
+    },
+  });
+  await expect(catalog.list()).resolves.toMatchObject({
+    ok: true,
+    stores: [{ consumers: ['/work/denied'], incomplete: true }],
+  });
+});
+
+test('catalog retains hoisted store consumers separately from isolated consumer records', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({
+      dependencySharing: { storeRoot: '/stores/current' },
+    }),
+    readDependencyFiles: async () => ({
+      version: 1,
+      views: {
+        first: {
+          checkoutIdentity: { checkoutPath: '/work/hoisted' },
+          mode: 'hoisted-cow',
+          state: 'completed',
+          storeIdentity: { root: '/stores/current' },
+        },
+        old: {
+          checkoutIdentity: { checkoutPath: '/work/partial' },
+          mode: 'hoisted-cow',
+          state: 'partial',
+          storeIdentity: { root: '/stores/previous' },
+        },
+      },
+    }),
+    readDependencyViews: async () => ({
+      consumers: { one: { checkout: '/work/isolated' } },
+    }),
+    readRegistry: async () => [],
+    realpathPath: async (path) => path,
+  });
+  await expect(catalog.list()).resolves.toMatchObject({
+    stores: [
+      {
+        consumers: ['/work/hoisted', '/work/isolated'],
+        incomplete: false,
+        path: '/stores/current',
+      },
+      {
+        consumers: ['/work/partial'],
+        incomplete: true,
+        path: '/stores/previous',
+      },
+    ],
+  });
+});
+
+test('catalog refuses corrupted hoisted view paths instead of calling the inventory complete', async () => {
+  const catalog = createSharedCacheCatalog({
+    readConfig: async () => ({}),
+    readDependencyFiles: async () => ({
+      version: 1,
+      views: {
+        bad: {
+          checkoutIdentity: { checkoutPath: '../escape' },
+          mode: 'hoisted-cow',
+          state: 'completed',
+          storeIdentity: { root: '/stores/one' },
+        },
+      },
+    }),
+    readRegistry: async () => [],
+  });
+  await expect(catalog.list()).rejects.toThrow(
+    'Hoisted dependency view metadata is invalid'
+  );
 });
