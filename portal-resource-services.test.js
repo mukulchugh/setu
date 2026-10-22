@@ -25,6 +25,7 @@ import {
   createPortalResourceServices,
   dispatchPortalResourceRoute,
 } from './portal-resource-services.js';
+import { createResourceAdmission } from './resource-admission.js';
 import { createWorkspaceState } from './workspace-state.js';
 
 const commandResult = (stdout = '') => ({
@@ -79,12 +80,14 @@ async function mcpTool(name, arguments_) {
   return JSON.parse(raw);
 }
 
-async function fixture() {
+async function fixture(serviceOverrides = {}) {
+  const { resourceAdmissionFactory, ...serviceOptions } = serviceOverrides;
   const root = mkdtempSync(join(tmpdir(), 'setu-resource-services-'));
+  const workspace = join(root, 'workspace');
   const bare = join(root, 'r.git');
   const seed = join(root, 'seed');
-  const topic = join(root, 'r', 'topic');
-  const other = join(root, 'r', 'other');
+  const topic = join(workspace, 'r', 'topic');
+  const other = join(workspace, 'r', 'other');
   const store = join(root, 'shared-store');
   git(['init', '--bare', bare]);
   git(['clone', bare, seed]);
@@ -95,10 +98,10 @@ async function fixture() {
   git(['commit', '-m', 'fixture'], seed);
   git(['push', 'origin', 'HEAD:main'], seed);
   git(['symbolic-ref', 'HEAD', 'refs/heads/main'], bare);
-  mkdirSync(join(root, 'r'), { recursive: true });
+  mkdirSync(join(workspace, 'r'), { recursive: true });
   git(['worktree', 'add', '-b', 'topic', topic, 'main'], bare);
   git(['worktree', 'add', '-b', 'other', other, 'main'], bare);
-  mkdirSync(store);
+  mkdirSync(store, { mode: 0o700 });
   const canonicalStore = await realpathAsync(store);
   const storeStat = statSync(canonicalStore);
   let currentConfig = {
@@ -109,14 +112,14 @@ async function fixture() {
       storeRoot: canonicalStore,
       targets: { 'r/topic': true },
       version: '1.3.14',
-      workspaceRoot: root,
+      workspaceRoot: workspace,
     },
-    workspace: root,
+    workspace,
   };
   const state = createWorkspaceState({
     configPath: join(root, 'config.json'),
     setuDir: root,
-    workspaceRoot: root,
+    workspaceRoot: workspace,
   });
   await state.replace('ports', [
     { key: 'r/topic', name: 'topic', port: 3101, repo: 'r' },
@@ -215,6 +218,10 @@ async function fixture() {
     resolveTarget,
     state,
     trackedPaths: async () => ({ state: 'clean' }),
+    ...serviceOptions,
+    ...(resourceAdmissionFactory
+      ? { resourceAdmission: resourceAdmissionFactory(state) }
+      : {}),
   });
   return {
     calls,
@@ -243,6 +250,38 @@ test('production resource dispatcher dynamically catalogs registered source and 
     await fx.state.replace('dependencyViews', {
       consumers: {
         [identity.checkoutPath]: { checkout: identity.checkoutPath },
+      },
+    });
+    await fx.state.replace('dependencyFiles', {
+      operations: {},
+      version: 1,
+      views: {
+        'r/topic': {
+          checkoutIdentity: identity,
+          completedFiles: 1,
+          createdAt: 1,
+          id: 'a'.repeat(64),
+          inputDigest: 'b'.repeat(64),
+          logicalCloneBytes: 10,
+          mode: 'hoisted-cow',
+          name: 'topic',
+          physicalSavingsBytes: null,
+          planId: 'a'.repeat(64),
+          repo: 'r',
+          retainedOriginalFiles: 1,
+          state: 'completed',
+          storeIdentity: {
+            device: String((await statAsync(fx.store)).dev),
+            executable: '/opt/setu/bin/bun',
+            mountPath: await realpathAsync(fx.root),
+            namespace: 'hoisted/darwin-arm64-bun-1.3.14',
+            root: await realpathAsync(fx.store),
+            version: '1.3.14',
+          },
+          totalFiles: 1,
+          updatedAt: 1,
+          version: 1,
+        },
       },
     });
     mkdirSync(join(fx.topic, 'node_modules'), { recursive: true });
@@ -486,6 +525,7 @@ test('dependency views use the durable canonical consumer map and reject malform
       repo: 'r',
       state: 'shared and healthy',
     });
+    expect(verified.view.reason).toContain('Disk savings are not measured');
     const beforeRepair = await readdirAsync(
       join(target.wtDir, 'node_modules', '.bun')
     );
@@ -530,6 +570,564 @@ test('dependency views use the durable canonical consumer map and reject malform
   } finally {
     rmSync(fx.root, { force: true, recursive: true });
   }
+});
+
+test('dependency status shares disabled diagnostics across HTTP and MCP without changing an ordinary view', async () => {
+  const fx = await fixture();
+  try {
+    const target = fx.targets.get('r/topic');
+    const nodeModules = join(target.wtDir, 'node_modules');
+    mkdirSync(nodeModules);
+    writeFileSync(
+      join(target.wtDir, 'bunfig.toml'),
+      '[install]\nlinker = "hoisted"\n'
+    );
+    writeFileSync(join(nodeModules, 'marker.txt'), 'ordinary fixture view\n');
+    const before = await readFileAsync(join(nodeModules, 'marker.txt'), 'utf8');
+    fx.setConfig(undefined);
+
+    const http = await json(
+      fx.services,
+      '/api/dependency-sharing?repo=r&name=topic'
+    );
+    const view = http.views.find(
+      (row) => row.repo === 'r' && row.name === 'topic'
+    );
+    expect(view).toMatchObject({
+      enabled: false,
+      ok: true,
+      state: 'disabled',
+    });
+    expect(view.dependencyFiles).toMatchObject({
+      enabled: false,
+      ok: true,
+      state: 'disabled',
+    });
+    expect(view.reason).toContain('no dependencySharing configuration');
+    expect(view.reason).toContain('linker = "hoisted"');
+    expect(view.reason).toContain('will be left unchanged');
+
+    initMcpServer({ dependencyViews: fx.services.dependencyViews });
+    const mcp = await mcpTool('list_dependency_sharing', {
+      name: 'topic',
+      repo: 'r',
+    });
+    const mcpViews = JSON.parse(mcp.result.content[0].text);
+    const mcpView = mcpViews.views.find(
+      (row) => row.repo === 'r' && row.name === 'topic'
+    );
+    expect(mcpView.reason).toBe(view.reason);
+    expect(await readFileAsync(join(nodeModules, 'marker.txt'), 'utf8')).toBe(
+      before
+    );
+
+    fx.setConfig({ dependencySharing: '/store' });
+    const malformed = await json(
+      fx.services,
+      '/api/dependency-sharing?repo=r&name=topic'
+    );
+    expect(malformed).toMatchObject({
+      code: 'DEPENDENCY_VIEW_STATE_CORRUPT',
+      ok: false,
+    });
+  } finally {
+    rmSync(fx.root, { force: true, recursive: true });
+  }
+});
+
+// Injected G4 results exercise target guards and portal envelopes only; no native file operation runs.
+test('dependency file preparation requires a known bare runtime mode and preserves the G4 result envelope', async () => {
+  const digest = 'a'.repeat(64);
+  let engineCalls = 0;
+  const engineFactory = () => ({
+    apply: async () => ({ ok: true }),
+    prepare: () => {
+      engineCalls += 1;
+      return {
+        logicalCloneBytes: 8,
+        ok: true,
+        plan: { id: digest, mode: 'hoisted-cow' },
+        skipped: [{ reason: 'metadata-unsupported', relativePath: 'bin/tool' }],
+      };
+    },
+    prepareRelease: async () => ({ ok: true }),
+    recover: async () => ({ ok: true }),
+    release: async () => ({ ok: true }),
+    status: async () => ({ enabled: true, ok: true, state: 'ordinary' }),
+  });
+  const fx = await fixture({ dependencyFileEngineFactory: engineFactory });
+  try {
+    const refused = await json(fx.services, '/api/dependency-sharing/prepare', {
+      body: JSON.stringify({ name: 'topic', repo: 'r' }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    expect(refused).toMatchObject({
+      code: 'CONTAINER_MODE_UNKNOWN',
+      ok: false,
+    });
+    expect(engineCalls).toBe(0);
+  } finally {
+    rmSync(fx.root, { force: true, recursive: true });
+  }
+
+  const admitted = await fixture({
+    containerMode: async () => 'bare',
+    dependencyFileEngineFactory: engineFactory,
+  });
+  try {
+    const result = await json(
+      admitted.services,
+      '/api/dependency-sharing/prepare',
+      {
+        body: JSON.stringify({ name: 'topic', repo: 'r' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }
+    );
+    expect(result).toMatchObject({
+      logicalCloneBytes: 8,
+      ok: true,
+      plan: { id: digest, mode: 'hoisted-cow' },
+      skipped: [{ reason: 'metadata-unsupported', relativePath: 'bin/tool' }],
+    });
+    expect(engineCalls).toBe(1);
+    const inventory = await json(
+      admitted.services,
+      '/api/dependency-sharing?repo=r&name=topic'
+    );
+    expect(inventory.views[0].dependencyFiles).toMatchObject({
+      enabled: true,
+      ok: true,
+      state: 'ordinary',
+    });
+    expect(admitted.state.read('operationEvents').events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: expect.any(String),
+          kind: 'dependency-file-prepare',
+          state: 'completed',
+          target: { name: 'topic', repo: 'r' },
+        }),
+      ])
+    );
+  } finally {
+    rmSync(admitted.root, { force: true, recursive: true });
+  }
+});
+
+// These injected observations exercise refusal paths only, not native runtime or claim verification.
+test('dependency file mutation guard refuses active runtimes, writer claims, and setup', async () => {
+  const digest = 'a'.repeat(64);
+  const engineFactory = () => ({
+    apply: async () => ({ ok: true }),
+    prepare: async () => ({ ok: true, plan: { id: digest } }),
+    prepareRelease: async () => ({ ok: true }),
+    recover: async () => ({ ok: true }),
+    release: async () => ({ ok: true }),
+    status: async () => ({ ok: true }),
+  });
+  const cases = [
+    {
+      expected: 'ACTIVE_RUNTIME',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+        lifecycle: {
+          operationStatus: () => null,
+          snapshot: () => ({ phase: 'running', reserved: true }),
+          snapshots: () => [],
+        },
+      },
+    },
+    {
+      expected: 'TARGET_QUEUED',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+        lifecycle: {
+          operationStatus: () => null,
+          snapshot: () => ({ phase: 'queued', reserved: false }),
+          snapshots: () => [],
+        },
+      },
+    },
+    {
+      expected: 'TARGET_STARTING',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+        lifecycle: {
+          operationStatus: () => null,
+          snapshot: () => ({ phase: 'starting', reserved: true }),
+          snapshots: () => [],
+        },
+      },
+    },
+    {
+      expected: 'TARGET_STOPPING',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+        lifecycle: {
+          operationStatus: () => null,
+          snapshot: () => ({ phase: 'stopping', reserved: true }),
+          snapshots: () => [],
+        },
+      },
+    },
+    {
+      before: async (fx) => {
+        const target = fx.targets.get('r/topic');
+        const checkoutIdentity = await inspectCheckoutIdentity(
+          target,
+          checkoutFs
+        );
+        await fx.state.replace('setupProgress', {
+          records: {
+            'r/topic': {
+              attemptId: 'attempt-1',
+              checkoutIdentity,
+              logLocation: '/tmp/setup.log',
+              outcome: null,
+              stage: 'install',
+              startedAt: 1,
+              state: 'running',
+              target: { name: 'topic', repo: 'r' },
+              updatedAt: 1,
+            },
+          },
+        });
+      },
+      expected: 'SETUP_ACTIVE',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+      },
+    },
+    {
+      before: async (fx) => {
+        await fx.state.replace('resourceAdmission', { leases: 'malformed' });
+      },
+      expected: 'ADMISSION_STATE_UNKNOWN',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+      },
+    },
+    {
+      expected: 'CONTAINER_MODE_UNSUPPORTED',
+      overrides: {
+        containerMode: async () => 'container',
+        dependencyFileEngineFactory: engineFactory,
+      },
+    },
+    {
+      expected: 'RUNTIME_UNKNOWN',
+      overrides: {
+        containerMode: async () => 'bare',
+        dependencyFileEngineFactory: engineFactory,
+        nativeRuntime: async () => 'unknown',
+      },
+    },
+  ];
+
+  await Promise.all(
+    cases.map(async (row) => {
+      const fx = await fixture(row.overrides);
+      try {
+        if (row.before) {
+          await row.before(fx);
+        }
+        const result = await json(
+          fx.services,
+          '/api/dependency-sharing/prepare',
+          {
+            body: JSON.stringify({ name: 'topic', repo: 'r' }),
+            headers: { 'content-type': 'application/json' },
+            method: 'POST',
+          }
+        );
+        expect(result).toMatchObject({ code: row.expected, ok: false });
+      } finally {
+        rmSync(fx.root, { force: true, recursive: true });
+      }
+    })
+  );
+
+  const claim = { wtDir: '' };
+  const claimed = await fixture({
+    claims: () => [claim],
+    containerMode: async () => 'bare',
+    dependencyFileEngineFactory: engineFactory,
+  });
+  claim.wtDir = claimed.topic;
+  try {
+    const result = await json(
+      claimed.services,
+      '/api/dependency-sharing/prepare',
+      {
+        body: JSON.stringify({ name: 'topic', repo: 'r' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }
+    );
+    expect(result).toMatchObject({ code: 'ACTIVE_WRITER', ok: false });
+  } finally {
+    rmSync(claimed.root, { force: true, recursive: true });
+  }
+});
+
+test('fresh enrollment refuses until the portal supplies durable setup binding', async () => {
+  const digest = 'a'.repeat(64);
+  const engineCalls = [];
+  const fx = await fixture({
+    containerMode: async () => 'bare',
+    dependencyFileEngineFactory: ({ assertMutable }) => ({
+      apply: async () => ({ ok: true }),
+      enrollFresh: async (target) => {
+        engineCalls.push(target.key);
+        await assertMutable(target, { phase: 'enroll-fresh' });
+        return { ok: true, operationId: digest, state: 'completed' };
+      },
+      prepare: async () => ({ ok: true }),
+      prepareRelease: async () => ({ ok: true }),
+      recover: async () => ({ ok: true }),
+      release: async () => ({ ok: true }),
+      status: async () => ({ ok: true }),
+    }),
+    hostHealth: async () => ({
+      availableBytes: Number.MAX_SAFE_INTEGER,
+      state: 'ready',
+    }),
+    lifecycle: {
+      operationStatus: () => ({ kind: 'setup', phase: 'running' }),
+      snapshot: () => ({ phase: 'running', reserved: true }),
+      snapshots: () => [],
+    },
+    resourceAdmission: {
+      status: async () => ({
+        leases: [
+          {
+            kind: 'install',
+            operationId: 'admission-install-exact',
+            ownership: 'confirmed',
+            recoveryRequired: false,
+            target: { name: 'topic', repo: 'r' },
+          },
+        ],
+        ok: true,
+      }),
+    },
+  });
+  try {
+    const target = await fx.targets.get('r/topic');
+    const checkoutIdentity = await inspectCheckoutIdentity(target, checkoutFs);
+    const setupContext = {
+      admissionOperationId: 'admission-install-exact',
+      attemptId: 'attempt-settled-1',
+      checkoutIdentity,
+      installerSettled: true,
+      target: { name: 'topic', repo: 'r' },
+    };
+    await fx.state.replace('setupProgress', {
+      records: {
+        topic: {
+          attemptId: setupContext.attemptId,
+          checkoutIdentity,
+          logLocation: '/fixture/setup.log',
+          outcome: null,
+          stage: 'dependency-enrollment',
+          startedAt: 1,
+          state: 'running',
+          target: setupContext.target,
+          updatedAt: 2,
+        },
+      },
+    });
+    const enrolled = await fx.services.dependencyFiles.enrollFresh(
+      { name: 'topic', repo: 'r' },
+      setupContext
+    );
+    expect(enrolled).toMatchObject({
+      code: 'DEPENDENCY_FILE_SETUP_BINDING_REQUIRED',
+      ok: false,
+    });
+    expect(engineCalls).toEqual([]);
+
+    const changed = await fx.services.dependencyFiles.enrollFresh(
+      { name: 'topic', repo: 'r' },
+      { ...setupContext, attemptId: 'different-attempt' }
+    );
+    expect(changed).toMatchObject({
+      code: 'DEPENDENCY_FILE_SETUP_CONTEXT_INVALID',
+      ok: false,
+    });
+    expect(engineCalls).toHaveLength(0);
+    const pathInjection = await fx.services.dependencyFiles.enrollFresh(
+      { name: 'topic', repo: 'r', wtDir: target.wtDir },
+      setupContext
+    );
+    expect(pathInjection).toMatchObject({
+      code: 'DEPENDENCY_FILE_SETUP_CONTEXT_INVALID',
+      ok: false,
+    });
+  } finally {
+    rmSync(fx.root, { force: true, recursive: true });
+  }
+});
+
+test('fresh enrollment blocks unresolved admission ownership and a sibling install lease', async () => {
+  const cases = [
+    { expected: 'ADMISSION_STATE_UNKNOWN', kind: 'unknown-owner' },
+    { expected: 'ACTIVE_ADMISSION', kind: 'sibling-install' },
+  ];
+  await Promise.all(
+    cases.map(async (row) => {
+      const fx = await fixture({
+        containerMode: async () => 'bare',
+        hostHealth: async () => ({
+          availableBytes: Number.MAX_SAFE_INTEGER,
+          state: 'ready',
+        }),
+        lifecycle: {
+          operationStatus: () => ({ kind: 'setup', phase: 'running' }),
+          snapshot: () => null,
+          snapshots: () => [],
+        },
+        // OS seam: the real admission factory receives a deterministic process
+        // identity observation so the test can exercise unknown-owner handling.
+        resourceAdmissionFactory: (state) =>
+          createResourceAdmission({
+            hostHealth: async () => ({
+              availableBytes: Number.MAX_SAFE_INTEGER,
+              state: 'ready',
+            }),
+            limits: { lowStorageFloorBytes: 0 },
+            observeProcess: async (pid) => ({
+              processId: pid,
+              processStartIdentity: 'observed-process-incarnation',
+              state: 'alive',
+            }),
+            state,
+          }),
+      });
+      try {
+        const target = await fx.targets.get('r/topic');
+        const checkoutIdentity = await inspectCheckoutIdentity(
+          target,
+          checkoutFs
+        );
+        const admissionOperationId = 'admission-setup-exact';
+        const setupContext = {
+          admissionOperationId,
+          attemptId: 'attempt-guarded-setup',
+          checkoutIdentity,
+          installerSettled: true,
+          target: { name: 'topic', repo: 'r' },
+        };
+        await fx.state.replace('setupProgress', {
+          records: {
+            'r/topic': {
+              attemptId: setupContext.attemptId,
+              checkoutIdentity,
+              dependencyEnrollment: {
+                admissionOperationId,
+                bunVersion: '1.3.14',
+                installerSettled: true,
+                version: 1,
+              },
+              logLocation: '/fixture/setup.log',
+              outcome: null,
+              stage: 'dependency-enrollment',
+              startedAt: 1,
+              state: 'running',
+              target: setupContext.target,
+              updatedAt: 2,
+            },
+          },
+        });
+        const exactLease = {
+          acquiredAt: 1,
+          kind: 'install',
+          operationId: admissionOperationId,
+          owner: {
+            pid: process.pid,
+            processStart: 'observed-process-incarnation',
+          },
+          target: { name: 'topic', repo: 'r' },
+        };
+        const leases = { [admissionOperationId]: exactLease };
+        if (row.kind === 'unknown-owner') {
+          leases[admissionOperationId].owner.processStart = 'stale-incarnation';
+        } else {
+          leases['admission-sibling-install'] = {
+            ...exactLease,
+            operationId: 'admission-sibling-install',
+            target: { name: 'other', repo: 'r' },
+          };
+        }
+        await fx.state.replace('resourceAdmission', { leases });
+
+        const result = await fx.services.dependencyFiles.enrollFresh(
+          { name: 'topic', repo: 'r' },
+          setupContext
+        );
+        expect(result).toMatchObject({ code: row.expected, ok: false });
+      } finally {
+        rmSync(fx.root, { force: true, recursive: true });
+      }
+    })
+  );
+});
+
+test('in-process MCP release preserves distinct review and known operation ids and leaves unknown ownership unset', async () => {
+  // Real G6 resource, service, wiring and MCP factories; the injected G4 engine
+  // isolates identity transport and does not claim native-operation coverage.
+  const releaseId = 'b'.repeat(64);
+  const operationId = 'c'.repeat(64);
+  async function assertMcpRelease(outcome) {
+    const fx = await fixture({
+      containerMode: async () => 'bare',
+      dependencyFileEngineFactory: () => ({
+        apply: async () => ({ ok: true }),
+        enrollFresh: async () => ({ ok: true }),
+        prepare: async () => ({ ok: true }),
+        prepareRelease: async () => ({ ok: true }),
+        recover: async () => ({ ok: true }),
+        release: () =>
+          outcome instanceof Error
+            ? Promise.reject(outcome)
+            : Promise.resolve({ ok: true, ...outcome }),
+        status: async () => ({ ok: true }),
+      }),
+    });
+    try {
+      initMcpServer({ dependencyRelease: fx.services.dependencyRelease });
+      const mcp = await mcpTool('release_dependency_originals', {
+        confirmation: releaseId,
+        name: 'topic',
+        releaseId,
+        repo: 'r',
+      });
+      const result = JSON.parse(mcp.result.content[0].text);
+      expect(result.releaseId).toBe(releaseId);
+      if (outcome instanceof Error) {
+        expect(result).toMatchObject({ ok: false });
+        expect(result).not.toHaveProperty('operationId');
+      } else {
+        expect(result).toMatchObject({ ok: true, operationId, releaseId });
+        expect(result.operationId).not.toBe(releaseId);
+      }
+    } finally {
+      rmSync(fx.root, { force: true, recursive: true });
+    }
+  }
+
+  await assertMcpRelease({ operationId, releaseId });
+  await assertMcpRelease(
+    new Error('engine lost the response before loading the owning operation')
+  );
 });
 
 test('the imported dispatcher and MCP expose the same managed-service malformed-journal refusal', async () => {

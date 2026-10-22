@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -325,6 +326,94 @@ test('unknown background ownership retains its cooperating-writer lock while ret
   );
   expect(held).toBe(1);
   expect(f.lifecycle.quiesce().ok).toBe(false);
+});
+
+test('setup recovery continues inside the retained lock and releases only after durable completion', async () => {
+  const context = new AsyncLocalStorage();
+  const lockOwner = Symbol('original setup owner');
+  let held = false;
+  const f = fixture({
+    controller: {
+      withTarget: (_target, work) =>
+        context.run(lockOwner, async () => {
+          expect(held).toBe(false);
+          held = true;
+          try {
+            return await work();
+          } finally {
+            held = false;
+          }
+        }),
+    },
+  });
+  const unknown = await f.lifecycle.runOperation(target('a'), 'setup', () => {
+    throw Object.assign(new Error('enrollment outcome lost'), {
+      code: 'OPERATION_UNKNOWN',
+    });
+  });
+  expect(unknown.code).toBe('OPERATION_UNKNOWN');
+  const recovered = await f.lifecycle.resumeUnknownOperation(
+    target('a'),
+    'setup',
+    () => {
+      expect(context.getStore()).toBe(lockOwner);
+      expect(held).toBe(true);
+      return { ok: true, state: 'partial' };
+    }
+  );
+  expect(recovered.state).toBe('partial');
+  expect(held).toBe(true);
+  await expect(
+    f.lifecycle.resumeUnknownOperation(target('a'), 'setup', () => {
+      throw new Error('journal remains unreadable');
+    })
+  ).rejects.toThrow('journal remains unreadable');
+  expect(held).toBe(true);
+  const gate = deferred();
+  const applied = f.lifecycle.resumeUnknownOperation(
+    target('a'),
+    'setup',
+    async () => {
+      expect(context.getStore()).toBe(lockOwner);
+      await gate.promise;
+      return { ok: true, setupRecoveryComplete: true };
+    }
+  );
+  expect(
+    (await f.lifecycle.resumeUnknownOperation(target('a'), 'setup', () => ({})))
+      .code
+  ).toBe('TARGET_BUSY');
+  gate.resolve();
+  expect((await applied).setupRecoveryComplete).toBe(true);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(held).toBe(false);
+});
+
+test('setup recovery cannot enter another kind or a running operation', async () => {
+  const f = fixture();
+  const gate = deferred();
+  const started = deferred();
+  const operation = f.lifecycle.runOperation(target('a'), 'setup', async () => {
+    started.resolve();
+    await gate.promise;
+    return { ok: true };
+  });
+  await started.promise;
+  let invoked = false;
+  const work = () => {
+    invoked = true;
+    return { ok: true };
+  };
+  expect(
+    (await f.lifecycle.resumeUnknownOperation(target('a'), 'setup', work)).code
+  ).toBe('TARGET_BUSY');
+  expect(
+    (await f.lifecycle.resumeUnknownOperation(target('b'), 'remove', work)).code
+  ).toBe('TARGET_BUSY');
+  expect(invoked).toBe(false);
+  gate.resolve();
+  expect((await operation).ok).toBe(true);
 });
 
 test('a dequeued target reserves its slot while asynchronous revalidation is pending', async () => {

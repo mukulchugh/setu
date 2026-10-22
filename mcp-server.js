@@ -74,6 +74,10 @@ async function mutationResult(call) {
       'reconciled',
       'phase',
       'operationId',
+      'planId',
+      'releaseId',
+      'state',
+      'recovery',
     ]) {
       const value = errorProperty(error, key);
       if (value !== undefined) {
@@ -699,6 +703,78 @@ function registerTools(server) {
     },
     (input) =>
       mutationResult(() => deps.dependencyRepair({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'prepare_dependency_sharing',
+    {
+      description:
+        'Prepare a reviewable hoisted dependency sharing plan for one registered worktree.',
+      inputSchema: z.strictObject(worktree),
+      title: 'Prepare dependency sharing',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyPrepare({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'apply_dependency_sharing',
+    {
+      description:
+        'Apply the exact reviewed dependency plan. Supply its plan ID and matching confirmation token; an operation ID defaults to the plan ID.',
+      inputSchema: z.strictObject({
+        ...worktree,
+        confirmation: z.string().min(1),
+        operationId: z.string().min(1).optional(),
+        planId: z.string().min(1),
+      }),
+      title: 'Apply dependency sharing',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyApply({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'recover_dependency_sharing',
+    {
+      description:
+        'Reconcile one recorded dependency sharing operation without replacing or deleting files.',
+      inputSchema: z.strictObject({
+        ...worktree,
+        operationId: z.string().min(1),
+      }),
+      title: 'Recover dependency sharing',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyRecover({ ...input, source: 'mcp' }))
+  );
+  server.registerTool(
+    'prepare_dependency_release',
+    {
+      description:
+        'Prepare a separate review of the exact original dependency files retained by one operation.',
+      inputSchema: z.strictObject({
+        ...worktree,
+        operationId: z.string().min(1),
+      }),
+      title: 'Prepare dependency release',
+    },
+    (input) =>
+      mutationResult(() =>
+        deps.dependencyPrepareRelease({ ...input, source: 'mcp' })
+      )
+  );
+  server.registerTool(
+    'release_dependency_originals',
+    {
+      description:
+        'Release only the exact reviewed original dependency files. Supply the release ID and its confirmation token.',
+      inputSchema: z.strictObject({
+        ...worktree,
+        confirmation: z.string().min(1),
+        releaseId: z.string().min(1),
+      }),
+      title: 'Release dependency originals',
+    },
+    (input) =>
+      mutationResult(() => deps.dependencyRelease({ ...input, source: 'mcp' }))
   );
   server.registerTool(
     'end_agent_session',

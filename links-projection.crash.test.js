@@ -82,11 +82,78 @@ function inspect(root) {
 
 async function child(root, killAt, killOn, count = EVENTS) {
   const process_ = Bun.spawn(
-    ['bun', fixture, root, String(count), killAt, String(killOn)],
+    [process.execPath, fixture, root, String(count), killAt, String(killOn)],
     { stderr: 'ignore', stdout: 'pipe' }
   );
   const code = await process_.exited;
   return code;
+}
+
+function createMessageReader(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+
+  return async function nextMessage() {
+    for (;;) {
+      const newline = buffered.indexOf('\n');
+      if (newline !== -1) {
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        return JSON.parse(line);
+      }
+      // biome-ignore lint/performance/noAwaitInLoops: Read the child protocol one chunk at a time.
+      const { done, value } = await reader.read();
+      if (done) {
+        throw new Error(
+          'Crash fixture exited before reporting a read boundary'
+        );
+      }
+      buffered += decoder.decode(value, { stream: true });
+    }
+  };
+}
+
+async function waitForReadBoundary(nextMessage, expectedOffset) {
+  let timer;
+  try {
+    const message = await Promise.race([
+      nextMessage(),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Crash fixture read boundary timed out')),
+          10_000
+        );
+      }),
+    ]);
+    if (message.type !== 'read-ready' || message.after !== expectedOffset) {
+      throw new Error(
+        `Expected a read boundary at ${expectedOffset}; got ${message.after}`
+      );
+    }
+    return message;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pauseableChild(root, count) {
+  const process_ = Bun.spawn(
+    [
+      process.execPath,
+      fixture,
+      root,
+      String(count),
+      'never',
+      '1',
+      'pause-reads',
+    ],
+    { stderr: 'ignore', stdin: 'pipe', stdout: 'pipe' }
+  );
+  return {
+    nextMessage: createMessageReader(process_.stdout),
+    process: process_,
+  };
 }
 
 const consistent = ({ ids, offset }) => {
@@ -135,30 +202,41 @@ for (const [killAt, killOn] of [
   });
 }
 
-test('SIGKILL at many arbitrary instants, including inside the open archive transaction', async () => {
-  const total = 3000;
+test('SIGKILL live workers at observed page boundaries, then restart to the uninterrupted history', async () => {
+  const total = 1000;
   const root = seedRoot();
-  const delays = [60, 90, 120, 150, 180, 210, 240, 280, 320, 380];
-  let killedMidRun = 0;
-  for (const delay of delays) {
-    const running = Bun.spawn(['bun', fixture, root, String(total)], {
-      stderr: 'ignore',
-      stdout: 'ignore',
-    });
-    // biome-ignore lint/performance/noAwaitInLoops: each worker must be killed and inspected before the next starts.
-    const finished = await Promise.race([
-      running.exited.then(() => true),
-      Bun.sleep(delay).then(() => false),
-    ]);
-    if (!finished) {
-      running.kill('SIGKILL');
-      await running.exited;
-      killedMidRun += 1;
+  const killOffsets = [0, 100, 300, 600, 900];
+  for (const killOffset of killOffsets) {
+    const running = pauseableChild(root, total);
+    try {
+      let cursor = inspect(root).offset;
+      while (cursor < killOffset) {
+        // biome-ignore lint/performance/noAwaitInLoops: Release only the page at the current archive cursor.
+        await waitForReadBoundary(running.nextMessage, cursor);
+        await running.process.stdin.write('continue\n');
+        await running.process.stdin.flush();
+        cursor += 100;
+      }
+      const boundary = await waitForReadBoundary(
+        running.nextMessage,
+        killOffset
+      );
+      expect(boundary.count).toBeGreaterThan(0);
+      expect(inspect(root).offset).toBe(killOffset);
+
+      // The fixture holds the worker after a real engine page read and before
+      // the projection can commit it, so this SIGKILL is deterministic.
+      running.process.kill('SIGKILL');
+      expect(await running.process.exited).not.toBe(0);
+      consistent(inspect(root));
+    } finally {
+      if (running.process.exitCode === null) {
+        running.process.kill('SIGKILL');
+      }
+      await running.process.exited;
     }
-    consistent(inspect(root));
   }
-  // The test is only meaningful if workers really were killed while working.
-  expect(killedMidRun).toBeGreaterThanOrEqual(3);
+
   expect(await child(root, 'never', 1, total)).toBe(0);
   const finished = inspect(root);
   consistent(finished);

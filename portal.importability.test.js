@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { createPortalRuntime } from './portal.js';
 import { createWorkspaceState } from './workspace-state.js';
@@ -25,7 +27,7 @@ async function fixture(options = {}) {
   });
   const server = {
     requestIP: () => ({ address: '127.0.0.1' }),
-    timeout: () => undefined,
+    timeout: options.requestTimeout ?? (() => undefined),
   };
   return {
     dispose: async () => {
@@ -36,7 +38,7 @@ async function fixture(options = {}) {
     request: (path, body, source = 'ui') =>
       portal.handle(
         new Request(
-          `http://localhost:2999${path}`,
+          `http://localhost:${options.port ?? 2999}${path}`,
           body === undefined
             ? {}
             : {
@@ -51,6 +53,28 @@ async function fixture(options = {}) {
     state,
   };
 }
+
+test('dependency file mutations retain their connection beyond the ordinary server idle window', async () => {
+  const timeouts = [];
+  const fx = await fixture({
+    port: 43_210,
+    requestTimeout: (request, seconds) => {
+      timeouts.push({ path: new URL(request.url).pathname, seconds });
+    },
+  });
+  try {
+    await fx.request('/api/dependency-sharing/prepare', {
+      name: 'missing',
+      repo: 'fixture',
+    });
+    await fx.request('/api/operations');
+    expect(timeouts).toEqual([
+      { path: '/api/dependency-sharing/prepare', seconds: 0 },
+    ]);
+  } finally {
+    await fx.dispose();
+  }
+});
 
 function mcpInitializeRequest(port, host = `localhost:${port}`) {
   return new Request(`http://localhost:${port}/mcp`, {
@@ -277,19 +301,23 @@ test('a queued HTTP start records completion only after the real lifecycle obser
   }
 });
 
-test('explicit startup binds one injected server and dispose removes its hooks and timers', async () => {
+test('explicit startup binds one injected server, installs dependency MCP handlers and disposes its hooks and timers', async () => {
   const timers = new Set();
   let timerId = 0,
     served = 0,
     stopped = 0,
     migrations = 0,
     routed = 0,
-    routes;
+    routes,
+    installedMcp;
   const before = process.listenerCount('SIGTERM');
   const fx = await fixture({
     computeWorktrees: async () => [],
     indexPage: new Response('fixture'),
-    initializeMcp: () => undefined,
+    initializeMcp: (deps) => {
+      installedMcp = deps;
+      initMcpServer(deps);
+    },
     managedAgents: {
       dispose: async () => {
         // The fixture starts no managed agents.
@@ -342,6 +370,74 @@ test('explicit startup binds one injected server and dispose removes its hooks a
     expect(served).toBe(0);
     await Promise.all([fx.portal.start(), fx.portal.start()]);
     expect([served, migrations, routed]).toEqual([1, 1, 1]);
+    const digest = 'a'.repeat(64);
+    await Promise.all(
+      [
+        ['dependencyPrepare', 'prepare_dependency_sharing', {}],
+        [
+          'dependencyApply',
+          'apply_dependency_sharing',
+          { confirmation: digest, planId: digest },
+        ],
+        [
+          'dependencyRecover',
+          'recover_dependency_sharing',
+          { operationId: digest },
+        ],
+        [
+          'dependencyPrepareRelease',
+          'prepare_dependency_release',
+          { operationId: digest },
+        ],
+        [
+          'dependencyRelease',
+          'release_dependency_originals',
+          { confirmation: digest, releaseId: digest },
+        ],
+      ].map(async ([dependency, tool, review]) => {
+        expect(typeof installedMcp[dependency], dependency).toBe('function');
+        const response = await handleMcpRequest(
+          new Request('http://localhost:43210/mcp', {
+            body: JSON.stringify({
+              id: tool,
+              jsonrpc: '2.0',
+              method: 'tools/call',
+              params: {
+                arguments: { name: 'missing', repo: 'fixture', ...review },
+                name: tool,
+              },
+            }),
+            headers: {
+              accept: 'application/json, text/event-stream',
+              'content-type': 'application/json',
+              host: 'localhost:43210',
+            },
+            method: 'POST',
+          }),
+          43_210
+        );
+        expect(response.status).toBe(200);
+        const wire = await response.text();
+        const payload = response.headers
+          .get('content-type')
+          ?.includes('text/event-stream')
+          ? JSON.parse(
+              wire
+                .split('\n')
+                .find((line) => line.startsWith('data:'))
+                .slice(5)
+            )
+          : JSON.parse(wire);
+        const result = JSON.parse(
+          payload.result.content.find((item) => item.type === 'text').text
+        );
+        expect(result).toMatchObject({
+          code: 'WORKTREE_NOT_FOUND',
+          ok: false,
+        });
+        expect(payload.result.isError).toBe(true);
+      })
+    );
     expect(routes['/links']).toBeDefined();
     // Log retention, memory ceilings, idle timeouts and the Links presence round.
     expect(timers.size).toBe(4);
@@ -448,6 +544,121 @@ test('real fixture removal uses injected routing without invoking host commands'
     expect(existsSync(checkout)).toBe(false);
     expect(fx.state.read('ports')).toEqual([]);
     expect(effects).toEqual(['reconcile', 'tunnel', 'hosts', 'caddy']);
+  } finally {
+    await fx.dispose();
+  }
+});
+
+async function registerEmptyFixture(fx) {
+  const bare = join(fx.root, 'fixture.git');
+  const checkout = join(fx.root, 'fixture', 'topic');
+  const git = (...args) =>
+    execFileSync('git', args, {
+      encoding: 'utf8',
+      input: '',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  git('init', '--bare', bare);
+  const tree = git('-C', bare, 'mktree');
+  const revision = git(
+    '-C',
+    bare,
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.invalid',
+    'commit-tree',
+    tree,
+    '-m',
+    'fixture'
+  );
+  git('-C', bare, 'update-ref', 'refs/heads/main', revision);
+  git('-C', bare, 'worktree', 'add', '--detach', checkout, revision);
+  await fx.state.replace('projects', {
+    fixture: { base: 3910, label: 'Fixture', slug: null },
+  });
+  await fx.state.replace('ports', [
+    { key: 'fixture/topic', name: 'topic', port: 3910, repo: 'fixture' },
+  ]);
+  return { bare, checkout };
+}
+
+test('retry of unknown enrollment never enters new installation admission or invents a dependency operation id', async () => {
+  let admissionChecks = 0;
+  const fx = await fixture({
+    hostHealth: () => {
+      admissionChecks += 1;
+      throw new Error('New installation admission must not run');
+    },
+    port: 43_210,
+  });
+  try {
+    const { bare, checkout } = await registerEmptyFixture(fx);
+    const identity = await inspectCheckoutIdentity(
+      { repoDir: bare, wtDir: checkout },
+      { lstat, readFile, realpath, stat }
+    );
+    expect(identity.known).toBe(true);
+    const record = {
+      attemptId: 'original-enrollment-attempt',
+      checkoutIdentity: identity,
+      finishedAt: 2,
+      logLocation: join(fx.root, 'setup.log'),
+      outcome: 'unknown',
+      stage: 'dependency-enrollment',
+      startedAt: 1,
+      state: 'unknown',
+      target: { name: 'topic', repo: 'fixture' },
+      updatedAt: 2,
+    };
+    await fx.state.replace('setupProgress', {
+      records: { 'fixture/topic': record },
+    });
+    const result = await (
+      await fx.request('/api/setup-progress/retry', {
+        attemptId: record.attemptId,
+        checkoutIdentity: identity,
+        ...record.target,
+      })
+    ).json();
+    expect(result).toMatchObject({
+      code: 'DEPENDENCY_FILE_SETUP_BINDING_REQUIRED',
+      ok: false,
+    });
+    expect(typeof result.eventId).toBe('string');
+    expect(result.operationId).toBeUndefined();
+    expect(admissionChecks).toBe(0);
+    expect(fx.state.read('setupProgress').records['fixture/topic']).toEqual(
+      record
+    );
+    expect(existsSync(join(checkout, 'node_modules'))).toBe(false);
+  } finally {
+    await fx.dispose();
+  }
+});
+
+test('dependency conversion refuses retained listeners after their observation becomes unknown', async () => {
+  const fx = await fixture({
+    listenerObservation: {
+      observation: () => ({ observedAt: Date.now(), state: 'unknown' }),
+      read: () => Promise.resolve([]),
+    },
+    port: 43_210,
+  });
+  try {
+    await registerEmptyFixture(fx);
+    const result = await (
+      await fx.request('/api/dependency-sharing/prepare', {
+        name: 'topic',
+        repo: 'fixture',
+      })
+    ).json();
+    expect(result).toMatchObject({ code: 'RUNTIME_UNKNOWN', ok: false });
+    expect(fx.state.read('dependencyFiles')).toEqual({
+      operations: {},
+      version: 1,
+      views: {},
+    });
   } finally {
     await fx.dispose();
   }

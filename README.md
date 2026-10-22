@@ -133,6 +133,12 @@ unknown when Setu cannot establish them.
 
 ### Experimental host dependency sharing
 
+Shared package downloads and installed dependency views are separate. A shared
+download cache avoids repeated downloads; it does not establish that installed
+packages are shared. The native installed-store path below uses isolated linking.
+The separate [hoisted file workflow](docs/dependency-sharing.md) keeps hoisted
+paths and requires a reviewed conversion; neither path adopts existing views automatically.
+
 Sharing is off by default and applies only to explicitly named fresh checkouts.
 All participating projects and worktrees use one centrally configured store.
 Bun's native global store installs eligible package content once and links each
@@ -173,6 +179,8 @@ the same policy and reject malformed sharing configuration before creating a
 checkout. The checkout needs a regular
 `bun.lock` and no existing root `node_modules`; existing views are never converted
 automatically. Normal setup remains unchanged for every other target.
+Dependency repair returns a proposed command only; it does not run an install
+or replace the existing view.
 
 The earlier per-target policy map must be migrated explicitly: move the shared
 store/installer fields to the central setting and list target names under
@@ -187,6 +195,9 @@ versions and resolved peer/dependency graphs remain distinct inside it. The
 entries; it does not disable the global store's symlinks for eligible packages.
 Patched/trusted packages and packages tied to local workspace paths can remain
 local. Their presence must be measured rather than reported as full deduplication.
+The status explanation identifies observed local fallback data, but does not
+measure disk savings. Directory sizes and APFS copy-on-write observations do
+not establish unique physical reclaim.
 
 External-SSD migration is not enabled by this configuration example. It requires
 verified volume identity and missing-drive handling before existing consumers
@@ -236,3 +247,5 @@ copytruncate policy can lose a concurrent line during trimming and allows bursts
 After installing the root and Raycast dependencies, run `bun run verify` for lifecycle,
 security, resource, log, and cost regression checks plus separate portal and Raycast type checks.
 The repository-wide `bun run check` also applies the existing Ultracite style rules.
+
+For the opt-in isolated and hoisted workflows, native helper build, exact review IDs and recovery limits, see [Shared dependencies](docs/dependency-sharing.md).

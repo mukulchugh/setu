@@ -331,3 +331,159 @@ test('a dead owner remains visible as uncertain until its exact lease is recover
     })
   ).resolves.toMatchObject({ ok: true });
 });
+
+async function seedRecoverableLease(state, overrides = {}) {
+  const lease = {
+    acquiredAt: 41,
+    kind: 'install',
+    operationId: 'recover-this',
+    owner: { pid: 987_654, processStart: 'old-incarnation' },
+    target: { name: 'topic', repo: 'repo' },
+    ...overrides,
+  };
+  await state.replace('resourceAdmission', {
+    leases: { [lease.operationId]: lease },
+  });
+  return lease;
+}
+
+function recoveryAdmission(state, oldObservation) {
+  return createResourceAdmission({
+    hostHealth: async () => ({ availableBytes: 0, state: 'unknown' }),
+    observeProcess: async (pid) =>
+      pid === process.pid
+        ? {
+            processId: pid,
+            processStartIdentity: 'current-incarnation',
+            state: 'alive',
+          }
+        : oldObservation(pid),
+    state,
+  });
+}
+
+test('recoverLease transfers one absent-owner lease without changing its identity or checking capacity', async () => {
+  const f = fixture();
+  const original = await seedRecoverableLease(f.state);
+  let oldOwnerReads = 0;
+  const admission = recoveryAdmission(f.state, () => {
+    oldOwnerReads += 1;
+    return { state: 'absent' };
+  });
+
+  const recovered = await admission.recoverLease(original);
+  expect(recovered).toMatchObject({
+    lease: {
+      acquiredAt: original.acquiredAt,
+      kind: original.kind,
+      operationId: original.operationId,
+      owner: { pid: process.pid, processStart: 'current-incarnation' },
+      target: original.target,
+    },
+    ok: true,
+  });
+  expect(oldOwnerReads).toBe(2);
+  expect(
+    f.state.read('resourceAdmission').leases[original.operationId]
+  ).toEqual({
+    ...original,
+    owner: recovered.lease.owner,
+  });
+  await expect(admission.recoverLease(recovered.lease)).resolves.toMatchObject({
+    lease: recovered.lease,
+    ok: true,
+  });
+});
+
+test('recoverLease accepts a positively replaced prior PID incarnation', async () => {
+  const f = fixture();
+  const original = await seedRecoverableLease(f.state);
+  let reads = 0;
+  const admission = recoveryAdmission(f.state, (pid) => {
+    reads += 1;
+    return {
+      processId: pid,
+      processStartIdentity: 'new-incarnation',
+      state: 'alive',
+    };
+  });
+  await expect(admission.recoverLease(original)).resolves.toMatchObject({
+    ok: true,
+  });
+  expect(reads).toBe(2);
+});
+
+test.each([
+  [
+    'same prior incarnation',
+    (pid) => ({
+      processId: pid,
+      processStartIdentity: 'old-incarnation',
+      state: 'alive',
+    }),
+  ],
+  ['unknown prior owner', () => ({ state: 'unknown' })],
+  [
+    'unreadable prior owner',
+    () => {
+      throw new Error('probe failed');
+    },
+  ],
+])(
+  'recoverLease refuses %s and retains the exact lease',
+  async (_label, observeOld) => {
+    const f = fixture();
+    const original = await seedRecoverableLease(f.state);
+    const admission = recoveryAdmission(f.state, observeOld);
+    await expect(admission.recoverLease(original)).resolves.toMatchObject({
+      code: 'LEASE_OWNER_NOT_RECOVERABLE',
+      ok: false,
+    });
+    expect(
+      f.state.read('resourceAdmission').leases[original.operationId]
+    ).toEqual(original);
+  }
+);
+
+test('recoverLease rejects a stale exact identity and detects replacement during the serialized update', async () => {
+  const f = fixture();
+  const original = await seedRecoverableLease(f.state);
+  const admission = recoveryAdmission(f.state, () => ({ state: 'absent' }));
+  await expect(
+    admission.recoverLease({ ...original, acquiredAt: 42 })
+  ).resolves.toMatchObject({
+    code: 'LEASE_MISMATCH',
+    ok: false,
+  });
+
+  let updates = 0;
+  const racingState = {
+    read: (key) => f.state.read(key),
+    update: (key, transform) => {
+      updates += 1;
+      if (updates === 1) {
+        return f.state.update(key, (document) =>
+          transform({
+            ...document,
+            leases: {
+              ...document.leases,
+              [original.operationId]: {
+                ...original,
+                acquiredAt: original.acquiredAt + 1,
+              },
+            },
+          })
+        );
+      }
+      return f.state.update(key, transform);
+    },
+  };
+  const racing = recoveryAdmission(racingState, () => ({ state: 'absent' }));
+  await expect(racing.recoverLease(original)).resolves.toMatchObject({
+    code: 'LEASE_MISMATCH',
+    ok: false,
+  });
+  expect(
+    f.state.read('resourceAdmission').leases[original.operationId].acquiredAt
+  ).toBe(42);
+});

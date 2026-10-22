@@ -3,7 +3,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import nativeFs from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+} from 'node:path';
 
 // One async chain must never invert the documented routing -> workspace -> document order.
 const lockContext = new AsyncLocalStorage();
@@ -108,6 +115,226 @@ const sidecar = (value) =>
 const perRepo = (value, validate) =>
   object(value) &&
   Object.entries(value).every(([repo, row]) => repoName(repo) && validate(row));
+
+const dependencyFileDigest = /^[a-f0-9]{64}$/;
+const dependencyFileDigits = /^\d+$/;
+const dependencyFileCode = /^[A-Z0-9_]{1,64}$/;
+const pathSeparators = /[/\\]/;
+const dependencyFileStates = new Set([
+  'prepared',
+  'running',
+  'partial',
+  'completed',
+  'unknown',
+  'conflict',
+  'released',
+]);
+
+function safeDependencyFileJson(value, depth = 0, budget = { nodes: 0 }) {
+  budget.nodes += 1;
+  if (depth > 16 || budget.nodes > 20_000) {
+    return false;
+  }
+  if (
+    value === null ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isSafeInteger(value))
+  ) {
+    return true;
+  }
+  if (typeof value === 'string') {
+    return value.length <= 16_384;
+  }
+  if (Array.isArray(value)) {
+    return (
+      value.length <= 20_000 &&
+      value.every((entry) => safeDependencyFileJson(entry, depth + 1, budget))
+    );
+  }
+  if (!object(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  return Object.entries(value).every(
+    ([key, entry]) =>
+      key.length > 0 &&
+      key.length <= 128 &&
+      !['__proto__', 'prototype', 'constructor'].includes(key) &&
+      safeDependencyFileJson(entry, depth + 1, budget)
+  );
+}
+
+function canonicalDependencyFilePath(value) {
+  return (
+    typeof value === 'string' &&
+    isAbsolute(value) &&
+    normalize(value) === value &&
+    !value.split(pathSeparators).includes('..')
+  );
+}
+
+function validDependencyFileCheckoutIdentity(value) {
+  const exact = (candidate, keys) =>
+    object(candidate) &&
+    Object.keys(candidate).sort().join(',') === [...keys].sort().join(',');
+  const decimalEvidence = (candidate) =>
+    exact(candidate, ['birthtimeNs', 'dev', 'ino']) &&
+    ['birthtimeNs', 'dev', 'ino'].every(
+      (key) =>
+        typeof candidate[key] === 'string' &&
+        dependencyFileDigits.test(candidate[key])
+    ) &&
+    candidate.birthtimeNs !== '0' &&
+    candidate.ino !== '0';
+  return (
+    exact(value, [
+      'known',
+      'checkoutPath',
+      'repositoryPath',
+      'adminPath',
+      'checkout',
+      'repository',
+      'admin',
+    ]) &&
+    value.known === true &&
+    ['checkoutPath', 'repositoryPath', 'adminPath'].every((key) =>
+      canonicalDependencyFilePath(value[key])
+    ) &&
+    ['checkout', 'repository', 'admin'].every((key) =>
+      decimalEvidence(value[key])
+    ) &&
+    safeDependencyFileJson(value)
+  );
+}
+
+function validDependencyFileStoreIdentity(value) {
+  const keys = [
+    'root',
+    'device',
+    'mountPath',
+    'executable',
+    'version',
+    'namespace',
+  ];
+  if (
+    !object(value) ||
+    Object.keys(value).sort().join(',') !== [...keys].sort().join(',') ||
+    !['root', 'mountPath', 'executable'].every((key) =>
+      canonicalDependencyFilePath(value[key])
+    ) ||
+    typeof value.device !== 'string' ||
+    !dependencyFileDigits.test(value.device) ||
+    value.version !== '1.3.14' ||
+    value.namespace !== 'hoisted/darwin-arm64-bun-1.3.14'
+  ) {
+    return false;
+  }
+  // The store verifies the observed device; macOS firmlinks defeat text ancestry.
+  return value.root !== value.mountPath && safeDependencyFileJson(value);
+}
+
+function validDependencyFileSummary(value) {
+  const keys = [
+    'version',
+    'id',
+    'planId',
+    'mode',
+    'repo',
+    'name',
+    'checkoutIdentity',
+    'inputDigest',
+    'storeIdentity',
+    'state',
+    'completedFiles',
+    'retainedOriginalFiles',
+    'totalFiles',
+    'logicalCloneBytes',
+    'physicalSavingsBytes',
+    'createdAt',
+    'updatedAt',
+  ];
+  if (!object(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  const required = [
+    ...keys,
+    ...(Object.hasOwn(value, 'code') ? ['code'] : []),
+  ].sort();
+  return (
+    actual.length === required.length &&
+    actual.every((key, index) => key === required[index]) &&
+    value.version === 1 &&
+    dependencyFileDigest.test(value.id) &&
+    value.id === value.planId &&
+    value.mode === 'hoisted-cow' &&
+    repoName(value.repo) &&
+    branchName(value.name) &&
+    validDependencyFileCheckoutIdentity(value.checkoutIdentity) &&
+    dependencyFileDigest.test(value.inputDigest) &&
+    validDependencyFileStoreIdentity(value.storeIdentity) &&
+    dependencyFileStates.has(value.state) &&
+    Number.isSafeInteger(value.completedFiles) &&
+    value.completedFiles >= 0 &&
+    Number.isSafeInteger(value.retainedOriginalFiles) &&
+    value.retainedOriginalFiles >= 0 &&
+    Number.isSafeInteger(value.totalFiles) &&
+    value.totalFiles >= 0 &&
+    value.completedFiles <= value.totalFiles &&
+    value.retainedOriginalFiles <= value.totalFiles &&
+    (value.state !== 'prepared' ||
+      (value.completedFiles === 0 && value.retainedOriginalFiles === 0)) &&
+    (value.state !== 'completed' ||
+      value.completedFiles === value.totalFiles) &&
+    (value.state !== 'released' ||
+      (value.completedFiles === value.totalFiles &&
+        value.retainedOriginalFiles === 0)) &&
+    Number.isSafeInteger(value.logicalCloneBytes) &&
+    value.logicalCloneBytes >= 0 &&
+    value.physicalSavingsBytes === null &&
+    Number.isSafeInteger(value.createdAt) &&
+    value.createdAt >= 0 &&
+    Number.isSafeInteger(value.updatedAt) &&
+    value.updatedAt >= value.createdAt &&
+    (!Object.hasOwn(value, 'code') ||
+      (typeof value.code === 'string' && dependencyFileCode.test(value.code)))
+  );
+}
+
+function validDependencyFilesDocument(value) {
+  if (
+    !object(value) ||
+    Object.keys(value).sort().join(',') !== 'operations,version,views' ||
+    value.version !== 1 ||
+    !object(value.operations) ||
+    !object(value.views)
+  ) {
+    return false;
+  }
+  for (const [id, summary] of Object.entries(value.operations)) {
+    if (
+      !(
+        dependencyFileDigest.test(id) &&
+        validDependencyFileSummary(summary) &&
+        summary.id === id
+      )
+    ) {
+      return false;
+    }
+  }
+  for (const [target, summary] of Object.entries(value.views)) {
+    if (
+      !validDependencyFileSummary(summary) ||
+      target !== `${summary.repo}/${summary.name}`
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export function parsePorts(text) {
   const seenKeys = new Set(),
@@ -219,6 +446,12 @@ const definitions = {
             (key) => typeof row[key] === 'string'
           )
       ),
+  },
+  dependencyFiles: {
+    file: '.setu-dependency-files.json',
+    initial: () => ({ operations: {}, version: 1, views: {} }),
+    private: true,
+    validate: validDependencyFilesDocument,
   },
   dependencyViews: {
     file: '.setu-dependency-views.json',

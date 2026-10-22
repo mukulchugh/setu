@@ -50,3 +50,6 @@ echo ""
 echo "✓ setu ready — run: setu setup   (or: setu setup --name <you> --yes for non-interactive)"
 echo "  setu setup also checks for Raycast and, if it's installed, prints the one manual"
 echo "  step to load the Setu Raycast extension (cd raycast && bun install && bunx ray develop)"
+
+echo "  Optional hoisted dependency sharing needs a separately approved native helper build."
+echo "  See docs/dependency-sharing.md before enabling or converting a checkout."

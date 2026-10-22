@@ -254,7 +254,7 @@ test.each([
       const spawned = f.effects.find(([kind]) => kind === 'spawn');
       if (manifest) {
         expect(calls[0].slice(0, 2)).toEqual([command, args]);
-        expect(spawned[1].slice(4)).toEqual([command, ...args]);
+        expect(spawned[1]).toEqual([command, ...args]);
       } else {
         expect(calls).toEqual([]);
         expect(spawned).toBeUndefined();
@@ -924,6 +924,35 @@ test('CLI create retains admission when both install outcome and progress persis
   }
 });
 
+test('CLI setup threads the admitted lease operation id into installer context', async () => {
+  const f = durableFixture();
+  const wtDir = join(f.workspace, 'repo', 'topic');
+  mkdirSync(wtDir, { recursive: true });
+  const lease = { kind: 'install', operationId: 'lease-operation-exact' };
+  let installContext;
+  try {
+    await createAndInstallWorktree({
+      admission: {
+        admit: async () => ({ lease, ok: true }),
+        release: async (received) => ({ ok: received === lease }),
+      },
+      checkoutIdentity: async () => realpathSync(wtDir),
+      create: async () => ({ wtDir }),
+      install: (_path, context) => {
+        installContext = context;
+      },
+      logLocation: join(f.root, 'setup.log'),
+      name: 'topic',
+      operationId: 'lease-operation-exact',
+      repo: 'repo',
+      state: f.state,
+    });
+    expect(installContext.admissionOperationId).toBe(lease.operationId);
+  } finally {
+    f.dispose();
+  }
+});
+
 test('completed create retry does not reinstall or move tunnel ownership', async () => {
   const f = durableFixture();
   const target = { name: 'topic', repo: 'repo' };
@@ -968,7 +997,7 @@ test('completed create retry does not reinstall or move tunnel ownership', async
       state: f.state,
       tunnel: true,
     });
-    expect(result).toMatchObject({ setup: 'ready', wtDir });
+    expect(result).toMatchObject({ setup: 'unverified', wtDir });
     expect(installs).toBe(0);
     expect(tunnels).toBe(0);
   } finally {

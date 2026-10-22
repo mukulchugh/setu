@@ -93,6 +93,49 @@ function snapshotDescendants(rows, rootPid) {
 // only care about parentage may omit it.
 const groupOf = (row) => (positiveInteger(row?.groupId) ? row.groupId : null);
 
+// Pure topology check shared by async ownership proofs and native group
+// monitors. Callers must still establish each process incarnation separately.
+export function inspectProcessGroupRows(rows, { groupId, pid } = {}) {
+  if (!(Array.isArray(rows) && positiveInteger(pid) && groupId === pid)) {
+    return { state: 'unknown' };
+  }
+  if (
+    rows.some(
+      (row) =>
+        !(
+          positiveInteger(row?.pid) &&
+          processParent(row.parentPid) &&
+          positiveInteger(row.groupId)
+        )
+    )
+  ) {
+    return { state: 'unknown' };
+  }
+  const root = rows.find((row) => row?.pid === pid);
+  if (groupOf(root) !== groupId) {
+    return { state: 'unknown' };
+  }
+  const descendants = snapshotDescendants(rows, pid);
+  if (!descendants) {
+    return { state: 'unknown' };
+  }
+  const members = rows.filter((row) => groupOf(row) === groupId);
+  const descendantPids = new Set([pid, ...descendants.map((row) => row.pid)]);
+  if (
+    !members.some((row) => row.pid === pid) ||
+    members.some((row) => !descendantPids.has(row.pid))
+  ) {
+    return { state: 'unknown' };
+  }
+  return {
+    descendants,
+    members: [...new Set(members.map((row) => row.pid))].sort(
+      (left, right) => left - right
+    ),
+    state: 'owned',
+  };
+}
+
 function hasParentRelation(rows, candidate) {
   const current = snapshotDescendants(rows, candidate.parentPid);
   return current?.some(
@@ -277,23 +320,23 @@ export async function proveProcessGroupOwnership(
   } catch {
     return { state: 'unknown' };
   }
-  if (!Array.isArray(rows)) {
+  const topology = inspectProcessGroupRows(rows, { groupId, pid });
+  if (topology.state !== 'owned') {
     return { state: 'unknown' };
   }
-  const members = rows
-    .filter((row) => row?.groupId === groupId)
-    .map((row) => row.pid);
-  const descendants = new Set([
-    pid,
-    ...tree.children.map((child) => child.pid),
-  ]);
-  if (
-    !members.includes(pid) ||
-    members.some(
-      (member) => !(positiveInteger(member) && descendants.has(member))
-    )
-  ) {
-    return { state: 'unknown' };
+  const certified = new Map(tree.children.map((child) => [child.pid, child]));
+  for (const candidate of topology.descendants) {
+    if (candidate.pid === pid) {
+      continue;
+    }
+    const child = certified.get(candidate.pid);
+    if (
+      !child ||
+      child.groupId !== groupOf(candidate) ||
+      child.processStart.length === 0
+    ) {
+      return { state: 'unknown' };
+    }
   }
   return {
     // Descendants already outside the group when it is proven.
@@ -303,7 +346,7 @@ export async function proveProcessGroupOwnership(
         pid: childPid,
         processStart: childStart,
       })),
-    members: [...new Set(members)].sort((a, b) => a - b),
+    members: topology.members,
     state: 'owned',
   };
 }

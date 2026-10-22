@@ -6,9 +6,11 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   writeFileSync,
@@ -18,9 +20,10 @@ import {
   realpath as realpathAsync,
   stat as statAsync,
 } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { createCliApi } from './cli-api.js';
 import {
@@ -36,6 +39,7 @@ import {
   withSetuBlock,
 } from './cli-helpers.js';
 import { isConnectionRefused } from './connection-refused.js';
+import { createDependencyFileNative } from './dependency-file-native.js';
 import { dependencySharingForTarget } from './dependency-sharing.js';
 import { createHostHealth } from './host-health.js';
 import {
@@ -84,20 +88,23 @@ import {
   writerClaimPaths,
 } from './lib.js';
 import { createOperationEvents } from './operation-events.js';
+import { createPortalResourceServices } from './portal-resource-services.js';
 import {
   requestPortalMutation,
   requestRemoval,
   runRemoveCommand,
 } from './remove-command.js';
 import { createResourceAdmission } from './resource-admission.js';
+import { createSetupInstallProcesses } from './setup-install-process.js';
 import { createSetupProgress } from './setup-progress.js';
 import { runTriggerCommand } from './trigger-command.js';
 import { createUpdateCommand, describeUpdate } from './update-command.js';
 import {
   createAndInstallWorktree,
-  installWorktreeDependencies,
+  startWorktreeSetupInstall,
 } from './workspace-setup.js';
 import { releaseHeldLocks } from './workspace-state.js';
+import { listWriterClaims } from './writer-claims.js';
 
 const PKG_DIR = fileURLToPath(new URL('.', import.meta.url));
 
@@ -458,14 +465,34 @@ async function ensurePortal(c) {
   });
 }
 
-function autoInstall(wtDir, sharing, stdio, options = {}) {
-  return installWorktreeDependencies(wtDir, {
-    exists: existsSync,
-    run: spawnSync,
-    sharing,
-    ...(stdio ? { stdio } : {}),
-    ...options,
-  });
+async function autoInstall(wtDir, sharing, _stdio, options = {}) {
+  const processes = (
+    options.createSetupInstallProcesses ?? createSetupInstallProcesses
+  )();
+  try {
+    const launched = await startWorktreeSetupInstall(
+      { ready: false, res: { wtDir } },
+      {
+        ...options,
+        closeLog: closeSync,
+        exists: existsSync,
+        openLog: () => {
+          mkdirSync(dirname(options.logLocation), { recursive: true });
+          return openSync(options.logLocation, 'a', 0o600);
+        },
+        setupAttempt: options.setup?.record,
+        sharing,
+        spawn: processes.spawn,
+        stopProcess: processes.stopProcess,
+      }
+    );
+    await launched.completion;
+  } finally {
+    // Keep an unknown owner alive so its setup admission cannot be released.
+    if (!processes.hasOwnedWork()) {
+      processes.close();
+    }
+  }
 }
 
 // ── setu setup [--name x] [--workspace p] [--zone z] [--local-zone l] [--yes] ─────────────────
@@ -997,6 +1024,90 @@ function newSetupFailureResult(error) {
   };
 }
 
+function snapshotWorktree(snapshot, repo, name) {
+  return snapshot?.worktrees.find(
+    (entry) => entry?.repo === repo && entry?.name === name
+  );
+}
+
+const OBSERVED_LIFECYCLE_PHASES = new Set([
+  'admitting',
+  'complete',
+  'failed',
+  'queued',
+  'restarting',
+  'running',
+  'starting',
+  'stopped',
+  'stopping',
+  'unknown',
+]);
+const ACTIVE_LIFECYCLE_PHASES = new Set([
+  'admitting',
+  'queued',
+  'restarting',
+  'running',
+  'starting',
+  'stopping',
+]);
+
+export function classifyDependencyRuntime(row) {
+  if (
+    !row ||
+    typeof row.phase !== 'string' ||
+    !OBSERVED_LIFECYCLE_PHASES.has(row.phase) ||
+    (row.operation !== null &&
+      row.operation !== undefined &&
+      (typeof row.operation !== 'object' ||
+        typeof row.operation.phase !== 'string' ||
+        !OBSERVED_LIFECYCLE_PHASES.has(row.operation.phase))) ||
+    typeof row.active !== 'boolean' ||
+    typeof row.queued !== 'boolean' ||
+    typeof row.starting !== 'boolean' ||
+    typeof row.stopping !== 'boolean' ||
+    typeof row.inngestActive !== 'boolean' ||
+    typeof row.triggerActive !== 'boolean' ||
+    typeof row.convexActive !== 'boolean' ||
+    !Array.isArray(row.sidecars) ||
+    row.sidecars.some((sidecar) => typeof sidecar.active !== 'boolean')
+  ) {
+    return 'unknown';
+  }
+  if (row.phase === 'unknown' || row.operation?.phase === 'unknown') {
+    return 'unknown';
+  }
+  if (
+    ACTIVE_LIFECYCLE_PHASES.has(row.phase) ||
+    ACTIVE_LIFECYCLE_PHASES.has(row.operation?.phase) ||
+    row.queued ||
+    row.starting ||
+    row.stopping ||
+    row.active ||
+    row.inngestActive ||
+    row.triggerActive ||
+    row.convexActive ||
+    row.sidecars.some((sidecar) => sidecar.active)
+  ) {
+    return 'alive';
+  }
+  return 'dead';
+}
+
+function plannedSetupContainer(row, commandFlags) {
+  if (commandFlags.bare === true) {
+    return false;
+  }
+  if (commandFlags.container === true) {
+    return true;
+  }
+  if (row?.nextStartMode === 'container') {
+    return true;
+  }
+  if (row?.nextStartMode === 'bare') {
+    return false;
+  }
+}
+
 async function createNewWorktreeResult({
   c,
   deps,
@@ -1010,6 +1121,15 @@ async function createNewWorktreeResult({
   const sharing = (
     deps.dependencySharingForTarget ?? dependencySharingForTarget
   )(c, repo, name);
+  let ownedDependencyFileNative;
+  const { dependencyFileNative: borrowedDependencyFileNative } = deps;
+  let dependencyFileNative = borrowedDependencyFileNative;
+  if (dependencyFileNative === undefined && sharing?.enabled === true) {
+    ownedDependencyFileNative = (
+      deps.createDependencyFileNative ?? createDependencyFileNative
+    )();
+    dependencyFileNative = ownedDependencyFileNative;
+  }
   const state = (deps.workspaceState ?? workspaceState)(c.workspace);
   tracker.setEvents(
     (deps.createOperationEvents ?? createOperationEvents)({ state })
@@ -1022,45 +1142,401 @@ async function createNewWorktreeResult({
     newAttemptId: () => crypto.randomUUID(),
     state,
   });
-  const logLocation = join(c.workspace, 'logs', repo, name, 'setup.log');
-  await tracker.recordOutcome('accepted');
-  return (deps.createAndInstallWorktree ?? createAndInstallWorktree)({
-    admission,
-    checkoutIdentity: async (wtDir) => {
-      const identity = await (
-        deps.inspectCheckoutIdentity ?? inspectCheckoutIdentity
-      )(
-        { repoDir: join(c.workspace, `${repo}.git`), wtDir },
+  let localFinalization = null;
+  let localPreflightAuthority = null;
+  let setupPreflight = null;
+  const snapshotCache = new Map();
+  const worktreeSnapshot = async (targetData) => {
+    const cacheKey = `${targetData.repo}/${targetData.name}`;
+    const cached = snapshotCache.get(cacheKey);
+    if (cached?.value && Date.now() - cached.checkedAt <= 250) {
+      return cached.value;
+    }
+    if (cached?.pending) {
+      return cached.pending;
+    }
+    const pending = (async () => {
+      try {
+        const snapshot = await cliApi.get('/api/worktrees', { snapshot: 1 });
+        if (
+          snapshot?.ok === false ||
+          !Number.isFinite(snapshot?.checkedAt) ||
+          Math.abs(Date.now() - snapshot.checkedAt) > 1500 ||
+          snapshot.listenerObservation?.state !== 'ready' ||
+          !Array.isArray(snapshot.worktrees) ||
+          !snapshotWorktree(snapshot, targetData.repo, targetData.name)
+        ) {
+          return null;
+        }
+        return snapshot;
+      } catch {
+        return null;
+      }
+    })();
+    snapshotCache.set(cacheKey, { pending });
+    const result = await pending;
+    if (snapshotCache.get(cacheKey)?.pending === pending) {
+      if (result) {
+        snapshotCache.set(cacheKey, { checkedAt: Date.now(), value: result });
+      } else {
+        snapshotCache.delete(cacheKey);
+      }
+    }
+    return result;
+  };
+  const localLifecycle = {
+    operationStatus(key) {
+      const owner = localFinalization ?? localPreflightAuthority;
+      if (key !== `${repo}/${name}` || !owner) {
+        return null;
+      }
+      return {
+        kind: 'setup',
+        operationId: owner.admissionOperationId,
+        phase: 'running',
+      };
+    },
+    snapshot(key) {
+      const owner = localFinalization ?? localPreflightAuthority;
+      if (key !== `${repo}/${name}` || !owner) {
+        return null;
+      }
+      return {
+        launchSpec: { container: owner.container },
+        phase: 'running',
+      };
+    },
+  };
+  const service = createPortalResourceServices({
+    claims: () =>
+      listWriterClaims(writerClaimPaths(c.workspace), { includeStale: true }),
+    config: async () => c,
+    containerMode: async (targetData) => {
+      const snapshot = await worktreeSnapshot(targetData);
+      const row = snapshotWorktree(snapshot, targetData.repo, targetData.name);
+      if (!row) {
+        return 'unknown';
+      }
+      const observedPlan = plannedSetupContainer(row, flags);
+      if (
+        localFinalization &&
+        flags.bare !== true &&
+        flags.container !== true &&
+        observedPlan !== localFinalization.container
+      ) {
+        return 'unknown';
+      }
+      const planned = localFinalization?.container ?? observedPlan;
+      if (typeof planned !== 'boolean') {
+        return 'unknown';
+      }
+      return planned ? 'container' : 'bare';
+    },
+    entries: () =>
+      state.read('ports').map((row) => ({
+        ...row,
+        wtDir: join(c.workspace, row.repo, row.name),
+      })),
+    gitHead: (targetData) => {
+      try {
+        const head = git(targetData.wtDir, ['rev-parse', 'HEAD']).trim();
+        return head ? { state: 'known', value: head } : { state: 'unknown' };
+      } catch {
+        return { state: 'unknown' };
+      }
+    },
+    lifecycle: localLifecycle,
+    nativeRuntime: async (targetData) => {
+      const snapshot = await worktreeSnapshot(targetData);
+      const row = snapshotWorktree(snapshot, targetData.repo, targetData.name);
+      return classifyDependencyRuntime(row);
+    },
+    ...(dependencyFileNative === undefined ? {} : { dependencyFileNative }),
+    resolveTarget: async (targetRepo, targetName) => {
+      const port = state
+        .read('ports')
+        .find(
+          (entry) => entry.repo === targetRepo && entry.name === targetName
+        )?.port;
+      if (!port) {
+        return null;
+      }
+      const wtDir = join(c.workspace, targetRepo, targetName);
+      const repoDir = join(c.workspace, `${targetRepo}.git`);
+      const identity = await inspectCheckoutIdentity(
+        { repoDir, wtDir },
         { readFile: readFileAsync, realpath: realpathAsync, stat: statAsync }
       );
-      if (!identity.known) {
-        throw Object.assign(new Error(identity.reason), {
-          code: 'CHECKOUT_IDENTITY_UNKNOWN',
-        });
-      }
-      return identity;
+      return identity.known
+        ? {
+            checkoutIdentity: identity,
+            key: `${targetRepo}/${targetName}`,
+            name: targetName,
+            port,
+            repo: targetRepo,
+            repoDir,
+            wtDir,
+          }
+        : { code: 'CHECKOUT_IDENTITY_UNKNOWN', ok: false };
     },
-    create: (options) =>
-      (deps.createWorktree ?? createWorktree)(c, repo, name, options),
-    enableTunnel: async () => {
-      await (deps.ensureTunnel ?? ensureTunnel)(c, repo, name);
-      return publicDomain(c);
-    },
-    install: (wtDir, setup) =>
-      autoInstall(wtDir, sharing, asJson ? ['ignore', 2, 2] : undefined, {
-        ...setup,
-        state,
-      }),
-    logLocation,
-    name,
-    operationId,
-    progress,
-    repo,
+    resourceAdmission: admission,
     state,
-    target: operationTarget,
-    tunnel: withTunnel,
-    withTarget: (lockedTarget, task) => state.withTargets([lockedTarget], task),
+    trackedPaths: (targetData, roots) => {
+      try {
+        const tracked = git(targetData.wtDir, ['ls-files', '--', ...roots]);
+        return { state: tracked.trim() ? 'tracked' : 'clean' };
+      } catch {
+        return { state: 'unknown' };
+      }
+    },
   });
+  const prepareHoistedDependencySharing = async (targetData, setupContext) => {
+    const snapshot = await worktreeSnapshot(targetData);
+    const row = snapshotWorktree(snapshot, targetData.repo, targetData.name);
+    const container = plannedSetupContainer(row, flags);
+    if (
+      !row ||
+      typeof container !== 'boolean' ||
+      !setupContext ||
+      typeof setupContext.attemptId !== 'string' ||
+      typeof setupContext.admissionOperationId !== 'string' ||
+      setupContext.checkoutIdentity?.known !== true ||
+      !isDeepStrictEqual(setupContext.target, { name, repo })
+    ) {
+      throw Object.assign(
+        new Error(
+          'Fresh hoisted setup mode or ownership could not be confirmed'
+        ),
+        { code: 'CONTAINER_MODE_UNKNOWN' }
+      );
+    }
+    const { preflight } = service.dependencyFiles;
+    if (typeof preflight !== 'function') {
+      throw Object.assign(
+        new Error('Fresh hoisted dependency preflight is unavailable'),
+        { code: 'DEPENDENCY_ENROLLMENT_UNAVAILABLE' }
+      );
+    }
+    const currentSetup = progress.get(targetData);
+    const matchingLeases = await admission
+      .status()
+      .then((result) =>
+        result?.ok === true && Array.isArray(result.leases)
+          ? result.leases.filter(
+              (lease) =>
+                lease?.kind === 'install' &&
+                lease.operationId === setupContext.admissionOperationId &&
+                lease.target?.repo === repo &&
+                lease.target?.name === name &&
+                lease.ownership === 'confirmed' &&
+                lease.recoveryRequired === false
+            )
+          : []
+      )
+      .catch(() => []);
+    if (
+      currentSetup?.state !== 'running' ||
+      currentSetup.target?.repo !== repo ||
+      currentSetup.target?.name !== name ||
+      currentSetup.attemptId !== setupContext.attemptId ||
+      !isDeepStrictEqual(
+        currentSetup.checkoutIdentity,
+        setupContext.checkoutIdentity
+      ) ||
+      matchingLeases.length !== 1
+    ) {
+      throw Object.assign(
+        new Error('Fresh setup admission ownership could not be confirmed'),
+        { code: 'ADMISSION_STATE_UNKNOWN' }
+      );
+    }
+    const staged = await progress.stage({
+      attemptId: setupContext.attemptId,
+      checkoutIdentity: setupContext.checkoutIdentity,
+      stage: 'dependency-enrollment-preflight',
+      target: targetData,
+    });
+    const durableSetup = progress.get(targetData);
+    if (
+      staged?.ok !== true ||
+      durableSetup?.state !== 'running' ||
+      durableSetup.stage !== 'dependency-enrollment-preflight' ||
+      durableSetup.attemptId !== setupContext.attemptId ||
+      !isDeepStrictEqual(
+        durableSetup.checkoutIdentity,
+        setupContext.checkoutIdentity
+      )
+    ) {
+      throw Object.assign(
+        new Error('Fresh setup preflight stage could not be confirmed'),
+        { code: staged?.code ?? 'SETUP_PROGRESS_OUTCOME_UNKNOWN' }
+      );
+    }
+    const authority = { ...setupContext, container };
+    localPreflightAuthority = authority;
+    try {
+      const result = await preflight.call(
+        service.dependencyFiles,
+        targetData,
+        setupContext
+      );
+      if (result?.ok !== true) {
+        throw Object.assign(
+          new Error(result?.error ?? 'Fresh enrollment preflight failed'),
+          {
+            code: result?.code ?? 'DEPENDENCY_ENROLLMENT_PREFLIGHT_FAILED',
+            result,
+          }
+        );
+      }
+      setupPreflight = { ...setupContext, container, target: targetData };
+      return result;
+    } catch (error) {
+      setupPreflight = null;
+      throw error;
+    } finally {
+      localPreflightAuthority = null;
+    }
+  };
+  const finalizeHoistedDependencySharingOwned = async (
+    targetData,
+    setupContext
+  ) => {
+    if (
+      !setupContext ||
+      typeof setupContext !== 'object' ||
+      setupContext.installerSettled !== true ||
+      typeof setupContext.attemptId !== 'string' ||
+      typeof setupContext.admissionOperationId !== 'string' ||
+      setupContext.target?.repo !== repo ||
+      setupContext.target?.name !== name ||
+      !isDeepStrictEqual(targetData, setupPreflight?.target) ||
+      !setupPreflight ||
+      setupContext.attemptId !== setupPreflight.attemptId ||
+      setupContext.admissionOperationId !==
+        setupPreflight.admissionOperationId ||
+      !isDeepStrictEqual(
+        setupContext.checkoutIdentity,
+        setupPreflight.checkoutIdentity
+      )
+    ) {
+      throw Object.assign(
+        new Error(
+          'Fresh hoisted dependency enrollment needs its settled setup ownership record'
+        ),
+        { code: 'SETUP_COORDINATION_INVALID' }
+      );
+    }
+    const { container } = setupPreflight;
+    const admitted = await admission.status().catch(() => null);
+    const ownedLeases =
+      admitted?.ok === true && Array.isArray(admitted.leases)
+        ? admitted.leases.filter(
+            (lease) =>
+              lease?.kind === 'install' &&
+              lease.operationId === setupContext.admissionOperationId &&
+              lease.target?.repo === repo &&
+              lease.target?.name === name &&
+              lease.ownership === 'confirmed' &&
+              lease.recoveryRequired === false
+          )
+        : [];
+    if (ownedLeases.length !== 1) {
+      throw Object.assign(
+        new Error(
+          'Fresh enrollment admission ownership could not be confirmed'
+        ),
+        { code: 'ADMISSION_STATE_UNKNOWN' }
+      );
+    }
+    localFinalization = { ...setupContext, container, setupContext };
+    try {
+      const result = await service.dependencyFiles.enrollFresh(
+        targetData,
+        setupContext
+      );
+      if (result?.ok !== true) {
+        throw Object.assign(
+          new Error(result?.error ?? 'Fresh enrollment failed'),
+          {
+            code: result?.code ?? 'DEPENDENCY_ENROLLMENT_FAILED',
+            operationId: result?.operationId,
+            result,
+            state: result?.state,
+          }
+        );
+      }
+      return result;
+    } finally {
+      localFinalization = null;
+    }
+  };
+  const finalizeHoistedDependencySharing = async (targetData, setupContext) => {
+    try {
+      return await finalizeHoistedDependencySharingOwned(
+        targetData,
+        setupContext
+      );
+    } finally {
+      localFinalization = null;
+      setupPreflight = null;
+    }
+  };
+  const logLocation = join(c.workspace, 'logs', repo, name, 'setup.log');
+  await tracker.recordOutcome('accepted');
+  try {
+    return await (deps.createAndInstallWorktree ?? createAndInstallWorktree)({
+      admission,
+      checkoutIdentity: async (wtDir) => {
+        const identity = await (
+          deps.inspectCheckoutIdentity ?? inspectCheckoutIdentity
+        )(
+          { repoDir: join(c.workspace, `${repo}.git`), wtDir },
+          { readFile: readFileAsync, realpath: realpathAsync, stat: statAsync }
+        );
+        if (!identity.known) {
+          throw Object.assign(new Error(identity.reason), {
+            code: 'CHECKOUT_IDENTITY_UNKNOWN',
+          });
+        }
+        return identity;
+      },
+      create: (options) =>
+        (deps.createWorktree ?? createWorktree)(c, repo, name, options),
+      enableTunnel: async () => {
+        await (deps.ensureTunnel ?? ensureTunnel)(c, repo, name);
+        return publicDomain(c);
+      },
+      install: (wtDir, setup) =>
+        (deps.autoInstall ?? autoInstall)(
+          wtDir,
+          sharing,
+          asJson ? ['ignore', 2, 2] : undefined,
+          {
+            ...setup,
+            createSetupInstallProcesses: deps.createSetupInstallProcesses,
+            finalizeHoistedDependencySharing,
+            prepareHoistedDependencySharing,
+            state,
+          }
+        ),
+      logLocation,
+      name,
+      operationId,
+      progress,
+      repo,
+      sharing,
+      state,
+      target: operationTarget,
+      tunnel: withTunnel,
+      withTarget: (lockedTarget, task) =>
+        state.withTargets([lockedTarget], task),
+    });
+  } finally {
+    if (ownedDependencyFileNative) {
+      await ownedDependencyFileNative.close();
+    }
+  }
 }
 
 async function startNewWorktree(deps, c, repo, name, result) {
@@ -3074,30 +3550,69 @@ async function cmdHeadless() {
 
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdDependencies() {
-  validateCommand({
-    argCounts: [0, 1, 2, 3],
-    usage:
-      'setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]',
-  });
+  const usage =
+    'setu dependencies [status [repo branch] | verify|repair|prepare <repo> <branch> | apply <repo> <branch> --plan-id <id> [--operation-id <id>] --confirm <id> | recover <repo> <branch> --operation-id <id> | prepare-release <repo> <branch> --operation-id <id> | release <repo> <branch> --release-id <id> --confirm <id>] [--json]';
+  const actions = new Set([
+    'apply',
+    'prepare',
+    'prepare-release',
+    'recover',
+    'release',
+    'repair',
+    'status',
+    'verify',
+  ]);
   let [action, repo, name] = args;
-  if (args.length === 2) {
+  if (args.length === 2 && !actions.has(action)) {
     [repo, name] = args;
     action = 'status';
   } else if (!action) {
     action = 'status';
   }
-  if (action === 'status') {
+
+  const allowedFlags = {
+    apply: ['confirm', 'operation-id', 'plan-id'],
+    prepare: [],
+    'prepare-release': ['operation-id'],
+    recover: ['operation-id'],
+    release: ['confirm', 'release-id'],
+    repair: [],
+    status: [],
+    verify: [],
+  }[action];
+  if (!allowedFlags) {
+    die(`Usage: ${usage}`);
+  }
+  validateCommand({ allowedFlags, argCounts: [0, 1, 2, 3], usage });
+
+  if (action === 'status' && (args.length < 2 || (repo && name))) {
     return apiResult(() =>
       cliApi.get('/api/dependency-sharing', { name, repo })
     );
   }
-  if (!(['verify', 'repair'].includes(action) && repo && name)) {
-    die(
-      'Usage: setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]'
-    );
+  if (!(repo && name)) {
+    die(`Usage: ${usage}`);
   }
+
+  const body = { name, repo };
+  if (action === 'apply') {
+    body.planId = requireFlag('plan-id');
+    const operationId = optionalFlag('operation-id');
+    if (operationId !== undefined) {
+      body.operationId = operationId;
+    }
+    body.confirmation = requireFlag('confirm');
+  } else if (action === 'recover' || action === 'prepare-release') {
+    body.operationId = requireFlag('operation-id');
+  } else if (action === 'release') {
+    body.releaseId = requireFlag('release-id');
+    body.confirmation = requireFlag('confirm');
+  } else if (!['prepare', 'repair', 'verify'].includes(action)) {
+    die(`Usage: ${usage}`);
+  }
+
   return apiResult(() =>
-    cliApi.post(`/api/dependency-sharing/${action}`, { name, repo })
+    cliApi.post(`/api/dependency-sharing/${action}`, body)
   );
 }
 
@@ -3993,7 +4508,7 @@ function cmdHelp() {
     setu headless start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]
     setu headless cancel <repo> <branch> --run <id> --checkout <file|-> [--json]
     setu headless resume <repo> <branch> --run <id> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]
-    setu dependencies [status [repo branch] | verify|repair <repo> <branch>] [--json]
+    setu dependencies [status [repo branch] | verify|repair|prepare <repo> <branch> | apply <repo> <branch> --plan-id <id> [--operation-id <id>] --confirm <id> | recover <repo> <branch> --operation-id <id> | prepare-release <repo> <branch> --operation-id <id> | release <repo> <branch> --release-id <id> --confirm <id>] [--json]
     setu shared-caches [--json]
     setu workflows list|runs <repo> <branch> [--json]
     setu workflows dispatch <repo> <branch> --workflow <id> --ref <ref> --inputs <file|-> [--confirmation <token>] [--json]

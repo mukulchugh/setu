@@ -270,7 +270,11 @@ test('actual Compose writer uses exact admitted limits and never rewrites shared
 
 test('actual routing wrappers stage fresh registry values inside shared routing scope with no privileged calls', async () => {
   const root = fixture(),
-    state = workspaceState(root, { setuDir: root });
+    state = workspaceState(root, {
+      configPath: join(root, 'config.json'),
+      setuDir: root,
+    });
+  await state.replace('config', { localZone: 'fixture.invalid' });
   mkdirSync(join(root, 'caddy.d'));
   await state.replace('ports', [
     { key: 'r/main', name: 'main', port: 3200, repo: 'r' },
@@ -292,7 +296,7 @@ test('actual routing wrappers stage fresh registry values inside shared routing 
     );
     expect(await reloadCaddy(root, { run, state })).toBe(true);
   });
-  expect(readFileSync(hostsPath, 'utf8')).toContain('r.setu.local');
+  expect(readFileSync(hostsPath, 'utf8')).toContain('r.fixture.invalid');
   await state.replace('ports', []);
   await expect(
     writeCaddy({ workspace: root }, 'r', 'main', 3200, false, { state })

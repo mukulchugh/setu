@@ -746,17 +746,13 @@ export function createWorktreeLifecycle({
             );
           } catch (error) {
             if (error.code === 'OPERATION_UNKNOWN') {
-              if (operations.get(target.key)?.token === token) {
-                operations.get(target.key).phase = 'unknown';
-              }
+              const retained = retainUnknownOperation(target, token, kind);
               uncertain(failure('OPERATION_UNKNOWN', error));
               publish();
               // Returning an error must not release a lock while a process may still
               // use the checkout. This lock needs diagnosed reconciliation; never
               // silently steal or release it because an observation failed.
-              await new Promise(() => {
-                // Diagnosed recovery, rather than an elapsed timer, owns this lease.
-              });
+              return retained;
             }
             throw error;
           }
@@ -772,6 +768,77 @@ export function createWorktreeLifecycle({
         return result;
       });
     return Promise.race([completion, unknownOutcome]);
+  }
+
+  function retainUnknownOperation(target, token, kind) {
+    if (operations.get(target.key)?.token === token) {
+      operations.get(target.key).phase = 'unknown';
+    }
+    if (kind === 'setup') {
+      return continueUnknownSetup(target, token);
+    }
+    return new Promise(() => {
+      // Diagnosed recovery, rather than an elapsed timer, owns this lease.
+    });
+  }
+
+  async function continueUnknownSetup(target, token) {
+    const operation = operations.get(target.key);
+    while (operation?.token === token) {
+      // Await inside the original target-lock context; no lock is stolen or
+      // released while a recovery attempt only classifies an unknown outcome.
+      // biome-ignore lint/performance/noAwaitInLoops: Each explicit continuation must finish before another request can own recovery.
+      const continuation = await new Promise((resolve) => {
+        operation.continueSetup = resolve;
+      });
+      try {
+        const result = await continuation.task();
+        if (result?.setupRecoveryComplete === true) {
+          operation.continueSetup = null;
+          continuation.resolve(result);
+          return result;
+        }
+        continuation.resolve(result);
+      } catch (error) {
+        continuation.reject(error);
+      } finally {
+        operation.recovering = false;
+      }
+    }
+    return failure('TARGET_BUSY', 'The retained setup operation changed');
+  }
+
+  function resumeUnknownOperation(target, kind, task) {
+    if (
+      kind !== 'setup' ||
+      typeof task !== 'function' ||
+      disposed ||
+      closedBy
+    ) {
+      return Promise.resolve(
+        failure('TARGET_BUSY', 'Setup recovery is not available')
+      );
+    }
+    const operation = operations.get(target.key);
+    if (!operation) {
+      return Promise.resolve().then(task);
+    }
+    if (
+      operation.kind !== kind ||
+      operation.phase !== 'unknown' ||
+      operation.recovering ||
+      typeof operation.continueSetup !== 'function'
+    ) {
+      return Promise.resolve(
+        failure('TARGET_BUSY', 'Another operation owns this worktree')
+      );
+    }
+    operation.recovering = true;
+    const resume = operation.continueSetup;
+    operation.continueSetup = null;
+    return new Promise((resolve, reject) => {
+      resume({ reject, resolve, task });
+    });
   }
   function startOperation(target, kind, launchOperation) {
     let accept;
@@ -936,6 +1003,7 @@ export function createWorktreeLifecycle({
     refreshCapacity,
     reopen,
     restart,
+    resumeUnknownOperation,
     runOperation,
     snapshot: (key) => view(records.get(key)),
     snapshots: () => Object.freeze([...records.values()].map(view)),
