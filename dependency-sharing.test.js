@@ -775,6 +775,37 @@ test('enabled:true requires an explicit targets map', () => {
   ).toThrow('targets is required');
 });
 
+test('a "<repo>/*" target opts in every worktree of that repo, and an exact false opts one out', () => {
+  const config = (targets) => ({
+    dependencySharing: {
+      enabled: true,
+      executable: '/bun',
+      storeRoot: '/store',
+      targets,
+      version: '1.3.14',
+    },
+    workspace: '/managed',
+  });
+  expect(
+    dependencySharingForTarget(config({ 'r/*': true }), 'r', 'feat/new')
+  ).toMatchObject({ enabled: true, storeRoot: '/store' });
+  expect(
+    dependencySharingForTarget(config({ 'r/*': true }), 'other', 'feat/new')
+  ).toBeUndefined();
+  expect(
+    dependencySharingForTarget(
+      config({ 'r/*': true, 'r/feat/skip': false }),
+      'r',
+      'feat/skip'
+    )
+  ).toBeUndefined();
+  expect(() =>
+    dependencySharingForTarget(config({ 'r/*': 'yes' }), 'r', 'feat/new')
+  ).toThrow(
+    'Per-target dependency-sharing overrides are not supported for "r/*"'
+  );
+});
+
 test('the resolved installer/store/version/workspace fields are validated synchronously, before any checkout exists', () => {
   const targets = { 'r/feat/topic': true };
   for (const fields of [

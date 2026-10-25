@@ -4,6 +4,26 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 
 const generatedRoots = ['.next/cache', '.next/dev/cache/turbopack'];
+// Monorepos keep each Next app's output under apps/<name>/.next.
+const appsDirectory = 'apps';
+const appNamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const appRootPattern =
+  /^apps\/[A-Za-z0-9][A-Za-z0-9._-]*\/\.next\/(?:cache|dev\/cache\/turbopack)$/;
+
+// The checkout's own roots first in their fixed order, then app roots sorted.
+// Manifests prepared before app roots existed carry only the first two.
+function validRootPaths(paths) {
+  return (
+    paths.length >= generatedRoots.length &&
+    generatedRoots.every((root, index) => paths[index] === root) &&
+    paths
+      .slice(generatedRoots.length)
+      .every(
+        (path, index, rest) =>
+          appRootPattern.test(path) && (index === 0 || rest[index - 1] < path)
+      )
+  );
+}
 const decimalPattern = /^\d+$/;
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const object = (value) =>
@@ -148,19 +168,17 @@ function hashManifest(manifest) {
     .digest('hex');
 }
 
-function allowedPath(path) {
+function allowedPath(path, roots) {
   return (
     typeof path === 'string' &&
     path &&
     !isAbsolute(path) &&
     !path.split(sep).some((part) => !part || part === '.' || part === '..') &&
-    generatedRoots.some(
-      (root) => path === root || path.startsWith(`${root}${sep}`)
-    )
+    roots.some((root) => path === root || path.startsWith(`${root}${sep}`))
   );
 }
 
-function entryValid(entry) {
+function entryValid(entry, roots) {
   return (
     keysExactly(entry, [
       'path',
@@ -171,7 +189,7 @@ function entryValid(entry) {
       'size',
       'type',
     ]) &&
-    allowedPath(entry.path) &&
+    allowedPath(entry.path, roots) &&
     ['file', 'directory'].includes(entry.type) &&
     ['birthtimeNs', 'dev', 'ino', 'mtimeNs', 'size'].every(
       (key) => typeof entry[key] === 'string' && decimalPattern.test(entry[key])
@@ -209,21 +227,24 @@ function validManifest(manifest, id) {
     return false;
   }
   if (
-    manifest.roots.length !== generatedRoots.length ||
     manifest.roots.some(
-      (root, index) =>
+      (root) =>
         !keysExactly(root, ['exists', 'path']) ||
-        root.path !== generatedRoots[index] ||
+        typeof root.path !== 'string' ||
         typeof root.exists !== 'boolean'
-    )
+    ) ||
+    !validRootPaths(manifest.roots.map((root) => root.path))
   ) {
     return false;
   }
+  const rootPaths = manifest.roots.map((root) => root.path);
   const paths = new Set();
   if (
     manifest.entries.some(
       (entry) =>
-        !entryValid(entry) || paths.has(entry.path) || !paths.add(entry.path)
+        !entryValid(entry, rootPaths) ||
+        paths.has(entry.path) ||
+        !paths.add(entry.path)
     )
   ) {
     return false;
@@ -246,10 +267,12 @@ function validManifest(manifest, id) {
   for (const entry of manifest.entries) {
     const parent = dirname(entry.path);
     if (
-      entry.path !== generatedRoots.find((root) => entry.path === root) &&
-      !manifest.entries.some(
-        (candidate) =>
-          candidate.path === parent && candidate.type === 'directory'
+      !(
+        rootPaths.includes(entry.path) ||
+        manifest.entries.some(
+          (candidate) =>
+            candidate.path === parent && candidate.type === 'directory'
+        )
       )
     ) {
       return false;
@@ -443,6 +466,31 @@ export function createWorktreeCache({
     };
   }
 
+  // Only real directories directly under apps/ count; a symlinked app could
+  // point the cleanup outside the checkout.
+  async function appRoots(checkout) {
+    let names;
+    try {
+      names = await fs.readdir(join(checkout, appsDirectory));
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        return [];
+      }
+      throw error;
+    }
+    const roots = [];
+    for (const name of names.filter((n) => appNamePattern.test(n)).sort()) {
+      // biome-ignore lint/performance/noAwaitInLoops: A handful of app directories, checked in sorted manifest order.
+      const stat = await fs.lstat(join(checkout, appsDirectory, name));
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        roots.push(
+          ...generatedRoots.map((root) => `${appsDirectory}/${name}/${root}`)
+        );
+      }
+    }
+    return roots.sort();
+  }
+
   async function scan(target, identity) {
     const budget = scanBudget();
     const checkout = identity.checkoutPath;
@@ -454,13 +502,14 @@ export function createWorktreeCache({
     }
     const roots = [];
     const entries = [];
-    for (const generated of generatedRoots) {
+    const rootPaths = [...generatedRoots, ...(await appRoots(checkout))];
+    for (const generated of rootPaths) {
       // biome-ignore lint/performance/noAwaitInLoops: Generated roots share a bounded budget and their configured order is recorded in the manifest.
       const scanned = await scanGeneratedRoot(checkout, generated, budget);
       roots.push(scanned.root);
       entries.push(...scanned.entries);
     }
-    const tracked = await trackedPaths(target, generatedRoots);
+    const tracked = await trackedPaths(target, rootPaths);
     if (
       !(
         object(tracked) &&
@@ -630,7 +679,10 @@ export function createWorktreeCache({
       if (membersFailure) {
         return membersFailure;
       }
-      const tracked = await trackedPaths(manifest.target, generatedRoots);
+      const tracked = await trackedPaths(
+        manifest.target,
+        manifest.roots.map((root) => root.path)
+      );
       return tracked?.state === 'clean'
         ? { ok: true }
         : { code: 'CACHE_CHANGED', ok: false };

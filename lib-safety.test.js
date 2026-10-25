@@ -27,6 +27,7 @@ import {
   PACKAGE_VERSION,
   portalRequestError,
   reloadCaddyAsync,
+  runtimeContainerMode,
   SETU_DIR,
   saveSidecars,
   syncWithBase,
@@ -99,6 +100,58 @@ test('removal allows ignored env symlinks and generated Setu excludes keep git c
     expect(git(f.wt, ['status', '--porcelain'])).toBe('');
   } finally {
     rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
+test('removal allows the .envrc Setu writes but refuses one with user lines', async () => {
+  const f = repoFixture();
+  try {
+    ensureSetuExcludes(join(f.root, 'repo', '.git'));
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport NEXT_PUBLIC_APP_BASE_URL=http://feature.quivly.local\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=http://feature.quivly.local/callback\n'
+    );
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).resolves.toBeUndefined();
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport OPENAI_API_KEY=secret\n'
+    );
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).rejects.toMatchObject({ code: 'WORKTREE_DIRTY' });
+  } finally {
+    rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
+test('runtime container mode follows the live runtime, then the compose file, never the start default', () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-runtime-mode-'));
+  try {
+    mkdirSync(join(root, 'repo', 'never-started'), { recursive: true });
+    expect(runtimeContainerMode(root, 'repo', 'never-started')).toBe('bare');
+    expect(runtimeContainerMode(root, 'repo', 'never-started', true)).toBe(
+      'container'
+    );
+    writeFileSync(
+      join(root, 'repo', 'never-started', 'docker-compose.setu.yml'),
+      'services: {}\n'
+    );
+    expect(runtimeContainerMode(root, 'repo', 'never-started')).toBe(
+      'container'
+    );
+    expect(runtimeContainerMode(root, 'repo', 'never-started', false)).toBe(
+      'bare'
+    );
+    const denied = () => {
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    };
+    expect(
+      runtimeContainerMode(root, 'repo', 'x', undefined, { lstat: denied })
+    ).toBe('unknown');
+  } finally {
+    rmSync(root, { force: true, recursive: true });
   }
 });
 

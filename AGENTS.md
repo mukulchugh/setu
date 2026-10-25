@@ -42,7 +42,8 @@ setu rm <repo> <branch> [--force]    # stops servers (via portal) + removes work
                                       # after an uncertain response, inspect status before retrying
                                       # never removes a worktree named main, with or without --force
                                       # without --force it also refuses ignored local env files that are
-                                      # real files (not symlinks) and commits only a detached HEAD holds
+                                      # real files (not symlinks) and commits only a detached HEAD holds;
+                                      # the .envrc Setu writes itself (PORT/app URL lines only) is exempt
                                       # a registry row whose folder and git registration are both gone is
                                       # cleaned up without --force
 setu rm <repo> <branch> --operation-id <id> [--json]

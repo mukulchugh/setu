@@ -371,17 +371,23 @@ export function dependencySharingForTarget(config, repo, name) {
       'dependencySharing.targets must be an object mapping "repo/name" to true'
     );
   }
-  if (!Object.hasOwn(targets, key)) {
+  // "<repo>/*" opts in every worktree of a repo, including ones created later;
+  // an exact "<repo>/<name>" entry still wins, so false opts one out.
+  const wildcard = `${repo}/*`;
+  const matched = Object.hasOwn(targets, key)
+    ? key
+    : Object.hasOwn(targets, wildcard) && wildcard;
+  if (!matched) {
     return;
   }
-  const opt = targets[key];
+  const opt = targets[matched];
   if (opt === false) {
     return;
   }
   if (opt !== true) {
     throw new Error(
-      `Per-target dependency-sharing overrides are not supported for "${key}"; ` +
-        `storeRoot/executable/version are central-only. Set targets["${key}"] to true to opt in.`
+      `Per-target dependency-sharing overrides are not supported for "${matched}"; ` +
+        `storeRoot/executable/version are central-only. Set targets["${matched}"] to true to opt in.`
     );
   }
   const resolved = {
@@ -413,8 +419,9 @@ function disabledReasonForTarget(config, repo, name) {
     sharing.targets &&
     typeof sharing.targets === 'object' &&
     !Array.isArray(sharing.targets) &&
-    Object.hasOwn(sharing.targets, `${repo}/${name}`) &&
-    sharing.targets[`${repo}/${name}`] === false
+    (Object.hasOwn(sharing.targets, `${repo}/${name}`)
+      ? sharing.targets[`${repo}/${name}`] === false
+      : sharing.targets[`${repo}/*`] === false)
   ) {
     return 'This worktree is explicitly opted out of dependency sharing.';
   }

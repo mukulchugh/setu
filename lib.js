@@ -44,6 +44,9 @@ const worktreeBranchPattern = /^branch refs\/heads\/(.+)$/m;
 const originPrefixPattern = /^origin\//;
 const mergeConflictPattern = /^(UU|AA|DD|AU|UA|UD|DU)/;
 const environmentFilePattern = /^\.env/;
+// Lines writeEnvrc writes now, plus the redirect URI older versions wrote.
+const setuEnvrcLinePattern =
+  /^export (PORT|NEXT_PUBLIC_APP_BASE_URL|NEXT_PUBLIC_WORKOS_REDIRECT_URI)=\S*$/;
 const remoteUrlSchemePattern = /^\w+:\/\/[^/]+\//;
 const remoteUrlSshPattern = /^[^@\s]+@[^:]+:/;
 const remoteUrlGitSuffixPattern = /\.git$/;
@@ -353,6 +356,16 @@ export function readEnvrc(wtDir) {
   } catch {
     return '';
   }
+}
+
+// Setu writes .envrc itself, so removal must not treat it as user env state.
+function setuGeneratedEnvrc(wtDir) {
+  const lines = readEnvrc(wtDir)
+    .split('\n')
+    .filter((line) => line.trim());
+  return (
+    lines.length > 0 && lines.every((line) => setuEnvrcLinePattern.test(line))
+  );
 }
 
 export function tunnelEnabled(wtDir, c) {
@@ -1321,6 +1334,27 @@ export function dockerComposePath(wtDir) {
 // sticky-bare — it has to be opted in explicitly with --container once. Only
 // a genuinely brand-new worktree (no history either way) gets the intended
 // global default.
+// What a checkout actually runs as, for features (dependency sharing) that
+// care about where node_modules lives now. Unlike defaultContainerMode, a
+// never-started worktree is bare: nothing has containerized it yet.
+export function runtimeContainerMode(
+  workspace,
+  repo,
+  name,
+  live,
+  { lstat = lstatSync } = {}
+) {
+  if (typeof live === 'boolean') {
+    return live ? 'container' : 'bare';
+  }
+  try {
+    lstat(dockerComposePath(join(workspace, repo, name)));
+    return 'container';
+  } catch (error) {
+    return error.code === 'ENOENT' ? 'bare' : 'unknown';
+  }
+}
+
 export function defaultContainerMode(workspace, repo, name) {
   const wtDir = join(workspace, repo, name);
   if (existsSync(dockerComposePath(wtDir))) {
@@ -2189,7 +2223,8 @@ export async function assertRemovableWorktree(
       } catch {
         return false;
       }
-    });
+    })
+    .filter((path) => !(path === '.envrc' && setuGeneratedEnvrc(wtDir)));
   if (envFiles.length) {
     throw Object.assign(
       new Error(

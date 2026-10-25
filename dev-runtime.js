@@ -89,9 +89,14 @@ export function renderDockerCompose(
   if (!(spec.container && spec.limits?.cpus > 0 && spec.limits?.memMb > 0)) {
     throw new Error('An admitted container specification is required');
   }
+  // Nx records running tasks by process ID in its workspace data. A container
+  // restarts with the same low PIDs, so keeping that data on the bind-mounted
+  // checkout makes the next start fail as "Recursive task invocation". A tmpfs
+  // is emptied on every container stop and restart.
   const environment = new Map([
     ['PORT', String(spec.port)],
     ['BUN_INSTALL_CACHE_DIR', '/bun-cache'],
+    ['NX_WORKSPACE_DATA_DIRECTORY', '/nx-workspace-data'],
   ]);
   for (const [key, value] of Object.entries(env)) {
     environment.set(key, value);
@@ -116,6 +121,8 @@ services:
     cpus: "${spec.limits.cpus}"
     ports:
       - "${spec.port}:${spec.port}"
+    tmpfs:
+      - "/nx-workspace-data"
     environment:
 ${[...environment].map(([key, value]) => `      ${key}: ${JSON.stringify(String(value))}`).join('\n')}
     volumes:

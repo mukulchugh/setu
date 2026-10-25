@@ -2,7 +2,7 @@
 
 Setu keeps the package download cache separate from installed dependencies. A cache hit avoids downloading a package; it does not establish that installed files share disk data.
 
-Installed sharing is opt-in for each checkout. Existing dependency directories are never replaced by setup or repair. A configured store alone does not mean a checkout is enrolled.
+Installed sharing is opt-in for each checkout, by exact `"<repo>/<branch>"` target or for a whole repository with `"<repo>/*"`. Eligibility follows the checkout's actual runtime: a worktree is container-backed only while it runs in a container or once Setu has written its `docker-compose.setu.yml`, not merely because its next Start would default to a container. Existing dependency directories are never replaced by setup or repair. A configured store alone does not mean a checkout is enrolled.
 
 ## Supported layouts
 
