@@ -27,6 +27,7 @@ import {
   PACKAGE_VERSION,
   portalRequestError,
   reloadCaddyAsync,
+  runtimeContainerMode,
   SETU_DIR,
   saveSidecars,
   syncWithBase,
@@ -122,6 +123,35 @@ test('removal allows the .envrc Setu writes but refuses one with user lines', as
     ).rejects.toMatchObject({ code: 'WORKTREE_DIRTY' });
   } finally {
     rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
+test('runtime container mode follows the live runtime, then the compose file, never the start default', () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-runtime-mode-'));
+  try {
+    mkdirSync(join(root, 'repo', 'never-started'), { recursive: true });
+    expect(runtimeContainerMode(root, 'repo', 'never-started')).toBe('bare');
+    expect(runtimeContainerMode(root, 'repo', 'never-started', true)).toBe(
+      'container'
+    );
+    writeFileSync(
+      join(root, 'repo', 'never-started', 'docker-compose.setu.yml'),
+      'services: {}\n'
+    );
+    expect(runtimeContainerMode(root, 'repo', 'never-started')).toBe(
+      'container'
+    );
+    expect(runtimeContainerMode(root, 'repo', 'never-started', false)).toBe(
+      'bare'
+    );
+    const denied = () => {
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    };
+    expect(
+      runtimeContainerMode(root, 'repo', 'x', undefined, { lstat: denied })
+    ).toBe('unknown');
+  } finally {
+    rmSync(root, { force: true, recursive: true });
   }
 });
 

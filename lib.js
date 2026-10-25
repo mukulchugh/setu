@@ -1334,6 +1334,27 @@ export function dockerComposePath(wtDir) {
 // sticky-bare — it has to be opted in explicitly with --container once. Only
 // a genuinely brand-new worktree (no history either way) gets the intended
 // global default.
+// What a checkout actually runs as, for features (dependency sharing) that
+// care about where node_modules lives now. Unlike defaultContainerMode, a
+// never-started worktree is bare: nothing has containerized it yet.
+export function runtimeContainerMode(
+  workspace,
+  repo,
+  name,
+  live,
+  { lstat = lstatSync } = {}
+) {
+  if (typeof live === 'boolean') {
+    return live ? 'container' : 'bare';
+  }
+  try {
+    lstat(dockerComposePath(join(workspace, repo, name)));
+    return 'container';
+  } catch (error) {
+    return error.code === 'ENOENT' ? 'bare' : 'unknown';
+  }
+}
+
 export function defaultContainerMode(workspace, repo, name) {
   const wtDir = join(workspace, repo, name);
   if (existsSync(dockerComposePath(wtDir))) {

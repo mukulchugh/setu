@@ -86,6 +86,7 @@ import {
   removeProject,
   requireConfig,
   resourceSettings,
+  runtimeContainerMode,
   SETU_DIR,
   saveCustomAgents,
   saveFileSyncGlobs,
@@ -3555,9 +3556,12 @@ export async function createPortalRuntime(options = {}) {
     command: checkedCommand,
     config: async () => _cfg,
     containerMode: (target) =>
-      defaultContainerMode(WORKSPACE, target.repo, target.name)
-        ? 'container'
-        : 'bare',
+      runtimeContainerMode(
+        WORKSPACE,
+        target.repo,
+        target.name,
+        lifecycle.snapshot(target.key)?.launchSpec?.container
+      ),
     dependencyFileNative,
     entries: () =>
       portEntries(WORKSPACE).map((row) => ({
