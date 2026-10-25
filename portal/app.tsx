@@ -50,6 +50,7 @@ import {
   McpSection,
   RaycastSection,
 } from './components/settings-sections';
+import { SpansClientIntegrations } from './components/spans-client-integrations';
 import { SpansPage } from './components/spans-page';
 import { TriviaCard } from './components/trivia-card';
 import { WorkspaceSidebar } from './components/workspace-sidebar';
@@ -4460,6 +4461,7 @@ function SettingsPage({
           ['sidecar-settings', 'Sidecars'],
           ['file-sync-settings', 'File sync'],
           ['agent-settings', 'Coding agents'],
+          ['integration-settings', 'Agent integrations'],
           ['mcp-settings', 'MCP'],
           ['raycast-settings', 'Raycast'],
         ].map(([id, label]) => (
@@ -4844,6 +4846,10 @@ function SettingsPage({
           </p>
         </div>
       </Section>
+
+      <div class="section-anchor" id="integration-settings" tabIndex={-1}>
+        <SpansClientIntegrations />
+      </div>
 
       <div class="section-anchor" id="mcp-settings" tabIndex={-1}>
         <McpSection toast={toast} />

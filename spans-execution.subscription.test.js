@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  approvedDispatchInput,
   createExecutionFixture,
   METERED_PROFILES,
   PROFILE,
@@ -349,12 +350,11 @@ describe('reviewing a subscription dispatch', () => {
       code: 'SPANS_EXEC_BUDGET_NOT_APPLICABLE',
       ok: false,
     });
-    const reviewed = await service.review(REVIEW);
+    const approved = await approvedDispatchInput(service, REVIEW);
     expect(
       await service.dispatch({
-        ...REVIEW,
+        ...approved,
         budgetUsd: 1,
-        confirmation: reviewed.confirmation,
       })
     ).toMatchObject({ code: 'SPANS_EXEC_BUDGET_NOT_APPLICABLE', ok: false });
     expect(run().executions).toBeUndefined();
@@ -383,12 +383,11 @@ describe('running a subscription dispatch', () => {
   async function finished(wanted, options) {
     const instructions = wanted ?? REVIEW.instructions;
     const service = await readyService(options);
-    const reviewed = await service.review({ ...REVIEW, instructions });
-    const launched = await service.dispatch({
+    const input = await approvedDispatchInput(service, {
       ...REVIEW,
-      confirmation: reviewed.confirmation,
       instructions,
     });
+    const launched = await service.dispatch(input);
     expect(launched.status).toBe('launched');
     await service.idle();
     return { launched, service };
@@ -473,11 +472,8 @@ describe('running a subscription dispatch', () => {
     const service = await readyService({
       env: { SETU_FIXTURE_DELAY_MS: '600' },
     });
-    const reviewed = await service.review(REVIEW);
-    const launched = await service.dispatch({
-      ...REVIEW,
-      confirmation: reviewed.confirmation,
-    });
+    const input = await approvedDispatchInput(service, REVIEW);
+    const launched = await service.dispatch(input);
     expect(launched.status).toBe('launched');
     expect(launched.resources.usage).toBe('held');
     // The ledger row carries no amount and the policy no limit and no hard cap.
@@ -512,7 +508,7 @@ describe('running a subscription dispatch', () => {
     });
     expect(accepted).toMatchObject({ accepted: true, ok: true });
     expect(run().spans.build.state).toBe('completed');
-  });
+  }, 20_000);
 
   test('a session that ran with another toolset is not completed work', async () => {
     const { launched, service } = await finished(
@@ -532,15 +528,11 @@ describe('running a subscription dispatch', () => {
     const service = await readyService({
       env: { SETU_FIXTURE_DELAY_MS: '250' },
     });
-    const reviewed = await service.review({
+    const input = await approvedDispatchInput(service, {
       ...REVIEW,
       instructions: 'MODE:hang keep running',
     });
-    const launched = await service.dispatch({
-      ...REVIEW,
-      confirmation: reviewed.confirmation,
-      instructions: 'MODE:hang keep running',
-    });
+    const launched = await service.dispatch(input);
     expect(launched.status).toBe('launched');
     const [attempt] = (await service.status({ runId: 'run-1' })).attempts;
     expect(

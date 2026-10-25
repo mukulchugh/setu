@@ -26,6 +26,7 @@
 //   persist({ op: 'write', runId, assignmentId, generation, expected, record,
 //             event })
 //     -> { ok: true } | { ok: false, code: 'PHASE_CONFLICT'|'STALE_GENERATION' }
+//        | { ok: false, unknown: true } when the write may have committed.
 //
 // promptNewline ('lf' by default, or 'crlf' / 'cr') is the one explicitly bound
 // newline convention the prompt may use. The sent text is converted to it and
@@ -42,6 +43,7 @@
 // inputs here.
 
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 import { redactSpansValue as redactValue } from './spans-redaction.js';
 
 const MAX_ID_LENGTH = 128;
@@ -277,7 +279,7 @@ const bareDigest = (value) =>
 // properties. Accessors, symbols and exotic prototypes are rejected, so a
 // getter cannot answer twice and nothing the caller holds is shared.
 function plainCopy(input, allowed) {
-  if (!isRecord(input)) {
+  if (!isRecord(input) || types.isProxy(input)) {
     return null;
   }
   const prototype = Object.getPrototypeOf(input);
@@ -1001,6 +1003,9 @@ export function createSpansCmuxTransport({
       if (isRecord(value) && value.ok === true) {
         return { ok: true };
       }
+      if (isRecord(value) && value.unknown === true) {
+        return { code: 'PERSIST_UNKNOWN', ok: false };
+      }
       if (isRecord(value) && value.code === 'STALE_GENERATION') {
         return { code: 'STALE_GENERATION', ok: false };
       }
@@ -1430,3 +1435,8 @@ export function createSpansCmuxTransport({
 
   return Object.freeze({ acknowledge, deliver, inspect });
 }
+
+export {
+  deliveryEvent as spansCmuxDeliveryEvent,
+  parseRecord as parseSpansCmuxRecord,
+};

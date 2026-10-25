@@ -28,8 +28,9 @@ import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { createCliApi } from './cli-api.js';
 import {
   caddyfileText,
+  codexMcpConfiguration,
   cursorConfigText,
-  hasCodexServerTable,
+  cursorMcpConfiguration,
   hasIdentifiableWorktreeCwd,
   hasPortalCaddyRoute,
   portalCaddyRoute,
@@ -97,6 +98,7 @@ import {
 import { createResourceAdmission } from './resource-admission.js';
 import { createSetupInstallProcesses } from './setup-install-process.js';
 import { createSetupProgress } from './setup-progress.js';
+import { SPANS_SEARCH_LIMITS } from './spans-search.js';
 import { runTriggerCommand } from './trigger-command.js';
 import { createUpdateCommand, describeUpdate } from './update-command.js';
 import {
@@ -313,12 +315,12 @@ export async function runCli(
       return 1;
     }
 
-    // The offline index command touches only its explicit archive root, so the
-    // update nudge (config write, git fetch) must not run for it.
+    // Offline archive commands must not trigger config writes or git fetches.
     if (
       !(
         injectedRequest ||
-        (cmd === 'spans' && args[0] === 'index') ||
+        (cmd === 'spans' &&
+          ['index', 'backup', 'restore', 'import'].includes(args[0])) ||
         [
           'rm',
           'trigger',
@@ -1134,8 +1136,9 @@ async function createNewWorktreeResult({
   tracker.setEvents(
     (deps.createOperationEvents ?? createOperationEvents)({ state })
   );
+  const hostHealth = (deps.createHostHealth ?? createHostHealth)(c.workspace);
   const admission = (deps.createResourceAdmission ?? createResourceAdmission)({
-    hostHealth: (deps.createHostHealth ?? createHostHealth)(c.workspace),
+    hostHealth,
     state,
   });
   const progress = (deps.createSetupProgress ?? createSetupProgress)({
@@ -2050,9 +2053,17 @@ export function mcpInstallCodex({
   const path = join(dir, 'config.toml');
   mkdirSync(dir, { recursive: true });
   const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  if (hasCodexServerTable(text)) {
+  const configuration = codexMcpConfiguration(text, MCP_URL);
+  if (configuration === 'configured') {
     ok(`Already configured in ${path}`);
     return;
+  }
+  if (configuration !== 'absent') {
+    die(
+      configuration === 'conflict'
+        ? 'MCP_CONFIG_CONFLICT'
+        : 'MCP_CONFIG_INVALID'
+    );
   }
   writeAtomic(
     path,
@@ -2078,17 +2089,21 @@ export function mcpInstallCursor({ home = HOME } = {}) {
   if (existsSync(path)) {
     try {
       conf = JSON.parse(readFileSync(path, 'utf8'));
-    } catch (e) {
-      die(`${path} has invalid JSON -- fix it manually first: ${e.message}`);
+    } catch {
+      die('MCP_CONFIG_INVALID');
     }
   }
-  if (conf === null || typeof conf !== 'object' || Array.isArray(conf)) {
-    die(`${path} must contain a plain object`);
-  }
-  conf.mcpServers ??= {};
-  if (conf.mcpServers.setu) {
+  const configuration = cursorMcpConfiguration(conf, MCP_URL);
+  if (configuration === 'configured') {
     ok(`Already configured in ${path}`);
     return;
+  }
+  if (configuration !== 'absent') {
+    die(
+      configuration === 'conflict'
+        ? 'MCP_CONFIG_CONFLICT'
+        : 'MCP_CONFIG_INVALID'
+    );
   }
   writeAtomic(path, cursorConfigText(conf, MCP_URL));
   ok(`Added Setu MCP server to ${path}`);
@@ -2158,25 +2173,42 @@ function genericMcpConfig(client) {
   );
 }
 
-function codexConfigured() {
+function codexConfiguration() {
   const path = join(
     process.env.CODEX_HOME || join(HOME, '.codex'),
     'config.toml'
   );
-  return existsSync(path) && hasCodexServerTable(readFileSync(path, 'utf8'));
+  try {
+    return existsSync(path)
+      ? codexMcpConfiguration(readFileSync(path, 'utf8'), MCP_URL)
+      : 'absent';
+  } catch {
+    return 'invalid';
+  }
 }
 
-function cursorConfigured() {
+function cursorConfiguration() {
   const path = join(HOME, '.cursor', 'mcp.json');
   if (!existsSync(path)) {
-    return false;
+    return 'absent';
   }
   try {
-    return !!JSON.parse(readFileSync(path, 'utf8')).mcpServers?.setu;
+    return cursorMcpConfiguration(
+      JSON.parse(readFileSync(path, 'utf8')),
+      MCP_URL
+    );
   } catch {
-    return false;
+    return 'invalid';
   }
 }
+
+const mcpConfigurationLabel = (state) =>
+  ({
+    absent: 'not configured',
+    configured: 'configured',
+    conflict: 'configuration conflict',
+    invalid: 'invalid configuration',
+  })[state];
 
 function mcpClientStatus(id) {
   const { bin } = AGENT_CLIS[id];
@@ -2195,13 +2227,9 @@ function mcpClientStatus(id) {
 function mcpStatus() {
   for (const id of Object.keys(AGENT_CLIS)) {
     if (id === 'codex') {
-      console.log(
-        `codex: ${codexConfigured() ? 'configured' : mcpClientStatus(id)}`
-      );
+      console.log(`codex: ${mcpConfigurationLabel(codexConfiguration())}`);
     } else if (id === 'cursor') {
-      console.log(
-        `cursor: ${cursorConfigured() ? 'configured' : mcpClientStatus(id)}`
-      );
+      console.log(`cursor: ${mcpConfigurationLabel(cursorConfiguration())}`);
     } else if (verifiedMcpInstallers[id]) {
       console.log(`${id}: ${mcpClientStatus(id)}`);
     } else {
@@ -2647,16 +2675,13 @@ function spansIndexFailure(code, progress = {}) {
 
 // Pages are bounded; the checkpoint lives in the archive, so a rerun resumes.
 // Coverage is reported exactly as the store states it, never inferred.
-function runSpansIndex(store, limit, maxPages) {
-  const initialized = store.initializeSearch();
-  if (initialized?.ok !== true) {
-    return spansIndexFailure(initialized?.code, { indexed: 0, pages: 0 });
-  }
+async function runSpansIndex(store, limit, maxPages, write) {
   let indexed = 0;
   let pages = 0;
   let page;
   do {
-    page = store.indexSearchPage({ limit });
+    // biome-ignore lint/performance/noAwaitInLoops: Each bounded page must acquire fresh shared archive capacity.
+    page = await write(() => store.indexSearchPage({ limit }));
     if (page?.ok !== true) {
       return spansIndexFailure(page?.code, { indexed, pages });
     }
@@ -2690,6 +2715,133 @@ function runSpansIndex(store, limit, maxPages) {
   };
 }
 
+// shortcut: this conservative growth allowance is post-checked, not a filesystem
+// quota; use measured page growth if real archive workloads exceed it.
+const SPANS_INDEX_WRITE_BYTES =
+  SPANS_SEARCH_LIMITS.indexPageBytes * 4 + 2 * 1024 * 1024;
+
+function spansArchiveGate(deps) {
+  let gate = deps.spansArchiveWrite;
+  if (gate === undefined) {
+    const config = (deps.loadConfig ?? loadConfig)();
+    if (!config?.workspace) {
+      return async () => ({
+        code: 'SPANS_ARCHIVE_WRITE_UNAVAILABLE',
+        ok: false,
+      });
+    }
+    gate = (deps.createResourceAdmission ?? createResourceAdmission)({
+      hostHealth: (deps.createHostHealth ?? createHostHealth)(config.workspace),
+      state: (deps.workspaceState ?? workspaceState)(config.workspace),
+    }).withSpansArchiveWrite;
+  }
+  return gate;
+}
+
+function spansIndexWriter(root, deps) {
+  const gate = spansArchiveGate(deps);
+  return async (effect) => {
+    if (typeof gate !== 'function') {
+      return spansIndexFailure('SPANS_ARCHIVE_WRITE_UNAVAILABLE');
+    }
+    const result = await gate(
+      { maxBytes: SPANS_INDEX_WRITE_BYTES, root },
+      effect
+    );
+    return result?.ok === true && Object.hasOwn(result, 'value')
+      ? result.value
+      : spansIndexFailure(result?.code);
+  };
+}
+
+function spansAbsolutePathFlag(name) {
+  const value = requireFlag(name);
+  if (
+    !isAbsolute(value) ||
+    value.includes('\0') ||
+    value.split(PATH_SEPARATOR_RE).includes('..')
+  ) {
+    die(`--${name} must be an absolute path without ".." segments.`);
+  }
+  return value;
+}
+
+async function cmdSpansMaintenance(operation) {
+  const sourceKey = operation === 'backup' ? 'root' : 'backupRoot';
+  const input = {
+    [sourceKey]: spansAbsolutePathFlag(
+      operation === 'backup' ? 'root' : 'backup-root'
+    ),
+    destination: spansAbsolutePathFlag('destination'),
+    operation,
+  };
+  let result;
+  try {
+    const { runSpansMaintenanceCommand } = await (
+      localCommandOverrides.loadSpansMaintenance ??
+      (() => import('./spans-maintenance-command.js'))
+    )();
+    result = await runSpansMaintenanceCommand(input);
+  } catch {
+    result = {
+      code: 'SPANS_MAINTENANCE_UNKNOWN',
+      error:
+        'Archive maintenance did not return a confirmed result. Inspect the destination before retrying.',
+      ok: false,
+      outcomeUnknown: true,
+    };
+  }
+  return apiResult(() => result);
+}
+
+async function cmdSpansImport() {
+  const root = spansAbsolutePathFlag('root');
+  const input = spansPlanningInput();
+  const deps = localCommandOverrides;
+  let runtime;
+  let result;
+  let closeFailed = false;
+  try {
+    const { createSpansImportRuntime } = await (
+      deps.loadSpansImportRuntime ?? (() => import('./spans-import-runtime.js'))
+    )();
+    runtime = createSpansImportRuntime({
+      archiveWrite: spansArchiveGate(deps),
+      root,
+    });
+    result = await runtime.importSelected(input);
+  } catch {
+    result = {
+      code: 'SPANS_IMPORT_UNKNOWN',
+      error:
+        'Selected import did not return a confirmed result. Inspect its checkpoint before retrying.',
+      nextOffset: null,
+      ok: false,
+      outcomeUnknown: true,
+    };
+  } finally {
+    if (runtime) {
+      try {
+        closeFailed = (await runtime.close())?.ok !== true;
+      } catch {
+        closeFailed = true;
+      }
+    }
+  }
+  if (closeFailed) {
+    result = {
+      ...result,
+      code: 'SPANS_IMPORT_CLOSE_FAILED',
+      error:
+        'Selected import archive did not close cleanly. Inspect its checkpoint before retrying.',
+      nextOffset: null,
+      ok: false,
+      outcomeUnknown: true,
+    };
+  }
+  return apiResult(() => result);
+}
+
 // Offline and explicit: no portal, no default or live root, no import or
 // dispatch. An existing archive is required, so this never creates one.
 async function cmdSpansIndex() {
@@ -2720,8 +2872,15 @@ async function cmdSpansIndex() {
       // Absent or unreadable alike: there is no archive to index.
     }
     if (database?.isFile() && database.size > 0) {
-      store = openSpansStore({ root });
-      result = runSpansIndex(store, limit, maxPages);
+      const write = spansIndexWriter(root, deps);
+      const initialized = await write(() => {
+        store = openSpansStore({ create: false, root });
+        return store.initializeSearch();
+      });
+      result =
+        initialized?.ok === true
+          ? await runSpansIndex(store, limit, maxPages, write)
+          : spansIndexFailure(initialized?.code, { indexed: 0, pages: 0 });
     } else {
       result = spansIndexFailure('SPANS_INDEX_NO_ARCHIVE');
     }
@@ -2775,6 +2934,7 @@ function spansPlanningCommand(action, usage) {
   const planningRoutes = {
     'create-draft': '/api/spans/drafts/create',
     'create-workflow': '/api/spans/workflows/create',
+    'import-history': '/api/spans/history/import',
     preview: '/api/spans/workflows/preview',
     'revise-plan': '/api/spans/plans/revise',
   };
@@ -2797,6 +2957,11 @@ const SPANS_EXECUTION_POSITIONAL = {
   complete: [4, 'post', (run, action) => ({ actionId: action, runId: run })],
   probe: [3, 'post', (profile) => ({ profile })],
   reconcile: [2, 'post', () => ({})],
+  'saved-review': [
+    4,
+    'get',
+    (run, digest) => ({ reviewDigest: digest, runId: run }),
+  ],
   status: [3, 'get', (run) => ({ runId: run })],
 };
 
@@ -2828,7 +2993,17 @@ function spansExecutionCommand(usage) {
       cliApi.post(spansExecutionRoute('report'), spansPlanningInput())
     );
   }
-  if ((action === 'review' || action === 'dispatch') && args.length === 2) {
+  if (
+    [
+      'review',
+      'prepare',
+      'approval-challenge',
+      'approve',
+      'revoke',
+      'dispatch',
+    ].includes(action) &&
+    args.length === 2
+  ) {
     validateFlags(
       action === 'dispatch' ? ['confirmation', 'input'] : ['input'],
       usage
@@ -2858,13 +3033,62 @@ function spansEventQuery(runId) {
   };
 }
 
+function spansOfflineCommand(action, usage) {
+  if (args.length !== 1) {
+    return null;
+  }
+  if (action === 'index') {
+    validateFlags(['limit', 'pages', 'root'], usage);
+    return cmdSpansIndex();
+  }
+  if (action === 'backup' || action === 'restore') {
+    validateFlags(
+      [action === 'backup' ? 'root' : 'backup-root', 'destination'],
+      usage
+    );
+    return cmdSpansMaintenance(action);
+  }
+  if (action === 'import') {
+    validateFlags(['input', 'root'], usage);
+    return cmdSpansImport();
+  }
+  return null;
+}
+
+function spansIntegrationsCommand(usage) {
+  const operation = args[1] ?? 'status';
+  if (args.length > 2) {
+    return die(usage);
+  }
+  const root = '/api/spans/integrations';
+  if (operation === 'status') {
+    validateFlags([], usage);
+    return apiResult(() => cliApi.get(root));
+  }
+  if (operation === 'reconcile') {
+    validateFlags([], usage);
+    return apiResult(() => cliApi.post(`${root}/reconcile`, {}));
+  }
+  if (operation === 'review' || operation === 'apply') {
+    validateFlags(['input'], usage);
+    const input =
+      operation === 'review' && flags.input === undefined
+        ? {}
+        : spansPlanningInput();
+    return apiResult(() => cliApi.post(`${root}/${operation}`, input));
+  }
+  return die(usage);
+}
+
 async function cmdSpans() {
   const usage =
-    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path> | exec capabilities <profile> | exec status <run> | exec probe <profile> | exec review --input <json> | exec dispatch --input <json> [--confirmation <token>] | exec cancel <run> <attempt> | exec complete <run> <action> | exec accept <run> <action> [--confirmation <token>] | exec report --input <json> | exec reconcile | exec resolve <run> <action> [--confirmation <token>]] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
+    'setu spans [list | show <run> | events <run> | artifact <run> <artifact> | search <query> | search-status | integrations [status|review|apply|reconcile] | workflows | preview --input <json> | create-workflow --input <json> | create-draft --input <json> | revise-plan --input <json> | index --root <absolute-path> | import-history --input <json> | import --root <absolute-path> --input <json> | backup --root <absolute-path> --destination <new-path> | restore --backup-root <absolute-path> --destination <new-path> | exec capabilities <profile> | exec status <run> | exec probe <profile> | exec review --input <json> | exec prepare --input <json> | exec approval-challenge --input <json> | exec approve --input <json> | exec revoke --input <json> | exec saved-review <run> <digest> | exec dispatch --input <json> [--confirmation <token>] | exec cancel <run> <attempt> | exec complete <run> <action> | exec accept <run> <action> [--confirmation <token>] | exec report --input <json> | exec reconcile | exec resolve <run> <action> [--confirmation <token>]] [--after <run> --since <sequence> --through <sequence> --generation <N> --run <run> --limit <N>] [--json]';
   validateCommand({
     allowedFlags: [
       'after',
+      'backup-root',
       'confirmation',
+      'destination',
       'generation',
       'input',
       'limit',
@@ -2885,13 +3109,16 @@ async function cmdSpans() {
   if (action === 'exec') {
     return await spansExecutionCommand(usage);
   }
+  if (action === 'integrations') {
+    return await spansIntegrationsCommand(usage);
+  }
   const planning = spansPlanningCommand(action, usage);
   if (planning) {
     return await planning;
   }
-  if (action === 'index' && args.length === 1) {
-    validateFlags(['limit', 'pages', 'root'], usage);
-    return await cmdSpansIndex();
+  const offline = spansOfflineCommand(action, usage);
+  if (offline) {
+    return await offline;
   }
   if (action === 'search' && args.length === 2) {
     validateFlags(['generation', 'limit', 'run', 'since', 'through'], usage);
@@ -3149,7 +3376,10 @@ async function cmdLinksHistory(action) {
     const factory =
       deps.createLinksHistoryService ??
       (async (given) =>
-        (await import('./links-runtime.js')).createOfflineLinksHistory(given));
+        (await import('./links-runtime.js')).createOfflineLinksHistory({
+          ...given,
+          archiveWrite: spansArchiveGate(deps),
+        }));
     let result;
     try {
       const service = await factory(
@@ -3378,10 +3608,10 @@ async function cmdAdmission() {
 // biome-ignore lint/suspicious/useAwait: runCli and direct command callers require synchronous validation failures as rejected command promises.
 async function cmdSetupProgress() {
   validateCommand({
-    allowedFlags: ['attempt', 'checkout'],
+    allowedFlags: ['attempt', 'checkout', 'refresh-dependencies'],
     argCounts: [0, 1, 3],
     usage:
-      'setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id>] [--json]',
+      'setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id> [--refresh-dependencies]] [--json]',
   });
   const [action, repo, name] = args;
   if (!action || action === 'list') {
@@ -3398,11 +3628,20 @@ async function cmdSetupProgress() {
   }
   if (action !== 'retry' || !(repo && name)) {
     die(
-      'Usage: setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <identity> --attempt <id>] [--json]'
+      'Usage: setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <identity> --attempt <id> [--refresh-dependencies]] [--json]'
     );
+  }
+  if (
+    flags['refresh-dependencies'] !== undefined &&
+    flags['refresh-dependencies'] !== true
+  ) {
+    die('--refresh-dependencies does not accept a value');
   }
   return apiResult(() =>
     cliApi.post('/api/setup-progress/retry', {
+      ...(flags['refresh-dependencies'] === true
+        ? { refreshDependencies: true }
+        : {}),
       attemptId: requireFlag('attempt'),
       checkoutIdentity: checkoutIdentity(),
       name,
@@ -4463,8 +4702,15 @@ function cmdHelp() {
     setu spans search <query> [--run <run> --since <sequence> --through <sequence> --generation <N> --limit <N>] [--json]
                                       A page after --since needs the --generation it returned; a
                                       missing index is unavailable, never zero results
+    setu spans integrations [status|reconcile] [--json]
+    setu spans integrations review [--input '<selection JSON>'] [--json]
+    setu spans integrations apply --input '<reviewId and response JSON>' [--json]
     setu spans exec capabilities <profile> | status <run> | probe <profile> [--json]
     setu spans exec review --input '<review JSON>' [--json]
+    setu spans exec prepare --input '<review JSON>' [--json]
+    setu spans exec approval-challenge --input '<review reference JSON>' [--json]
+    setu spans exec approve|revoke --input '<typed confirmation JSON>' [--json]
+    setu spans exec saved-review <run> <digest> [--json]
     setu spans exec dispatch --input '<review JSON>' [--confirmation <token>] [--json]
     setu spans exec cancel <run> <attempt> [--json]
     setu spans exec complete <run> <action> [--json]
@@ -4476,6 +4722,11 @@ function cmdHelp() {
     setu spans search-status [--json]
     setu spans index --root <absolute-path> [--limit <N> --pages <N>] [--json]
                                       Offline: indexes an existing archive in bounded pages; rerun to resume
+    setu spans import --root <absolute-path> --input <json> [--json]
+                                      Offline: imports one bounded page from one explicitly selected source
+    setu spans backup --root <absolute-path> --destination <new-absolute-path> [--json]
+    setu spans restore --backup-root <absolute-path> --destination <new-absolute-path> [--json]
+                                      Offline: preserves the source and never activates the restored copy
     setu sessions [list [repo branch] | end <repo> <branch> --session <id> --checkout <file|-> | resume <repo> <branch> --native <id> [--confirmation <token>]] [--json]
     setu links send <repo> <branch> --session <id> --body-file <file|-> [--idempotency-key <key> --reply-to <message>] [--json]
     setu links inbox <repo> <branch> --session <id> [--state <state>] [--json]
@@ -4502,7 +4753,7 @@ function cmdHelp() {
     setu caches execute <repo> <branch> --retry <file|-> [--json]
                                       Retry input contains the returned manifestId and retryId
     setu admission [--json]
-    setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id>] [--json]
+    setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout <file|-> --attempt <id> [--refresh-dependencies]] [--json]
     setu attention [list [repo branch] [--limit <n> --before <cursor>] | focus <repo> <branch> --session <id> --checkout <file|->] [--json]
     setu headless list [repo branch] [--json]
     setu headless start <repo> <branch> --prompt-file <file|-> [--model <name> --budget <USD> --wall-clock-ms <N> --output-bytes <N>] [--json]

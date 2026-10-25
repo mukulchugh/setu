@@ -346,7 +346,7 @@ describe('real archive search lifecycle', () => {
     expect(
       await runtime.spansSearch({ limit: 1, query: 'needle' })
     ).toMatchObject({
-      code: 'SPANS_SERVICE_UNAVAILABLE',
+      code: 'SPANS_ARCHIVE_NOT_INITIALIZED',
       ok: false,
     });
     expect(await runtime.spansSearchStatus()).toMatchObject({ ok: false });

@@ -935,7 +935,9 @@ async function prepareSetupInstall({
     const installInputs = selectedBunVersion
       ? await captureBunInstallInputs(res.wtDir, selectedBunVersion)
       : undefined;
-    const installCommand = shared?.command ?? command;
+    const installCommand =
+      shared?.command ??
+      (bunInstaller ? [process.execPath, command[1]] : command);
     await setupStage(progress, setup, 'installing');
     return { installCommand, installInputs, shared };
   } catch (error) {

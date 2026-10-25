@@ -1112,6 +1112,78 @@ test('MCP config installers are idempotent and retain unrelated temp configurati
   expect(cursorConfig.mcpServers.setu.url).toBe('http://localhost:2999/mcp');
 });
 
+test('MCP installers refuse conflicting or invalid entries without changing temporary config bytes', () => {
+  const home = fs.mkdtempSync(join(tmpdir(), 'setu-cli-mcp-conflict-'));
+  roots.push(home);
+  const codexHome = join(home, 'codex');
+  const cursorHome = join(home, '.cursor');
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(cursorHome, { recursive: true });
+  const codexPath = join(codexHome, 'config.toml');
+  const cursorPath = join(cursorHome, 'mcp.json');
+  const install = (client) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--eval',
+        `import { mcpInstallCodex, mcpInstallCursor } from './cli.js';
+if (process.env.SETU_MCP_TEST_CLIENT === 'codex') {
+  mcpInstallCodex({ codexHome: process.env.CODEX_HOME });
+} else {
+  mcpInstallCursor({ home: process.env.HOME });
+}`,
+      ],
+      {
+        cwd: import.meta.dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          CODEX_HOME: codexHome,
+          HOME: home,
+          SETU_MCP_TEST_CLIENT: client,
+        },
+        timeout: 5000,
+      }
+    );
+  for (const text of [
+    '[mcp_servers.setu]\nurl = "http://wrong.test/mcp"\n',
+    '[mcp_servers.setu]\ncommand = "private-tool"\n',
+    '[mcp_servers.setu]\nurl = "http://localhost:2999/mcp"\nenabled = false\n',
+    'mcp_servers = =',
+  ]) {
+    fs.writeFileSync(codexPath, text);
+    const result = install('codex');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('MCP_CONFIG_');
+    expect(fs.readFileSync(codexPath, 'utf8')).toBe(text);
+  }
+  for (const text of [
+    '{"mcpServers":{"setu":{"url":"http://wrong.test/mcp"}}}',
+    '{"mcpServers":{"setu":{"command":"private-tool"}}}',
+    '{"mcpServers":{"setu":{"url":"http://localhost:2999/mcp","disabled":true}}}',
+    '{"mcpServers":null}',
+    '{"mcpServers":[]}',
+    '{"private":"unterminated',
+  ]) {
+    fs.writeFileSync(cursorPath, text);
+    const result = install('cursor');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('MCP_CONFIG_');
+    expect(fs.readFileSync(cursorPath, 'utf8')).toBe(text);
+  }
+});
+
+test('Codex installer recognizes a parsed inline endpoint and preserves the entire temporary config', () => {
+  const home = fs.mkdtempSync(join(tmpdir(), 'setu-cli-mcp-inline-'));
+  roots.push(home);
+  const path = join(home, 'config.toml');
+  const text =
+    'model = "fixture"\nmcp_servers = { setu = { url = "http://localhost:2999/mcp" } } # keep\n';
+  fs.writeFileSync(path, text);
+  mcpInstallCodex({ codexHome: home });
+  expect(fs.readFileSync(path, 'utf8')).toBe(text);
+});
+
 test('the entry point is the last statement, so no command runs before the module is initialised', () => {
   const source = fs.readFileSync(new URL('./cli.js', import.meta.url), 'utf8');
   const entry = source.lastIndexOf('if (import.meta.main) {');
@@ -1201,5 +1273,51 @@ test('Spans refusal prints a runnable writer release command for a path with spa
     ]);
   } finally {
     console.error = originalError;
+  }
+});
+
+test('setup refresh is explicit and forwards the exact attempt and checkout only once', async () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'setu-refresh-cli-'));
+  roots.push(root);
+  const identity = { checkoutPath: root, known: true };
+  const identityPath = join(root, 'identity.json');
+  fs.writeFileSync(identityPath, JSON.stringify(identity));
+  const calls = [];
+  const original = console.log;
+  console.log = () => undefined;
+  try {
+    expect(
+      await runCli(
+        [
+          'setup-progress',
+          'retry',
+          'repo',
+          'topic',
+          '--checkout',
+          identityPath,
+          '--attempt',
+          'completed-attempt',
+          '--refresh-dependencies',
+          '--json',
+        ],
+        {
+          request: (input) => {
+            calls.push(input);
+            return Promise.resolve({ ok: true });
+          },
+        }
+      )
+    ).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].path).toBe('/api/setup-progress/retry');
+    expect(calls[0].body).toMatchObject({
+      attemptId: 'completed-attempt',
+      checkoutIdentity: identity,
+      name: 'topic',
+      refreshDependencies: true,
+      repo: 'repo',
+    });
+  } finally {
+    console.log = original;
   }
 });

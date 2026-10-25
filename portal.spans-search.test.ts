@@ -45,6 +45,137 @@ describe('decodeSpansSearch', () => {
     expect(decoded.coverage.complete).toBe(true);
   });
 
+  const validCache = () => ({
+    ageMs: 2500.5,
+    createdAt: 1_700_000_000_000,
+    hit: true,
+    key: `sha256:${'a'.repeat(64)}`,
+    manifest: {
+      dependencies: [
+        {
+          digest: `sha256:${'b'.repeat(64)}`,
+          generation: '4:8:8',
+          kind: 'corpus',
+        },
+      ],
+      scope: { environment: '/private/archive/path' },
+      versions: { parser: 'parser-v2', tool: 'tool-v3' },
+    },
+    persisted: true,
+  });
+
+  test('decodes a cache hit with matching source evidence without exposing private scope', () => {
+    const cache = validCache();
+    const decoded = decodeSpansSearch(response([hit(3)], { cache }), request);
+    expect(decoded.cache?.kind).toBe('available');
+    if (decoded.cache?.kind !== 'available') {
+      throw new Error('Expected a current cache receipt');
+    }
+    expect(decoded.cache.hit).toBe(true);
+    expect(decoded.cache.ageMs).toBe(2500.5);
+    expect(decoded.cache.persisted).toBe(true);
+    expect(decoded.cache.source?.corpusGeneration).toBe('4:8:8');
+    expect(decoded.cache.source?.toolVersion).toBe('tool-v3');
+    expect(decoded.cache.key).toBe(cache.key);
+    expect(JSON.stringify(decoded.cache)).not.toContain(
+      '/private/archive/path'
+    );
+  });
+
+  test('keeps an empty fresh result when cache persistence was refused', () => {
+    const decoded = decodeSpansSearch(
+      response([], {
+        cache: {
+          hit: false,
+          persisted: false,
+          persistenceReason: 'ARCHIVE_WRITE_REFUSED',
+        },
+      }),
+      request
+    );
+    expect(decoded.hits).toEqual([]);
+    expect(decoded.cache).toEqual({
+      ageMs: null,
+      createdAt: null,
+      hit: false,
+      key: null,
+      kind: 'available',
+      missReason: null,
+      persisted: false,
+      persistenceReason: 'ARCHIVE_WRITE_REFUSED',
+      source: null,
+    });
+  });
+
+  test('keeps unknown age unknown for an otherwise complete hit', () => {
+    const cache = { ...validCache(), ageMs: 'recent', createdAt: 'yesterday' };
+    const decoded = decodeSpansSearch(response([hit(3)], { cache }), request);
+    expect(decoded.cache).toMatchObject({
+      ageMs: null,
+      createdAt: null,
+      hit: true,
+      persisted: true,
+    });
+  });
+
+  test('does not infer a hit from incomplete or contradictory cache evidence', () => {
+    const cache = validCache();
+    for (const bad of [
+      { ...cache, key: null },
+      { ...cache, manifest: null },
+      { ...cache, hit: 'yes' },
+      { ...cache, persisted: 'unknown' },
+      { ...cache, persisted: false },
+      {
+        ...cache,
+        manifest: {
+          ...cache.manifest,
+          dependencies: [
+            { ...cache.manifest.dependencies[0], generation: '5:8:8' },
+          ],
+        },
+      },
+      { cacheMeta: cache, persisted: true },
+    ]) {
+      const decoded = decodeSpansSearch(
+        response([hit(3)], { cache: bad }),
+        request
+      );
+      expect(decoded.hits).toHaveLength(1);
+      expect(decoded.cache).toEqual({ kind: 'unavailable' });
+    }
+  });
+
+  test('an unconfirmed save stays unknown and cannot invalidate valid search results', () => {
+    const decoded = decodeSpansSearch(
+      response([hit(3)], {
+        cache: {
+          ageMs: null,
+          hit: false,
+          persisted: 'unknown',
+          persistenceReason: 'ARCHIVE_WRITE_UNKNOWN',
+        },
+      }),
+      request
+    );
+    expect(decoded.hits).toHaveLength(1);
+    expect(decoded.cache).toMatchObject({
+      ageMs: null,
+      hit: false,
+      persisted: 'unknown',
+    });
+  });
+
+  test('invalid creation dates cannot reach date rendering', () => {
+    const decoded = decodeSpansSearch(
+      response([hit(3)], {
+        cache: { ...validCache(), createdAt: Number.MAX_SAFE_INTEGER },
+      }),
+      request
+    );
+    expect(decoded.cache).toMatchObject({ createdAt: null, hit: true });
+  });
+
   test('rejects malformed responses and hits from a different requested run', () => {
     expect(() => decodeSpansSearch({ ok: true }, request)).toThrow();
     expect(() =>

@@ -52,10 +52,89 @@ const configInvalid = Object.freeze({
   ok: false,
 });
 
+// Read paths never initialize or migrate an archive. The first writable
+// handle opens only inside the execution service's admitted write effect.
+function executionArchive(root) {
+  let handle = null;
+  let writable = false;
+  let closed = false;
+  const unavailable = () => ({
+    code: 'SPANS_EXEC_ARCHIVE_UNAVAILABLE',
+    ok: false,
+  });
+  const reader = () => {
+    if (closed) {
+      throw new Error('Execution archive is closed.');
+    }
+    handle ??= openSpansStore({ create: false, readonly: true, root });
+    return handle;
+  };
+  const prepareWrite = () => {
+    if (closed) {
+      throw new Error('Execution archive is closed.');
+    }
+    if (writable) {
+      return;
+    }
+    if (handle && handle.close()?.ok !== true) {
+      throw new Error('Execution archive reader could not close.');
+    }
+    handle = null;
+    handle = openSpansStore({ create: false, root });
+    writable = true;
+  };
+  const store = {};
+  for (const method of [
+    'getArtifactReference',
+    'getEventById',
+    'listRuns',
+    'readCache',
+    'readEvents',
+    'readRun',
+    'readSourceCursor',
+  ]) {
+    store[method] = (...args) => {
+      try {
+        return reader()[method](...args);
+      } catch {
+        return unavailable();
+      }
+    };
+  }
+  for (const method of [
+    'appendEvent',
+    'commitRun',
+    'writeCache',
+    'withCurrentAttempt',
+  ]) {
+    store[method] = (...args) => {
+      if (!(writable && handle) || closed) {
+        return unavailable();
+      }
+      return handle[method](...args);
+    };
+  }
+  return {
+    artifacts: createSpansArtifacts({ root }),
+    close() {
+      closed = true;
+      const result = handle?.close() ?? { ok: true };
+      if (result.ok === true) {
+        handle = null;
+      }
+      return result;
+    },
+    prepareWrite,
+    root,
+    store: Object.freeze(store),
+  };
+}
+
 export function createSpansExecutionRuntime({
   admission,
   config,
   injected,
+  resourcePaths,
   resolveTarget,
   root = defaultSpansRoot(),
   setupProgress,
@@ -84,31 +163,33 @@ export function createSpansExecutionRuntime({
   }
 
   let opened = null;
+  let closed = false;
+  const closedResult = () => ({ code: 'SPANS_EXEC_RUNTIME_CLOSED', ok: false });
   function open() {
     if (injected) {
       return injected;
     }
     if (!opened) {
-      const store = openSpansStore({ root });
+      const archive = executionArchive(root);
       opened = {
+        archive,
         service: createSpansExecution({
           admission,
-          archive: {
-            artifacts: createSpansArtifacts({ root }),
-            root,
-            store,
-          },
+          archive,
           resolveTarget,
+          resourcePaths,
           runBudgetUsd: chosen.runBudgetUsd,
           setupProgress,
         }),
-        store,
       };
     }
     return opened.service;
   }
 
   async function status(input) {
+    if (closed) {
+      return closedResult();
+    }
     const service = open();
     const result = await service.status(input);
     return result.ok
@@ -116,36 +197,51 @@ export function createSpansExecutionRuntime({
       : result;
   }
 
+  const invoke = (method, input) =>
+    closed ? closedResult() : open()[method](input);
+
   return Object.freeze({
     async close() {
+      closed = true;
       if (injected) {
         return;
       }
       if (opened) {
         await opened.service.close();
-        opened.store.close();
+        if (opened.archive.close()?.ok !== true) {
+          throw new Error('Execution archive could not close.');
+        }
         opened = null;
       }
     },
     // At startup, only an archive that already exists is reconciled. This holds
     // what is unknown and settles what is proven; it never starts anything.
     recover() {
+      if (closed) {
+        return Promise.resolve(closedResult());
+      }
       if (!(injected || existsSync(join(root, SPANS_STORE_DATABASE_FILE)))) {
         return Promise.resolve({ ok: true, skipped: true });
       }
       return open().reconcile();
     },
     services: Object.freeze({
-      spansExecutionAccept: (input) => open().accept(input),
-      spansExecutionCancel: (input) => open().cancel(input),
-      spansExecutionCapabilities: (input) => open().capabilities(input),
-      spansExecutionComplete: (input) => open().complete(input),
-      spansExecutionDispatch: (input) => open().dispatch(input),
-      spansExecutionProbe: (input) => open().probe(input),
-      spansExecutionReconcile: (input) => open().reconcile(input),
-      spansExecutionReport: (input) => open().report(input),
-      spansExecutionResolve: (input) => open().resolve(input),
-      spansExecutionReview: (input) => open().review(input),
+      spansExecutionAccept: (input) => invoke('accept', input),
+      spansExecutionApprovalChallenge: (input) =>
+        invoke('approvalChallenge', input),
+      spansExecutionApprove: (input) => invoke('approve', input),
+      spansExecutionCancel: (input) => invoke('cancel', input),
+      spansExecutionCapabilities: (input) => invoke('capabilities', input),
+      spansExecutionComplete: (input) => invoke('complete', input),
+      spansExecutionDispatch: (input) => invoke('dispatch', input),
+      spansExecutionPrepare: (input) => invoke('prepare', input),
+      spansExecutionProbe: (input) => invoke('probe', input),
+      spansExecutionReadReview: (input) => invoke('readReview', input),
+      spansExecutionReconcile: (input) => invoke('reconcile', input),
+      spansExecutionReport: (input) => invoke('report', input),
+      spansExecutionResolve: (input) => invoke('resolve', input),
+      spansExecutionReview: (input) => invoke('review', input),
+      spansExecutionRevoke: (input) => invoke('revoke', input),
       spansExecutionStatus: status,
     }),
   });

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -12,6 +13,8 @@ import fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { createDependencyReceipt } from './dependency-readiness.js';
+import { observeProcessIdentity } from './process-observation.js';
 import { createResourceAdmission } from './resource-admission.js';
 import { createSetupProgress } from './setup-progress.js';
 import { createSpansArtifacts } from './spans-artifacts.js';
@@ -49,15 +52,116 @@ function git(dir, args) {
   ).trimEnd();
 }
 
-function runsFixture(pid) {
+function runsFixture(pid, pidFile) {
   try {
-    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).includes(PROVIDER_FIXTURE);
+    const proof = JSON.parse(
+      readFileSync(`${pidFile}.${pid}.identity.json`, 'utf8')
+    );
+    const command = execFileSync(
+      'ps',
+      ['-p', String(pid), '-o', 'lstart=,command='],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }
+    )
+      .trim()
+      .replace(/\s+/g, ' ');
+    return (
+      proof.state === 'alive' &&
+      proof.processId === pid &&
+      command.startsWith(`${proof.processStartIdentity} `) &&
+      command.includes(PROVIDER_FIXTURE)
+    );
   } catch {
     return false;
   }
+}
+
+async function waitForFixtureCaptureExit(captured, deadline, escalateAt) {
+  const observed = await observeProcessIdentity(captured.pid);
+  if (
+    observed.state === 'absent' ||
+    (observed.state === 'alive' &&
+      observed.processStartIdentity !== captured.processStartIdentity)
+  ) {
+    return;
+  }
+  if (Date.now() >= deadline) {
+    throw new Error('Fixture capture cleanup did not finish.');
+  }
+  if (
+    Date.now() >= escalateAt &&
+    observed.state === 'alive' &&
+    observed.processStartIdentity === captured.processStartIdentity
+  ) {
+    try {
+      process.kill(captured.pid, 'SIGKILL');
+    } catch (error) {
+      if (error.code !== 'ESRCH') {
+        throw error;
+      }
+    }
+  }
+  await Bun.sleep(20);
+  await waitForFixtureCaptureExit(captured, deadline, escalateAt);
+}
+
+async function stopFixtureCapture(root, entry) {
+  let captured;
+  try {
+    captured = JSON.parse(
+      readFileSync(join(root, entry, 'capture-process.json'), 'utf8')
+    ).captureProcess;
+  } catch {
+    return;
+  }
+  await stopOwnedFixtureCapture(captured);
+}
+
+export async function stopOwnedFixtureCapture(captured) {
+  const current = await observeProcessIdentity(captured.pid);
+  if (
+    current.state === 'absent' ||
+    (current.state === 'alive' &&
+      current.processStartIdentity !== captured.processStartIdentity)
+  ) {
+    return;
+  }
+  if (
+    current.state !== 'alive' ||
+    current.processStartIdentity !== captured.processStartIdentity
+  ) {
+    throw new Error('Fixture capture cleanup cannot prove ownership.');
+  }
+  try {
+    process.kill(captured.pid, 'SIGTERM');
+  } catch (error) {
+    if (error.code !== 'ESRCH') {
+      throw error;
+    }
+  }
+  await waitForFixtureCaptureExit(
+    captured,
+    Date.now() + 2000,
+    Date.now() + 500
+  );
+}
+
+async function stopFixtureCaptures(root, children, index = 0) {
+  if (index >= children.length) {
+    return;
+  }
+  await stopFixtureCapture(root, children[index]);
+  await stopFixtureCaptures(root, children, index + 1);
+}
+
+async function stopFixtureCaptureChildren(root) {
+  const children = readdirSync(root).filter((entry) =>
+    entry.startsWith('swp-')
+  );
+  await stopFixtureCaptures(root, children);
 }
 
 export const TARGET = Object.freeze({ name: 'feature', repo: 'demo' });
@@ -86,6 +190,59 @@ export const SPANS = [
   { dependencies: ['build'], spanId: 'verify', title: 'Verify the thing' },
 ];
 
+// Complete the accepted human path for tests that are meant to start a worker.
+// The typed phrase is test input here; production services never auto-confirm.
+export async function approvedDispatchInput(service, request) {
+  const prepared = await service.prepare(request);
+  if (prepared?.ok !== true || prepared.status !== 'prepared') {
+    throw new Error(
+      `execution fixture approval prepare failed: ${prepared?.code ?? 'unexpected response'}`
+    );
+  }
+  const reviewDigest = prepared.review?.reviewDigest;
+  if (typeof reviewDigest !== 'string' || !reviewDigest) {
+    throw new Error(
+      'execution fixture approval prepare returned no review digest'
+    );
+  }
+
+  const challenge = await service.approvalChallenge({
+    reviewDigest,
+    runId: request.runId,
+  });
+  if (
+    challenge?.ok !== true ||
+    typeof challenge.challengeId !== 'string' ||
+    typeof challenge.phrase !== 'string'
+  ) {
+    throw new Error(
+      `execution fixture approval challenge failed: ${challenge?.code ?? 'unexpected response'}`
+    );
+  }
+
+  const approved = await service.approve({
+    confirmation: {
+      challengeId: challenge.challengeId,
+      response: challenge.phrase,
+    },
+    reviewDigest,
+    runId: request.runId,
+  });
+  if (approved?.ok !== true) {
+    throw new Error(
+      `execution fixture approval record failed: ${approved?.code ?? 'unexpected response'}`
+    );
+  }
+
+  const preview = await service.review(request);
+  if (preview?.ok !== true || typeof preview.confirmation !== 'string') {
+    throw new Error(
+      `execution fixture approval preview failed: ${preview?.code ?? 'unexpected response'}`
+    );
+  }
+  return { ...request, confirmation: preview.confirmation, reviewDigest };
+}
+
 // Builds the repository, worktree and archive layout under a fresh directory.
 function buildWorld() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'setu-spans-exec-')));
@@ -97,6 +254,10 @@ function buildWorld() {
   mkdirSync(source);
   git(source, ['init', '--quiet', '-b', 'main']);
   writeFileSync(join(source, 'README.md'), 'demo\n');
+  writeFileSync(
+    join(source, 'package.json'),
+    JSON.stringify({ name: 'execution-fixture', version: '1.0.0' })
+  );
   writeFileSync(join(source, 'bun.lock'), '{"lockfileVersion":1}\n');
   git(source, ['add', '-A']);
   git(source, ['commit', '--quiet', '-m', 'initial']);
@@ -158,12 +319,24 @@ export function attachExecutionFixture(root, options = {}) {
       if (!started.ok) {
         throw new Error(`fixture setup failed: ${started.code}`);
       }
-      await setupProgress.finish({
+      const observed = await createDependencyReceipt({
         attemptId: started.record.attemptId,
         checkoutIdentity,
+        wtDir,
+      });
+      if (!observed.ok) {
+        throw new Error(`fixture dependency receipt failed: ${observed.code}`);
+      }
+      const completed = await setupProgress.finish({
+        attemptId: started.record.attemptId,
+        checkoutIdentity,
+        dependencyReceipt: observed.receipt,
         outcome: 'completed',
         target: TARGET,
       });
+      if (!completed.ok) {
+        throw new Error(`fixture setup completion failed: ${completed.code}`);
+      }
     },
     // Builds the execution service over the fixture. The provider command is
     // the local process fixture; every other collaborator is the real module.
@@ -188,6 +361,11 @@ export function attachExecutionFixture(root, options = {}) {
               ? { repoDir, wtDir }
               : null
           ),
+        resourcePaths: {
+          configPath: join(root, 'config.json'),
+          setuDir: root,
+          workspaceRoot: workspace,
+        },
         setupProgress,
         ...rest,
       });
@@ -195,9 +373,10 @@ export function attachExecutionFixture(root, options = {}) {
       return service;
     },
     async dispose({ keepRoot = false } = {}) {
-      await Promise.all(services.splice(0).map((service) => service.close()));
-      store.close();
       fixture.killProviders();
+      await Promise.all(services.splice(0).map((service) => service.close()));
+      await stopFixtureCaptureChildren(root);
+      store.close();
       if (!keepRoot) {
         rmSync(root, { force: true, recursive: true });
       }
@@ -209,7 +388,7 @@ export function attachExecutionFixture(root, options = {}) {
       for (const pid of fixture.providerPids()) {
         // A pid can be reused once its process is gone: only ever signal a
         // process that is still running this fixture.
-        if (!runsFixture(pid)) {
+        if (!runsFixture(pid, pidFile)) {
           continue;
         }
         try {

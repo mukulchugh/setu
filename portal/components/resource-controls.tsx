@@ -204,6 +204,37 @@ export function cleanupExecutionBody(manifestId: string, retryId?: string) {
     : { confirmation: manifestId, manifestId };
 }
 
+export function setupDependencyRefreshBody(
+  entry: Record<string, unknown>,
+  repo: string,
+  name: string,
+  confirmed: boolean,
+  ready = true,
+  pending = false
+) {
+  const target = isRecord(entry.target) ? entry.target : null;
+  return confirmed &&
+    ready &&
+    !pending &&
+    target?.repo === repo &&
+    target.name === name &&
+    entry.state === 'completed' &&
+    entry.outcome === 'completed' &&
+    typeof entry.attemptId === 'string' &&
+    entry.attemptId.length > 0 &&
+    entry.attemptId.length <= 512 &&
+    isRecord(entry.checkoutIdentity) &&
+    entry.checkoutIdentity.known === true
+    ? {
+        attemptId: entry.attemptId,
+        checkoutIdentity: entry.checkoutIdentity,
+        name,
+        refreshDependencies: true,
+        repo,
+      }
+    : null;
+}
+
 export function handoffFindings(value: string) {
   const context = value.trim();
   return context && context.length <= 800
@@ -1077,12 +1108,14 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
       readResource(resourceReadUrl('/api/attention', repo, name), signal)
   );
   const [busy, setBusy] = useState<string | null>(null);
+  const [refreshReview, setRefreshReview] = useState<string | null>(null);
   // Older Links requests loaded below the first page, and the cursor to continue from.
   const [older, setOlder] = useState<{
     events: Record<string, unknown>[];
     links: unknown;
   }>({ events: [], links: null });
   const records = setup.data?.ok ? array(setup.data.records) : [];
+  const setupReady = !setup.failed && setup.data?.ok === true;
   const firstEvents = attention.data?.ok ? array(attention.data.events) : [];
   const events = mergeAttentionEvents(firstEvents, older.events);
   const links =
@@ -1111,7 +1144,17 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
   }
   async function retry(entry: Record<string, unknown>) {
     const { attemptId, checkoutIdentity } = entry;
-    if (!(typeof attemptId === 'string' && checkoutIdentity) || busy) {
+    if (
+      !(
+        typeof attemptId === 'string' &&
+        checkoutIdentity &&
+        ['failed', 'unknown'].includes(
+          text(entry.outcome, text(entry.state))
+        ) &&
+        setupReady
+      ) ||
+      busy
+    ) {
       return;
     }
     setBusy(attemptId);
@@ -1127,6 +1170,33 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
       setup.refresh();
     } else {
       toast(`✗ Setup retry failed: ${text(response.error)}`, 'red');
+    }
+  }
+  async function refreshDependencies(entry: Record<string, unknown>) {
+    const body = setupDependencyRefreshBody(
+      entry,
+      repo,
+      name,
+      refreshReview ===
+        JSON.stringify(setupDependencyRefreshBody(entry, repo, name, true)),
+      setupReady,
+      busy !== null
+    );
+    if (!body) {
+      return;
+    }
+    setBusy(body.attemptId);
+    const response = await resourceAction('/api/setup-progress/retry', body);
+    setBusy(null);
+    setup.refresh();
+    if (response.ok) {
+      setRefreshReview(null);
+      toast(
+        'Dependency refresh accepted. Setup readiness is pending.',
+        'emerald'
+      );
+    } else {
+      toast(`✗ Dependency refresh failed: ${text(response.error)}`, 'red');
     }
   }
   async function focus(event: Record<string, unknown>) {
@@ -1178,7 +1248,20 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
                 const id = text(entry.attemptId, text(entry.id));
                 const retryable =
                   !!entry.checkoutIdentity &&
-                  typeof entry.attemptId === 'string';
+                  typeof entry.attemptId === 'string' &&
+                  ['failed', 'unknown'].includes(
+                    text(entry.outcome, text(entry.state))
+                  );
+                const completed =
+                  entry.state === 'completed' && entry.outcome === 'completed';
+                const refreshable =
+                  completed &&
+                  !!setupDependencyRefreshBody(entry, repo, name, true);
+                const reviewingRefresh =
+                  refreshReview ===
+                  JSON.stringify(
+                    setupDependencyRefreshBody(entry, repo, name, true)
+                  );
                 return (
                   <li class="flex flex-wrap items-center gap-2" key={id}>
                     <Badge tone={stateTone(entry.state ?? entry.stage)}>
@@ -1188,12 +1271,76 @@ function SetupAttentionControls({ repo, name, toast }: TargetProps) {
                     {retryable && (
                       <Button
                         compact
-                        disabled={busy !== null}
+                        disabled={!setupReady || busy !== null}
                         onClick={() => retry(entry)}
                         variant="secondary"
                       >
                         {busy === id ? 'Retrying…' : 'Retry'}
                       </Button>
+                    )}
+                    {completed && refreshable && !reviewingRefresh && (
+                      <Button
+                        compact
+                        disabled={!setupReady || busy !== null}
+                        onClick={() =>
+                          setRefreshReview(
+                            JSON.stringify(
+                              setupDependencyRefreshBody(
+                                entry,
+                                repo,
+                                name,
+                                true
+                              )
+                            )
+                          )
+                        }
+                        variant="secondary"
+                      >
+                        Review dependency refresh
+                      </Button>
+                    )}
+                    {completed && !refreshable && (
+                      <span class="text-zinc-500" role="status">
+                        Dependency refresh unavailable: this completed record
+                        needs a valid setup attempt ID and verified checkout
+                        identity.
+                      </span>
+                    )}
+                    {reviewingRefresh && refreshable && (
+                      <fieldset
+                        aria-label="Review dependency refresh"
+                        class="basis-full space-y-2"
+                      >
+                        <p
+                          class="text-zinc-600 dark:text-zinc-300"
+                          role="status"
+                        >
+                          This will reinstall project dependencies and may run
+                          package install scripts. It creates a new setup
+                          attempt and invalidates the previous readiness until
+                          setup completes successfully.
+                        </p>
+                        <div class="flex flex-wrap gap-2">
+                          <Button
+                            compact
+                            disabled={!setupReady || busy !== null}
+                            onClick={() => refreshDependencies(entry)}
+                            variant="secondary"
+                          >
+                            {busy === entry.attemptId
+                              ? 'Refreshing dependencies…'
+                              : 'Confirm reinstall dependencies'}
+                          </Button>
+                          <Button
+                            compact
+                            disabled={busy !== null}
+                            onClick={() => setRefreshReview(null)}
+                            variant="secondary"
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      </fieldset>
                     )}
                   </li>
                 );

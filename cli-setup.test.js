@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runCli } from './cli.js';
+import { createResourceAdmission } from './resource-admission.js';
+import { createSetupProgress } from './setup-progress.js';
 import {
   createAndInstallWorktree,
   installWorktreeDependencies,
@@ -240,3 +243,133 @@ test.each(['install', 'enable'])(
     expect(localResult.pubDom).toBeNull();
   }
 );
+
+test('public CLI creation records dependency readiness only after its owned installer group settles', async () => {
+  const f = fixture();
+  const root = fs.realpathSync(f.root);
+  const wtDir = join(root, 'repo', 'topic');
+  fs.mkdirSync(wtDir, { recursive: true });
+  fs.writeFileSync(
+    join(wtDir, 'package.json'),
+    '{"name":"cli-readiness-fixture","version":"1.0.0"}'
+  );
+  const state = createWorkspaceState({
+    configPath: join(root, 'config.json'),
+    setuDir: root,
+    workspaceRoot: root,
+  });
+  const stamp = (path) => {
+    const info = fs.statSync(path, { bigint: true });
+    return {
+      birthtimeNs: String(info.birthtimeNs),
+      dev: String(info.dev),
+      ino: String(info.ino),
+    };
+  };
+  const identity = {
+    admin: stamp(root),
+    adminPath: root,
+    checkout: stamp(wtDir),
+    checkoutPath: wtDir,
+    known: true,
+    repository: stamp(root),
+    repositoryPath: root,
+  };
+  const progress = createSetupProgress({ state });
+  let entered;
+  let settle;
+  const groupEntered = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const groupSettled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let active = false;
+  let closed = false;
+  const output = [];
+  const originalLog = console.log;
+  let running;
+  console.log = (value) => output.push(value);
+  try {
+    running = runCli(['new', 'repo', 'topic', '--json'], {
+      newCommand: {
+        config: () => ({ workspace: root }),
+        createHostHealth: () => async () => ({
+          availableBytes: 30 * 1024 ** 3,
+          state: 'ready',
+        }),
+        createSetupInstallProcesses: () => ({
+          close() {
+            closed = true;
+          },
+          hasOwnedWork: () => active,
+          spawn(argv, options) {
+            expect(argv).toEqual([process.execPath, 'install']);
+            fs.writeSync(options.stdout, 'fixture install completed\n');
+            active = true;
+            return {
+              exited: Promise.resolve(0),
+              pid: 4321,
+              setupOwnerId: 'cli-fixture-owner',
+              signalCode: null,
+            };
+          },
+          async stopProcess(owner) {
+            expect(owner).toEqual({
+              ownedGroup: true,
+              pid: 4321,
+              setupOwnerId: 'cli-fixture-owner',
+            });
+            entered();
+            await groupSettled;
+            active = false;
+          },
+        }),
+        createWorktree: async () => ({
+          localDom: 'topic.example.test',
+          port: 3301,
+          wtDir,
+        }),
+        inspectCheckoutIdentity: async () => identity,
+        workspaceState: () => state,
+      },
+      request: () =>
+        Promise.reject(
+          new Error('No portal or server request belongs to this creation')
+        ),
+    });
+    await Promise.race([
+      groupEntered,
+      running.then(() => {
+        throw new Error('CLI returned before entering group settlement');
+      }),
+    ]);
+    const pending = progress.get(f.target);
+    expect(pending.state).toBe('running');
+    expect(pending.dependencyReceipt).toBeUndefined();
+    const admission = createResourceAdmission({
+      hostHealth: async () => ({
+        availableBytes: 30 * 1024 ** 3,
+        state: 'ready',
+      }),
+      state,
+    });
+    expect((await admission.status()).leases).toHaveLength(1);
+    settle();
+    expect(await running).toBe(0);
+    expect(closed).toBe(true);
+    const completed = progress.get(f.target);
+    expect(completed.state).toBe('completed');
+    expect(completed.dependencyReceipt.attemptId).toBe(completed.attemptId);
+    expect(completed.dependencyReceipt.inputs.noDependencies).toBe(true);
+    expect((await admission.status()).leases).toHaveLength(0);
+    expect(
+      fs.readFileSync(join(root, 'logs', 'repo', 'topic', 'setup.log'), 'utf8')
+    ).toBe('fixture install completed\n');
+    expect(JSON.parse(output.at(-1)).started).toBe(false);
+  } finally {
+    settle();
+    await running;
+    console.log = originalLog;
+  }
+});

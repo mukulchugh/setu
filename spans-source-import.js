@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { importSpansSource } from './spans-import.js';
+import { SPANS_MODEL_LIMITS } from './spans-model-store.js';
 import { redactSpansValue } from './spans-redaction.js';
 import {
   checkpointSpansSource,
@@ -261,7 +262,20 @@ function publicResult({
 }
 
 /** Import one bounded page from an explicitly selected local source file. */
-export async function importSpansSourceFile(raw) {
+export async function importSpansSourceFile(raw, admission) {
+  if (
+    admission !== undefined &&
+    (!admission ||
+      typeof admission.archiveWrite !== 'function' ||
+      typeof admission.root !== 'string' ||
+      !isAbsolute(admission.root) ||
+      resolve(admission.root) !== admission.root)
+  ) {
+    return resultError(
+      'SPANS_ARCHIVE_WRITE_INVALID',
+      'Invalid archive write authority.'
+    );
+  }
   const input = normalizedInput(raw);
   if (!input) {
     return publicResult({
@@ -336,6 +350,53 @@ export async function importSpansSourceFile(raw) {
     });
   }
 
+  const effect = () => commitSourcePage(input, cursor, page);
+  if (admission === undefined) {
+    return effect();
+  }
+  // JSON escaping can expand source text sixfold; include the bounded event
+  // batch and SQLite bookkeeping. The shared gate also checks actual growth.
+  const maxBytes =
+    MAX_PENDING_BYTE_COUNT * 6 +
+    SPANS_MODEL_LIMITS.batchBytes +
+    2 * 1024 * 1024;
+  let started = false;
+  let result;
+  try {
+    result = await admission.archiveWrite(
+      { maxBytes, root: admission.root },
+      () => {
+        started = true;
+        return effect();
+      }
+    );
+  } catch {
+    result = null;
+  }
+  if (result?.ok === true && Object.hasOwn(result, 'value')) {
+    return result.value;
+  }
+  return {
+    ...publicResult({
+      code: started
+        ? 'SPANS_ARCHIVE_WRITE_UNKNOWN'
+        : safeCode(result?.code, 'SPANS_ARCHIVE_WRITE_UNAVAILABLE'),
+      committed: false,
+      eof: page.eof,
+      error: started
+        ? 'Import outcome is unknown; inspect the archived cursor before retrying.'
+        : 'Archive capacity did not admit the import.',
+      expectedOffset: offset,
+      hasMore: false,
+      nextOffset: started ? null : offset,
+      ok: false,
+    }),
+    ...(started ? { unknown: true } : {}),
+  };
+}
+
+async function commitSourcePage(input, cursor, page) {
+  const { offset } = cursor;
   let checkpointFailure;
   const coordinatorStore = {
     async commitImport(batch) {

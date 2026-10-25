@@ -3,6 +3,7 @@ import fsPromises from 'node:fs/promises';
 import { join } from 'node:path';
 import { observeProcessIdentity } from './process-observation.js';
 import { proveProcessGroupOwnership } from './process-tree.js';
+import { createNativeSessionObserver } from './spans-native-session.js';
 
 // The process side of a Spans worker attempt: a durable output spool and the
 // one supervisor that owns each child process. The worker engine
@@ -214,17 +215,6 @@ export function createSpansExecutionSpool({
 // process whose identity it can still prove.
 // ---------------------------------------------------------------------------
 
-function sessionIdOf(line) {
-  try {
-    const event = JSON.parse(line);
-    return typeof event?.session_id === 'string' && event.session_id
-      ? event.session_id
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 // Splits text on code point boundaries so each piece fits the worker's chunk
 // bound. A piece larger than the bound would be refused and lost.
 function splitForBound(text, maxBytes) {
@@ -251,6 +241,7 @@ export function createSpansExecutionLauncher({
   escalationMs = DEFAULT_ESCALATION_MS,
   exitGraceMs = DEFAULT_EXIT_GRACE_MS,
   maxChunkBytes,
+  launchEffect = (_binding, effect) => ({ child: effect(), ok: true }),
   observeProcess = observeProcessIdentity,
   onExit = () => undefined,
   proveGroup = proveProcessGroupOwnership,
@@ -265,7 +256,7 @@ export function createSpansExecutionLauncher({
 
   function track(promise) {
     background.add(promise);
-    promise.finally(() => background.delete(promise));
+    promise.finally(() => background.delete(promise)).catch(() => undefined);
     return promise;
   }
 
@@ -317,42 +308,45 @@ export function createSpansExecutionLauncher({
 
   async function pump(stream, sink, state, { watchSession }) {
     const decoder = new TextDecoder();
-    let pending = '';
+    const observer = watchSession ? createNativeSessionObserver() : null;
+    const observeNative = async (id) => {
+      if (!id) {
+        return;
+      }
+      try {
+        const result = await sink.native(id);
+        state.nativeSent = result?.ok === true;
+      } catch {
+        // A session observation is not a durable binding until its write succeeds.
+        state.nativeSent = false;
+      }
+    };
     const forward = async (text) => {
       if (!text) {
         return;
       }
       await deliver(sink, text, state);
-      if (!watchSession || state.nativeSent) {
-        return;
-      }
-      pending += text;
-      const lines = pending.split('\n');
-      pending = lines.pop();
-      for (const line of lines) {
-        const id = sessionIdOf(line);
-        if (id) {
-          state.nativeSent = true;
-          // biome-ignore lint/performance/noAwaitInLoops: The first observed native id is reported once, before any later line.
-          await sink.native(id);
-          return;
-        }
-      }
+      await observeNative(observer?.push(text));
     };
     for await (const chunk of stream) {
       await forward(decoder.decode(chunk, { stream: true }));
     }
     await forward(decoder.decode());
+    await observeNative(observer?.finish());
   }
 
   async function watchExit({ binding, child, entry, pumps, sink, state }) {
     try {
       await child.exited;
-      await Promise.allSettled(pumps);
+      const captured = await Promise.allSettled(pumps);
       // A wrapper exiting is not the work ending: report an exit only when the
       // whole owned group is gone. Otherwise the attempt stays running and the
       // deadline or recovery holds it.
-      if ((await settledGroup(entry.pid)) !== 'absent' || state.lost) {
+      if (
+        captured.some((pumpResult) => pumpResult.status === 'rejected') ||
+        (await settledGroup(entry.pid)) !== 'absent' ||
+        state.lost
+      ) {
         return;
       }
       const result = await sink.exit({
@@ -387,14 +381,20 @@ export function createSpansExecutionLauncher({
     }
     let child;
     try {
-      child = spawn(plan.argv, {
-        cwd: plan.cwd,
-        detached: true,
-        env: plan.env,
-        stderr: 'pipe',
-        stdin: 'pipe',
-        stdout: 'pipe',
-      });
+      const launched = launchEffect(binding, () =>
+        spawn(plan.argv, {
+          cwd: plan.cwd,
+          detached: true,
+          env: plan.env,
+          stderr: 'pipe',
+          stdin: 'pipe',
+          stdout: 'pipe',
+        })
+      );
+      if (launched?.ok !== true || !launched.child) {
+        return { code: 'WORKER_REFUSED', launched: false, ok: false };
+      }
+      ({ child } = launched);
     } catch {
       return { code: 'WORKER_UNAVAILABLE', launched: false, ok: false };
     }

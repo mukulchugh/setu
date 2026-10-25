@@ -40,7 +40,7 @@ const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
 const SYNCHRONOUS_FULL = 2;
 const sidecarSuffixes = ['-wal', '-shm', '-journal'];
-const openKeys = new Set(['busyTimeoutMs', 'readonly', 'root']);
+const openKeys = new Set(['busyTimeoutMs', 'create', 'readonly', 'root']);
 const queryKeys = new Set(['afterSequence', 'limit', 'runId']);
 const eventKeys = ['eventId', 'payload', 'runId', 'type'];
 const artifactIdPattern = /^sha256:[0-9a-f]{64}$/;
@@ -728,6 +728,37 @@ function boundedArtifactReader(root) {
   };
 }
 
+const attemptBindingKeys = [
+  'actionId',
+  'attemptId',
+  'generation',
+  'runId',
+  'spanId',
+  'workerId',
+];
+
+function normalizeAttemptBinding(input) {
+  if (
+    !isPlainObject(input) ||
+    Reflect.ownKeys(input).length !== attemptBindingKeys.length
+  ) {
+    return null;
+  }
+  const binding = {};
+  for (const key of attemptBindingKeys) {
+    const value = ownDataValue(input, key);
+    if (
+      key === 'generation'
+        ? !Number.isSafeInteger(value) || value < 0
+        : typeof value !== 'string' || value.length === 0 || value.length > 256
+    ) {
+      return null;
+    }
+    binding[key] = value;
+  }
+  return binding;
+}
+
 function createStore(db, { readonly, root }) {
   // Uncached statements owned by this store; close() finalizes them before the
   // connection is released so no statement can keep the file locked.
@@ -960,6 +991,63 @@ function createStore(db, { readonly, root }) {
     },
     search: (input) => withSearch((search) => search.query(input)),
     searchStatus: () => withSearch((search) => search.status()),
+    // Trusted synchronous filesystem effects only. SQLite excludes generation
+    // changes on every connection until the effect returns; never await here.
+    withCurrentAttempt(input, effect) {
+      if (closed) {
+        return closedResult();
+      }
+      if (readonly || db.inTransaction || typeof effect !== 'function') {
+        return failure(
+          'SPANS_EFFECT_UNAVAILABLE',
+          'Attempt effects are unavailable.'
+        );
+      }
+      try {
+        const binding = normalizeAttemptBinding(input);
+        if (!binding) {
+          return failure('BINDING_MISMATCH', 'Attempt binding is invalid.');
+        }
+        return immediate(db, () => {
+          const current = models.readRun({ runId: binding.runId });
+          if (!current.ok) {
+            return current;
+          }
+          if (current.generation !== binding.generation) {
+            return failure('STALE_GENERATION', 'Attempt generation is stale.');
+          }
+          const { attempts } = current.view;
+          const currentAttempt =
+            isPlainObject(attempts) &&
+            Object.hasOwn(attempts, binding.attemptId)
+              ? attempts[binding.attemptId]
+              : null;
+          if (
+            !(
+              isPlainObject(currentAttempt) &&
+              ['launching', 'running', 'finalizing'].includes(
+                currentAttempt.status
+              ) &&
+              attemptBindingKeys.every(
+                (key) => currentAttempt[key] === binding[key]
+              )
+            )
+          ) {
+            return failure(
+              'ATTEMPT_CLOSED',
+              'Attempt is not current and open.'
+            );
+          }
+          const result = effect();
+          if (result && typeof result.then === 'function') {
+            throw new TypeError('Attempt effects must be synchronous.');
+          }
+          return result;
+        });
+      } catch (error) {
+        return storageFailure(error, 'read');
+      }
+    },
   };
   models = createSpansModelStore({ appendEvent: store.appendEvent, db });
   const { closeStatements, ...modelMethods } = models;
@@ -977,10 +1065,11 @@ function openSettings(options) {
   }
   const {
     busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
+    create = true,
     readonly = false,
     root,
   } = options;
-  if (typeof readonly !== 'boolean') {
+  if (typeof readonly !== 'boolean' || typeof create !== 'boolean') {
     throw new SpansStoreError('SPANS_STORE_OPTIONS_INVALID', 'readonly');
   }
   if (
@@ -1003,7 +1092,7 @@ function openSettings(options) {
   ) {
     throw new SpansStoreError('SPANS_STORE_ROOT_INVALID', 'root');
   }
-  return { busyTimeoutMs, readonly, root };
+  return { busyTimeoutMs, create, readonly, root };
 }
 
 function closeQuietly(db) {
@@ -1028,22 +1117,25 @@ export function inspectSpansStoreFiles({ root } = {}) {
 // caller; there is deliberately no default location. busyTimeoutMs is bounded
 // to SPANS_STORE_LIMITS.busyTimeoutMs.
 export function openSpansStore(options = {}) {
-  const { busyTimeoutMs, readonly, root } = openSettings(options);
-  prepareRoot(root, readonly);
+  const { busyTimeoutMs, create, readonly, root } = openSettings(options);
+  prepareRoot(root, readonly || !create);
   const path = join(root, SPANS_STORE_DATABASE_FILE);
-  const identity = prepareDatabaseFile(path, readonly);
+  const identity = prepareDatabaseFile(path, readonly || !create);
   let db;
   try {
     db = new Database(
       path,
       readonly
         ? { readonly: true, strict: true }
-        : { readwrite: true, strict: true }
+        : { create: false, readwrite: true, strict: true }
     );
     configureConnection(db, busyTimeoutMs);
     const state = inspectSchema(db);
     const modelState = inspectSpansModelSchema(db);
-    if (readonly && (state !== 'current' || modelState !== 'current')) {
+    if (
+      (readonly || !create) &&
+      (state !== 'current' || modelState !== 'current')
+    ) {
       throw new SpansStoreError(
         'SPANS_STORE_SCHEMA_UNSUPPORTED',
         'readonly-schema'

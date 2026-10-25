@@ -114,7 +114,7 @@ export function createLinksProjection({
         summary.pending = page.has_more === true || page.head > offset;
         return summary;
       }
-      const committed = store.commitImport({
+      const committed = await store.commitImport({
         ...key,
         events: mapped.events,
         expectedOffset: offset,
@@ -122,6 +122,13 @@ export function createLinksProjection({
         nextOffset: mapped.nextOffset,
       });
       if (committed?.ok !== true) {
+        if (
+          typeof committed?.code === 'string' &&
+          (committed.code.startsWith('SPANS_ARCHIVE_') ||
+            committed.code === 'ADMISSION_UNAVAILABLE')
+        ) {
+          return stop('admission-refused', committed.code);
+        }
         // A concurrent worker won this offset: read the cursor again.
         if (committed?.code === 'SPANS_MODEL_OFFSET_CONFLICT') {
           conflicts += 1;

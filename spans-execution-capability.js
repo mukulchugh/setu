@@ -172,6 +172,7 @@ export function createSpansCapability({
   profiles,
   spawn = Bun.spawn,
   store,
+  writeArchive,
 }) {
   const definitionOf = (profileId) =>
     Object.hasOwn(profiles, profileId) ? profiles[profileId] : null;
@@ -224,7 +225,7 @@ export function createSpansCapability({
       ? Object.values(summary.tokens).reduce((left, right) => left + right, 0)
       : 0;
     const subscription = isSubscription(definition);
-    store.writeCache(SPEND_KEY, {
+    return store.writeCache(SPEND_KEY, {
       ...before,
       estimatedApiEquivalentMicro:
         before.estimatedApiEquivalentMicro + (subscription ? micro : 0),
@@ -346,13 +347,23 @@ export function createSpansCapability({
     if (!definition) {
       return { code: 'SPANS_EXEC_PROFILE_UNKNOWN', ok: false };
     }
+    if (
+      typeof writeArchive !== 'function' ||
+      (await writeArchive(() => ({ ok: true })))?.ok !== true
+    ) {
+      return { code: 'SPANS_EXEC_PROBE_NOT_RECORDED', ok: false };
+    }
     const output = await runProbe(definition);
     if (output === null) {
       return { code: 'SPANS_EXEC_PROBE_FAILED', ok: false };
     }
     const summary = summarizeProviderOutput(output);
     // The session ran and may have charged, whatever else it showed.
-    accountProbe(summary, definition);
+    if (
+      (await writeArchive(() => accountProbe(summary, definition)))?.ok !== true
+    ) {
+      return { code: 'SPANS_EXEC_PROBE_NOT_RECORDED', ok: false };
+    }
     const capUsd = SPANS_EXEC_PROBE_BUDGET_USD;
     const evidence = observedEvidence(summary, definition, {
       now,
@@ -361,11 +372,13 @@ export function createSpansCapability({
     if (!evidence) {
       return { code: 'SPANS_EXEC_PROBE_INCONCLUSIVE', ok: false };
     }
-    const saved = store.writeCache(evidenceKey(profileId), {
-      evidence,
-      observations: observationsOf(summary, definition, capUsd),
-      profileId,
-    });
+    const saved = await writeArchive(() =>
+      store.writeCache(evidenceKey(profileId), {
+        evidence,
+        observations: observationsOf(summary, definition, capUsd),
+        profileId,
+      })
+    );
     if (saved?.ok !== true) {
       return { code: 'SPANS_EXEC_PROBE_NOT_RECORDED', ok: false };
     }

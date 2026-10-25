@@ -1,15 +1,15 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { isAbsolute, join, resolve, sep } from 'node:path';
+import { promisify } from 'node:util';
 import {
   lstat,
-  mkdir,
   readdir,
   readFile,
   realpath,
   stat,
-} from 'node:fs/promises';
-import { isAbsolute, join, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
+} from './dependency-readiness-checkpoint.js';
 import { assertStorageHeadroom } from './host-health.js';
 
 const exec = promisify(execFile);
@@ -671,7 +671,11 @@ async function inspectIsolatedDependencyView(
   };
 }
 
-export async function repairDependencyView(checkout, sharing) {
+export async function repairDependencyView(
+  checkout,
+  sharing,
+  assertStoreStorage = assertStorageHeadroom
+) {
   const view = await inspectDependencyView(checkout, sharing);
   if (view.state !== 'shared but replaced by an ordinary install') {
     return {
@@ -684,6 +688,7 @@ export async function repairDependencyView(checkout, sharing) {
   }
   const plan = await dependencyInstallPlan(checkout, sharing, {
     allowExistingView: true,
+    assertStoreStorage,
     createStore: false,
   });
   return {

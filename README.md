@@ -65,7 +65,7 @@ setu caches prepare <repo> <branch>
 setu caches execute <repo> <branch> --manifest ID --confirmation TOKEN
 setu caches execute <repo> <branch> --retry FILE|-
 setu admission
-setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout FILE|- --attempt ID]
+setu setup-progress [list [repo branch] | retry <repo> <branch> --checkout FILE|- --attempt ID [--refresh-dependencies]]
 setu attention [list [repo branch] | focus <repo> <branch> --session ID --checkout FILE|-]
 setu headless list [repo branch]
 setu headless start <repo> <branch> --prompt-file FILE|- [--model NAME --budget USD --wall-clock-ms N --output-bytes N]
@@ -98,6 +98,84 @@ confirmation and recovery requirements, front-door support, and MCP tool input
 shapes are in [AGENTS.md](./AGENTS.md#complete-interface-contract). The tables
 are maintained against the exported portal route catalog rather than a second
 hand-maintained API list.
+
+## Spans
+
+Open Spans in the portal to plan a workflow or inspect Past, Live and Planned
+history. Saving a reviewed draft creates a Planned entry. Import conversation
+accepts one explicit local Codex or Claude conversation path and retains a bounded,
+redacted page. Standalone imports appear in Past and remain read-only, with their
+original provenance. You can attach selected history to an existing run instead.
+Opening the page does not create an archive or scan provider directories.
+
+Search reads the retained index. A missing index is unavailable rather than an
+empty result. Offline indexing, selected-source import, backup and restore use
+explicit paths and do not start the portal:
+
+```text
+setu spans list --json
+setu spans import-history --input '{"path":"/absolute/conversation.jsonl","provider":"codex"}' --json
+setu spans index --root /absolute/archive --json
+setu spans backup --root /absolute/archive --destination /absolute/new-backup --json
+setu spans restore --backup-root /absolute/backup --destination /absolute/new-archive --json
+```
+
+The read and `import-history` commands require the portal. Dashboard backup and
+restore use a background child and show their reviewed destination. Neither copy
+operation overwrites a path. Restore creates an inactive archive; switching the
+portal to it is a separate configuration change. Keep partial or unknown
+outcomes for inspection before retrying.
+
+Settings → Agent integrations previews the bundled Spans skill and exact owned
+paths for Codex, Claude Code and Cursor. Review the hashes and consumers, then
+type the returned phrase to apply that review. Codex and Cursor share one owned
+skill file, so removal must explicitly name both consumers. Client receipts stay
+outside conversation archives. User edits and unowned files refuse replacement;
+unknown results require receipt reconciliation. This flow does not configure
+native MCP settings. Installed files alone do not prove a connection, fresh
+session or activated skill. CLI uses `setu spans integrations status|review|apply|reconcile`;
+MCP exposes preview only.
+
+Live execution is opt-in and disabled by default. The current execution service
+supports a reviewed headless Claude Code span through completion, with a local
+capability probe, writer ownership, shared admission and usage tracking. A probe
+or dispatch starts a real provider session and needs explicit approval. The Plan
+tab guides you through preview, saved review, typed approval and Start. The exact
+review digest binds dispatch; changed input or a revoked receipt is refused.
+Dispatch requires a current Setu setup receipt for the checkout's Bun inputs and
+installed package view. Older completed setups remain unverified. In worktree
+Resources, choose Review dependency refresh and confirm the reinstall, or use
+`setu setup-progress retry REPO BRANCH --checkout IDENTITY.json --attempt ID --refresh-dependencies`.
+Use the exact current attempt and checkout identity from setup progress. This
+explicit action may run package installation scripts and clears previous readiness
+until the owned install succeeds. Reads never install dependencies. Records without
+a verifiable checkout or attempt identity need individual review first.
+
+Private hoisted installs can qualify for Spans readiness. Shared isolated installs
+require healthy Setu-owned links. Shared hoisted installs require a completed
+enrollment matching the current setup receipt and dependency view. Refresh never
+converts an unmanaged or replaced dependency view. Older saved execution reviews
+remain readable and revocable, but a new approval or Start needs a fresh receipt
+binding.
+
+Approval and retained capture survive a portal restart. A detached child owns the
+provider and output capture, and reconciliation observes the existing attempt
+without launching it again. Stop confirms delivery separately from exit. An
+incomplete capture stays held, with its available evidence and resources retained.
+
+The cmux transport has an archive adapter that retains delivery phases in the
+existing event log. Restarted transports read the retained intent before sending,
+and a possibly committed write blocks a resend. Those archive and transport
+fixtures do not establish native cmux delivery; its production adapter remains
+unconnected.
+
+The built-in execution profile uses Claude Code. Luna execution remains unavailable
+until the client can prove configuration isolation while retaining subscription
+authentication. Configured model and effort do not prove the model that served a
+turn, and no model is substituted automatically. Local process fixtures verify
+capture and recovery; browser acceptance, native provider acceptance and live
+rollout remain separate checks. See
+[the execution contract](./AGENTS.md#spans-execution-live-opt-in) before enabling it.
 
 ## Raycast extension
 

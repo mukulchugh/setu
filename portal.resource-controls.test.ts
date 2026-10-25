@@ -18,11 +18,85 @@ import {
   readResource,
   resourceAction,
   resourceReadUrl,
+  setupDependencyRefreshBody,
   storageBytes,
   workflowValue,
 } from './portal/components/resource-controls';
 import { createReviewHandoff } from './review-handoff.js';
 import { createTerminalAttention } from './terminal-attention.js';
+
+test('setup dependency refresh requires explicit confirmation and the exact completed worktree attempt', () => {
+  const completed = {
+    attemptId: 'attempt-7',
+    checkoutIdentity: {
+      checkoutPath: '/workspace/app/topic',
+      inode: 42,
+      known: true,
+    },
+    outcome: 'completed',
+    state: 'completed',
+    target: { name: 'topic', repo: 'app' },
+  };
+  expect(
+    setupDependencyRefreshBody(completed, 'app', 'topic', false)
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(completed, 'app', 'topic', true, false)
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(completed, 'app', 'topic', true, true, true)
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(completed, 'app', 'other', true)
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(
+      { ...completed, outcome: 'failed', state: 'failed' },
+      'app',
+      'topic',
+      true
+    )
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(
+      { ...completed, attemptId: undefined },
+      'app',
+      'topic',
+      true
+    )
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(
+      { ...completed, checkoutIdentity: undefined },
+      'app',
+      'topic',
+      true
+    )
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(
+      { ...completed, checkoutIdentity: '/legacy/path' },
+      'app',
+      'topic',
+      true
+    )
+  ).toBeNull();
+  expect(
+    setupDependencyRefreshBody(
+      { ...completed, checkoutIdentity: { known: false } },
+      'app',
+      'topic',
+      true
+    )
+  ).toBeNull();
+  expect(setupDependencyRefreshBody(completed, 'app', 'topic', true)).toEqual({
+    attemptId: 'attempt-7',
+    checkoutIdentity: completed.checkoutIdentity,
+    name: 'topic',
+    refreshDependencies: true,
+    repo: 'app',
+  });
+});
 
 test('attention focus uses the verified session joined to an actual hook event', async () => {
   const session = {

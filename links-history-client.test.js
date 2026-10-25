@@ -128,7 +128,11 @@ describe('peer_list', () => {
           peer({
             published: [
               {
-                recipient: { checkout: 'c', provider: 'claude-code', session_hint: 's' },
+                recipient: {
+                  checkout: 'c',
+                  provider: 'claude-code',
+                  session_hint: 's',
+                },
                 scope: 'ps_1',
                 session_hint: 's',
               },
@@ -211,9 +215,7 @@ describe('events', () => {
     const reply = await replying(
       page([event({ stage: 'pending', state: 'queued' })])
     ).call('events', {});
-    expect(reply.result.events[0].message.origin).toBe(
-      PEER_ORIGIN
-    );
+    expect(reply.result.events[0].message.origin).toBe(PEER_ORIGIN);
   });
 
   test('refuses noncanonical event origins', async () => {
@@ -237,7 +239,9 @@ describe('show', () => {
   });
 
   test('keeps a baseline reply optional while accepting a canonical origin', async () => {
-    expect(await replying(shown()).call('show', {})).toMatchObject({ ok: true });
+    expect(await replying(shown()).call('show', {})).toMatchObject({
+      ok: true,
+    });
     expect(
       await replying(shown({ origin: PEER_ORIGIN })).call('show', {})
     ).toMatchObject({ ok: true });

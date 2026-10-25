@@ -6,6 +6,7 @@ import { createLinksAssociations } from './links-associations.js';
 import { associationIdOf } from './links-history.js';
 import { createSpansActions } from './spans-actions.js';
 import { createSpansDrafts } from './spans-drafts.js';
+import { createSpansHistoryImport } from './spans-history-import.js';
 import { redactSpansValue } from './spans-redaction.js';
 import { openSpansStore } from './spans-store.js';
 import { createSpansUsage } from './spans-usage.js';
@@ -150,16 +151,67 @@ test('a writer that redacts the whole view leaves an approval byte-identical', (
   );
 });
 
+test('resuming imported history preserves its existing Links approval', async () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'setu-history-links-'));
+  roots.push(root);
+  const archive = join(root, 'archive');
+  const path = join(root, 'selected.jsonl');
+  fs.writeFileSync(
+    path,
+    `${JSON.stringify({
+      payload: {
+        content: [{ text: 'retained message', type: 'output_text' }],
+        role: 'assistant',
+        type: 'message',
+      },
+      type: 'response_item',
+    })}\n`
+  );
+  const importer = createSpansHistoryImport({
+    archiveWrite: async (_request, effect) => ({
+      ok: true,
+      value: await effect(),
+    }),
+    root: archive,
+  });
+  try {
+    const input = { path, provider: 'codex' };
+    const imported = await importer.importSelected(input);
+    expect(imported.ok).toBe(true);
+    const store = openSpansStore({ create: false, root: archive });
+    stores.push(store);
+    const links = createLinksAssociations({ isKnownOrigin: () => true, store });
+    const linkedTarget = { ...target, runId: imported.runId };
+    const preview = links.preview(linkedTarget);
+    expect(preview.ok).toBe(true);
+    expect(
+      links.approve({ ...linkedTarget, confirmation: preview.review.token }).ok
+    ).toBe(true);
+    const approved = store.readRun({ runId: imported.runId }).view
+      .linksAssociations;
+    expect((await importer.importSelected(input)).ok).toBe(true);
+    expect(
+      store.readRun({ runId: imported.runId }).view.linksAssociations
+    ).toEqual(approved);
+  } finally {
+    await importer.close();
+  }
+});
+
 // Any new code that commits a run view must be reviewed against the key above.
 test('only the reviewed modules commit run views', () => {
   const reviewed = new Set([
     'links-associations.js',
     'spans-actions.js',
+    'spans-cmux-store.js',
     'spans-drafts.js',
+    'spans-execution-review.js',
     'spans-execution.js',
+    'spans-history-import.js',
     'spans-model-store.js',
     'spans-planning-runtime.js',
     'spans-usage.js',
+    'spans-worker-host.js',
     'spans-worker.js',
   ]);
   const writers = fs

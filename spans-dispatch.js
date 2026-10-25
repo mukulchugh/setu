@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { types } from 'node:util';
+import { parseSpansDependencyBinding } from './spans-dependency-binding.js';
 import { redactSpansValue as redactValue } from './spans-redaction.js';
 
 // Guarded dispatch coordinator. It owns no scheduler, store, clock or live
@@ -539,26 +540,7 @@ function isDirty(value) {
   );
 }
 
-const DEPENDENCY_FIELDS = [
-  'bunVersion',
-  'linkerMode',
-  'lockfileHash',
-  'platformNamespace',
-];
-
-function pickDependency(value) {
-  if (
-    !(
-      isRecord(value) &&
-      DEPENDENCY_FIELDS.every(
-        (key) => typeof value[key] === 'string' && value[key].length > 0
-      )
-    )
-  ) {
-    return null;
-  }
-  return Object.fromEntries(DEPENDENCY_FIELDS.map((key) => [key, value[key]]));
-}
+const pickDependency = parseSpansDependencyBinding;
 
 function parseExpected(value) {
   if (!isRecord(value)) {
@@ -586,7 +568,7 @@ function parseExpected(value) {
 
 // The digest the planner and the authorization must bind for a checkout: the
 // SHA-256 of the canonical JSON of {dependency, dirty, head, identity}, where
-// dependency holds only the four dependency identity fields. Null when the
+// dependency is the explicitly versioned receipt binding or a legacy identity. Null when the
 // snapshot is not exact.
 export function targetDigestFor(expected) {
   const copy = snapshotPlain(expected);
@@ -992,7 +974,11 @@ export function createSpansDispatch({ adapters } = {}) {
       return refusal('CHECKOUT_UNKNOWN');
     }
     const observedDependencies = await callAdapter(() =>
-      adapters.dependencies.observe({ ...target })
+      adapters.dependencies.observe({
+        checkoutIdentity: checkout.identity,
+        target: { ...request.target },
+        wtDir: request.wtDir,
+      })
     );
     const dependency = succeeded(observedDependencies.value)
       ? pickDependency(observedDependencies.value.identity)

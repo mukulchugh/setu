@@ -241,9 +241,9 @@ test('every registered Links route is served, and the hook-only operations are n
     'POST /api/links/share/disable',
     'POST /api/links/share/enable',
   ]);
-  expect(new Set(links.map((route) => `${route.methods[0]} ${route.path}`)).size).toBe(
-    links.length
-  );
+  expect(
+    new Set(links.map((route) => `${route.methods[0]} ${route.path}`)).size
+  ).toBe(links.length);
   // Listing everything shared is a complete request; every other route needs its target.
   const listings = new Set([
     '/api/links/capabilities',

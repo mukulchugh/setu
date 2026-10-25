@@ -302,7 +302,7 @@ export function buildDeepReviewArgs(skill, slug, prNumber, pluginRoot) {
           hooks: [
             {
               args: [REVIEW_GUARD, 'bash', pluginRoot ?? ''],
-              command: 'bun',
+              command: process.execPath,
               type: 'command',
             },
           ],
@@ -312,7 +312,7 @@ export function buildDeepReviewArgs(skill, slug, prNumber, pluginRoot) {
           hooks: [
             {
               args: [REVIEW_GUARD, 'write', reportDir],
-              command: 'bun',
+              command: process.execPath,
               type: 'command',
             },
           ],

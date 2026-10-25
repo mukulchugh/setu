@@ -14,7 +14,9 @@ import { LinksRecoveryPanel } from './links-history';
 import { SpansConversation } from './spans-conversation';
 import { SpansDetail } from './spans-detail';
 import { SpansEvidence } from './spans-evidence';
+import { SpansHistoryImport } from './spans-history-import';
 import { SpansList } from './spans-list';
+import { SpansMaintenance } from './spans-maintenance';
 import { SpansPlanning } from './spans-planning';
 import { SpansSearch } from './spans-search';
 
@@ -57,6 +59,9 @@ function RunList({
     15_000,
     (signal) => readSpansRuns(phase, query, cursor, signal)
   );
+  const archiveNotInitialized =
+    page.data?.kind === 'archive-not-initialized' && !page.failed;
+  const runPage = page.data?.kind === 'page' ? page.data.page : undefined;
   if (planning) {
     return (
       <>
@@ -74,15 +79,18 @@ function RunList({
       <div class="px-4 pt-4 sm:px-6">
         <Button onClick={() => setPlanning(true)}>Plan a workflow</Button>
       </div>
+      <SpansHistoryImport onSelect={onSelect} />
+      <SpansMaintenance />
       <SpansList
+        archiveNotInitialized={archiveNotInitialized}
         error={page.failed ? 'Refresh to retry.' : null}
-        hasMore={page.data?.hasMore ?? false}
+        hasMore={runPage?.hasMore ?? false}
         hasPrevious={cursors.length > 1}
         loading={!(page.data || page.failed)}
         onBack={onBack}
         onNext={() => {
-          if (page.data?.hasMore && page.data.nextRunId) {
-            setCursors([...cursors, page.data.nextRunId]);
+          if (runPage?.hasMore && runPage.nextRunId) {
+            setCursors([...cursors, runPage.nextRunId]);
           }
         }}
         onPhaseChange={(value) => {
@@ -100,8 +108,8 @@ function RunList({
         onSelect={onSelect}
         phase={phase}
         query={query}
-        records={page.data?.records ?? []}
-        stale={page.failed && !!page.data}
+        records={runPage?.records ?? []}
+        stale={page.failed && runPage !== undefined}
       />
       <SpansSearch onSelect={onSelect} />
     </>
@@ -110,7 +118,12 @@ function RunList({
 
 function RunPage({ runId, onBack }: { runId: string; onBack: () => void }) {
   const [initial] = useState(() => parseSpansLocation(window.location.search));
-  const [tab, setTab] = useState(initial.tab);
+  const [tab, setTab] = useState<string | null>(() =>
+    initial.tab === 'Plan' &&
+    new URLSearchParams(window.location.search).get('tab') !== 'Plan'
+      ? null
+      : initial.tab
+  );
   const [artifactId, setArtifactId] = useState<string | null>(
     initial.artifactId || null
   );
@@ -222,7 +235,9 @@ function RunPage({ runId, onBack }: { runId: string; onBack: () => void }) {
       }}
       record={run.data ?? null}
       stale={run.failed && !!run.data}
-      tab={tab}
+      tab={
+        tab ?? (run.data?.view.kind === 'imported' ? 'Conversation' : 'Plan')
+      }
     />
   );
 }

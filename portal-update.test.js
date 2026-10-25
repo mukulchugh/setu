@@ -63,6 +63,7 @@ test('portal shutdown disposes recurring work and waits for response drain befor
       await drain;
     },
   });
+  await Promise.resolve();
   expect(calls).toEqual(['dispose', 'close-sockets', 'drain']);
   drained();
   await completion;
@@ -204,4 +205,33 @@ test('a dead quiesce owner is reopened before a new owner is admitted', () => {
     ownerProcessId: 456,
   });
   expect(second).toMatchObject({ ok: true, token: 'owner-3' });
+});
+
+test('update shutdown waits for asynchronous disposal and refuses exit on failed disposal', async () => {
+  let finish;
+  const calls = [];
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const completion = drainPortalForUpdate({
+    closeConnections: () => calls.push('close'),
+    dispose: () => pending,
+    exit: () => calls.push('exit'),
+    stopServer: () => calls.push('stop'),
+  });
+  await Promise.resolve();
+  expect(calls).toEqual([]);
+  finish();
+  await completion;
+  expect(calls).toEqual(['close', 'stop', 'exit']);
+  calls.length = 0;
+  await expect(
+    drainPortalForUpdate({
+      closeConnections: () => calls.push('close'),
+      dispose: () => Promise.reject(new Error('archive close uncertain')),
+      exit: () => calls.push('exit'),
+      stopServer: () => calls.push('stop'),
+    })
+  ).rejects.toThrow('archive close uncertain');
+  expect(calls).toEqual([]);
 });

@@ -87,6 +87,40 @@ test('construction performs no filesystem reads; only missing stores get default
   );
 });
 
+test('integrationReceipts uses only its explicit private root and never workspaceRoot', async () => {
+  const { root } = fixture();
+  const integrationRoot = join(root, 'machine-wide-integrations');
+  fs.mkdirSync(integrationRoot, { mode: 0o700 });
+  const state = createWorkspaceState({ integrationRoot, workspaceRoot: root });
+  expect(state.read('integrationReceipts')).toEqual({
+    records: [],
+    version: 1,
+  });
+  await state.update('integrationReceipts', (document) => ({
+    ...document,
+    records: [{ operationId: 'fixture-only' }],
+  }));
+  expect(fs.existsSync(join(integrationRoot, 'receipts.json'))).toBe(true);
+  expect(fs.existsSync(join(root, 'receipts.json'))).toBe(false);
+  expect(fs.existsSync(join(root, '.setu-state.lock'))).toBe(false);
+  // biome-ignore lint/suspicious/noBitwiseOperators: File modes are Unix permission bit fields.
+  expect(fs.statSync(join(integrationRoot, 'receipts.json')).mode & 0o777).toBe(
+    0o600
+  );
+});
+
+test('integrationReceipts requires its own root even when workspaceRoot exists', () => {
+  const { root } = fixture();
+  const state = createWorkspaceState({ workspaceRoot: root });
+  expect(() => state.read('integrationReceipts')).toThrow(
+    expect.objectContaining({
+      code: 'STATE_UNREADABLE',
+      phase: 'explicit-path-required',
+    })
+  );
+  expect(fs.existsSync(join(root, 'receipts.json'))).toBe(false);
+});
+
 test('malformed sidecars are never replaced by an edited project', async () => {
   const { root, store } = fixture();
   const path = join(root, 'sidecars.json');
@@ -372,6 +406,137 @@ test('generated output rejects symlinks and never changes shared input', async (
     phase: 'symlink-rejected',
   });
   expect(fs.readFileSync(secret, 'utf8')).toBe('fixture-only');
+});
+
+test('generated output CAS refuses an edit made while the target writer is locked', async () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'setu-state-cas-'));
+  roots.push(root);
+  const target = join(root, '.envrc');
+  fs.writeFileSync(target, 'reviewed bytes');
+  const openPaths = new Map();
+  let edited = false;
+  const store = createWorkspaceState({
+    fs: {
+      ...fs,
+      closeSync(fd) {
+        openPaths.delete(fd);
+        return fs.closeSync(fd);
+      },
+      fsyncSync(fd) {
+        fs.fsyncSync(fd);
+        if (!edited && openPaths.get(fd)?.includes('.setu-tmp-')) {
+          edited = true;
+          fs.writeFileSync(target, 'sentinel edit');
+        }
+      },
+      openSync(path, ...args) {
+        const fd = fs.openSync(path, ...args);
+        openPaths.set(fd, String(path));
+        return fd;
+      },
+    },
+  });
+
+  await expect(
+    store.replaceText(target, 'absent-only', {
+      expectedText: null,
+      mode: null,
+    })
+  ).rejects.toMatchObject({ code: 'STATE_PRECONDITION_FAILED' });
+  expect(fs.readFileSync(target, 'utf8')).toBe('reviewed bytes');
+
+  await expect(
+    store.replaceText(target, 'new bytes', {
+      expectedText: 'reviewed bytes',
+      mode: null,
+    })
+  ).rejects.toMatchObject({
+    code: 'STATE_PRECONDITION_FAILED',
+    committed: false,
+  });
+  expect(fs.readFileSync(target, 'utf8')).toBe('sentinel edit');
+  expect(
+    fs.readdirSync(roots.at(-1)).some((name) => name.includes('.setu-tmp-'))
+  ).toBe(false);
+});
+
+test('concurrent generated output CAS writers have one winner', async () => {
+  const { root, store } = fixture();
+  const target = join(root, '.envrc');
+  fs.writeFileSync(target, 'before');
+  const results = await Promise.allSettled([
+    store.replaceText(target, 'first', { expectedText: 'before', mode: null }),
+    store.replaceText(target, 'second', {
+      expectedText: 'before',
+      mode: null,
+    }),
+  ]);
+
+  expect(
+    results.filter((result) => result.status === 'fulfilled')
+  ).toHaveLength(1);
+  expect(results.filter((result) => result.status === 'rejected')).toHaveLength(
+    1
+  );
+  expect(
+    results.find((result) => result.status === 'rejected').reason
+  ).toMatchObject({ code: 'STATE_PRECONDITION_FAILED' });
+  expect(['first', 'second']).toContain(fs.readFileSync(target, 'utf8'));
+});
+
+test('generated text guards refuse changed sizes before reading target bytes', async () => {
+  const { root } = fixture();
+  const target = join(root, 'owned-skill.md');
+  fs.writeFileSync(target, 'a larger user replacement');
+  let targetReads = 0;
+  const store = createWorkspaceState({
+    fs: {
+      ...fs,
+      readFileSync(path, ...args) {
+        if (path === target) {
+          targetReads += 1;
+        }
+        return fs.readFileSync(path, ...args);
+      },
+    },
+  });
+  await expect(
+    store.replaceText(target, 'new', { expectedText: 'old' })
+  ).rejects.toMatchObject({ code: 'STATE_PRECONDITION_FAILED' });
+  await expect(
+    store.removeText(target, { expectedText: 'old' })
+  ).rejects.toMatchObject({ code: 'STATE_PRECONDITION_FAILED' });
+  expect(targetReads).toBe(0);
+  expect(fs.readFileSync(target, 'utf8')).toBe('a larger user replacement');
+});
+
+test('generated file removal requires exact existing bytes and preserves edits', async () => {
+  const { root, store } = fixture();
+  const target = join(root, '.agents/skills/setu-spans/SKILL.md');
+  fs.mkdirSync(join(root, '.agents/skills/setu-spans'), { recursive: true });
+  const shared = join(root, '.agents/skills/setu-spans/linked.md');
+  fs.writeFileSync(shared, 'shared input');
+  fs.symlinkSync(shared, target);
+  await expect(
+    store.removeText(target, { expectedText: 'shared input' })
+  ).rejects.toMatchObject({
+    code: 'STATE_UNREADABLE',
+    phase: 'symlink-rejected',
+  });
+  expect(fs.readFileSync(shared, 'utf8')).toBe('shared input');
+  fs.unlinkSync(target);
+  fs.writeFileSync(target, 'user edit');
+
+  await expect(
+    store.removeText(target, { expectedText: 'owned bytes' })
+  ).rejects.toMatchObject({ code: 'STATE_PRECONDITION_FAILED' });
+  expect(fs.readFileSync(target, 'utf8')).toBe('user edit');
+
+  await expect(
+    store.removeText(target, { expectedText: 'user edit' })
+  ).resolves.toMatchObject({ committed: true, reconciled: true, value: null });
+  expect(fs.existsSync(target)).toBe(false);
+  expect(fs.existsSync(join(root, '.agents/skills/setu-spans'))).toBe(true);
 });
 
 test('five-second lock deadline is monotonic for unreadable locks and dead owners are reclaimed', async () => {

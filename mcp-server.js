@@ -528,6 +528,30 @@ function registerTools(server) {
   ];
   const planningTools = [
     [
+      'import_spans_history',
+      'Import one bounded page from an explicit absolute local path into read-only Past history, or attach to existingRunId. Input: path, provider (codex or claude), optional existingRunId and maxBytes. Internal identities persist across pages. Continue explicitly only after a known successful hasMore response. No scans or execution.',
+      'spansHistoryImport',
+      false,
+    ],
+    [
+      'backup_spans_archive',
+      'Copy the configured private Spans archive to an explicit new absolute destination. Input: destination. Never overwrites an existing path or deletes history. Incomplete or unknown results retain the destination for inspection.',
+      'spansBackup',
+      false,
+    ],
+    [
+      'restore_spans_archive',
+      'Verify and restore an explicitly selected Spans backup to a new absolute destination. Input: backupRoot, destination. Does not overwrite, activate the restored archive or change configuration. Incomplete or unknown results retain the destination for inspection.',
+      'spansRestore',
+      false,
+    ],
+    [
+      'import_spans_source',
+      'Import one bounded page from an explicitly selected local Codex or Claude history file into the existing private archive. Input: path, provider, sourceId, sourceGeneration, parserVersion, runId, optional maxBytes. Repeat the same input only after a known successful page with hasMore. Does not scan folders or launch work.',
+      'spansImport',
+      false,
+    ],
+    [
       'list_spans_workflows',
       'List offline Spans workflow templates.',
       'spansWorkflows',
@@ -574,13 +598,19 @@ function registerTools(server) {
             ? deps[action](listing ? {} : input.input)
             : {
                 code: 'SPANS_SERVICE_UNAVAILABLE',
-                error: 'Spans planning is unavailable.',
+                error: 'Spans action is unavailable.',
                 ok: false,
               }
         )
     );
   }
   const spansReadTools = [
+    [
+      'get_spans_integrations',
+      'Read client artifact installation and connection evidence. Never issues a review challenge or changes native files.',
+      'spansIntegrationsPreview',
+      {},
+    ],
     [
       'list_spans_runs',
       'List retained Spans run summaries.',
@@ -825,11 +855,12 @@ function registerTools(server) {
     'retry_setup',
     {
       description:
-        'Retry one exact durable setup attempt after checkout-identity confirmation.',
+        'Retry an exact failed setup attempt. Set refreshDependencies:true explicitly to reinstall a completed checkout, run its install scripts, and invalidate dependency readiness until the new attempt succeeds. Requires the exact current attempt and checkout identity.',
       inputSchema: {
         ...worktree,
         attemptId: z.string().min(1),
         checkoutIdentity: identity,
+        refreshDependencies: z.boolean().optional(),
       },
       title: 'Retry setup',
     },

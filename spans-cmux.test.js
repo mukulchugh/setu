@@ -169,6 +169,31 @@ function transportFor(world, overrides = {}) {
 const stored = (world, assignmentId = DEFAULT.assignmentId) =>
   world.store.records.get(`run-1/${assignmentId}`);
 
+test('an explicitly unknown persistence reply holds a committed intent without offering a safe retry', async () => {
+  const world = createWorld();
+  const { persist } = world.impl;
+  world.impl.persist = (input) => {
+    const result = persist(input);
+    return input.op === 'write' && input.record.phase === 'intent'
+      ? { ok: false, unknown: true }
+      : result;
+  };
+  const reply = await transportFor(world).deliver(request());
+  expect(reply).toMatchObject({
+    held: true,
+    ok: false,
+    recordUncertain: true,
+    retryAllowed: false,
+  });
+  expect(world.sent).toHaveLength(0);
+  world.impl.persist = persist;
+  expect(await transportFor(world).deliver(request())).toMatchObject({
+    held: true,
+    ok: false,
+  });
+  expect(world.sent).toHaveLength(0);
+});
+
 // What the agent's message carries.
 const ackFor = (overrides = {}) => ({
   ackCode: DEFAULT.ackCode,

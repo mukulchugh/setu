@@ -2,6 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useId, useState } from 'preact/hooks';
 import type { SpansRecord } from '../spans-types';
 import { Button } from '../ui/button';
+import { SpansExecutionPanel } from './spans-execution-panel';
 import {
   SpansAgentsPanel,
   SpansPlanPanel,
@@ -116,7 +117,23 @@ export function SpansDetail({
     }
     switch (selectedTab) {
       case 'Plan':
-        return <SpansPlanPanel view={view} />;
+        return (
+          <>
+            <SpansPlanPanel view={view} />
+            {record && (
+              <SpansExecutionPanel
+                key={JSON.stringify([
+                  record.runId,
+                  record.generation,
+                  view.planVersion,
+                ])}
+                onRefresh={onRefresh}
+                record={record}
+                stale={stale}
+              />
+            )}
+          </>
+        );
       case 'Agents':
         return <SpansAgentsPanel view={view} />;
       case 'Conversation':
@@ -142,10 +159,11 @@ export function SpansDetail({
   return (
     <div class="mx-auto w-full min-w-0 max-w-6xl px-4 py-5 sm:px-6">
       <div class="mb-5 flex flex-wrap items-center gap-2">
-        <Button compact onClick={onBack} variant="secondary">
+        <Button class="min-h-11" compact onClick={onBack} variant="secondary">
           Back to runs
         </Button>
         <Button
+          class="min-h-11"
           compact
           disabled={loading}
           onClick={onRefresh}
@@ -168,14 +186,35 @@ export function SpansDetail({
         <h1 class="max-w-4xl break-words font-semibold text-2xl text-zinc-950 tracking-tight sm:text-3xl dark:text-zinc-50">
           {goal}
         </h1>
+        {view?.kind === 'imported' && (
+          <p class="mt-3 text-sm text-zinc-600 dark:text-zinc-300">
+            Imported conversation · read-only. Setu did not execute or verify
+            this imported work's outcome.
+          </p>
+        )}
         <dl class="mt-4 grid min-w-0 gap-x-8 sm:grid-cols-3">
           <SummaryField label="Owner" value={view?.owner} />
           <SummaryField label="Next step" value={view?.nextStep} />
-          <SummaryField
-            label="Work state"
-            value={view?.state ?? view?.status}
-          />
-          <SummaryField label="Process state" value={view?.processState} />
+          {view?.kind === 'imported' ? (
+            <>
+              <SummaryField
+                label="Recorded source state"
+                value={view.state ?? view.status}
+              />
+              <SummaryField
+                label="Setu process state"
+                value="Not run by Setu"
+              />
+            </>
+          ) : (
+            <>
+              <SummaryField
+                label="Work state"
+                value={view?.state ?? view?.status}
+              />
+              <SummaryField label="Process state" value={view?.processState} />
+            </>
+          )}
         </dl>
       </header>
       <fieldset class="mt-4 flex min-w-0 flex-wrap gap-2">

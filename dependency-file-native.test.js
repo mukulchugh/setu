@@ -16,6 +16,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { setFixtureTimesNs } from './dependency-file-fixture-times.js';
 import {
   createDependencyFileNative,
   sameDependencyFile,
@@ -122,9 +123,11 @@ function nativeRunner({
       return helperOutput(probe);
     }
     if (args[0] === 'restore-times') {
-      const atime = new Date(Number(BigInt(args[3])) / 1_000_000);
-      const mtime = new Date(Number(BigInt(args[4])) / 1_000_000);
-      await utimes(join(args[1], ...args[2].split('/')), atime, mtime);
+      await setFixtureTimesNs(
+        join(args[1], ...args[2].split('/')),
+        args[3],
+        args[4]
+      );
       return helperOutput({
         atimeNs: args[3],
         device: args[5],
@@ -993,10 +996,10 @@ describe('native helper boundaries', () => {
           return probeResponse(requestRoot, relativePath);
         }
         if (command === 'restore-times') {
-          await utimes(
+          await setFixtureTimesNs(
             join(requestRoot, relativePath),
-            new Date(Number(BigInt(atimeNs)) / 1e6),
-            new Date(Number(BigInt(mtimeNs)) / 1e6)
+            atimeNs,
+            mtimeNs
           );
           return null;
         }
@@ -1120,11 +1123,7 @@ describe('native helper boundaries', () => {
         return baseRunner(command, args, options);
       }
       commands.push({ args, command, options });
-      await utimes(
-        file,
-        new Date(Number(BigInt(args[3])) / 1e6),
-        new Date(Number(BigInt(args[4])) / 1e6)
-      );
+      await setFixtureTimesNs(file, args[3], args[4]);
       throw Object.assign(new Error('post-effect metadata read failed'), {
         stdout: '{"ok":false,"protocol":1,"code":"TIMESTAMP_RESTORE_UNKNOWN"}',
       });
@@ -1234,9 +1233,7 @@ describe('native helper boundaries', () => {
                 command === '/test/setu-dependency-files' &&
                 args[0] === 'restore-times'
               ) {
-                const atime = new Date(Number(BigInt(args[3])) / 1_000_000);
-                const mtime = new Date(Number(BigInt(args[4])) / 1_000_000);
-                await utimes(path, atime, mtime);
+                await setFixtureTimesNs(path, args[3], args[4]);
                 throw Object.assign(
                   new Error('helper exited after changing timestamps'),
                   {

@@ -917,6 +917,36 @@ export function LinksPage({
     setReport(actionError(result));
     return result;
   };
+  const handleSendResult = (
+    intent: PendingSend,
+    result: Awaited<ReturnType<typeof post>>
+  ) => {
+    if (result?.code === 'LINKS_OUTCOME_UNKNOWN' || result?.networkUncertain) {
+      setReport(
+        `Send outcome is unknown for ${intent.target.repo}/${intent.target.name} session ${intent.target.sessionId}. Reconcile the inbox, then retry only with key ${intent.key}.`
+      );
+      return;
+    }
+    const cleared = clearPendingSend(intent);
+    if (!cleared) {
+      setReport(
+        'Send completed, but its recovery key could not be cleared. Keep the exact draft and retry only with that key if needed.'
+      );
+      return;
+    }
+    if (
+      result?.ok &&
+      targetRef.current &&
+      sendFingerprint(
+        targetRef.current,
+        bodyRef.current.trim(),
+        replyToRef.current.trim()
+      ) === intent.fingerprint
+    ) {
+      setBody('');
+      setReplyTo('');
+    }
+  };
   const send = async () => {
     if (!(target && body.trim())) {
       return;
@@ -962,31 +992,7 @@ export function LinksPage({
           replyToRef.current.trim()
         ) === intent.fingerprint
     );
-    if (result?.code === 'LINKS_OUTCOME_UNKNOWN' || result?.networkUncertain) {
-      setReport(
-        `Send outcome is unknown for ${intent.target.repo}/${intent.target.name} session ${intent.target.sessionId}. Reconcile the inbox, then retry only with key ${intent.key}.`
-      );
-      return;
-    }
-    const cleared = clearPendingSend(intent);
-    if (!cleared) {
-      setReport(
-        'Send completed, but its recovery key could not be cleared. Keep the exact draft and retry only with that key if needed.'
-      );
-      return;
-    }
-    if (
-      result?.ok &&
-      targetRef.current &&
-      sendFingerprint(
-        targetRef.current,
-        bodyRef.current.trim(),
-        replyToRef.current.trim()
-      ) === intent.fingerprint
-    ) {
-      setBody('');
-      setReplyTo('');
-    }
+    handleSendResult(intent, result);
   };
   const startRedelivery = async () => {
     if (!(target && selectedMessage?.attemptId)) {

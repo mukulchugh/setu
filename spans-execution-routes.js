@@ -9,6 +9,10 @@ export const SPANS_EXECUTION_GET_ROUTES = Object.freeze({
     action: 'spansExecutionCapabilities',
     query: ['profile'],
   },
+  '/api/spans/execution/saved-review': {
+    action: 'spansExecutionReadReview',
+    query: ['runId', 'reviewDigest'],
+  },
   '/api/spans/execution/status': {
     action: 'spansExecutionStatus',
     query: ['runId'],
@@ -17,14 +21,18 @@ export const SPANS_EXECUTION_GET_ROUTES = Object.freeze({
 
 export const SPANS_EXECUTION_POST_ROUTES = Object.freeze({
   '/api/spans/execution/accept': 'spansExecutionAccept',
+  '/api/spans/execution/approval-challenge': 'spansExecutionApprovalChallenge',
+  '/api/spans/execution/approve': 'spansExecutionApprove',
   '/api/spans/execution/cancel': 'spansExecutionCancel',
   '/api/spans/execution/complete': 'spansExecutionComplete',
   '/api/spans/execution/dispatch': 'spansExecutionDispatch',
+  '/api/spans/execution/prepare': 'spansExecutionPrepare',
   '/api/spans/execution/probe': 'spansExecutionProbe',
   '/api/spans/execution/reconcile': 'spansExecutionReconcile',
   '/api/spans/execution/report': 'spansExecutionReport',
   '/api/spans/execution/resolve': 'spansExecutionResolve',
   '/api/spans/execution/review': 'spansExecutionReview',
+  '/api/spans/execution/revoke': 'spansExecutionRevoke',
 });
 
 const disabled = Object.freeze({
