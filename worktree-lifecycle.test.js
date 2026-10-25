@@ -615,6 +615,9 @@ test('restart retains admitted limits in both resource ledger and rendered Compo
   });
   expect(yaml).toContain('cpus: "2"');
   expect(yaml).toContain('mem_limit: "1024m"');
+  // Nx running-task records must not survive a container restart (PID reuse).
+  expect(yaml).toContain('NX_WORKSPACE_DATA_DIRECTORY: "/nx-workspace-data"');
+  expect(yaml).toContain('tmpfs:\n      - "/nx-workspace-data"');
   await f.lifecycle.stop(target('a'));
   expect((await f.lifecycle.start(target('a'), true)).queued).toBe(true);
 });
