@@ -161,6 +161,63 @@ function generated(context, files = { 'a.cache': 'a', 'b.cache': 'b' }) {
   }
 }
 
+test('prepare and execute also clean an Nx app cache under apps/<name>/.next', async () => {
+  const f = fixture();
+  generated(f);
+  const app = join(
+    f.checkout,
+    'apps',
+    'web',
+    '.next',
+    'dev',
+    'cache',
+    'turbopack'
+  );
+  fs.mkdirSync(app, { recursive: true });
+  fs.writeFileSync(join(app, 'app.cache'), 'app');
+  fs.mkdirSync(join(f.checkout, 'apps', 'web', 'src'), { recursive: true });
+  fs.writeFileSync(join(f.checkout, 'apps', 'web', 'src', 'page.js'), 'x');
+
+  const prepared = await f.cache.prepare(f.target);
+  expect(prepared.ok).toBe(true);
+  expect(prepared.manifest.roots.map((root) => root.path)).toEqual([
+    '.next/cache',
+    '.next/dev/cache/turbopack',
+    'apps/web/.next/cache',
+    'apps/web/.next/dev/cache/turbopack',
+  ]);
+  await expect(
+    f.cache.execute(prepared.manifest.id, prepared.manifest.id)
+  ).resolves.toMatchObject({ ok: true });
+  expect(fs.existsSync(join(app, 'app.cache'))).toBe(false);
+  expect(fs.existsSync(join(f.output, 'a.cache'))).toBe(false);
+  expect(fs.existsSync(join(f.checkout, 'apps', 'web', 'src', 'page.js'))).toBe(
+    true
+  );
+});
+
+test('prepare skips a symlinked app directory instead of following it', async () => {
+  const f = fixture();
+  generated(f);
+  const outside = fs.mkdtempSync(join(tmpdir(), 'setu-outside-app-'));
+  roots.push(outside);
+  fs.mkdirSync(join(outside, '.next', 'cache'), { recursive: true });
+  fs.writeFileSync(join(outside, '.next', 'cache', 'keep.cache'), 'keep');
+  fs.mkdirSync(join(f.checkout, 'apps'));
+  fs.symlinkSync(outside, join(f.checkout, 'apps', 'linked'));
+
+  const prepared = await f.cache.prepare(f.target);
+  expect(prepared.ok).toBe(true);
+  expect(prepared.manifest.roots.map((root) => root.path)).toEqual([
+    '.next/cache',
+    '.next/dev/cache/turbopack',
+  ]);
+  await f.cache.execute(prepared.manifest.id, prepared.manifest.id);
+  expect(fs.existsSync(join(outside, '.next', 'cache', 'keep.cache'))).toBe(
+    true
+  );
+});
+
 test('prepare rejects a symlink planted inside the exact Turbopack directory', async () => {
   const f = fixture();
   generated(f, { 'entry.cache': 'generated' });
