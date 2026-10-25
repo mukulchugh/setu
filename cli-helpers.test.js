@@ -17,7 +17,7 @@ import {
 
 test('caddyfileText uses a valid multiline global options block', () => {
   expect(caddyfileText('/tmp/a workspace')).toBe(
-    '{\n  auto_https off\n}\nimport /tmp/a workspace/caddy.d/*.caddy\n'
+    '{\n  auto_https off\n  grace_period 3s\n}\nimport /tmp/a workspace/caddy.d/*.caddy\n'
   );
 });
 

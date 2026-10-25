@@ -8,8 +8,10 @@ const sudoRuleContinuationPattern = /\n {5,}(?=\S)/g;
 const sudoRulePattern = /NOPASSWD:\s*(.+)$/;
 const sudoRuleSeparatorPattern = /\s*,\s*/;
 
+// The default grace period is eternal: one long-lived dev request keeps the
+// old config alive, so every later reload (and Setu's 5s reload) hangs.
 export function caddyfileText(workspace) {
-  return `{\n  auto_https off\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
+  return `{\n  auto_https off\n  grace_period 3s\n}\nimport ${workspace}/caddy.d/*.caddy\n`;
 }
 
 export function portalCaddyRoute(port, zone) {
