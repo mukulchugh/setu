@@ -155,7 +155,7 @@ function validateArtifactDirectory(root) {
   return directory;
 }
 
-function hashArtifact(mediaType, text) {
+export function hashArtifact(mediaType, text) {
   return createHash('sha256')
     .update(mediaType)
     .update('\0')

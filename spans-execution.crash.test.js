@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { observeProcessIdentity } from './process-observation.js';
 import {
+  approvedDispatchInput,
   createExecutionFixture,
   PROFILE,
   TARGET,
 } from './spans-execution.test-support.js';
+import { openSpansStore } from './spans-store.js';
 import { checkWriter } from './writer-claims.js';
 
 // Crash tests. A child process runs the real service and is frozen at one
@@ -14,6 +17,17 @@ import { checkWriter } from './writer-claims.js';
 // fixture, so this proves Setu's restart behavior and nothing about a provider.
 
 const CRASH_FIXTURE = join(import.meta.dir, 'spans-execution.crash-fixture.js');
+const BINDING_FIELDS = [
+  'actionId',
+  'attemptId',
+  'generation',
+  'runId',
+  'spanId',
+  'workerId',
+];
+const WORKER_ID = 'spans-worker-local';
+const ATTEMPT_DIGEST = /^[0-9a-f]{64}$/;
+const ARTIFACT_DIGEST = /^sha256:[0-9a-f]{64}$/;
 const REVIEW = Object.freeze({
   instructions: 'Create fixture-output.txt in the checkout.',
   profile: PROFILE,
@@ -39,50 +53,169 @@ const events = (type) =>
 const run = () => fx.store.readRun({ runId: 'run-1' }).view;
 const claim = () => checkWriter(fx.wtDir, 'observer').claim;
 
-async function waitForFile(path, timeoutMs = 20_000) {
+async function waitForBoundary(path, resultPath, child, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
+    if (child.exitCode !== null) {
+      const result = existsSync(resultPath)
+        ? readFileSync(resultPath, 'utf8')
+        : 'no fixture result';
+      throw new Error(`fixture exited before ${path}: ${result}`);
+    }
     if (Date.now() > deadline) {
       throw new Error(`timed out waiting for ${path}`);
     }
-    // biome-ignore lint/performance/noAwaitInLoops: Poll for the file in order.
+    // biome-ignore lint/performance/noAwaitInLoops: Wait for the supervised child or its boundary marker.
     await Bun.sleep(20);
   }
 }
 
+function bindingFields(value) {
+  return Object.fromEntries(
+    BINDING_FIELDS.map((field) => [field, value?.[field]])
+  );
+}
+
+function executionAttempt(view = run()) {
+  if (!view) {
+    return null;
+  }
+  const execution = Object.values(view.executions ?? {}).find(
+    (row) => row.spanId === 'build'
+  );
+  return execution ? (view.attempts?.[execution.attemptId] ?? null) : null;
+}
+
+function expectExactAttemptBinding(attempt = executionAttempt()) {
+  expect(attempt).toBeTruthy();
+  const view = run();
+  const expected = {
+    actionId: attempt.actionId,
+    attemptId: attempt.attemptId,
+    generation: view.generation,
+    runId: 'run-1',
+    spanId: 'build',
+    workerId: WORKER_ID,
+  };
+  expect(bindingFields(attempt)).toEqual(expected);
+  if (attempt.receipt) {
+    expect(bindingFields(attempt.receipt)).toEqual(expected);
+  }
+  return expected;
+}
+
+function expectCompleteReceipt(attempt = executionAttempt()) {
+  expect(attempt).toBeTruthy();
+  const binding = expectExactAttemptBinding(attempt);
+  expect(attempt.exit).not.toBeNull();
+  expect(attempt.status).toBe('exited');
+  expect(attempt).toMatchObject({
+    receipt: {
+      ...binding,
+      attemptDigest: attempt.attemptDigest,
+      capture: {
+        complete: true,
+        countsConfirmed: true,
+      },
+      exit: attempt.exit,
+      kind: 'spans.worker.receipt',
+      outcome: 'process-exited',
+      ownershipReleased: false,
+      reason: 'process-exited',
+      resumeAvailable: false,
+      retryEligible: false,
+      status: 'exited',
+      workAccepted: false,
+    },
+  });
+  expect(attempt.attemptDigest).toMatch(ATTEMPT_DIGEST);
+  expect(attempt.receipt.capture.artifactId).toMatch(ARTIFACT_DIGEST);
+  expect(attempt.receipt.capture).toEqual(attempt.capture);
+  expect(attempt.receipt.processStart).toEqual(attempt.processStart);
+  expect(attempt.receipt.nativeId).toBe(attempt.nativeId);
+  expect(attempt.receipt.nativeIdState).toBe(
+    attempt.nativeId === null ? 'missing' : 'recorded'
+  );
+  expect(attempt.receipt.capture.gap).toBeNull();
+  return attempt.receipt;
+}
+
+async function waitForTerminalReceipt(timeoutMs = 15_000) {
+  const reader = openSpansStore({
+    create: false,
+    readonly: true,
+    root: fx.archive,
+  });
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() <= deadline) {
+      const read = reader.readRun({ runId: 'run-1' });
+      const attempt = executionAttempt(read.view);
+      if (attempt?.receipt?.kind === 'spans.worker.receipt' && attempt.exit) {
+        return attempt;
+      }
+      // biome-ignore lint/performance/noAwaitInLoops: Poll the read-only archive for the detached child's terminal receipt.
+      await Bun.sleep(20);
+    }
+  } finally {
+    reader.close();
+  }
+  throw new Error('timed out waiting for a durable detached-worker receipt');
+}
+
+async function expectResourcesHeld(service) {
+  expect((await fx.admission.status()).leases).toHaveLength(1);
+  expect((await service.usage({ runId: 'run-1' })).heldCount).toBe(1);
+  expect(claim()).toMatchObject({ agent: 'spans' });
+}
+
 // Runs the dispatch in a child, kills it at `boundary`, and returns a fresh
 // service that has reconciled the archive.
-async function crashAt(boundary, serviceOptions = {}) {
+async function crashAt(
+  boundary,
+  serviceOptions = {},
+  { providerDelayMs, restart = true, review = REVIEW } = {}
+) {
   fx = createExecutionFixture();
   await fx.completeSetup();
   const service = fx.createService();
   await service.probe({ profile: PROFILE });
   probeRuns = fx.providerPids().length;
-  const reviewed = await service.review(REVIEW);
-  const input = { ...REVIEW, confirmation: reviewed.confirmation };
+  const input = await approvedDispatchInput(service, review);
   await service.close();
 
   const child = Bun.spawn(
     [
       process.execPath,
       CRASH_FIXTURE,
-      JSON.stringify({ boundary, input, root: fx.root }),
+      JSON.stringify({ boundary, input, providerDelayMs, root: fx.root }),
     ],
     { stderr: 'pipe', stdout: 'ignore' }
   );
   try {
-    await waitForFile(join(fx.root, 'boundary'));
+    await waitForBoundary(
+      join(fx.root, 'boundary'),
+      join(fx.root, 'fixture-result.json'),
+      child
+    );
   } catch (error) {
-    child.kill('SIGKILL');
+    const { exitCode } = child;
+    if (exitCode === null) {
+      child.kill('SIGKILL');
+    }
     throw new Error(
-      `${error.message}: ${await new Response(child.stderr).text()}`,
-      { cause: error }
+      `${error.message} (${boundary}, exit ${exitCode ?? 'unknown'})`,
+      {
+        cause: error,
+      }
     );
   }
   child.kill('SIGKILL');
   await child.exited;
-  // Let a provider the child started finish; its pipe to the dead parent is gone.
-  await Bun.sleep(400);
+
+  if (!restart) {
+    return { input, restarted: null, summary: null };
+  }
 
   const restarted = fx.createService(serviceOptions);
   const summary = await restarted.reconcile();
@@ -122,34 +255,140 @@ describe('killing the process at each boundary', () => {
     await expectHeldNotRelaunched(result, { providers: 0 });
   });
 
-  test('mid-launch, with a process that was never recorded', async () => {
-    const result = await crashAt('launch');
-    const [attempt] = Object.values(run().attempts);
-    expect(attempt).toMatchObject({
-      receipt: { outcome: 'unknown', reason: 'launch-unknown' },
-      status: 'held',
-    });
-    expect(Object.values(run().actions)[0].state).toBe('unknown');
-    await expectHeldNotRelaunched(result, { providers: 1 });
-  });
+  test('the native capture child keeps running after a crash at its spawn event', async () => {
+    await crashAt(
+      'launch',
+      {},
+      {
+        providerDelayMs: 900,
+        restart: false,
+      }
+    );
+    const observer = fx.createService();
+    const attempt = await waitForTerminalReceipt();
+    expectCompleteReceipt(attempt);
+    const [action] = Object.values(run().actions);
+    expect(action.state).toBe('intent');
+    expect(events('spans.execution.captured')).toHaveLength(0);
+    expect(events('spans.action.outcome')).toHaveLength(0);
+    expect(workers()).toBe(1);
+    await expectResourcesHeld(observer);
 
-  test('mid-run, with a worker nobody is watching', async () => {
-    const result = await crashAt('run');
-    const [attempt] = Object.values(run().attempts);
-    expect(attempt).toMatchObject({
-      receipt: { outcome: 'unknown', reason: 'worker-lost' },
-      status: 'held',
-    });
-    expect(Object.values(run().actions)[0].state).toBe('unknown');
-    expect(events('spans.recovery.reconciled').length).toBeGreaterThan(0);
-    await expectHeldNotRelaunched(result, { providers: 1 });
-  });
-
-  test('after the exit was recorded, the verified outcome completes and settles', async () => {
-    const { restarted } = await crashAt('exit');
-    const [attempt] = Object.values(run().attempts);
-    expect(attempt.status).toBe('exited');
+    const summary = await observer.reconcile();
+    expect(summary.ok).toBe(true);
     expect(Object.values(run().actions)[0].state).toBe('completed');
+    expect(await observer.usage({ runId: 'run-1' })).toMatchObject({
+      outstandingReservationMicro: 0,
+      runActualMicro: 0,
+      unmeteredCount: 1,
+    });
+    expect((await fx.admission.status()).leases).toEqual([]);
+    expect(claim()).toMatchObject({ agent: 'spans' });
+    expect(workers()).toBe(1);
+    expect(events('spans.completion.accepted')).toHaveLength(0);
+  });
+
+  test('the live provider continues after its parent dies before start acknowledgement', async () => {
+    const { input } = await crashAt(
+      'start',
+      {},
+      {
+        restart: false,
+        review: {
+          ...REVIEW,
+          instructions:
+            'MODE:controlled-success\nCreate fixture-output.txt in the checkout.',
+        },
+      }
+    );
+    const restarted = fx.createService();
+    const before = executionAttempt();
+    expect(before).toMatchObject({ status: 'running' });
+    expectExactAttemptBinding(before);
+    expect(Object.values(run().actions)[0].state).toBe('intent');
+    expect(events('spans.execution.captured')).toHaveLength(0);
+    expect(events('spans.action.outcome')).toHaveLength(0);
+    expect(workers()).toBe(1);
+    await expectResourcesHeld(restarted);
+
+    const readyFile = join(
+      fx.root,
+      `provider-pids.${before.processStart.pid}.ready`
+    );
+    const readyDeadline = Date.now() + 3000;
+    while (!existsSync(readyFile)) {
+      if (Date.now() >= readyDeadline) {
+        throw new Error(
+          'The surviving controlled provider did not become ready.'
+        );
+      }
+      // biome-ignore lint/performance/noAwaitInLoops: Wait for this exact owned fixture's completion trigger to be installed.
+      await Bun.sleep(20);
+    }
+    const owned = await observeProcessIdentity(before.processStart.pid);
+    expect(`${owned.processId}:${owned.processStartIdentity}`).toBe(
+      before.processStart.id
+    );
+    process.kill(before.processStart.pid, 'SIGUSR2');
+    const receipt = expectCompleteReceipt(await waitForTerminalReceipt());
+    expect(receipt.capture.complete).toBe(true);
+    expect(Object.values(run().actions)[0].state).toBe('intent');
+    expect(events('spans.execution.captured')).toHaveLength(0);
+    await expectResourcesHeld(restarted);
+
+    const summary = await restarted.reconcile();
+    expect(summary.ok).toBe(true);
+    expect(Object.values(run().actions)[0].state).toBe('completed');
+    expect(await restarted.usage({ runId: 'run-1' })).toMatchObject({
+      outstandingReservationMicro: 0,
+      runActualMicro: 0,
+      unmeteredCount: 1,
+    });
+    expect((await fx.admission.status()).leases).toEqual([]);
+    expect(claim()).toMatchObject({ agent: 'spans' });
+    expect(workers()).toBe(1);
+    expect(events('spans.completion.accepted')).toHaveLength(0);
+    expect((await restarted.dispatch(input)).status).not.toBe('launched');
+    expect(workers()).toBe(1);
+  });
+
+  test('after the exact terminal receipt and captured event, before parent outcome', async () => {
+    await crashAt('captured', {}, { restart: false });
+    const observer = fx.createService();
+    expectCompleteReceipt();
+    const [action] = Object.values(run().actions);
+    expect(action.state).toBe('intent');
+    expect(events('spans.execution.captured')).toHaveLength(1);
+    expect(events('spans.action.outcome')).toHaveLength(0);
+    await expectResourcesHeld(observer);
+
+    const summary = await observer.reconcile();
+    expect(summary.ok).toBe(true);
+    expect(Object.values(run().actions)[0].state).toBe('completed');
+    expect(await observer.usage({ runId: 'run-1' })).toMatchObject({
+      outstandingReservationMicro: 0,
+      runActualMicro: 0,
+      unmeteredCount: 1,
+    });
+    expect((await fx.admission.status()).leases).toEqual([]);
+    expect(claim()).toMatchObject({ agent: 'spans' });
+    expect(workers()).toBe(1);
+    expect(events('spans.completion.accepted')).toHaveLength(0);
+  });
+
+  test('after outcome commit but before lease and usage settlement', async () => {
+    await crashAt('outcome', {}, { restart: false });
+    const [action] = Object.values(run().actions);
+    expect(action.state).toBe('completed');
+    expectCompleteReceipt();
+    expect(events('spans.execution.captured')).toHaveLength(1);
+    expect((await fx.admission.status()).leases).toHaveLength(1);
+    expect(Object.values(run().usage.reservations)[0].state).toBe('reserved');
+    expect(claim()).toMatchObject({ agent: 'spans' });
+
+    const restarted = fx.createService();
+    const summary = await restarted.reconcile();
+    expect(summary.ok).toBe(true);
     expect(await restarted.usage({ runId: 'run-1' })).toMatchObject({
       outstandingReservationMicro: 0,
       runActualMicro: 0,
@@ -160,19 +399,6 @@ describe('killing the process at each boundary', () => {
     expect(workers()).toBe(1);
     expect(events('spans.worker.launched')).toHaveLength(1);
     expect(run().spans.build.state).toBe('planned');
-  });
-
-  test('after the outcome was recorded, before it was settled', async () => {
-    const { restarted } = await crashAt('outcome');
-    expect(Object.values(run().actions)[0].state).toBe('completed');
-    expect(await restarted.usage({ runId: 'run-1' })).toMatchObject({
-      outstandingReservationMicro: 0,
-      runActualMicro: 0,
-      unmeteredCount: 1,
-    });
-    expect((await fx.admission.status()).leases).toEqual([]);
-    expect(claim()).toMatchObject({ agent: 'spans' });
-    expect(events('spans.worker.launched')).toHaveLength(1);
   });
 
   test('before acceptance, the restarted service can still review and accept', async () => {
@@ -201,7 +427,7 @@ describe('killing the process at each boundary', () => {
   });
 
   test('reconciling again changes nothing', async () => {
-    const { restarted } = await crashAt('run');
+    const { restarted } = await crashAt('intent');
     const before = fx.store.readEvents({ limit: 200, runId: 'run-1' }).events
       .length;
     const { revision } = fx.store.readRun({ runId: 'run-1' });
@@ -219,6 +445,7 @@ describe('resolving a dispatch that never reached intent', () => {
     return { actionId: execution.actionId, runId: 'run-1' };
   };
 
+  // Includes the 20s crash-boundary wait and a separate fresh native dispatch.
   test('shows what it would release, needs the exact confirmation, then frees it all', async () => {
     const { restarted, summary } = await crashAt('reservation');
     expect(summary.reconciled[0]).toMatchObject({
@@ -273,20 +500,33 @@ describe('resolving a dispatch that never reached intent', () => {
       instructions: 'Create fixture-output.txt, differently.',
     });
     expect(again.ok).toBe(true);
-    const launched = await restarted.dispatch({
+    const input = await approvedDispatchInput(restarted, {
       ...REVIEW,
-      confirmation: again.confirmation,
       instructions: 'Create fixture-output.txt, differently.',
     });
+    const launched = await restarted.dispatch(input);
     expect(launched.status).toBe('launched');
     await restarted.idle();
-  });
+  }, 30_000);
 
-  test('refuses anything that reached intent or launched, and keeps every resource', async () => {
-    for (const boundary of ['intent', 'run']) {
-      // biome-ignore lint/performance/noAwaitInLoops: Each crash starts from a fresh fixture, in order.
-      const { restarted } = await crashAt(boundary);
+  for (const boundary of ['intent', 'captured']) {
+    test(`refuses resolution after ${boundary} and keeps every resource`, async () => {
+      const { restarted: alreadyReconciled } = await crashAt(
+        boundary,
+        {},
+        { restart: boundary !== 'captured' }
+      );
+      const restarted = alreadyReconciled ?? fx.createService();
       const ids = idsOf();
+      if (boundary === 'captured') {
+        expectExactAttemptBinding();
+        expectCompleteReceipt();
+        // Launch acknowledgment can become unknown before capture finishes.
+        expect(['intent', 'unknown']).toContain(
+          Object.values(run().actions)[0].state
+        );
+        expect(events('spans.action.outcome')).toHaveLength(0);
+      }
       expect(await restarted.resolve(ids)).toMatchObject({
         code: 'SPANS_EXEC_NOT_RESOLVABLE',
         ok: false,
@@ -297,10 +537,13 @@ describe('resolving a dispatch that never reached intent', () => {
       expect((await fx.admission.status()).leases).toHaveLength(1);
       expect((await restarted.usage({ runId: 'run-1' })).heldCount).toBe(1);
       expect(claim()).toMatchObject({ agent: 'spans' });
+      if (boundary === 'captured') {
+        expect((await restarted.reconcile()).ok).toBe(true);
+      }
       await fx.dispose();
       fx = undefined;
-    }
-  });
+    }, 20_000);
+  }
 
   test('a dispatch of the same binding cannot start while a resolve is releasing, and the worker keeps its claim', async () => {
     const armed = [];
@@ -388,12 +631,9 @@ describe('resolving a dispatch that never reached intent', () => {
     });
     await service.probe({ profile: PROFILE });
     probeRuns = fx.providerPids().length;
-    const reviewed = await service.review(REVIEW);
+    const input = await approvedDispatchInput(service, REVIEW);
     armed.push(true);
-    const dispatching = service.dispatch({
-      ...REVIEW,
-      confirmation: reviewed.confirmation,
-    });
+    const dispatching = service.dispatch(input);
     await atBarrier;
     const ids = idsOf();
     expect(
@@ -404,7 +644,7 @@ describe('resolving a dispatch that never reached intent', () => {
     expect((await dispatching).status).toBe('launched');
     expect(claim()).toMatchObject({ agent: 'spans' });
     await service.idle();
-  });
+  }, 20_000);
 
   test('a span reused after a resolve gets a fresh identity and a live reservation, and the old row stays', async () => {
     const { restarted } = await crashAt('reservation');
@@ -421,10 +661,8 @@ describe('resolving a dispatch that never reached intent', () => {
     const again = await restarted.review(REVIEW);
     expect(again.review.actionId).not.toBe(ids.actionId);
     expect(again.review.attemptId).not.toBe(oldReservation.attemptId);
-    const launched = await restarted.dispatch({
-      ...REVIEW,
-      confirmation: again.confirmation,
-    });
+    const input = await approvedDispatchInput(restarted, REVIEW);
+    const launched = await restarted.dispatch(input);
     expect(launched).toMatchObject({ status: 'launched' });
     expect(launched.actionId).toBe(again.review.actionId);
 
@@ -444,7 +682,7 @@ describe('resolving a dispatch that never reached intent', () => {
     expect(
       after.find((row) => row.actionId === launched.actionId)
     ).toMatchObject({ actualMicro: null, state: 'released' });
-  });
+  }, 20_000);
 
   test('a second supervisor cannot resolve', async () => {
     const { restarted } = await crashAt('reservation');

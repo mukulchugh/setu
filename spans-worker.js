@@ -911,8 +911,8 @@ export function createSpansWorker(options = {}) {
   }
 
   // -------------------------------------------------------------------------
-  // Hold: explicit unknown outcome with a receipt. Nothing is inferred and the
-  // process is not touched; no stop policy is approved.
+  // Hold: explicit unknown outcome with a receipt. Capture exhaustion records
+  // its owned stop result before reaching this boundary.
   // -------------------------------------------------------------------------
 
   // `known` carries identity already observed but not yet durable, such as the
@@ -924,9 +924,11 @@ export function createSpansWorker(options = {}) {
     ctx.holding = true;
     ctx.closed = true;
     let artifactId = null;
-    if (ctx.chunks > 0 && reason !== 'finalize-failed') {
+    const captureFailed = reason === 'capture-failed';
+    if (captureFailed || (ctx.chunks > 0 && reason !== 'finalize-failed')) {
       artifactId = (await finalizeSpool(ctx, false))?.artifactId ?? null;
     }
+    const countsConfirmed = !captureFailed || artifactId !== null;
     // Whatever was never persisted is named in the gap: raw text still waiting
     // for a safe record end, and callbacks accepted before a launch that was
     // never recorded. Holding capture is not enforcement; the process is not
@@ -963,11 +965,13 @@ export function createSpansWorker(options = {}) {
       const next = {
         ...record,
         capture: {
-          artifactId: artifactId ?? record.capture.artifactId,
+          artifactId: countsConfirmed
+            ? (artifactId ?? record.capture.artifactId)
+            : null,
           bytes: ctx.bytes,
           chunks: ctx.chunks,
           complete: false,
-          countsConfirmed: true,
+          countsConfirmed,
           gap,
         },
         launchedAt: record.launchedAt ?? known.launchedAt ?? null,
@@ -1369,8 +1373,12 @@ export function createSpansWorker(options = {}) {
       ctx.chunks + 1 > limits.maxAttemptChunks ||
       ctx.bytes + bytes > limits.maxAttemptBytes
     ) {
+      const stopped = await stopForCaptureExhaustion(ctx);
       const held = await holdJob(ctx, 'spool-limit');
-      return refuse('SPOOL_LIMIT', { held: held.ok === true });
+      return refuse('SPOOL_LIMIT', {
+        cancel: stopped.cancel ?? 'unknown',
+        held: held.ok === true,
+      });
     }
     const effect = await spoolEffect(ctx, 'append', {
       bytes,
@@ -1387,6 +1395,17 @@ export function createSpansWorker(options = {}) {
       ctx.chunks += 1;
       ctx.bytes += bytes;
       return { ok: true };
+    }
+    if (
+      effect.result.code === 'SPOOL_LIMIT' ||
+      effect.result.code === 'SPANS_ARCHIVE_CAPACITY_REACHED'
+    ) {
+      const stopped = await stopForCaptureExhaustion(ctx);
+      const held = await holdJob(ctx, 'spool-limit');
+      return refuse('SPOOL_LIMIT', {
+        cancel: stopped.cancel ?? 'unknown',
+        held: held.ok === true,
+      });
     }
     if (
       retryable &&
@@ -1715,6 +1734,43 @@ export function createSpansWorker(options = {}) {
     return exited;
   }
 
+  function confirmStoppedCaptureExit(ctx, exit) {
+    if (ctx.finished?.held !== true) {
+      return refuse('ATTEMPT_CLOSED');
+    }
+    return transactFor(ctx, (view, at) => {
+      const found = findRecord(view, ctx.binding);
+      if (!found.record) {
+        return found.refusal;
+      }
+      const { record } = found;
+      const reason = record.capture.gap?.reason;
+      if (
+        record.status !== 'held' ||
+        !['capture-failed', 'spool-limit', 'deadline'].includes(reason) ||
+        record.cancel?.state !== 'delivered' ||
+        record.processStart?.id !== ctx.processStartId
+      ) {
+        return refuse('ATTEMPT_CLOSED');
+      }
+      if (record.exit !== null) {
+        return sameExit(record.exit, exit)
+          ? unchanged({ duplicate: true, processExited: true, status: 'held' })
+          : refuse('EXIT_CONFLICT');
+      }
+      // Process exit resolves native ownership, never the incomplete work.
+      const next = { ...record, exit, updatedAt: at };
+      next.receipt = buildReceipt(next, { at, reason });
+      return write(
+        view,
+        next,
+        EVENT_TYPES.exited,
+        { receipt: next.receipt },
+        { processExited: true, receipt: next.receipt, status: 'held' }
+      );
+    });
+  }
+
   function exitFor(ctx, value, early = false) {
     const parsed = parseExit(value);
     if (!parsed.ok) {
@@ -1731,7 +1787,7 @@ export function createSpansWorker(options = {}) {
           );
     }
     if (ctx.closed || ctx.holding) {
-      return Promise.resolve(refuse('ATTEMPT_CLOSED'));
+      return serial(ctx, () => confirmStoppedCaptureExit(ctx, parsed.exit));
     }
     ctx.exit = parsed.exit;
     ctx.exitResult = serial(ctx, () => finalizeJob(ctx)).then((result) =>
@@ -1934,19 +1990,24 @@ export function createSpansWorker(options = {}) {
     if (!ref.ok) {
       return ref;
     }
-    if (typeof launcher.stop !== 'function') {
-      return refuse('CANCEL_UNSUPPORTED');
-    }
     const requested = await transact(
       ref.binding,
       cancelRequestBuild(ref),
       ref.fence
     );
     if (!requested.ok || requested.duplicate) {
-      return requested;
+      return requested.duplicate && requested.cancel === 'requested'
+        ? refuse('CANCEL_UNKNOWN', {
+            cancel: 'unknown',
+            duplicate: true,
+            unknown: true,
+          })
+        : requested;
     }
     // The request is durable; a delivered stop is still not an exit.
-    const delivered = await callStop(ref, digestOf(ref.binding));
+    const delivered =
+      typeof launcher.stop === 'function' &&
+      (await callStop(ref, digestOf(ref.binding)));
     const state = delivered ? 'delivered' : 'unknown';
     const recorded = await transact(
       ref.binding,
@@ -1959,6 +2020,22 @@ export function createSpansWorker(options = {}) {
     return delivered
       ? { cancel: 'delivered', ok: true, terminal: false }
       : refuse('CANCEL_UNKNOWN', { cancel: 'unknown', unknown: true });
+  }
+
+  // Called from the current capture job without queuing another job on ctx.chain.
+  // The cancel intent, exact owned effect, and result are durable before holdJob
+  // closes the attempt. A missing process identity cannot authorize a stop.
+  function stopForCaptureExhaustion(ctx) {
+    if (!ctx.processStartId) {
+      return refuse('CANCEL_UNKNOWN', {
+        cancel: 'unknown',
+        unknown: true,
+      });
+    }
+    return cancel({
+      ...ctx.binding,
+      processStartId: ctx.processStartId,
+    });
   }
 
   // -------------------------------------------------------------------------

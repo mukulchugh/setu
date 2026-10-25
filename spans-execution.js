@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
 import { observeProcessIdentity } from './process-observation.js';
 import { createSpansActions } from './spans-actions.js';
 import {
@@ -17,11 +18,14 @@ import {
   createSetupAdapter,
   createWriterAdapter,
 } from './spans-execution-adapters.js';
+import { readSpansExecutionRequest } from './spans-execution-binding.js';
 import { createSpansCapability } from './spans-execution-capability.js';
+import { createSpansExecutionCapture } from './spans-execution-capture.js';
 import {
   digestOf,
   exactRequest,
   holdsSecret,
+  spansExecutionInputDigest as inputDigestOf,
   isExplicitId,
   isRecord,
   PROFILE_PATTERN,
@@ -31,16 +35,14 @@ import {
 } from './spans-execution-core.js';
 import { createExecutionOwner } from './spans-execution-owner.js';
 import {
-  createSpansExecutionLauncher,
-  createSpansExecutionSpool,
-} from './spans-execution-process.js';
-import {
   isSubscription,
   launchModeOf,
   providerArguments,
   providerEnvironment,
   SPANS_EXEC_DEFAULT_PROFILES,
 } from './spans-execution-provider.js';
+import { createSpansExecutionResources } from './spans-execution-resources.js';
+import { createSpansExecutionReviewFlow } from './spans-execution-review-flow.js';
 import {
   createSpansExecutionUsage,
   usageReservationId,
@@ -51,11 +53,16 @@ import {
   describeChange,
   observeTree,
 } from './spans-execution-verifier.js';
+import { SPANS_MODEL_LIMITS } from './spans-model-store.js';
 import { reconcileSpansRecovery } from './spans-recovery.js';
 import { redactSpansValue } from './spans-redaction.js';
+import { SPANS_STORE_LIMITS } from './spans-store.js';
 import { evaluateDependencyReadiness } from './spans-transitions.js';
 import { createSpansUsage } from './spans-usage.js';
-import { createSpansWorker } from './spans-worker.js';
+import {
+  createSpansWorkerProcess,
+  spansWorkerCapturePath,
+} from './spans-worker-process.js';
 import { releaseWriter } from './writer-claims.js';
 
 // Live Spans execution: one composition that dispatches a reviewed span to one
@@ -80,12 +87,16 @@ const WORKER_LIMITS = Object.freeze({
   maxDeadlineMs: SPANS_EXEC_LIMITS.maxWallClockMs,
   maxQueueBytes: 1024 * 1024,
 });
+const ARCHIVE_WRITE_MAX_BYTES =
+  SPANS_MODEL_LIMITS.documentBytes +
+  SPANS_STORE_LIMITS.payloadBytes * 8 +
+  2 * 1024 * 1024;
 const DEFAULT_RUN_BUDGET_USD = 10;
-const DEFAULT_DEADLINE_INTERVAL_MS = 5000;
 const CONFIRMATION_PREFIX = 'spans-dispatch:';
 const ACCEPT_PREFIX = 'spans-accept:';
 const RESOLVE_PREFIX = 'spans-resolve:';
 const ADMISSION_KIND = 'headless-run';
+const REVIEW_DIGEST = /^[a-f0-9]{64}$/;
 const TARGET_PART = /^[^/\\\s:]+$/;
 const METERED_CAPABILITIES = Object.freeze([
   'effort',
@@ -117,6 +128,7 @@ const NOT_LAUNCHED_CODES = new Set([
   'ACTION_NOT_PENDING',
   'ACTION_NOT_PREPARED',
   'ATTEMPT_CONFLICT',
+  'CAPTURE_PROVIDER_REFUSED',
   'CLOCK_INVALID',
   'DEADLINE_INVALID',
   'GENERATION_INVALID',
@@ -172,6 +184,8 @@ const MESSAGES = Object.freeze({
     'This dispatch has an intent, an attempt or a live dispatch; it is not resolved here.',
   SPANS_EXEC_OWNED_ELSEWHERE:
     'Another service supervises this archive; nothing was started.',
+  SPANS_EXEC_PROBE_NOT_RECORDED:
+    'Probe evidence could not be recorded. Inspect the archive before another probe.',
   SPANS_EXEC_PROFILE_UNKNOWN: 'That model profile is not configured.',
   SPANS_EXEC_RELEASE_INCOMPLETE:
     'Not everything could be released; the dispatch stays held and can be resolved again.',
@@ -179,6 +193,7 @@ const MESSAGES = Object.freeze({
   SPANS_EXEC_REQUEST_INVALID: 'The request does not use the expected format.',
   SPANS_EXEC_REVIEW_CHANGED:
     'What would be dispatched changed since the review; review it again.',
+  SPANS_EXEC_RUN_READ_ONLY: 'Imported history cannot execute actions.',
   SPANS_EXEC_RUN_UNAVAILABLE: 'The run could not be read.',
   SPANS_EXEC_SETUP_NOT_READY:
     'Setup has not completed for this checkout; nothing was started.',
@@ -217,28 +232,6 @@ function parseTarget(value) {
     ? { name: target.name, repo: target.repo }
     : null;
 }
-
-// What a dispatch's input digest covers: the instructions, the budget, the wall
-// clock and the acceptance conditions a person reviewed, and the exact tree the
-// work was reviewed against.
-const inputDigestOf = ({
-  baselineTree,
-  budgetMicro,
-  criteria,
-  instructions,
-  launchMode,
-  requireChange,
-  wallClockMs,
-}) =>
-  digestOf({
-    baselineTree,
-    budgetMicro,
-    criteria,
-    instructions,
-    launchMode,
-    requireChange,
-    wallClockMs,
-  });
 
 // A stored record that no longer hashes to what was authorized is not run.
 const inputsIntact = (execution) =>
@@ -298,7 +291,7 @@ function parseReview(input, { confirmation = false } = {}) {
     input,
     REVIEW_FIELDS,
     confirmation
-      ? ['confirmation', ...OPTIONAL_REVIEW_FIELDS]
+      ? ['confirmation', 'reviewDigest', ...OPTIONAL_REVIEW_FIELDS]
       : OPTIONAL_REVIEW_FIELDS
   );
   const target = request && parseTarget(request.target);
@@ -322,7 +315,10 @@ function parseReview(input, { confirmation = false } = {}) {
       (request.requireChange === undefined ||
         typeof request.requireChange === 'boolean') &&
       (request.confirmation === undefined ||
-        typeof request.confirmation === 'string')
+        typeof request.confirmation === 'string') &&
+      (request.reviewDigest === undefined ||
+        (typeof request.reviewDigest === 'string' &&
+          REVIEW_DIGEST.test(request.reviewDigest)))
     )
   ) {
     return null;
@@ -411,7 +407,14 @@ function plannedSpan(view, spanId) {
 }
 
 // What the plan itself says about running this span now.
-function checkSpan(view, runId, spanId) {
+function checkSpan(view, runId, spanId, selector) {
+  if (
+    view.readOnly === true ||
+    view.kind === 'imported' ||
+    view.state === 'imported'
+  ) {
+    return { ok: false, refusal: fail('SPANS_EXEC_RUN_READ_ONLY') };
+  }
   const span = plannedSpan(view, spanId);
   if (!span) {
     return { ok: false, refusal: fail('SPANS_EXEC_SPAN_NOT_FOUND') };
@@ -437,13 +440,45 @@ function checkSpan(view, runId, spanId) {
   const actions = Object.values(view.actions ?? {}).filter(
     (action) => isRecord(action) && action.spanId === spanId
   );
-  if (actions.some((action) => action.state !== 'failed')) {
+  const ownAction =
+    selector && actions.find((action) => action.actionId === selector.actionId);
+  if (
+    ownAction &&
+    (ownAction.attemptId !== selector.attemptId || ownAction.state !== 'intent')
+  ) {
+    return { ok: false, refusal: fail('SPANS_EXEC_ACTION_OPEN') };
+  }
+  if (
+    actions.some((action) => action.state !== 'failed' && action !== ownAction)
+  ) {
     return { ok: false, refusal: fail('SPANS_EXEC_ACTION_OPEN') };
   }
   return {
     ok: true,
     ordinal: freshOrdinal(view, runId, spanId, actions.length + 1),
+    ownSelector: ownAction ? selector : null,
     span,
+  };
+}
+
+function plannedExecutionIds(planned, request) {
+  if (planned.ownSelector) {
+    const { actionId, attemptId } = planned.ownSelector;
+    return { actionId, attemptId };
+  }
+  return {
+    actionId: derivedId(
+      'spans-act',
+      request.runId,
+      request.spanId,
+      planned.ordinal
+    ),
+    attemptId: derivedId(
+      'spans-att',
+      request.runId,
+      request.spanId,
+      planned.ordinal
+    ),
   };
 }
 
@@ -479,23 +514,130 @@ const dispatchBinding = (request, profileDigest) =>
 export function createSpansExecution({
   admission,
   archive,
+  captureTempRoot,
+  createCaptureProcess = createSpansWorkerProcess,
   command = ['claude'],
-  deadlineIntervalMs = DEFAULT_DEADLINE_INTERVAL_MS,
-  escalationMs,
-  exitGraceMs,
   now = Date.now,
   observeProcess,
   profiles = SPANS_EXEC_DEFAULT_PROFILES,
   provider = {},
+  resourcePaths,
   resolveTarget: resolveRegisteredTarget,
   runBudgetUsd = DEFAULT_RUN_BUDGET_USD,
   setupProgress,
-  signal,
   spawn,
   workerLimits = {},
 } = {}) {
   const providerCommand = provider.command ?? command;
   const { artifacts, root, store } = archive;
+  const limitsInUse = { ...WORKER_LIMITS, ...workerLimits };
+  const resources = createSpansExecutionResources({
+    admission,
+    limits: limitsInUse,
+    resourcePaths,
+    root,
+    store,
+  });
+  const pendingWrites = new Set();
+  let writesClosed = false;
+
+  async function archiveWrite(
+    effect,
+    maxBytes = ARCHIVE_WRITE_MAX_BYTES,
+    request = { maxBytes, root }
+  ) {
+    if (
+      writesClosed ||
+      typeof admission?.withSpansArchiveWrite !== 'function'
+    ) {
+      return { code: 'SPANS_ARCHIVE_WRITE_UNAVAILABLE', ok: false };
+    }
+    let started = false;
+    let completed;
+    let effectPromise;
+    let settled = false;
+    let duplicate = false;
+    let admitted;
+    try {
+      admitted = await admission.withSpansArchiveWrite(request, () => {
+        if (started || settled) {
+          duplicate = true;
+          return { code: 'SPANS_ARCHIVE_WRITE_UNKNOWN', ok: false };
+        }
+        started = true;
+        effectPromise = Promise.resolve().then(() => {
+          archive.prepareWrite?.();
+          return effect();
+        });
+        return effectPromise.then((value) => {
+          completed = value;
+          return value;
+        });
+      });
+    } catch {
+      admitted = undefined;
+    } finally {
+      settled = true;
+    }
+    if (effectPromise) {
+      try {
+        await effectPromise;
+      } catch {
+        return {
+          code: 'SPANS_ARCHIVE_WRITE_UNKNOWN',
+          ok: false,
+          unknown: true,
+        };
+      }
+    }
+    if (
+      started &&
+      !duplicate &&
+      admitted?.ok === true &&
+      admitted.value === completed
+    ) {
+      return completed;
+    }
+    if (started) {
+      return { code: 'SPANS_ARCHIVE_WRITE_UNKNOWN', ok: false, unknown: true };
+    }
+    return admitted?.ok === false
+      ? admitted
+      : { code: 'SPANS_ARCHIVE_WRITE_UNAVAILABLE', ok: false };
+  }
+
+  function trackWrite(promise) {
+    pendingWrites.add(promise);
+    promise.finally(() => pendingWrites.delete(promise)).catch(() => undefined);
+    return promise;
+  }
+
+  const writeArchive = (effect, maxBytes) =>
+    trackWrite(archiveWrite(effect, maxBytes));
+
+  function writeMutation(method, payload) {
+    return trackWrite(
+      resources
+        .writeRequest({ method, payload })
+        .then((admitted) =>
+          admitted.ok
+            ? archiveWrite(
+                () => store[method](payload),
+                admitted.request.maxBytes,
+                admitted.request
+              )
+            : admitted
+        )
+    );
+  }
+
+  // Async consumers await these writes; the real store retains its synchronous
+  // SQLite contract for readers and effect fences.
+  const writeStore = {
+    ...store,
+    appendEvent: (event) => writeMutation('appendEvent', event),
+    commitRun: (input) => writeMutation('commitRun', input),
+  };
   // A resolver that fails is an unknown target, never an exception.
   const resolveTarget = async (target) => {
     try {
@@ -511,10 +653,18 @@ export function createSpansExecution({
     profiles,
     spawn,
     store,
+    writeArchive,
   });
   const checkout = createCheckoutAdapter();
-  const dependencies = createDependencyAdapter();
-  const setup = createSetupAdapter({ setupProgress });
+  const dependencies = createDependencyAdapter({
+    resourcePaths,
+    setupProgress,
+  });
+  const setup = createSetupAdapter({
+    dependencyAdapter: dependencies,
+    resourcePaths,
+    setupProgress,
+  });
   const runState = createRunStateAdapter({ store });
   const writer = createWriterAdapter({ store });
   const owner = createExecutionOwner({ root });
@@ -533,7 +683,6 @@ export function createSpansExecution({
     inFlight.add(key);
     return () => inFlight.delete(key);
   }
-  let deadlineTimer = null;
 
   // -------------------------------------------------------------------------
   // The run view: authorizations and their frozen inputs live beside the
@@ -552,7 +701,7 @@ export function createSpansExecution({
     return record && record.attemptId === binding.attemptId ? record : null;
   }
 
-  function commitView(runId, mutate) {
+  async function commitView(runId, mutate) {
     for (let tries = 0; tries < MAX_COMMIT_TRIES; tries += 1) {
       const read = store.readRun({ runId });
       if (read?.ok !== true) {
@@ -563,7 +712,8 @@ export function createSpansExecution({
       if (!changed.ok) {
         return changed;
       }
-      const committed = store.commitRun({
+      // biome-ignore lint/performance/noAwaitInLoops: Each admitted CAS retry must finish before rereading the current revision.
+      const committed = await writeStore.commitRun({
         events: changed.events,
         expectedGeneration: read.generation,
         expectedRevision: read.revision,
@@ -661,6 +811,17 @@ export function createSpansExecution({
     });
   }
 
+  const reviewFlow = createSpansExecutionReviewFlow({
+    admission,
+    artifacts,
+    buildReview,
+    now,
+    parseReview,
+    profiles,
+    store,
+    writeArchive,
+  });
+
   // -------------------------------------------------------------------------
   // Adapters for the dispatch coordinator
   // -------------------------------------------------------------------------
@@ -668,7 +829,7 @@ export function createSpansExecution({
   // Authorization exists only for a dispatch that was reviewed and confirmed
   // and recorded above. A request field can never stand in for it.
   const authorization = {
-    verify({ authorizationId, binding }) {
+    async verify({ authorizationId, binding }) {
       const record = executionOf(binding.runId, binding.actionId);
       if (
         !(
@@ -679,11 +840,15 @@ export function createSpansExecution({
       ) {
         return { ok: true, verified: false };
       }
+      const approved = await reviewFlow.authorize(record.reviewRef);
+      if (
+        !(approved.ok && digestOf(approved.approval) === record.approvalDigest)
+      ) {
+        return { ok: true, verified: false };
+      }
       return { authorizationId, binding, ok: true, verified: true };
     },
   };
-
-  const spool = createSpansExecutionSpool({ artifacts, root });
 
   async function resolveLaunch(binding) {
     const execution = executionFor(binding);
@@ -697,6 +862,22 @@ export function createSpansExecution({
         digestOf(launchModeOf(definition)) === digestOf(execution.launchMode)
       )
     ) {
+      return { code: 'WORKER_REFUSED', ok: false };
+    }
+    const approved = await reviewFlow.authorize(execution.reviewRef);
+    if (
+      !(approved.ok && digestOf(approved.approval) === execution.approvalDigest)
+    ) {
+      return { code: 'WORKER_REFUSED', ok: false };
+    }
+    const retainedInput = artifacts.read({
+      artifactId: execution.inputArtifact?.id,
+    });
+    const retainedRequest = readSpansExecutionRequest({
+      artifact: retainedInput,
+      binding: approved.review.binding,
+    });
+    if (!retainedRequest.ok) {
       return { code: 'WORKER_REFUSED', ok: false };
     }
     const resolved = await resolveTarget(execution.target);
@@ -735,25 +916,18 @@ export function createSpansExecution({
       cwd: observed.identity.checkoutPath,
       env: providerEnvironment(provider.env),
       ok: true,
-      stdin: execution.instructions,
+      stdin: retainedInput.text,
     };
   }
 
-  function resolveProcess({ attemptId, runId }) {
-    const read = store.readRun({ runId });
-    const start =
-      read?.ok === true ? read.view?.attempts?.[attemptId]?.processStart : null;
-    return start?.pid ? { pid: start.pid, startId: start.id } : null;
-  }
-
   // The captured artifact is the first durable trace of what the process did.
-  function recordCaptured({ binding, result }) {
+  async function recordCaptured({ binding, result }) {
     const receipt = result?.receipt;
     const artifactId = receipt?.capture?.artifactId;
     if (!(result?.ok === true && artifactId)) {
       return;
     }
-    store.appendEvent({
+    return await writeStore.appendEvent({
       eventId: `spans.execution.captured:${sha256(
         JSON.stringify([binding.runId, binding.attemptId])
       )}`,
@@ -773,24 +947,87 @@ export function createSpansExecution({
     });
   }
 
-  const limitsInUse = { ...WORKER_LIMITS, ...workerLimits };
-  const launcher = createSpansExecutionLauncher({
-    escalationMs,
-    exitGraceMs,
-    maxChunkBytes: limitsInUse.maxChunkBytes,
-    observeProcess,
-    onExit: handleExit,
-    resolveLaunch,
-    resolveProcess,
-    signal,
-    spawn,
-  });
-  const worker = createSpansWorker({
-    clock: { now },
-    launcher,
+  const freshDispatches = new Set();
+  const captureKey = (binding) =>
+    JSON.stringify([binding.runId, binding.attemptId]);
+  function authorizeCapture({ binding, operation }) {
+    const execution = executionFor(binding);
+    const read = store.readRun({ runId: binding.runId });
+    const action = read?.view?.actions?.[binding.actionId];
+    const exact = Boolean(
+      execution &&
+        read?.ok === true &&
+        read.generation === binding.generation &&
+        execution.reviewSelector?.generation === binding.generation &&
+        execution.spanId === binding.spanId &&
+        binding.workerId === WORKER_ID &&
+        action?.actionId === binding.actionId &&
+        action.attemptId === binding.attemptId &&
+        action.spanId === binding.spanId
+    );
+    if (!exact) {
+      return { currentAttempt: false, noEffect: true, ok: false };
+    }
+    if (operation === 'start') {
+      const freshDispatch = freshDispatches.has(captureKey(binding));
+      return {
+        currentAttempt: true,
+        freshDispatch,
+        noEffect: true,
+        ok: freshDispatch && reviewFlow.current(execution).ok === true,
+      };
+    }
+    return { currentAttempt: true, ok: true };
+  }
+  const worker = createSpansExecutionCapture({
+    archiveRoot: root,
+    authorize: authorizeCapture,
+    createProcess: ({
+      archiveRoot,
+      authorize,
+      resolveArchiveAdmission,
+      tempRoot,
+    }) =>
+      createCaptureProcess({
+        authorize,
+        observeProcess,
+        resolveArchiveAdmission,
+        root: archiveRoot,
+        tempRoot,
+        transportTimeoutMs: 5000,
+      }),
+    executionFor,
     limits: limitsInUse,
-    spool,
+    onExit: handleExit,
+    onHold: async ({ binding }) => {
+      const read = store.readRun({ runId: binding.runId });
+      if (
+        read?.ok === true &&
+        read.generation === binding.generation &&
+        read.view.attempts?.[binding.attemptId]?.status === 'held' &&
+        read.view.actions?.[binding.actionId]?.state === 'intent'
+      ) {
+        await recordUnknown(
+          binding.runId,
+          binding.actionId,
+          binding.generation
+        );
+      }
+    },
+    resolveArchiveAdmission: ({ binding }) =>
+      resources.captureContext({
+        ...binding,
+        target: executionFor(binding)?.target,
+      }),
+    resolveCapturePath: ({ archiveRoot, binding, tempRoot }) =>
+      spansWorkerCapturePath({
+        binding,
+        root: archiveRoot,
+        tempRoot,
+      }),
+    resolveSource: ({ binding }) => resolveLaunch(binding),
     store,
+    tempRoot: captureTempRoot ?? dirname(root),
     workerId: WORKER_ID,
   });
 
@@ -828,25 +1065,30 @@ export function createSpansExecution({
     ) {
       return notLaunched('FENCE_STALE');
     }
-    const started = await worker.start({
-      actionId: request.actionId,
-      attemptId: request.attemptId,
-      deadlineMs: execution.wallClockMs,
-      generation: request.generation,
-      runId: request.runId,
-      spanId: request.spanId,
-    });
+    const key = captureKey(request);
+    freshDispatches.add(key);
+    let started;
+    try {
+      started = await worker.start({
+        actionId: request.actionId,
+        attemptId: request.attemptId,
+        generation: request.generation,
+        runId: request.runId,
+        spanId: request.spanId,
+      });
+    } finally {
+      freshDispatches.delete(key);
+    }
     if (
       started.ok === true &&
       started.created === true &&
-      started.status === 'running'
+      ['running', 'observing', 'captured'].includes(started.status)
     ) {
       supervised.set(request.attemptId, {
         actionId: request.actionId,
         runId: request.runId,
         spanId: request.spanId,
       });
-      startDeadlineDriver();
       return {
         dispatched: true,
         fence: request.fence,
@@ -864,7 +1106,7 @@ export function createSpansExecution({
     return { ok: false };
   }
 
-  const usageLedger = createSpansUsage({ store });
+  const usageLedger = createSpansUsage({ store: writeStore });
   const usage = createSpansExecutionUsage({
     artifacts,
     executionOf,
@@ -877,11 +1119,15 @@ export function createSpansExecution({
     store,
   });
 
-  const actions = createSpansActions({ now, store, verifyEvidence });
+  const actions = createSpansActions({
+    now,
+    store: writeStore,
+    verifyEvidence,
+  });
   const coordinator = createSpansDispatch({
     adapters: {
       actions,
-      admission,
+      admission: resources.admission,
       archive: createArchiveAdapter({ root }),
       authorization,
       capabilities: { verify: (request) => capability.verify(request) },
@@ -1105,7 +1351,7 @@ export function createSpansExecution({
       if (!sealed) {
         return { ok: false };
       }
-      recordCompletion(sealed);
+      await recordCompletion(sealed);
       completion = completionOf(request.runId, request.actionId);
     }
     if (
@@ -1171,10 +1417,25 @@ export function createSpansExecution({
   // terminal result, recorded and settled. Anything unverifiable stays held.
   async function handleExit({ binding, result }) {
     supervised.delete(binding.attemptId);
-    recordCaptured({ binding, result });
-    if (result?.ok === true) {
-      await finishAction(binding.runId, binding.actionId);
+    const captured = await recordCaptured({ binding, result });
+    if (!(captured?.ok === true && result?.ok === true)) {
+      return captured;
     }
+    if (result.receipt.capture.complete !== true) {
+      const read = store.readRun({ runId: binding.runId });
+      if (read.view?.actions?.[binding.actionId]?.state === 'intent') {
+        const held = await recordUnknown(
+          binding.runId,
+          binding.actionId,
+          read.generation
+        );
+        if (held?.ok !== true) {
+          return held;
+        }
+      }
+      return { ok: true, settled: false };
+    }
+    return await finishAction(binding.runId, binding.actionId);
   }
 
   // -------------------------------------------------------------------------
@@ -1482,7 +1743,19 @@ export function createSpansExecution({
     if (!observed.ok) {
       return { refusal: fail('SPANS_EXEC_CHECKOUT_UNKNOWN') };
     }
-    const dependency = await dependencies.observe({ repoDir, wtDir });
+    const ready = await setup.ensure({
+      checkoutIdentity: observed.identity,
+      target: request.target,
+      wtDir,
+    });
+    if (!(ready.ok && ready.state === 'ready')) {
+      return { refusal: fail('SPANS_EXEC_SETUP_NOT_READY') };
+    }
+    const dependency = await dependencies.observe({
+      checkoutIdentity: observed.identity,
+      target: request.target,
+      wtDir,
+    });
     if (!dependency.ok) {
       return { refusal: fail('SPANS_EXEC_DEPENDENCY_UNKNOWN') };
     }
@@ -1491,13 +1764,6 @@ export function createSpansExecution({
     const before = await observeTree(observed.identity.checkoutPath);
     if (!before.ok) {
       return { refusal: fail('SPANS_EXEC_TREE_UNREADABLE') };
-    }
-    const ready = await setup.ensure({
-      checkoutIdentity: observed.identity,
-      target: request.target,
-    });
-    if (!(ready.ok && ready.state === 'ready')) {
-      return { refusal: fail('SPANS_EXEC_SETUP_NOT_READY') };
     }
     return {
       baseline: {
@@ -1513,13 +1779,13 @@ export function createSpansExecution({
     };
   }
 
-  async function buildReview(request) {
+  async function buildReview(request, selector) {
     const read = store.readRun({ runId: request.runId });
     if (read?.ok !== true || !isRecord(read.view)) {
       return { refusal: fail('SPANS_EXEC_RUN_UNAVAILABLE') };
     }
     const { view } = read;
-    const planned = checkSpan(view, request.runId, request.spanId);
+    const planned = checkSpan(view, request.runId, request.spanId, selector);
     if (!planned.ok) {
       return planned;
     }
@@ -1561,14 +1827,12 @@ export function createSpansExecution({
       requireChange: request.requireChange,
       wallClockMs: request.wallClockMs,
     });
-    const { ordinal } = planned;
     const review = {
       acceptance: {
         criteria: request.criteria,
         requireChange: request.requireChange,
       },
-      actionId: derivedId('spans-act', request.runId, request.spanId, ordinal),
-      attemptId: derivedId('spans-att', request.runId, request.spanId, ordinal),
+      ...plannedExecutionIds(planned, request),
       ...(budgetMicro === null
         ? { cost: SUBSCRIPTION_COST }
         : { budgetUsd: request.budgetUsd }),
@@ -1688,7 +1952,7 @@ export function createSpansExecution({
         attemptId: request.attemptId,
         cancel: result.cancel,
         ok: true,
-        terminal: false,
+        terminal: result.terminal === true,
       };
     }
     return result.cancel === 'unknown'
@@ -1696,43 +1960,28 @@ export function createSpansExecution({
       : fail('SPANS_EXEC_CANCEL_REFUSED');
   }
 
-  // An attempt held at its deadline is unknown, not failed: the action says so
-  // and every resource stays. The wall-clock bound was part of the reviewed
-  // dispatch, so the process is then stopped like any cancelled attempt.
-  async function settleOverdue(attemptId) {
-    const owned = supervised.get(attemptId);
-    supervised.delete(attemptId);
-    const found = owned && attemptRecord(owned.runId, attemptId);
-    if (!found) {
-      return;
-    }
-    await actions.recordOutcome({
-      actionId: owned.actionId,
-      artifactIds: [],
-      generation: found.generation,
-      outcome: 'unknown',
-      runId: owned.runId,
-    });
-    await worker.cancel(workerRef(found));
-  }
-
+  // The detached child owns deadlines and stop; the parent only observes them.
   async function enforceDeadlines() {
     if (!(await owner.acquire()).ok) {
       return fail('SPANS_EXEC_OWNED_ELSEWHERE');
     }
-    const result = await worker.enforceDeadlines();
-    await Promise.all(result.held.map(settleOverdue));
-    return { failed: result.failed, held: result.held, ok: result.ok };
-  }
-
-  function startDeadlineDriver() {
-    if (deadlineTimer || !(deadlineIntervalMs > 0)) {
-      return;
-    }
-    deadlineTimer = setInterval(() => {
-      enforceDeadlines().catch(() => undefined);
-    }, deadlineIntervalMs);
-    deadlineTimer.unref?.();
+    const held = [];
+    await Promise.all(
+      [...supervised.entries()].map(async ([attemptId, owned]) => {
+        const found = attemptRecord(owned.runId, attemptId);
+        if (!found) {
+          return;
+        }
+        await worker.observe(workerRef(found));
+        const current = attemptRecord(owned.runId, attemptId);
+        if (current?.record.status === 'held') {
+          held.push(attemptId);
+          supervised.delete(attemptId);
+          await recordUnknown(owned.runId, owned.actionId, current.generation);
+        }
+      })
+    );
+    return { failed: [], held, ok: true };
   }
 
   // A worker, a model or a peer may say it is done. That is recorded as what
@@ -1806,7 +2055,7 @@ export function createSpansExecution({
     if (request.generation < read.generation) {
       return await recordHistorical(request);
     }
-    const appended = store.appendEvent({
+    const appended = await writeStore.appendEvent({
       eventId: `spans.execution.reported:${digestOf([
         request.runId,
         request.actionId,
@@ -1834,8 +2083,6 @@ export function createSpansExecution({
   // Restart reconciliation: hold what is unknown, settle what is proven
   // -------------------------------------------------------------------------
 
-  const OPEN_ATTEMPT = new Set(['finalizing', 'launching', 'running']);
-
   async function processObservation(attempt) {
     const pid = attempt.processStart?.pid;
     if (!pid) {
@@ -1859,6 +2106,17 @@ export function createSpansExecution({
   // The recovery module only decides; this records what it decided. It never
   // signals, relaunches or completes anything: a worker that is alive, absent
   // or unknown is held, and only a verified terminal receipt settles.
+  function recoveryProcessIdentity(attempt) {
+    const start = attempt.processStart;
+    if (!start) {
+      return null;
+    }
+    const prefix = `${start.pid}:`;
+    return start.id?.startsWith(prefix)
+      ? start.id.slice(prefix.length)
+      : (start.id ?? null);
+  }
+
   async function recordRecovery({ attempt, execution, generation, runId }) {
     const resolved = await resolveTarget(execution.target);
     const current = isRecord(resolved)
@@ -1872,7 +2130,7 @@ export function createSpansExecution({
         actionId: attempt.actionId,
         attemptId: attempt.attemptId,
         checkoutIdentity: execution.checkoutIdentity,
-        deadlineAtMs: null,
+        deadlineAtMs: attempt.deadlineAt ?? null,
         generation: attempt.generation,
         lastObservedWallTimeMs: attempt.updatedAt ?? null,
         nativeSessionId: attempt.nativeId ?? null,
@@ -1880,7 +2138,7 @@ export function createSpansExecution({
         spanId: attempt.spanId,
         worker: {
           processId: attempt.processStart?.pid ?? null,
-          processStartIdentity: attempt.processStart?.id ?? null,
+          processStartIdentity: recoveryProcessIdentity(attempt),
         },
       },
       clock: { sleepWakeGap: null, wallTimeMs: now() },
@@ -1892,7 +2150,11 @@ export function createSpansExecution({
     });
     if (decision.ok) {
       for (const event of decision.events) {
-        store.appendEvent(event);
+        // biome-ignore lint/performance/noAwaitInLoops: Each durable recovery event must finish before the next is attempted.
+        const recorded = await writeStore.appendEvent(event);
+        if (recorded?.ok !== true) {
+          return { decision: 'unrecorded', status: 'unknown' };
+        }
       }
     }
     return decision.ok
@@ -1926,23 +2188,16 @@ export function createSpansExecution({
 
   // Anything else is work whose fate is not proven: hold it, record why, and
   // leave every resource where it is.
-  async function reconcileUnproven({ attempt, base, execution, read }) {
-    const { actionId, attemptId, runId, spanId } = base;
-    if (OPEN_ATTEMPT.has(attempt.status)) {
-      await worker.recover({
-        actionId,
-        attemptId,
-        coordinatorGeneration: read.generation,
-        generation: attempt.generation,
-        runId,
-        spanId,
-        workerId: attempt.workerId,
-      });
-    }
-    if (read.view.actions[actionId].state === 'intent') {
+  async function reconcileUnproven({ base, execution, read }) {
+    const { actionId, attemptId, runId } = base;
+    if (read.view.actions?.[actionId]?.state === 'intent') {
       await recordUnknown(runId, actionId, read.generation);
     }
-    const held = store.readRun({ runId }).view.attempts[attemptId];
+    const latest = store.readRun({ runId });
+    const held = latest?.ok === true ? latest.view.attempts?.[attemptId] : null;
+    if (!isRecord(held)) {
+      return { ...base, reason: 'attempt-observation-unknown', state: 'held' };
+    }
     const recovery = await recordRecovery({
       attempt: held,
       execution,
@@ -1963,9 +2218,6 @@ export function createSpansExecution({
     const read = store.readRun({ runId });
     const action = read?.ok === true ? read.view.actions?.[actionId] : null;
     const attempt = read?.ok === true ? read.view.attempts?.[attemptId] : null;
-    if (supervised.has(attemptId)) {
-      return { ...base, state: 'supervised' };
-    }
     if (!isRecord(action)) {
       // Authorized and possibly reserved, but no intent exists: nothing was
       // launched. What was reserved stays reserved.
@@ -1982,9 +2234,17 @@ export function createSpansExecution({
       }
       return { ...base, reason: 'intent-without-attempt', state: 'held' };
     }
-    return attempt.status === 'exited'
-      ? await reconcileExited(base)
-      : await reconcileUnproven({ attempt, base, execution, read });
+    const observed = await worker.recover(
+      workerRef({ generation: read.generation, record: attempt })
+    );
+    if (observed.ok === true && observed.status === 'running') {
+      supervised.set(attemptId, { actionId, runId, spanId });
+      return { ...base, state: 'supervised' };
+    }
+    if (observed.ok === true && observed.parentFinalized === true) {
+      return await reconcileExited(base);
+    }
+    return await reconcileUnproven({ base, execution, read });
   }
 
   // The executions recorded in one run.
@@ -2134,7 +2394,7 @@ export function createSpansExecution({
       released.usage = done.ok ? 'released' : 'failed';
     }
     if (built.held.lease) {
-      const done = await admission.release(built.held.lease);
+      const done = await resources.admission.release(built.held.lease);
       released.admission = done?.ok ? 'released' : 'failed';
     }
     if (built.held.writer) {
@@ -2214,8 +2474,8 @@ export function createSpansExecution({
     const finished = !Object.values(released).includes('failed');
     // The authorization goes only once nothing it reserved is still held, so a
     // partial release can be resolved again.
-    if (finished) {
-      withdrawAuthorization(execution);
+    if (finished && !(await withdrawAuthorization(execution)).ok) {
+      return fail('SPANS_EXEC_AUTHORIZATION_NOT_RECORDED');
     }
     return {
       actionId,
@@ -2358,7 +2618,7 @@ export function createSpansExecution({
   }
 
   async function dispatchReviewed(request) {
-    const built = await buildReview(request);
+    let built = await buildReview(request);
     if (built.refusal) {
       return built.refusal;
     }
@@ -2369,9 +2629,45 @@ export function createSpansExecution({
     if (request.confirmation !== confirmation) {
       return fail('SPANS_EXEC_REVIEW_CHANGED', { confirmation, review });
     }
+    if (!request.reviewDigest) {
+      return {
+        code: 'SPANS_EXECUTION_REVIEW_UNAPPROVED',
+        error: 'Prepare and approve this exact execution before dispatch.',
+        ok: false,
+      };
+    }
+    const approved = await reviewFlow.authorize({
+      reviewDigest: request.reviewDigest,
+      runId: request.runId,
+    });
+    if (!approved.ok) {
+      return approved;
+    }
+    if (approved.built?.confirmation !== built.confirmation) {
+      return fail('SPANS_EXEC_REVIEW_CHANGED');
+    }
+    ({ built } = approved);
+    const { inputArtifact } = approved.review.binding;
     const { dispatchRequest } = built;
+    dispatchRequest.inputDigest = inputDigestOf({
+      baselineTree: built.baseline.digest,
+      budgetMicro: built.budgetMicro,
+      criteria: review.acceptance.criteria,
+      inputArtifact,
+      instructions: review.instructions,
+      launchMode: built.launchMode,
+      requireChange: review.acceptance.requireChange,
+      wallClockMs: review.wallClockMs,
+    });
+    dispatchRequest.authorizationId = derivedId(
+      'spans-auth',
+      request.reviewDigest,
+      dispatchRequest.inputDigest
+    );
     const authorized = {
       actionId: review.actionId,
+      approval: approved.approval,
+      approvalDigest: digestOf(approved.approval),
       attemptId: review.attemptId,
       authorizationId: dispatchRequest.authorizationId,
       baseline: built.baseline,
@@ -2384,24 +2680,38 @@ export function createSpansExecution({
       checkoutIdentity: built.observed.identity,
       createdAt: now(),
       criteria: review.acceptance.criteria,
+      inputArtifact,
       inputDigest: dispatchRequest.inputDigest,
       instructions: review.instructions,
       launchMode: built.launchMode,
       profile: review.profile,
       requireChange: review.acceptance.requireChange,
+      reviewRef: { reviewDigest: request.reviewDigest, runId: request.runId },
+      reviewSelector: Object.fromEntries(
+        [
+          'actionId',
+          'attemptId',
+          'generation',
+          'planVersion',
+          'runId',
+          'spanId',
+        ].map((key) => [key, approved.review.binding[key]])
+      ),
       runId: review.runId,
       spanId: review.spanId,
       target: review.target,
       wallClockMs: review.wallClockMs,
     };
-    if (!recordAuthorization(authorized).ok) {
+    if (!(await recordAuthorization(authorized)).ok) {
       return fail('SPANS_EXEC_AUTHORIZATION_NOT_RECORDED');
     }
-    const result = await coordinator.dispatch(dispatchRequest);
+    const result = await resources.withExecution(authorized, () =>
+      coordinator.dispatch(dispatchRequest)
+    );
     if (!startedNothing(result)) {
       return result;
     }
-    withdrawAuthorization(authorized);
+    await withdrawAuthorization(authorized);
     // The dispatch contract keeps the writer claim after a refusal, so a retry
     // of the span reuses it. Say exactly what is held and how to let it go; the
     // claim is not released here.
@@ -2420,6 +2730,8 @@ export function createSpansExecution({
 
   return Object.freeze({
     accept,
+    approvalChallenge: (input) => reviewFlow.issue(input),
+    approve: (input) => reviewFlow.approve(input),
     cancel,
     capabilities(input) {
       const request = profileRequest(input);
@@ -2430,9 +2742,10 @@ export function createSpansExecution({
       return result.ok ? result : fail(result.code);
     },
     async close() {
-      clearInterval(deadlineTimer);
-      deadlineTimer = null;
-      launcher.shutdown();
+      await worker.shutdown();
+      await reviewFlow.close();
+      writesClosed = true;
+      await Promise.allSettled([...pendingWrites]);
       await owner.release();
       return { ok: true };
     },
@@ -2440,7 +2753,13 @@ export function createSpansExecution({
     dispatch,
     enforceDeadlines,
     // Resolves when every supervised process has been read to its end.
-    idle: () => launcher.idle(),
+    idle: () => worker.idle(),
+    prepare(input) {
+      const request = parseReview(input);
+      return request && Object.hasOwn(profiles, request.profile)
+        ? reviewFlow.prepare(request)
+        : Promise.resolve(invalid());
+    },
     async probe(input) {
       const request = profileRequest(input);
       if (!request) {
@@ -2449,6 +2768,7 @@ export function createSpansExecution({
       const result = await capability.probe(request.profile);
       return result.ok ? result : fail(result.code);
     },
+    readReview: (input) => reviewFlow.read(input),
     reconcile,
     report,
     resolve,
@@ -2470,6 +2790,7 @@ export function createSpansExecution({
         }
       );
     },
+    revoke: (input) => reviewFlow.revoke(input),
     status,
     usage(input) {
       const request = exactRequest(input, ['runId']);

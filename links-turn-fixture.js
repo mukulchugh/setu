@@ -410,6 +410,7 @@ export async function turnFixture({
             );
           return intercept ? intercept(request, respond) : respond();
         },
+        hostname: '127.0.0.1',
         port,
       });
       servers.push(server);

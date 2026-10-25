@@ -2,7 +2,9 @@ import { expect, test } from 'bun:test';
 import {
   caddyfileText,
   claudeSubscriptionEnv,
+  codexMcpConfiguration,
   cursorConfigText,
+  cursorMcpConfiguration,
   hasCodexServerTable,
   hasIdentifiableWorktreeCwd,
   hasPortalCaddyRoute,
@@ -79,14 +81,174 @@ test('sudoRuleCovers requires a NOPASSWD rule for the exact command', () => {
   ).toBe(false);
 });
 
-test('Codex quoted MCP tables are recognized and Cursor config must be an object', () => {
+test('hasCodexServerTable keeps its generic table-presence behavior', () => {
   expect(hasCodexServerTable('[mcp_servers."setu"]\nurl = "x"')).toBe(true);
-  expect(() => cursorConfigText([], 'http://localhost:2999/mcp')).toThrow(
-    'plain object'
+});
+
+test('Codex MCP identity parses standard and inline TOML tables', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(
+    codexMcpConfiguration(
+      `[mcp_servers."setu"]\nurl = "${url}" # exact endpoint`,
+      url
+    )
+  ).toBe('configured');
+  expect(
+    codexMcpConfiguration(`mcp_servers = { setu = { url = "${url}" } }`, url)
+  ).toBe('configured');
+});
+
+test('Codex MCP identity ignores comments and rejects conflicting transport, URL, or disabled state', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(
+    codexMcpConfiguration(`# [mcp_servers.setu]\n# url = "${url}"`, url)
+  ).toBe('absent');
+  expect(
+    codexMcpConfiguration(
+      '[mcp_servers.setu]\nurl = "http://127.0.0.1:2999/mcp"',
+      url
+    )
+  ).toBe('conflict');
+  expect(
+    codexMcpConfiguration(
+      `[mcp_servers.setu]\nurl = "${url}"\ncommand = "setu"`,
+      url
+    )
+  ).toBe('conflict');
+  expect(
+    codexMcpConfiguration(
+      `[mcp_servers.setu]\nurl = "${url}"\nenabled = false`,
+      url
+    )
+  ).toBe('conflict');
+});
+
+test('Codex MCP identity rejects duplicate Setu tables but ignores table-like text in strings', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(
+    codexMcpConfiguration(
+      `[mcp_servers.setu]\nurl = "${url}"\n[mcp_servers."setu"]`,
+      url
+    )
+  ).toBe('invalid');
+  expect(
+    codexMcpConfiguration(
+      `note = """\n[mcp_servers.setu]\n"""\n[mcp_servers.setu]\nurl = "${url}"`,
+      url
+    )
+  ).toBe('configured');
+});
+
+test('Codex MCP identity reports malformed TOML and malformed target tables as invalid', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(codexMcpConfiguration('mcp_servers = =', url)).toBe('invalid');
+  expect(
+    codexMcpConfiguration(
+      `[mcp_servers.setu]\nurl = "${url}"\nurl = "http://wrong/mcp"`,
+      url
+    )
+  ).toBe('invalid');
+  expect(codexMcpConfiguration('mcp_servers = 1', url)).toBe('invalid');
+  expect(codexMcpConfiguration('mcp_servers.setu = "not a table"', url)).toBe(
+    'invalid'
   );
   expect(
-    cursorConfigText({ mcpServers: {} }, 'http://localhost:2999/mcp')
-  ).toContain('"setu"');
+    codexMcpConfiguration('[mcp_servers.setu]\nenabled = "false"', url)
+  ).toBe('invalid');
+});
+
+test('Cursor MCP identity requires plain objects and an exact enabled HTTP entry', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(cursorMcpConfiguration({}, url)).toBe('absent');
+  expect(cursorMcpConfiguration({ mcpServers: {} }, url)).toBe('absent');
+  expect(cursorMcpConfiguration({ mcpServers: { setu: { url } } }, url)).toBe(
+    'configured'
+  );
+  expect(
+    cursorMcpConfiguration(
+      { mcpServers: { setu: { url: 'http://wrong/mcp' } } },
+      url
+    )
+  ).toBe('conflict');
+  expect(
+    cursorMcpConfiguration(
+      { mcpServers: { setu: { command: 'setu', type: 'stdio', url } } },
+      url
+    )
+  ).toBe('conflict');
+  expect(
+    cursorMcpConfiguration(
+      { mcpServers: { setu: { enabled: false, url } } },
+      url
+    )
+  ).toBe('conflict');
+  expect(
+    cursorMcpConfiguration(
+      { mcpServers: { setu: { disabled: true, url } } },
+      url
+    )
+  ).toBe('conflict');
+});
+
+test('Cursor MCP identity rejects malformed root, collection, and entry values', () => {
+  const url = 'http://localhost:2999/mcp';
+  expect(cursorMcpConfiguration(null, url)).toBe('invalid');
+  expect(cursorMcpConfiguration([], url)).toBe('invalid');
+  expect(cursorMcpConfiguration({ mcpServers: null }, url)).toBe('invalid');
+  expect(cursorMcpConfiguration({ mcpServers: [] }, url)).toBe('invalid');
+  expect(cursorMcpConfiguration({ mcpServers: 'invalid' }, url)).toBe(
+    'invalid'
+  );
+  expect(cursorMcpConfiguration({ mcpServers: { setu: null } }, url)).toBe(
+    'invalid'
+  );
+  expect(
+    cursorMcpConfiguration({ mcpServers: { setu: { url: 2999 } } }, url)
+  ).toBe('invalid');
+  expect(
+    cursorMcpConfiguration(
+      Object.assign(Object.create({ mcpServers: {} }), { other: true }),
+      url
+    )
+  ).toBe('invalid');
+});
+
+test('cursorConfigText preserves unrelated own entries, adds Setu once, and refuses conflicts', () => {
+  const url = 'http://localhost:2999/mcp';
+  const config = {
+    mcpServers: { unrelated: { command: 'other-server' } },
+    other: { keep: true },
+  };
+  const output = cursorConfigText(config, url);
+  const parsed = JSON.parse(output);
+  expect(parsed).toEqual({
+    mcpServers: {
+      setu: { url },
+      unrelated: { command: 'other-server' },
+    },
+    other: { keep: true },
+  });
+  expect(config.mcpServers).toEqual({ unrelated: { command: 'other-server' } });
+  expect(cursorConfigText(parsed, url)).toBe(
+    `${JSON.stringify(parsed, null, 2)}\n`
+  );
+  expect(() => cursorConfigText({ mcpServers: [] }, url)).toThrow(
+    'Cursor MCP config is invalid'
+  );
+  expect(() =>
+    cursorConfigText({ mcpServers: { setu: { url: 'http://wrong/mcp' } } }, url)
+  ).toThrow('Cursor Setu MCP entry conflicts');
+});
+
+test('cursorConfigText preserves an unrelated own __proto__ key', () => {
+  const config = JSON.parse('{"mcpServers":{},"__proto__":{"own":true}}');
+  const parsed = JSON.parse(
+    cursorConfigText(config, 'http://localhost:2999/mcp')
+  );
+  expect(Object.hasOwn(parsed, '__proto__')).toBe(true);
+  expect(Object.getOwnPropertyDescriptor(parsed, '__proto__').value).toEqual({
+    own: true,
+  });
 });
 
 test('startOutcome distinguishes queued starts from actual starts', () => {

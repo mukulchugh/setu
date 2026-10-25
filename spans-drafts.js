@@ -23,6 +23,8 @@ const errors = Object.freeze({
     'Every dependency must name an existing span.',
   SPANS_DRAFT_DEPENDENCY_SELF: 'A span cannot depend on itself.',
   SPANS_DRAFT_INVALID: 'Invalid Spans draft request.',
+  SPANS_DRAFT_READ_ONLY:
+    'Imported history cannot be revised into an execution plan.',
   SPANS_DRAFT_STALE: 'Spans draft revision or generation is stale.',
   SPANS_DRAFT_STORAGE: 'Spans draft could not be stored or read.',
 });
@@ -486,6 +488,13 @@ function checkRevisionEligibility(store, request) {
   const current = readStoreRun(store, request.runId);
   if (current?.ok === false || current === null) {
     return refusal('SPANS_DRAFT_STORAGE');
+  }
+  if (
+    current.view.readOnly === true ||
+    current.view.kind === 'imported' ||
+    current.view.state === 'imported'
+  ) {
+    return refusal('SPANS_DRAFT_READ_ONLY');
   }
   if (
     current.revision !== request.expectedRevision ||

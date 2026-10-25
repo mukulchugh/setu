@@ -33,6 +33,7 @@ interface EvidenceItem {
   artifactId: string;
   citations: { sequence: number; type: string }[];
   roles: Role[];
+  sources: string[];
 }
 
 interface EvidenceIndex {
@@ -103,11 +104,12 @@ function cite(
   groups: Map<string, EvidenceItem[]>,
   event: SpansEvent,
   artifactId: string,
-  role: Role
+  role: Role,
+  source: string | null
 ) {
   let item = items.get(artifactId);
   if (!item) {
-    item = { artifactId, citations: [], roles: [] };
+    item = { artifactId, citations: [], roles: [], sources: [] };
     items.set(artifactId, item);
     const group = groups.get(event.type) ?? [];
     group.push(item);
@@ -116,12 +118,39 @@ function cite(
   if (!item.roles.includes(role)) {
     item.roles.push(role);
   }
+  if (source && !item.sources.includes(source)) {
+    item.sources.push(source);
+  }
   const seen = item.citations.some(
     (c) => c.sequence === event.sequence && c.type === event.type
   );
   if (!seen) {
     item.citations.push({ sequence: event.sequence, type: event.type });
   }
+}
+
+function sourceProvenance(event: SpansEvent): string | null {
+  if (!isRecord(event.payload)) {
+    return null;
+  }
+  const { payload } = event;
+  const fields = [
+    typeof payload.provider === 'string'
+      ? `Provider: ${payload.provider}`
+      : null,
+    typeof payload.sourceId === 'string' ? `Source: ${payload.sourceId}` : null,
+    typeof payload.sourceGeneration === 'string' ||
+    typeof payload.sourceGeneration === 'number'
+      ? `Generation: ${payload.sourceGeneration}`
+      : null,
+    typeof payload.parserVersion === 'string'
+      ? `Parser: ${payload.parserVersion}`
+      : null,
+    typeof payload.byteStart === 'number' && typeof payload.byteEnd === 'number'
+      ? `Bytes: ${payload.byteStart}–${payload.byteEnd}`
+      : null,
+  ].filter((field): field is string => field !== null);
+  return fields.length > 0 ? fields.join(' · ') : null;
 }
 
 function indexEvidence(events: SpansEvent[]): EvidenceIndex {
@@ -141,7 +170,7 @@ function indexEvidence(events: SpansEvent[]): EvidenceIndex {
       }
       references += 1;
       cited = true;
-      cite(items, groups, event, id, role);
+      cite(items, groups, event, id, role, sourceProvenance(event));
     }
     if (cited) {
       eventCount += 1;
@@ -377,10 +406,13 @@ export function SpansEvidence({
       {index.groups.length > 0 ? (
         index.groups.map(([type, items]) => (
           <section class="mb-4 min-w-0" key={type}>
-            <h3 class="board-mono mb-1 font-bold text-[11px] text-zinc-600 dark:text-zinc-300">
+            <h3 class="board-mono mb-1 break-all font-bold text-[11px] text-zinc-600 dark:text-zinc-300">
               {type}
             </h3>
-            <ul class="glass-panel text-sm">
+            <ul
+              aria-label={`${type} evidence references`}
+              class="glass-panel text-sm"
+            >
               {items.map((item) => (
                 <li
                   class="flex min-w-0 flex-wrap items-center gap-2 border-zinc-200/60 border-b px-4 py-3 last:border-0 dark:border-white/10"
@@ -397,8 +429,16 @@ export function SpansEvidence({
                   <span class="text-xs text-zinc-600 dark:text-zinc-300">
                     Cited by {citedBy(item, type)}
                   </span>
+                  {item.sources.length > 0 && (
+                    <span class="min-w-0 break-all text-xs text-zinc-600 dark:text-zinc-300">
+                      {item.sources.join(' · ')}
+                    </span>
+                  )}
                   <Button
+                    aria-controls="spans-evidence-viewer"
+                    aria-expanded={selectedArtifactId === item.artifactId}
                     aria-label={`View evidence ${item.artifactId}`}
+                    class="min-h-11"
                     compact
                     onClick={() => {
                       if (selectedArtifactId === item.artifactId) {
@@ -424,43 +464,53 @@ export function SpansEvidence({
         </p>
       )}
 
-      {shown && (
-        <div class="mt-4 min-w-0 border-zinc-200/60 border-t pt-4 dark:border-white/10">
-          <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <p class="min-w-0 break-all font-mono text-xs text-zinc-700 dark:text-zinc-300">
-              {shown.artifactId}
-            </p>
-            <Button compact onClick={close} variant="secondary">
-              Close evidence
-            </Button>
-          </div>
-          {shown.status === 'loading' && (
-            <p class="empty-state" role="status">
-              Loading evidence…
-            </p>
-          )}
-          {shown.status === 'failed' && (
-            <p class="read-notice" role="status">
-              {FAILURE_COPY[shown.kind]}
-            </p>
-          )}
-          {shown.status === 'ready' && (
-            <>
-              {shown.note && (
-                <p class="mb-2 text-xs text-zinc-600 dark:text-zinc-300">
-                  {shown.note}
-                </p>
-              )}
-              <div class="mb-2">
-                <Badge tone="zinc">{shown.label}</Badge>
-              </div>
-              <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words border border-zinc-200/60 p-3 font-mono text-xs text-zinc-800 dark:border-white/10 dark:text-zinc-200">
-                {shown.body}
-              </pre>
-            </>
-          )}
-        </div>
-      )}
+      <div
+        class="mt-4 min-w-0 border-zinc-200/60 border-t pt-4 dark:border-white/10"
+        id="spans-evidence-viewer"
+      >
+        {shown && (
+          <>
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <p class="min-w-0 break-all font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                {shown.artifactId}
+              </p>
+              <Button
+                class="min-h-11"
+                compact
+                onClick={close}
+                variant="secondary"
+              >
+                Close evidence
+              </Button>
+            </div>
+            {shown.status === 'loading' && (
+              <p class="empty-state" role="status">
+                Loading evidence…
+              </p>
+            )}
+            {shown.status === 'failed' && (
+              <p class="read-notice" role="status">
+                {FAILURE_COPY[shown.kind]}
+              </p>
+            )}
+            {shown.status === 'ready' && (
+              <>
+                {shown.note && (
+                  <p class="mb-2 text-xs text-zinc-600 dark:text-zinc-300">
+                    {shown.note}
+                  </p>
+                )}
+                <div class="mb-2">
+                  <Badge tone="zinc">{shown.label}</Badge>
+                </div>
+                <pre class="min-w-0 max-w-full whitespace-pre-wrap break-all border border-zinc-200/60 p-3 font-mono text-xs text-zinc-800 dark:border-white/10 dark:text-zinc-200">
+                  {shown.body}
+                </pre>
+              </>
+            )}
+          </>
+        )}
+      </div>
     </Section>
   );
 }

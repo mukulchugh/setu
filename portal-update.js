@@ -6,7 +6,7 @@ export async function drainPortalForUpdate({
   stopServer,
   exit,
 }) {
-  dispose();
+  await dispose();
   closeConnections();
   await stopServer();
   exit(0);

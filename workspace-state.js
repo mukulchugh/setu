@@ -470,6 +470,18 @@ const definitions = {
     private: true,
     validate: object,
   },
+  integrationReceipts: {
+    file: 'receipts.json',
+    forceMode: 0o600,
+    initial: () => ({ records: [], version: 1 }),
+    private: true,
+    validate: (value) =>
+      object(value) &&
+      value.version === 1 &&
+      Array.isArray(value.records) &&
+      value.records.length <= 4096 &&
+      value.records.every(object),
+  },
   mcpActions: {
     file: 'mcp-actions.json',
     initial: () => ({}),
@@ -576,6 +588,7 @@ const definitions = {
 };
 
 export function createWorkspaceState({
+  integrationRoot,
   workspaceRoot,
   configPath,
   setuDir,
@@ -591,10 +604,14 @@ export function createWorkspaceState({
     if (!def) {
       throw new StateError('STATE_CORRUPT', 'store', 'unknown-store');
     }
-    const path =
-      name === 'config'
-        ? configPath
-        : workspaceRoot && join(workspaceRoot, def.file);
+    let path;
+    if (name === 'config') {
+      path = configPath;
+    } else if (name === 'integrationReceipts') {
+      path = integrationRoot && join(integrationRoot, def.file);
+    } else {
+      path = workspaceRoot && join(workspaceRoot, def.file);
+    }
     if (!(path && isAbsolute(path))) {
       throw new StateError('STATE_UNREADABLE', name, 'explicit-path-required');
     }
@@ -1037,7 +1054,92 @@ export function createWorkspaceState({
     }
   }
 
-  function replaceAt(def, canonical, value) {
+  function preconditionMetadata(def, canonical) {
+    try {
+      const info = fs.lstatSync(canonical);
+      if (info.isSymbolicLink()) {
+        throw new StateError('STATE_UNREADABLE', def.name, 'symlink-rejected');
+      }
+      if (!info.isFile()) {
+        throw new StateError('STATE_UNREADABLE', def.name, 'not-a-file');
+      }
+      return info;
+    } catch (error) {
+      if (error instanceof StateError) {
+        throw error;
+      }
+      if (error.code === 'ENOENT') {
+        return null;
+      }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized filesystem cause codes.
+      throw new StateError(
+        'STATE_UNREADABLE',
+        def.name,
+        'precondition',
+        error.code
+      );
+    }
+  }
+
+  function readPreconditionBytes(def, canonical) {
+    try {
+      return fs.readFileSync(canonical);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return null;
+      }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized filesystem cause codes.
+      throw new StateError(
+        'STATE_UNREADABLE',
+        def.name,
+        'precondition',
+        error.code
+      );
+    }
+  }
+
+  function textPreconditionMatches(def, canonical, expectedText) {
+    const info = preconditionMetadata(def, canonical);
+    if (!info) {
+      return expectedText === null;
+    }
+    if (
+      expectedText === null ||
+      info.size !== Buffer.byteLength(expectedText, 'utf8')
+    ) {
+      return false;
+    }
+    const bytes = readPreconditionBytes(def, canonical);
+    if (!bytes) {
+      return false;
+    }
+    try {
+      const after = preconditionMetadata(def, canonical);
+      return (
+        after !== null &&
+        sameFile(info, after) &&
+        after.size === bytes.length &&
+        bytes.equals(Buffer.from(expectedText, 'utf8'))
+      );
+    } catch (error) {
+      if (error.code?.startsWith('STATE_')) {
+        throw error;
+      }
+      return false;
+    }
+  }
+
+  function assertTextPrecondition(def, canonical, expectedText) {
+    if (!textPreconditionMatches(def, canonical, expectedText)) {
+      throw new StateError(
+        'STATE_PRECONDITION_FAILED',
+        def.name,
+        'precondition'
+      );
+    }
+  }
+
+  function replaceAt(def, canonical, value, expectedText) {
     const encoded = validatedEncoding(def, value);
     const temp = join(
       dirname(canonical),
@@ -1066,6 +1168,9 @@ export function createWorkspaceState({
       fd = undefined;
       assertDestination(def, canonical);
       assertOwned();
+      if (expectedText !== undefined) {
+        assertTextPrecondition(def, canonical, expectedText);
+      }
       phase = 'rename';
       fs.renameSync(temp, canonical);
     } catch (error) {
@@ -1089,6 +1194,55 @@ export function createWorkspaceState({
     const result = { committed: true, reconciled: true, status: 'committed' };
     syncDirectory(canonical, result);
     reconcileReplacement(def, canonical, result);
+    if (result.warning) {
+      result.status = 'committed-with-durability-warning';
+    }
+    return result;
+  }
+
+  function removeAt(def, canonical, expectedText) {
+    let phase = 'precondition';
+    try {
+      assertDestination(def, canonical);
+      assertOwned();
+      assertTextPrecondition(def, canonical, expectedText);
+      assertDestination(def, canonical);
+      assertOwned();
+      assertTextPrecondition(def, canonical, expectedText);
+      phase = 'unlink';
+      fs.unlinkSync(canonical);
+    } catch (error) {
+      if (error instanceof StateError) {
+        throw error;
+      }
+      // biome-ignore lint/style/useErrorCause: StateError intentionally exposes only sanitized filesystem cause codes.
+      throw new StateError('STATE_WRITE_FAILED', def.name, phase, error.code);
+    }
+
+    const result = {
+      committed: true,
+      reconciled: true,
+      status: 'committed',
+      value: null,
+    };
+    syncDirectory(canonical, result);
+    try {
+      assertDestination(def, canonical);
+      fs.lstatSync(canonical);
+      result.reconciled = false;
+      result.warning = {
+        code: 'STATE_DURABILITY_UNCONFIRMED',
+        phase: 'readback',
+      };
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        result.reconciled = false;
+        result.warning = {
+          code: 'STATE_DURABILITY_UNCONFIRMED',
+          phase: 'readback',
+        };
+      }
+    }
     if (result.warning) {
       result.status = 'committed-with-durability-warning';
     }
@@ -1148,10 +1302,15 @@ export function createWorkspaceState({
           const { def, canonical } = entry(name);
           return readAt(def, canonical);
         },
-        replace(name, value) {
+        replace(name, value, expectedText) {
           const { def, canonical } = entry(name);
+          if (expectedText !== undefined) {
+            assertDestination(def, canonical);
+            assertOwned();
+            assertTextPrecondition(def, canonical, expectedText);
+          }
           readAt(def, canonical); // Explicit replacement cannot silently repair corrupt old bytes.
-          return replaceAt(def, canonical, value);
+          return replaceAt(def, canonical, value, expectedText);
         },
         async update(name, mutate) {
           const next = await mutate(scope.read(name));
@@ -1287,11 +1446,8 @@ export function createWorkspaceState({
     }
     return enter(0);
   }
-  function replaceText(path, text, { mode } = {}) {
-    if (!isAbsolute(path) || typeof text !== 'string') {
-      throw new StateError('STATE_CORRUPT', 'generated', 'validate');
-    }
-    const def = {
+  function textDefinition(path, mode) {
+    return {
       encode: (value) => value,
       forceMode: mode,
       initial: () => '',
@@ -1301,7 +1457,40 @@ export function createWorkspaceState({
       symlinks: 'reject',
       validate: (value) => typeof value === 'string',
     };
-    return withDocuments([def], (scope) => scope.replace('generated', text));
+  }
+  function replaceText(path, text, options = {}) {
+    const { expectedText, mode } = options;
+    const hasExpectedText = Object.hasOwn(options, 'expectedText');
+    if (!isAbsolute(path) || typeof text !== 'string') {
+      throw new StateError('STATE_CORRUPT', 'generated', 'validate');
+    }
+    if (
+      hasExpectedText &&
+      expectedText !== null &&
+      typeof expectedText !== 'string'
+    ) {
+      throw new StateError('STATE_CORRUPT', 'generated', 'validate');
+    }
+    const def = textDefinition(path, mode);
+    return withDocuments([def], (scope) =>
+      scope.replace(
+        'generated',
+        text,
+        hasExpectedText ? expectedText : undefined
+      )
+    );
+  }
+  function removeText(path, { expectedText } = {}) {
+    if (!isAbsolute(path) || typeof expectedText !== 'string') {
+      throw new StateError('STATE_CORRUPT', 'generated', 'validate');
+    }
+    const def = textDefinition(path, null);
+    return withDocuments([def], () => {
+      const canonical = destination(def);
+      assertDestination(def, canonical);
+      assertOwned();
+      return removeAt(def, canonical, expectedText);
+    });
   }
   function inspectLock(kind, path) {
     let metadata;
@@ -1364,6 +1553,7 @@ export function createWorkspaceState({
   return {
     inspectLocks,
     read,
+    removeText,
     replace: (name, value) => update(name, () => value),
     replaceText,
     snapshot: (names) =>

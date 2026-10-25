@@ -774,3 +774,64 @@ test('a restored archive retains artifacts and resumes from the atomic source ch
   expect(restored.store.readEvents({ runId }).events).toHaveLength(4);
   expect(archive.store.readEvents({ runId }).events).toHaveLength(2);
 });
+
+test('source import capacity refusal preserves cursor and writes no artifacts', async () => {
+  const path = await sourceFile(line(message('bounded import')));
+  const archive = createArchive();
+  const result = await importSpansSourceFile(args(archive, path), {
+    archiveWrite: async () => ({
+      code: 'SPANS_ARCHIVE_CAPACITY_REACHED',
+      ok: false,
+    }),
+    root: '/private/fixture-archive',
+  });
+  expect(result).toMatchObject({
+    code: 'SPANS_ARCHIVE_CAPACITY_REACHED',
+    nextOffset: 0,
+    ok: false,
+  });
+  expect(archive.calls.put).toBe(0);
+  expect(archive.calls.commitImport).toBe(0);
+  expect(storedOffset(archive)).toBe(0);
+});
+
+test('source import enters the gate once after reading and before all archive effects', async () => {
+  const path = await sourceFile(line(message('bounded import')));
+  const archive = createArchive();
+  let calls = 0;
+  const result = await importSpansSourceFile(args(archive, path), {
+    archiveWrite: async (request, effect) => {
+      calls += 1;
+      expect(request.root).toBe('/private/fixture-archive');
+      expect(request.maxBytes).toBeGreaterThan(4 * 1024 * 1024);
+      expect(archive.calls.readSourceCursor).toBe(1);
+      expect(archive.calls.put).toBe(0);
+      const value = await effect();
+      expect(archive.calls.commitImport).toBe(1);
+      return { ok: true, value };
+    },
+    root: '/private/fixture-archive',
+  });
+  expect(result.ok).toBe(true);
+  expect(calls).toBe(1);
+  expect(storedOffset(archive)).toBeGreaterThan(0);
+});
+
+test('source import reports uncertain completion when admission loses its post-write proof', async () => {
+  const path = await sourceFile(line(message('unknown receipt')));
+  const archive = createArchive();
+  const result = await importSpansSourceFile(args(archive, path), {
+    archiveWrite: async (_request, effect) => {
+      await effect();
+      return { code: 'SPANS_ARCHIVE_WRITE_UNKNOWN', ok: false, unknown: true };
+    },
+    root: '/private/fixture-archive',
+  });
+  expect(result).toMatchObject({
+    code: 'SPANS_ARCHIVE_WRITE_UNKNOWN',
+    nextOffset: null,
+    ok: false,
+    unknown: true,
+  });
+  expect(storedOffset(archive)).toBeGreaterThan(0);
+});

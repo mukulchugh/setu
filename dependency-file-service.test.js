@@ -28,6 +28,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { setFixtureTimesNs } from './dependency-file-fixture-times.js';
 import { createDependencyFileJournal } from './dependency-file-journal.js';
 import { createDependencyFileService } from './dependency-file-service.js';
 import { createDependencyFileSharing } from './dependency-file-sharing.js';
@@ -267,11 +268,7 @@ function dependencyFileOsSeam() {
     },
     async restoreDependencyTimes(root, relativePath, { atimeNs, mtimeNs }) {
       const path = join(root, ...relativePath.split('/'));
-      await utimes(
-        path,
-        Number(BigInt(atimeNs)) / 1e9,
-        Number(BigInt(mtimeNs)) / 1e9
-      );
+      await setFixtureTimesNs(path, atimeNs, mtimeNs);
       return { atimeNs, mtimeNs, restored: true };
     },
     sameDependencyFile,

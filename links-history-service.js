@@ -6,7 +6,7 @@
 // each one a single archive transaction.
 import { createHash } from 'node:crypto';
 import { lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { createLinksAssociations } from './links-associations.js';
 import { associationIdOf } from './links-history.js';
 import {
@@ -14,6 +14,7 @@ import {
   createLinksProjection,
 } from './links-projection.js';
 import { createSpansArtifacts } from './spans-artifacts.js';
+import { SPANS_MODEL_LIMITS } from './spans-model-store.js';
 import { openSpansStore, SPANS_STORE_DATABASE_FILE } from './spans-store.js';
 
 export const LINKS_RECOVERY_LIMITS = Object.freeze({ default: 50, max: 200 });
@@ -22,6 +23,19 @@ const MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const KINDS = new Set(['delivery', 'unassociated']);
 const ATTENTION_STATES = ['held', 'handoff-unknown'];
 const MAX_INDEXED_RUNS = 16;
+// Each individual model write is bounded by one maximum batch, one maximum
+// document and SQLite journal/WAL bookkeeping. This bound is reused for every
+// import batch and every fixed-size derived index entry, never multiplied by
+// the number of runs in a projection pass.
+export const LINKS_ARCHIVE_WRITE_MAX_BYTES =
+  2 * SPANS_MODEL_LIMITS.batchBytes + SPANS_MODEL_LIMITS.documentBytes;
+const admissionOutcomeUnknown = () => ({
+  ...failure(
+    'SPANS_ARCHIVE_WRITE_UNKNOWN',
+    'Archive write outcome is unknown; inspect the archive before retrying.'
+  ),
+  unknown: true,
+});
 // Replies by which an engine that predates a listing refuses the request.
 const UPGRADE_CODES = new Set([
   'LINKS_FIELD_UNSUPPORTED',
@@ -91,11 +105,40 @@ function writeIndex(store, origin, hint, update) {
   });
 }
 
+async function useArchiveHandle(store, work) {
+  let result;
+  let operationError;
+  let operationFailed = false;
+  try {
+    result = await work(store);
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
+  }
+  let closeResult;
+  let closeError;
+  try {
+    closeResult = store.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (closeError || closeResult?.ok === false) {
+    throw new Error('Archive connection could not close.', {
+      cause: closeError ?? operationError,
+    });
+  }
+  if (operationFailed) {
+    throw operationError;
+  }
+  return result;
+}
+
 export function createLinksHistoryService({
   client,
   listPeers,
   newArtifacts = (root) => createSpansArtifacts({ root }),
   openStore = openSpansStore,
+  archiveWrite,
   spansRoot,
 } = {}) {
   if (!(typeof client?.call === 'function' && typeof spansRoot === 'string')) {
@@ -133,17 +176,69 @@ export function createLinksHistoryService({
     }
     let store;
     try {
-      store = openStore({ readonly: mode === 'read', root: spansRoot });
+      store = openStore({
+        create: false,
+        readonly: mode === 'read',
+        root: spansRoot,
+      });
     } catch {
       return failure(
         'LINKS_ARCHIVE_UNAVAILABLE',
         'The Spans archive could not be opened.'
       );
     }
+    return await useArchiveHandle(store, work);
+  }
+
+  // Projection keeps its reader open across engine pages and imports. Each
+  // admitted write uses a separate connection that can only open an existing
+  // current archive; a refused admission never reaches this open.
+  async function withExistingWritableArchive(work) {
+    const store = openStore({ create: false, root: spansRoot });
+    return await useArchiveHandle(store, work);
+  }
+
+  // The injected production collaborator admits exactly one bounded SQLite
+  // write. Direct service tests remain a trusted lower-level seam and may run
+  // the same connection-scoped effect without an admission coordinator.
+  async function writeArchive(effect, onAttempt) {
+    const runEffect = async () => {
+      onAttempt?.();
+      return await withExistingWritableArchive(effect);
+    };
+    if (typeof archiveWrite !== 'function') {
+      try {
+        return { ok: true, value: await runEffect() };
+      } catch {
+        return admissionOutcomeUnknown();
+      }
+    }
+    let effectRan = false;
     try {
-      return await work(store);
-    } finally {
-      store.close();
+      const admitted = await archiveWrite(
+        {
+          maxBytes: LINKS_ARCHIVE_WRITE_MAX_BYTES,
+          root: resolvePath(spansRoot),
+        },
+        async () => {
+          if (effectRan) {
+            throw new Error('Archive admission effect ran more than once.');
+          }
+          effectRan = true;
+          return await runEffect();
+        }
+      );
+      if (admitted?.ok !== true) {
+        return effectRan
+          ? admissionOutcomeUnknown()
+          : (admitted ?? admissionOutcomeUnknown());
+      }
+      if (!(effectRan && Object.hasOwn(admitted, 'value'))) {
+        return admissionOutcomeUnknown();
+      }
+      return { ok: true, value: admitted.value };
+    } catch {
+      return admissionOutcomeUnknown();
     }
   }
 
@@ -324,14 +419,25 @@ export function createLinksHistoryService({
 
   // The projection reads the engine through the client, one process round
   // trip at a time, and writes through the archive's fenced import only.
-  function projectionOver(store) {
+  function projectionOver(store, onWriteAttempt) {
+    const projectionStore = Object.freeze({
+      commitImport: async (input) => {
+        const outcome = await writeArchive(
+          (writer) => writer.commitImport(input),
+          onWriteAttempt
+        );
+        return outcome?.ok === true ? outcome.value : outcome;
+      },
+      readRun: store.readRun,
+      readSourceCursor: store.readSourceCursor,
+    });
     return createLinksProjection({
       associations: createLinksAssociations({
         isKnownOrigin: () => true,
         store,
       }),
       engine: createLinksEventsReader(client),
-      store,
+      store: projectionStore,
     });
   }
 
@@ -350,7 +456,7 @@ export function createLinksHistoryService({
   // entry from them: approved runs first, the rest while there is room, and
   // `overflow` when something had to be left out or a run could not be read.
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: One bounded walk builds every entry, so it stays in one place.
-  function refreshIndex(store) {
+  async function refreshIndex(store, onWriteAttempt) {
     const links = createLinksAssociations({
       isKnownOrigin: () => true,
       store,
@@ -364,7 +470,7 @@ export function createLinksHistoryService({
         limit: 50,
       });
       if (page.ok !== true) {
-        return { errors, ok: false };
+        return { errors, failure: page, ok: false };
       }
       errors.push(...page.errors);
       for (const association of page.associations) {
@@ -387,22 +493,59 @@ export function createLinksHistoryService({
     }
     for (const pair of pairs.values()) {
       const runs = [...pair.others, ...pair.approved];
-      store.writeCache(indexKey(pair.origin, pair.hint), {
-        overflow: runs.length > MAX_INDEXED_RUNS || errors.length > 0,
-        runs: runs.slice(-MAX_INDEXED_RUNS),
-      });
+      // biome-ignore lint/performance/noAwaitInLoops: Every cache row needs a separate admission, and refusal stops later writes.
+      const written = await writeArchive(
+        (writer) =>
+          writer.writeCache(indexKey(pair.origin, pair.hint), {
+            overflow: runs.length > MAX_INDEXED_RUNS || errors.length > 0,
+            runs: runs.slice(-MAX_INDEXED_RUNS),
+          }),
+        onWriteAttempt
+      );
+      if (written?.ok !== true) {
+        return { errors, failure: written, ok: false };
+      }
+      if (written.value?.ok !== true) {
+        return { errors, failure: written.value, ok: false };
+      }
     }
     return { errors, ok: true };
   }
 
   async function project({ maxBatches } = {}) {
-    return await withArchive('write', async (store) => {
-      const index = refreshIndex(store);
-      const result = await projectionOver(store).runOnce({ maxBatches });
-      return index.errors.length > 0
-        ? { ...result, indexErrors: index.errors }
-        : result;
-    });
+    let writeAttempted = false;
+    try {
+      return await withArchive('read', async (store) => {
+        const onWriteAttempt = () => {
+          writeAttempted = true;
+        };
+        const index = await refreshIndex(store, onWriteAttempt);
+        if (!index.ok) {
+          return (
+            index.failure ??
+            failure(
+              'LINKS_ARCHIVE_UNAVAILABLE',
+              'The Spans archive index could not be refreshed.'
+            )
+          );
+        }
+        const result = await projectionOver(store, onWriteAttempt).runOnce({
+          maxBatches,
+        });
+        return index.errors.length > 0
+          ? { ...result, indexErrors: index.errors }
+          : result;
+      });
+    } catch {
+      // A reader close can fail after an admitted write already committed.
+      // Report an unknown outcome so callers do not treat it as safe replay.
+      return writeAttempted
+        ? admissionOutcomeUnknown()
+        : failure(
+            'LINKS_ARCHIVE_UNAVAILABLE',
+            'The Spans archive could not be opened.'
+          );
+    }
   }
 
   // -------------------------------------------------------------------------

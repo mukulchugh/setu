@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { checkoutFingerprint } from './checkout-identity.js';
 import {
   lstat,
   readdir,
@@ -197,7 +198,7 @@ function statIdentity(info) {
 
 function checkoutStatIdentity(info) {
   try {
-    return statIdentity(info);
+    return checkoutFingerprint(info);
   } catch {
     fail('CHECKOUT_CHANGED');
   }

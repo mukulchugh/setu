@@ -11,6 +11,9 @@ export interface SpansPageResult {
   ok: true;
   records: SpansRecord[];
 }
+export type SpansRunsResult =
+  | { kind: 'archive-not-initialized' }
+  | { kind: 'page'; page: SpansPageResult };
 export interface SpansEventsResult {
   events: SpansEvent[];
   hasMore: boolean;
@@ -122,14 +125,34 @@ export async function readSpansRuns(
   query: string,
   afterRunId: string,
   signal: AbortSignal
-) {
-  return decodeSpansPage(
-    await read(
-      '/api/spans/runs',
-      { ...(afterRunId ? { afterRunId } : {}), limit: '50', phase, query },
-      signal
-    )
+): Promise<SpansRunsResult> {
+  const response = await fetch(
+    `/api/spans/runs?${new URLSearchParams({
+      ...(afterRunId ? { afterRunId } : {}),
+      limit: '50',
+      phase,
+      query,
+    })}`,
+    { signal }
   );
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    // biome-ignore lint/style/useErrorCause: Do not retain arbitrary server content from a JSON parser error.
+    throw new Error('Spans run summaries are unavailable.');
+  }
+  if (
+    object(value) &&
+    value.ok === false &&
+    value.code === 'SPANS_ARCHIVE_NOT_INITIALIZED'
+  ) {
+    return { kind: 'archive-not-initialized' };
+  }
+  if (!response.ok) {
+    throw new Error('Spans read failed.');
+  }
+  return { kind: 'page', page: decodeSpansPage(value) };
 }
 export async function readSpansRun(
   runId: string,

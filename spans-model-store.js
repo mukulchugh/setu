@@ -680,11 +680,12 @@ function prepareStatements(db) {
       ),
       listRuns: prepare(
         `SELECT run_id, revision, generation FROM spans_views WHERE run_id > ?
-        AND (? = 'all' OR CASE lower(replace((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.state') END), '_', ' '))
+        AND (? = 'all' OR CASE WHEN (CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.kind') END) = 'imported' THEN 'past'
+          ELSE CASE lower(replace((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.state') END), '_', ' '))
           WHEN 'planned' THEN 'planned' WHEN 'ready' THEN 'planned'
-          WHEN 'completed' THEN 'past' WHEN 'failed' THEN 'past' WHEN 'cancelled' THEN 'past'
+          WHEN 'imported' THEN 'past' WHEN 'completed' THEN 'past' WHEN 'failed' THEN 'past' WHEN 'cancelled' THEN 'past'
           WHEN 'running' THEN 'live' WHEN 'waiting for you' THEN 'live' WHEN 'paused' THEN 'live'
-          WHEN 'recovery required' THEN 'live' WHEN 'blocked' THEN 'live' ELSE 'unknown' END = ?)
+          WHEN 'recovery required' THEN 'live' WHEN 'blocked' THEN 'live' ELSE 'unknown' END END = ?)
         AND instr(lower(run_id || ' ' || coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.goal') END), '') || ' ' ||
           coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.owner') END), '') || ' ' || coalesce((CASE WHEN json_valid(view_json) THEN json_extract(view_json, '$.project') END), '')), lower(?)) > 0
         ORDER BY run_id ASC LIMIT ?`

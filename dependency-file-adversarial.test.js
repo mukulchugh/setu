@@ -19,6 +19,7 @@ import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { setFixtureTimesNs } from './dependency-file-fixture-times.js';
 import { createDependencyFileNative } from './dependency-file-native.js';
 import { createDependencyFileService } from './dependency-file-service.js';
 import { inspectDependencyReadiness } from './dependency-readiness.js';
@@ -292,11 +293,7 @@ function makeFixtureNative() {
       }
       if (action === 'restore-times') {
         const fullPath = join(root, relativePath);
-        utimesSync(
-          fullPath,
-          Number(BigInt(atimeNs)) / 1_000_000_000,
-          Number(BigInt(mtimeNs)) / 1_000_000_000
-        );
+        setFixtureTimesNs(fullPath, atimeNs, mtimeNs);
         const info = statSync(fullPath, { bigint: true });
         return {
           stdout: JSON.stringify({

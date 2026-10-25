@@ -254,7 +254,10 @@ test.each([
       const spawned = f.effects.find(([kind]) => kind === 'spawn');
       if (manifest) {
         expect(calls[0].slice(0, 2)).toEqual([command, args]);
-        expect(spawned[1]).toEqual([command, ...args]);
+        expect(spawned[1]).toEqual([
+          command === 'bun' ? process.execPath : command,
+          ...args,
+        ]);
       } else {
         expect(calls).toEqual([]);
         expect(spawned).toBeUndefined();

@@ -2,31 +2,34 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 const GIT_DIRECTORY_POINTER = /^gitdir: (.+)$/;
 
+export function checkoutFingerprint(stat) {
+  if (
+    !stat.isDirectory() ||
+    typeof stat.birthtimeNs !== 'bigint' ||
+    stat.birthtimeNs <= 0n ||
+    stat.ino <= 0n
+  ) {
+    throw new Error('Filesystem incarnation evidence unavailable');
+  }
+  return Object.freeze({
+    birthtimeNs: String(stat.birthtimeNs),
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+  });
+}
+
 // No Git invocation, host discovery, registry reads or writes. HEAD is deliberately
 // excluded: commits change within an incarnation, replacement directories do not.
 export async function inspectCheckoutIdentity(target, fs) {
   const unknown = (reason) => Object.freeze({ known: false, reason });
-  function fingerprint(stat) {
-    if (
-      !stat.isDirectory() ||
-      typeof stat.birthtimeNs !== 'bigint' ||
-      stat.birthtimeNs <= 0n ||
-      stat.ino <= 0n
-    ) {
-      throw new Error('Filesystem incarnation evidence unavailable');
-    }
-    return Object.freeze({
-      birthtimeNs: String(stat.birthtimeNs),
-      dev: String(stat.dev),
-      ino: String(stat.ino),
-    });
-  }
   try {
     const checkoutPath = await fs.realpath(target.wtDir);
     const repositoryPath = await fs.realpath(target.repoDir);
     const gitFile = resolve(checkoutPath, '.git');
-    const checkout = fingerprint(await fs.stat(checkoutPath, { bigint: true }));
-    const repository = fingerprint(
+    const checkout = checkoutFingerprint(
+      await fs.stat(checkoutPath, { bigint: true })
+    );
+    const repository = checkoutFingerprint(
       await fs.stat(repositoryPath, { bigint: true })
     );
     const pointer = (await fs.readFile(gitFile, 'utf8'))
@@ -64,7 +67,9 @@ export async function inspectCheckoutIdentity(target, fs) {
     ) {
       return unknown('Git administration does not point back to this checkout');
     }
-    const admin = fingerprint(await fs.stat(adminPath, { bigint: true }));
+    const admin = checkoutFingerprint(
+      await fs.stat(adminPath, { bigint: true })
+    );
     const result = {
       admin,
       adminPath,
@@ -76,8 +81,9 @@ export async function inspectCheckoutIdentity(target, fs) {
     };
     // Reject replacement during the read itself, as well as between operations.
     const unchanged = async (path, evidence) =>
-      JSON.stringify(fingerprint(await fs.stat(path, { bigint: true }))) ===
-      JSON.stringify(evidence);
+      JSON.stringify(
+        checkoutFingerprint(await fs.stat(path, { bigint: true }))
+      ) === JSON.stringify(evidence);
     if (
       !(
         (await unchanged(checkoutPath, checkout)) &&

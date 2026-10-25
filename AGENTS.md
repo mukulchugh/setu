@@ -373,6 +373,48 @@ would leak forever with nothing left pointing at it.
 - Logs: `$WORKSPACE/logs/<repo>/<branch>/{dev,setup,inngest,trigger,sidecar-<name>,pr-review}.log`.
 - PR review (`pr-review.js`): Tier 1 is the existing "Local diff" section (`computeDiff`/`/api/diff`) — a worktree-branch-vs-base diff, not the actual GitHub PR diff, labeled accordingly. Tier 2 shells out to the installed `pr-walkthrough`/`pr-brief` Claude Code plugin headlessly (`claude -p`, `--permission-mode acceptEdits`, `--tools` dropping `Edit`, `--disallowedTools` denying GH/git write-shaped Bash commands as the primary guard — verified empirically, not assumed, see the plugin-marketplace plan). Reads `~/.local/share/pr-walkthrough/{reviews,briefs}/<owner>/<repo>/pr-<N>/latest.json` + that snapshot's `manifest.json` for status/artifacts, never the multi-MB `guide.json`/`brief.json` directly.
 
+## Spans archive and client integration
+
+The Spans page reads Past, Live and Planned history from the private archive at
+`~/.local/share/setu/spans`. Opening it does not initialize an archive. Save a
+reviewed workflow draft or import one explicitly selected absolute conversation
+path to create the first entry. Standalone imports appear as read-only Past
+history, with provenance showing that Setu did not execute them. They cannot be
+revised or dispatched. An import may instead attach to an existing run. Imports
+are bounded pages; continue explicitly only after a known successful `hasMore`
+response. Unknown outcomes require inspection before replay.
+
+Portal, CLI and MCP share the same import and archive-maintenance owners. Backup
+and restore run in a bounded background child, require exact absolute paths, and
+never overwrite a destination. Restore creates an inactive archive; it does not
+change configuration or switch the portal. A partial or uncertain destination is
+retained for inspection. The dashboard retains unresolved destination metadata
+across reloads. Offline CLI import, index, backup and restore do not require a
+portal or start one. Index requires an existing archive; it does not discover
+provider histories or create an empty archive.
+
+Current execution metadata, usage, capability evidence and capture writes use
+the same archive admission callback as imports and planning. The underlying
+SQLite methods remain synchronous; async owners await admission before calling
+them. Capacity refusal before a probe or dispatch starts no provider. Execution
+reserves capture space on its existing shared admission lease before launch;
+reconnect reuses that exact lease. Links projection writers use the same archive
+gate. Unknown capacity or ownership retains the reservation. Native provider and
+live rollout acceptance remain separate from these source and fixture checks.
+
+Settings → Agent integrations reviews the bundled Spans skill for Codex, Claude
+Code and Cursor. Codex owns one shared artifact that Cursor reuses; removing that
+artifact requires explicitly selecting both consumers. The Claude plugin remains
+bundled in Setu. This flow does not configure native MCP settings. Receipts live
+outside archives at `~/.local/share/setu/integrations`, using the existing locked
+small-file writer. Preview is read-only; review issues a short-lived one-use
+challenge, and apply requires the exact typed phrase in a separate request.
+Changed native bytes, unowned files and user edits refuse replacement. An unknown
+apply blocks replay until receipts are reconciled. Installation, MCP connection,
+fresh-session evidence and skill activation are separate observations; missing
+evidence remains unknown. Native installation and activation need their own
+explicit user approval and verification.
+
 ## Spans execution (live, opt-in)
 
 Spans can dispatch one reviewed span to one real local worker (Claude Code,
@@ -406,9 +448,17 @@ The flow, over HTTP or `setu spans exec ...`:
    'none'`); a `budgetUsd` on it is `SPANS_EXEC_BUDGET_NOT_APPLICABLE`. A metered profile
    still requires `budgetUsd` (up to 2 USD).
    `dispatch` without the token returns the review.
-3. `dispatch` with the exact token, after the user confirmed the review, claims the
-   writer slot, takes shared admission, reserves usage, saves the durable intent and
-   then starts one process. Exactly one layer takes each resource. Only one dispatch or
+3. `prepare` retains the exact bounded, redacted input and an immutable execution
+   review. It starts nothing. `approval-challenge` issues a short-lived, one-use phrase
+   for that saved `reviewDigest`; the human types it and `approve` records the separate
+   receipt. `revoke` requires its own challenge and records a separate revocation.
+   Neither approval nor revocation launches a provider. `saved-review <run> <digest>`
+   reads the immutable record. The checksum returned by `review` alone is not approval.
+   `dispatch` needs that checksum plus the approved `reviewDigest`. It reloads the
+   retained request, rechecks the current binding and receipt, claims the writer slot,
+   takes shared admission, reserves usage, saves the durable intent and starts one
+   process. The final synchronous attempt fence checks the current receipt again.
+   The provider receives the saved JSON context and request, not newly supplied input. Exactly one layer takes each resource. Only one dispatch or
    resolve of a span runs at a time in a service: the other is refused
    (`SPANS_EXEC_SPAN_BUSY` for a dispatch, `SPANS_EXEC_NOT_RESOLVABLE` for a resolve)
    rather than queued, so a resolve can never release what a dispatch has just taken, nor
@@ -510,9 +560,12 @@ own are pruned, so a live successor is never deleted, and an owner that cannot b
 identified is never overtaken.
 
 Trust boundary: the portal API is the local user's cooperative API, as described for
-claims above and for the loopback/Host guard. A confirmation token is a digest the API
-hands back, not proof that a person reviewed anything, and nothing here defends against a
-program running as the same user that calls the API itself.
+claims above and the loopback/Host guard. A preview checksum is not human approval.
+Execution uses a separate, one-use typed challenge and persisted receipt; MCP exposes
+neither approval issuance nor dispatch. The phrase check records an exact response,
+not cryptographic proof of a person's identity. A program running as the same local
+user can still call the cooperative HTTP API; agent instructions do not change that
+security boundary.
 
 Not verified: the real `claude` binary was driven once by the parent through the public
 service (one probe, one edit, accepted completion); the default shipped argument list,
@@ -621,9 +674,19 @@ carry JSON must contain JSON.
 | `version`, `help` | none | Print local version/commit or help. |
 | `spans [list\|show <run>\|events <run>\|artifact <run> <artifact>\|search <query>\|search-status\|workflows]` | `--after`, `--since`, `--through`, `--generation`, `--run`, `--limit` | Read the offline Spans archive. Nothing here starts work. |
 | `spans preview\|create-workflow\|create-draft\|revise-plan` | `--input <json>` | Save offline plans only; does not approve or start work. |
+| `spans import-history` | `--input <json>` | Import an explicit selected path to read-only Past, or attach to `existingRunId`; uses the portal. |
+| `spans import` | `--root <absolute-path> --input <json>` | Offline selected-source import into an existing archive. |
+| `spans index` | `--root <absolute-path> [--limit N --pages N]` | Offline bounded indexing of an existing archive. |
+| `spans backup`, `spans restore` | backup: `--root <path> --destination <new-path>`; restore: `--backup-root <path> --destination <new-path>` | Offline copy or inactive restore; never overwrite. |
+| `spans integrations [status]` | none | Read client artifact and connection evidence through the portal. |
+| `spans integrations review`, `spans integrations apply` | review: `[--input <json>]`; apply: `--input <json>` containing only reviewId and response | Review exact paths/digests, then submit the user's typed phrase separately. |
+| `spans integrations reconcile` | none | Reconcile receipts against current bytes; never reinstall or replay native effects. |
 | `spans exec capabilities <profile>`, `exec status <run>` | none | Read stored probe evidence or run state. Starts nothing. |
 | `spans exec probe <profile>` | none | Start one short fresh provider session to observe capability. It uses the owner's subscription (a metered profile would use a dollar budget); confirm intent first. |
-| `spans exec review`, `exec dispatch` | `--input <json>`, dispatch also `[--confirmation <token>]` | Review is read-only. Dispatch without a token returns the review; with the exact token it starts one real local worker. |
+| `spans exec review`, `exec prepare` | `--input <json>` | Review is read-only; prepare retains exact input and an immutable review, without launch. |
+| `spans exec saved-review <run> <digest>` | none | Read an immutable execution binding. |
+| `spans exec approval-challenge`, `exec approve`, `exec revoke` | `--input <json>` | Issue a human-facing phrase, record the user's typed approval, or append its separately confirmed revocation. Starts nothing. |
+| `spans exec dispatch` | `--input <json>` including approved `reviewDigest`, plus `[--confirmation <token>]` | Without a checksum returns the preview; a matching checksum and current durable human receipt are both required before launch. |
 | `spans exec cancel <run> <attempt>`, `exec complete <run> <action>`, `exec report`, `exec reconcile` | `report --input <json>` | Deliver a stop (not an exit), verify a finished attempt, record a claim as history, or hold and settle after a restart. |
 | `spans exec accept <run> <action>`, `exec resolve <run> <action>` | `[--confirmation <token>]` | Without a token each returns the exact review. Accept completes a verified action; resolve releases a dispatch that never reached intent. |
 | `claim [worktree]` | `--agent --session --task [--pid]` | Claim or refresh a writer slot. |
@@ -745,6 +808,14 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/setup-progress` | `repo?`,`name?`; list durable setup records. | H W C M |
 | `POST` | `/api/setup-progress/retry` | T plus `attemptId`,`checkoutIdentity`; retry exact recorded attempt. | H W C M |
 | `GET` | `/api/shared-caches` | List shared-cache catalog records. | H W C M |
+| `POST` | `/api/spans/history/import` | `path`,`provider`, optional `existingRunId`,`maxBytes`; one explicit bounded page, standalone read-only Past by default. | H W C M |
+| `POST` | `/api/spans/import` | explicit source/run/parser identities and path; attach one selected page to an existing run. | H C M |
+| `POST` | `/api/spans/backup` | `destination`; bounded background copy to a new absolute path, no overwrite. | H W M |
+| `POST` | `/api/spans/restore` | `backupRoot`,`destination`; bounded inactive restore to a new path, no config change. | H W M |
+| `GET` | `/api/spans/integrations` | none; private-safe installation and connection evidence, no challenge or native write. | H W C M |
+| `POST` | `/api/spans/integrations/review` | optional client selection or explicit shared-artifact removal; exact paths/digests and short-lived challenge. | H W C |
+| `POST` | `/api/spans/integrations/apply` | only `reviewId`,`response`; user's exact phrase, one use, refuses changed native bytes. | H W C |
+| `POST` | `/api/spans/integrations/reconcile` | empty object; reconcile receipt evidence without native mutation or replay. | H W C |
 | `GET` | `/api/spans/runs` | `afterRunId?`,`limit?`,`phase?`,`query?`; bounded retained run summaries. | H W C M |
 | `GET` | `/api/spans/workflows` | none; offline workflow catalog, no archive write. | H W C M |
 | `POST` | `/api/spans/workflows/preview` | workflow inputs; redacted preview and digest, no archive write. | H W C M |
@@ -759,7 +830,12 @@ never downloads a provider tool to make a deployment possible.
 | `GET` | `/api/spans/execution/capabilities` | `profile`; launch capability from stored local probe evidence only; 503 while execution is disabled. | H C |
 | `POST` | `/api/spans/execution/probe` | `profile`; starts one fresh, short provider session (no budget flag on the subscription profile) to observe capability. It uses the owner's subscription (one recorded probe reported about 0.0103 USD of API-equivalent estimate); confirm user intent first. | H C |
 | `POST` | `/api/spans/execution/review` | runId, spanId, profile, instructions, wallClockMs, target, `budgetUsd?` (metered profiles only), `criteria?`, `requireChange?`; read-only review and exact confirmation token. | H C |
-| `POST` | `/api/spans/execution/dispatch` | the review fields plus `confirmation`; without it returns the review. Starts one real local worker; needs explicit user confirmation after review. | H C |
+| `POST` | `/api/spans/execution/prepare` | review fields; save exact input and immutable review, without launch. | H C |
+| `GET` | `/api/spans/execution/saved-review` | `runId`,`reviewDigest`; read the saved immutable binding. | H C |
+| `POST` | `/api/spans/execution/approval-challenge` | `runId`,`reviewDigest`,`intent?` (`approve` or `revoke`); human-facing one-use phrase. | H C |
+| `POST` | `/api/spans/execution/approve` | `runId`,`reviewDigest`,`confirmation:{challengeId,response}`; save a typed human approval, no launch. | H C |
+| `POST` | `/api/spans/execution/revoke` | same exact shape with a revocation challenge; append revocation, no launch. | H C |
+| `POST` | `/api/spans/execution/dispatch` | review fields plus `confirmation` and approved `reviewDigest`; without confirmation returns the preview. Revalidate the retained binding and human receipt before one launch. | H C |
 | `POST` | `/api/spans/execution/cancel` | `runId`,`attemptId`; deliver a stop to the exact owned attempt. Delivery is not an exit. | H C |
 | `POST` | `/api/spans/execution/accept` | `runId`,`actionId`,`confirmation?`; without it returns the exact review. Accepts a verified completed action only if the tree is unchanged; needs explicit user confirmation after review. | H C |
 | `POST` | `/api/spans/execution/complete` | `runId`,`actionId`; verify the finished attempt, record its outcome and settle usage and admission. Idempotent. | H C |
@@ -839,6 +915,11 @@ checkout identity. `review token` means preflight first and no edited input.
 | `get_diff`, `get_logs` | T, `verbose?`; T, `type?`, `lines?` | Read bounded diff/log output. |
 | `list_repo_prs` | `repo` | Read repository PRs. |
 | `get_pr_review_status`, `run_pr_review` | T; T, skill | Read or start paid fire-and-forget review after user approval. |
+| `list_spans_runs`, `get_spans_run`, `get_spans_events`, `get_spans_artifact` | bounded run/sequence/artifact selectors | Read retained history and inert redacted artifacts. |
+| `search_spans`, `get_spans_search_status` | bounded query selectors; none | Search the retained index or read its coverage. Never index automatically. |
+| `import_spans_history`, `import_spans_source` | explicit selected path/provider plus standalone or existing-run source identities | Import one bounded local conversation page. No directory scans or execution. |
+| `backup_spans_archive`, `restore_spans_archive` | destination; backupRoot and destination | Background copy to a new path or inactive restore. Unknown destinations stay retained. |
+| `get_spans_integrations` | none | Read client artifact and connection evidence only. No review challenge, apply or removal tool. |
 | `create_pr`, `pr_ready` | T; T, `ready` | Create a PR or toggle draft/ready. |
 
 ### State, setup, cleanup, attention, and deployment
@@ -1172,7 +1253,7 @@ Service packaging (a login item or launchd job) is the release-lifecycle ticket'
 
 ### Runtime and dependency-sharing limits
 
-The package version is `0.2.0`; no release is implied by that source value.
+The package version is `0.3.0`; no release is implied by that source value.
 Setu provisions Bun 1.3.14 through `install.sh`; a source checkout uses
 `bun install --frozen-lockfile`. `mise.toml` selects Bun 1.3.14. Root typecheck
 and Raycast typecheck require the root dependencies `typescript`, `@raycast/api`,

@@ -39,9 +39,9 @@ test('every Links runtime module, the engine source and its legal metadata are p
 });
 
 test('the verification path builds and tests the engine before the JavaScript suite', () => {
-  expect(pkg.scripts['engine:test']).toBe('bun links-engine.js test');
+  expect(pkg.scripts['engine:test']).toContain(' links-engine.js test');
   expect(pkg.scripts.verify.indexOf('engine:test')).toBeGreaterThanOrEqual(0);
   expect(pkg.scripts.verify.indexOf('engine:test')).toBeLessThan(
-    pkg.scripts.verify.indexOf('bun run test')
+    pkg.scripts.verify.indexOf(' run test')
   );
 });

@@ -162,6 +162,10 @@ test('deep review arguments fail closed for write-shaped Bash commands', () => {
   const args = buildDeepReviewArgs('pr-walkthrough', 'owner/repo', 42);
   expect(args).toContain('--settings');
   expect(args[args.indexOf('--settings') + 1]).toContain('pr-review-guard.js');
+  const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
+  for (const entry of settings.hooks.PreToolUse) {
+    expect(entry.hooks[0].command).toBe(process.execPath);
+  }
   expect(args[args.indexOf('--settings') + 1]).toContain(
     '/reviews/owner/repo/pr-42'
   );

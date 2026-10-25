@@ -27,6 +27,7 @@ type RunState =
   | 'cancelled'
   | 'completed'
   | 'failed'
+  | 'imported'
   | 'planned'
   | 'running'
   | 'unknown';
@@ -36,6 +37,7 @@ const STATE_BADGE: Record<RunState, { label: string; tone: Tone }> = {
   cancelled: { label: 'Cancelled', tone: 'zinc' },
   completed: { label: 'Completed', tone: 'emerald' },
   failed: { label: 'Failed', tone: 'red' },
+  imported: { label: 'Imported history', tone: 'zinc' },
   planned: { label: 'Planned', tone: 'zinc' },
   running: { label: 'Running', tone: 'emerald' },
   unknown: { label: 'Unknown', tone: 'zinc' },
@@ -50,6 +52,7 @@ const STATE_WORDS = new Map<string, RunState>([
   ['cancelled', 'cancelled'],
   ['completed', 'completed'],
   ['failed', 'failed'],
+  ['imported', 'imported'],
   ['paused', 'blocked'],
   ['planned', 'planned'],
   ['ready', 'planned'],
@@ -59,6 +62,7 @@ const STATE_WORDS = new Map<string, RunState>([
 ]);
 
 export interface SpansListProps {
+  archiveNotInitialized: boolean;
   error: string | null;
   hasMore: boolean;
   hasPrevious: boolean;
@@ -101,7 +105,7 @@ function runState(raw: string | null): RunState {
 }
 
 function phaseCls(active: boolean) {
-  return `min-h-9 shrink-0 rounded-none px-3 py-1.5 font-medium text-xs transition-colors duration-150 ${
+  return `min-h-11 shrink-0 rounded-none px-3 py-1.5 font-medium text-xs transition-colors duration-150 ${
     active
       ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-100'
       : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100'
@@ -118,7 +122,8 @@ function RunRow({
   const { runId, view } = record;
   const title = textField(view, 'goal') ?? 'Untitled run';
   const stateWord = textField(view, 'state') ?? textField(view, 'status');
-  const state = STATE_BADGE[runState(stateWord)];
+  const state =
+    STATE_BADGE[view.kind === 'imported' ? 'imported' : runState(stateWord)];
   const owner = textField(view, 'owner');
   const project = textField(view, 'project');
   const worktree = textField(view, 'worktree');
@@ -144,6 +149,7 @@ function RunRow({
       </div>
       <Button
         aria-label={`Open run: ${title} (${runId})`}
+        class="min-h-11"
         compact
         onClick={() => onSelect(runId)}
         variant="secondary"
@@ -155,6 +161,7 @@ function RunRow({
 }
 
 export function SpansList({
+  archiveNotInitialized,
   records,
   query,
   onQueryChange,
@@ -174,10 +181,11 @@ export function SpansList({
   const hasRecords = records.length > 0;
   const count = records.length;
   return (
-    <div class="portal-page mx-auto max-w-4xl px-4 py-6 sm:px-6">
+    <div class="portal-page mx-auto min-w-0 max-w-4xl px-4 py-6 sm:px-6">
       <PageHeader
         actions={
           <Button
+            class="min-h-11"
             compact
             disabled={loading}
             onClick={onRefresh}
@@ -233,10 +241,22 @@ export function SpansList({
               : 'Could not load Spans runs.'}{' '}
             {error}
           </p>
-          <Button compact onClick={onRefresh} variant="secondary">
+          <Button
+            class="min-h-11"
+            compact
+            onClick={onRefresh}
+            variant="secondary"
+          >
             Refresh
           </Button>
         </div>
+      )}
+      {archiveNotInitialized && error === null && (
+        <p class="read-notice" role="status">
+          No Spans archive has been initialized. Save a reviewed workflow draft
+          or import a conversation to create the first archive entry. Drafts
+          stay Planned, and imported conversations stay read-only in Past.
+        </p>
       )}
       {stale && (
         <p class="read-notice" role="status">
@@ -268,7 +288,7 @@ export function SpansList({
           Loading runs…
         </p>
       )}
-      {!(hasRecords || loading) && error === null && (
+      {!(hasRecords || loading || archiveNotInitialized) && error === null && (
         <p class="empty-state">{EMPTY_COPY[phase]}</p>
       )}
 
@@ -278,6 +298,7 @@ export function SpansList({
           class="mt-6 flex flex-wrap items-center justify-center gap-3 text-sm text-zinc-600 dark:text-zinc-300"
         >
           <Button
+            class="min-h-11"
             compact
             disabled={!hasPrevious}
             onClick={onPrevious}
@@ -286,6 +307,7 @@ export function SpansList({
             Previous page
           </Button>
           <Button
+            class="min-h-11"
             compact
             disabled={!hasMore}
             onClick={onNext}

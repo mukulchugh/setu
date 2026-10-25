@@ -1684,3 +1684,19 @@ test('real store: secret-field-like action keys refuse before revisions or event
     expect(eventsOf(store, 'run-1')).toHaveLength(1);
   });
 });
+
+test.each([
+  { readOnly: true },
+  { kind: 'imported', readOnly: false, state: 'planned' },
+  { state: 'imported' },
+])('imported history refuses actions with marker %j', async (marker) => {
+  const store = fakeStore({
+    view: { ...initialView(), ...marker },
+  });
+  const actions = createSpansActions({ store });
+  expect(await actions.prepareAction(prepareInput())).toMatchObject({
+    code: 'RUN_READ_ONLY',
+    ok: false,
+  });
+  expect(store.commitAttempts).toBe(0);
+});

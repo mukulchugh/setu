@@ -947,7 +947,10 @@ describe('projection status is passive and honest', () => {
     const actual = createFakeEngine();
     actual.record(
       'm_bad',
-      engineMessage({ origin: `peer:${'a'.repeat(64)}`, run_hint: 'other-run' }),
+      engineMessage({
+        origin: `peer:${'a'.repeat(64)}`,
+        run_hint: 'other-run',
+      }),
       'queued'
     );
     const engine = {

@@ -16,7 +16,7 @@ import {
   writeSync,
 } from 'node:fs';
 import identityFs from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { agentStatus } from './agent.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
@@ -39,6 +39,7 @@ import {
   assignPort,
   baseBranchRefAsync,
   branchMetadata,
+  CFG_PATH,
   CLOUDFLARED_BIN,
   caddySnippetPath,
   cloneBareRepoAsync,
@@ -85,6 +86,7 @@ import {
   removeProject,
   requireConfig,
   resourceSettings,
+  SETU_DIR,
   saveCustomAgents,
   saveFileSyncGlobs,
   saveMcpServers,
@@ -152,7 +154,11 @@ import {
 } from './removal-routing.js';
 import { createSetupInstallProcesses } from './setup-install-process.js';
 import { createSetupProgress } from './setup-progress.js';
+import { createSpansClientIntegrations } from './spans-client-integrations.js';
 import { createSpansExecutionRuntime } from './spans-execution-runtime.js';
+import { createSpansHistoryImport } from './spans-history-import.js';
+import { createSpansImportRuntime } from './spans-import-runtime.js';
+import { createSpansMaintenanceRuntime } from './spans-maintenance-runtime.js';
 import { createSpansRuntime } from './spans-runtime.js';
 import {
   createWorkspaceInventory,
@@ -198,6 +204,48 @@ const GITHUB_SSH_PREFIX_RE = /^git@github\.com:/;
 const GIT_SUFFIX_RE = /\.git$/;
 const FOOTPRINT_RE = /phys_footprint:\s*([\d.]+)\s*(KB|MB|GB)/i;
 
+function portalSpansClientIntegrations(options) {
+  return createSpansClientIntegrations({
+    home: options.spansIntegrationHome ?? homedir(),
+    integrationRoot:
+      options.spansIntegrationRoot ??
+      join(homedir(), '.local/share/setu/integrations'),
+    skillSourcePath: join(
+      import.meta.dir,
+      'claude-plugin/skills/setu-spans/SKILL.md'
+    ),
+  });
+}
+
+function executionResourcePaths(options, workspaceRoot) {
+  if (options.state) {
+    return options.spansExecutionResourcePaths;
+  }
+  return {
+    configPath: CFG_PATH,
+    setuDir: SETU_DIR,
+    workspaceRoot,
+  };
+}
+
+function validSetupRetryBody(body) {
+  return (
+    body &&
+    typeof body === 'object' &&
+    !Array.isArray(body) &&
+    (body.refreshDependencies === undefined ||
+      typeof body.refreshDependencies === 'boolean')
+  );
+}
+
+function portalConfig(options) {
+  let config = options.config ?? requireConfig();
+  if (options.workspace) {
+    config = { ...config, workspace: options.workspace };
+  }
+  return config;
+}
+
 /**
  * Builds an unstarted portal runtime.  Importing this module deliberately does
  * not read user configuration, touch a workspace, or install process hooks.
@@ -206,10 +254,9 @@ const FOOTPRINT_RE = /phys_footprint:\s*([\d.]+)\s*(KB|MB|GB)/i;
  */
 // biome-ignore lint/suspicious/useAwait: callers await this factory, so synchronous configuration or collaborator failures must reject its Promise.
 export async function createPortalRuntime(options = {}) {
-  let _cfg = options.config ?? requireConfig();
-  if (options.workspace) {
-    _cfg = { ..._cfg, workspace: options.workspace };
-  }
+  const setupInstallProcesses =
+    options.setupInstallProcesses ?? createSetupInstallProcesses();
+  let _cfg = portalConfig(options);
   let configReconciled = true;
 
   const WORKSPACE = _cfg.workspace;
@@ -239,7 +286,6 @@ export async function createPortalRuntime(options = {}) {
   const LOGS = `${WORKSPACE}/logs`;
   const PORT = options.port ?? PORTAL_PORT;
   const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5 MB
-  const { setupInstallProcesses = createSetupInstallProcesses() } = options;
 
   const inngestProcs = new Map();
   const triggerProcs = new Map();
@@ -1985,6 +2031,22 @@ export async function createPortalRuntime(options = {}) {
   const portalSockets = new Set();
   let updateShutdown = null;
 
+  async function closeApplicationServices() {
+    const archiveCloses = await Promise.all([
+      spans.close(),
+      spansImports.close(),
+      spansHistory.close(),
+      spansMaintenance.close(),
+      spansClientIntegrations.close(),
+    ]);
+    await spansExecution.close();
+    await linksPresence.dispose();
+    await managedAgents.dispose();
+    if (!archiveCloses.every((result) => result.ok === true)) {
+      throw new Error('Spans archive operations could not close.');
+    }
+  }
+
   function stopPortalForUpdate(portalServer) {
     if (updateShutdown) {
       return;
@@ -1998,13 +2060,13 @@ export async function createPortalRuntime(options = {}) {
           socket.close(1001, 'Portal update');
         }
       },
-      dispose: () => {
-        setupInstallProcesses.close();
+      dispose: async () => {
         runtimeTimers.clearInterval(logRetentionTimer);
         runtimeTimers.clearInterval(memoryCheckTimer);
         runtimeTimers.clearInterval(idleCheckTimer);
-        managedAgents.dispose();
+        setupInstallProcesses.close();
         lifecycle.dispose();
+        await closeApplicationServices();
       },
       exit: (code) => process.exit(code),
       stopServer: () => portalServer.stop(false),
@@ -3686,6 +3748,8 @@ export async function createPortalRuntime(options = {}) {
     linksWithdrawSharing,
     ...links
   } = createLinksRuntime({
+    archiveWrite: (request, effect) =>
+      portalB205.admission.withSpansArchiveWrite(request, effect),
     enginePath: options.linksEngine,
     // The registry itself, read fresh: the cached metadata would still hold a project that was just removed.
     isProject: (repo) =>
@@ -3709,6 +3773,7 @@ export async function createPortalRuntime(options = {}) {
         ? { repoDir: target.repoDir, wtDir: target.wtDir }
         : null;
     },
+    resourcePaths: executionResourcePaths(options, WORKSPACE),
     root: options.spansRoot,
     setupProgress,
   });
@@ -3735,7 +3800,21 @@ export async function createPortalRuntime(options = {}) {
     },
     listProvider: (input) => managedAgents.listAttention(input),
   });
-  const spans = createSpansRuntime({ root: options.spansRoot });
+  const { spansRoot = join(homedir(), '.local/share/setu/spans') } = options;
+  const spansOptions = {
+    archiveWrite: (request, effect) =>
+      portalB205.admission.withSpansArchiveWrite(request, effect),
+    root: spansRoot,
+  };
+  const spans = createSpansRuntime({
+    ...spansOptions,
+    archiveWrite: (request, effect) =>
+      updateControl.mutate(() => spansOptions.archiveWrite(request, effect)),
+  });
+  const spansImports = createSpansImportRuntime(spansOptions);
+  const spansHistory = createSpansHistoryImport(spansOptions);
+  const spansMaintenance = createSpansMaintenanceRuntime({ root: spansRoot });
+  const spansClientIntegrations = portalSpansClientIntegrations(options);
   const portalB205Composition = Object.freeze({
     ...spans,
     ...spansExecution.services,
@@ -3754,6 +3833,14 @@ export async function createPortalRuntime(options = {}) {
     headlessStart: (input) => managedAgents.startRun(input),
     linksAttentionOpen: (input) => linksAttention.open(input),
     resumeAgentSession: (input) => managedAgents.resume(input),
+    spansBackup: spansMaintenance.backup,
+    spansHistoryImport: spansHistory.importSelected,
+    spansImport: spansImports.importSelected,
+    spansIntegrationsApply: spansClientIntegrations.apply,
+    spansIntegrationsPreview: spansClientIntegrations.preview,
+    spansIntegrationsReconcile: spansClientIntegrations.reconcile,
+    spansIntegrationsReview: spansClientIntegrations.review,
+    spansRestore: spansMaintenance.restore,
   });
 
   async function continueSettledEnrollment(body, fresh, previous, outcome) {
@@ -3787,7 +3874,14 @@ export async function createPortalRuntime(options = {}) {
     };
   }
 
-  async function retrySetupProgress(body, source = 'portal') {
+  async function setupRetryTarget(body) {
+    if (!validSetupRetryBody(body)) {
+      return {
+        code: 'SETUP_PROGRESS_INVALID',
+        error: 'Dependency refresh must be an explicit boolean',
+        ok: false,
+      };
+    }
     if (!setupRecovery.ok) {
       return setupRecovery;
     }
@@ -3798,6 +3892,9 @@ export async function createPortalRuntime(options = {}) {
         error: 'No registered worktree matches this request',
         ok: false,
       };
+    }
+    if (fresh.ok === false) {
+      return fresh;
     }
     const previous = setupProgress.get({ name: fresh.name, repo: fresh.repo });
     if (previous?.ok === false) {
@@ -3810,6 +3907,15 @@ export async function createPortalRuntime(options = {}) {
         ok: false,
       };
     }
+    return { fresh, previous };
+  }
+
+  async function retrySetupProgress(body, source = 'portal') {
+    const target = await setupRetryTarget(body);
+    if (target.ok === false) {
+      return target;
+    }
+    const { fresh, previous } = target;
     const outcome = await operationOutcomes.accept({
       kind: 'setup-retry',
       source,
@@ -3841,12 +3947,17 @@ export async function createPortalRuntime(options = {}) {
               sameCheckoutIdentity(
                 locked.checkoutIdentity,
                 fresh.checkoutIdentity
+              ) &&
+              sameCheckoutIdentity(
+                locked.checkoutIdentity,
+                body.checkoutIdentity
               )
             )
           ) {
             return {
               code: 'CHECKOUT_IDENTITY_MISMATCH',
-              error: 'The checkout identity changed before retry',
+              error:
+                'The checkout identity changed or is unverified; setup was not started',
               ok: false,
             };
           }
@@ -3854,6 +3965,7 @@ export async function createPortalRuntime(options = {}) {
             attemptId: body.attemptId,
             checkoutIdentity: body.checkoutIdentity,
             logLocation: logPath(locked.repo, locked.name, 'setup'),
+            refreshDependencies: body.refreshDependencies === true,
             stage: 'preparing',
             target: { name: locked.name, repo: locked.repo },
           });
@@ -3884,6 +3996,7 @@ export async function createPortalRuntime(options = {}) {
             prepareHoistedDependencySharing: (setupTarget, setupContext) =>
               portalB205.dependencyFiles.preflight(setupTarget, setupContext),
             progress: setupProgress,
+            refreshDependencies: body.refreshDependencies === true,
             setupAttempt: accepted.record,
             sharing: dependencySharingForTarget(_cfg, locked.repo, locked.name),
             spawn: setupInstallProcesses.spawn,
@@ -5849,14 +5962,26 @@ export async function createPortalRuntime(options = {}) {
       setupRetry: (input) => retrySetupProgress(input, 'mcp'),
       sharedCaches: () => portalB205.sharedCaches(),
       spansArtifact: spans.spansArtifact,
-      spansDraftCreate: spans.spansDraftCreate,
+      spansBackup: (input) =>
+        updateControl.mutate(() => spansMaintenance.backup(input)),
+      spansDraftCreate: (input) =>
+        updateControl.mutate(() => spans.spansDraftCreate(input)),
       spansEvents: spans.spansEvents,
-      spansPlanRevise: spans.spansPlanRevise,
+      spansHistoryImport: (input) =>
+        updateControl.mutate(() => spansHistory.importSelected(input)),
+      spansImport: (input) =>
+        updateControl.mutate(() => spansImports.importSelected(input)),
+      spansIntegrationsPreview: spansClientIntegrations.preview,
+      spansPlanRevise: (input) =>
+        updateControl.mutate(() => spans.spansPlanRevise(input)),
+      spansRestore: (input) =>
+        updateControl.mutate(() => spansMaintenance.restore(input)),
       spansRun: spans.spansRun,
       spansRuns: spans.spansRuns,
       spansSearch: spans.spansSearch,
       spansSearchStatus: spans.spansSearchStatus,
-      spansWorkflowCreate: spans.spansWorkflowCreate,
+      spansWorkflowCreate: (input) =>
+        updateControl.mutate(() => spans.spansWorkflowCreate(input)),
       spansWorkflowPreview: spans.spansWorkflowPreview,
       spansWorkflows: spans.spansWorkflows,
       startConvex: (repo, name) => startConvexByName(repo, name, 'mcp'),
@@ -6055,10 +6180,7 @@ export async function createPortalRuntime(options = {}) {
     const boundServer = server;
     server = null;
     try {
-      spans.close();
-      await spansExecution.close();
-      await linksPresence.dispose();
-      await managedAgents.dispose();
+      await closeApplicationServices();
     } finally {
       try {
         if (!options.dependencyFileNative) {

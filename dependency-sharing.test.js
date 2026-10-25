@@ -283,7 +283,18 @@ test('repair returns an isolated command without modifying a recorded replaced v
     mkdirSync(join(f.wtDir, 'node_modules'));
     const ordinary = join(f.wtDir, 'node_modules', 'unowned.txt');
     writeFileSync(ordinary, 'keep');
-    const repair = await repairDependencyView(f.wtDir, sharing);
+    const repair = await repairDependencyView(
+      f.wtDir,
+      sharing,
+      async () => undefined
+    );
+    await expect(
+      repairDependencyView(f.wtDir, sharing, () => {
+        throw Object.assign(new Error('Fixture storage is full'), {
+          code: 'STORAGE_LOW',
+        });
+      })
+    ).rejects.toMatchObject({ code: 'STORAGE_LOW' });
     expect(repair).toMatchObject({ mode: 'isolated', ok: true });
     expect(Object.keys(repair.env).sort()).toEqual([
       'BUN_INSTALL_CACHE_DIR',
@@ -335,7 +346,11 @@ test('consumer records are written through workspace-state with the lockfile has
       userSetting: 'preserve this exact document',
     });
     const configBefore = readFileSync(configPath, 'utf8');
-    const plan = await sharedDependencyInstall(f.wtDir, f.sharing);
+    const plan = await sharedDependencyInstall(
+      f.wtDir,
+      f.sharing,
+      async () => undefined
+    );
     const recorded = await recordDependencyConsumer(
       state,
       f.wtDir,
@@ -438,7 +453,7 @@ test('consumer completion preserves malformed journal bytes instead of replacing
   }
 });
 
-test('one frozen copyfile plan reaches CLI and portal, with independent store storage gates', async () => {
+test('one frozen copyfile plan reaches inline and owned setup with independent store storage gates', async () => {
   const f = fixture(),
     storage = [],
     calls = [];
@@ -938,5 +953,45 @@ test('Python and manifest-free setup bypass even an invalid sharing policy', asy
     await pending.completion;
     expect(spawned).toEqual(manifest ? [['uv', 'sync']] : []);
     expect(context.ready).toBe(true);
+  }
+});
+
+test('an explicit shared refresh plans only a healthy owned existing view', async () => {
+  const f = fixture();
+  try {
+    const consumer = consumerFor(f);
+    createSharedView(f, consumer);
+    const sharing = {
+      ...f.sharing,
+      consumers: { [consumer.checkout]: consumer },
+    };
+    expect((await inspectDependencyView(f.wtDir, sharing)).state).toBe(
+      'shared and healthy'
+    );
+    await expect(
+      sharedDependencyInstall(f.wtDir, sharing, () => Promise.resolve())
+    ).rejects.toThrow('fresh checkout');
+    const plan = await sharedDependencyInstall(
+      f.wtDir,
+      sharing,
+      () => Promise.resolve(),
+      { refreshOwnedView: true }
+    );
+    expect(plan.mode).toBe('isolated');
+    expect(plan.command[0]).toBe(realpathSync(f.sharing.executable));
+    expect(plan.env.BUN_INSTALL_GLOBAL_STORE).toBe('1');
+    await expect(
+      sharedDependencyInstall(f.wtDir, f.sharing, () => Promise.resolve(), {
+        refreshOwnedView: true,
+      })
+    ).rejects.toMatchObject({ code: 'DEPENDENCY_VIEW_UNSAFE' });
+    rmSync(join(f.wtDir, 'node_modules', '.bun'), { recursive: true });
+    await expect(
+      sharedDependencyInstall(f.wtDir, sharing, () => Promise.resolve(), {
+        refreshOwnedView: true,
+      })
+    ).rejects.toMatchObject({ code: 'DEPENDENCY_VIEW_UNSAFE' });
+  } finally {
+    f.dispose();
   }
 });

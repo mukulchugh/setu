@@ -71,7 +71,7 @@ function JsonDisclosure({ label, value }: { label: string; value: SpansJson }) {
       <summary class="min-h-11 cursor-pointer py-2 text-zinc-700 dark:text-zinc-200">
         {label}
       </summary>
-      <pre class="max-h-80 max-w-full overflow-auto whitespace-pre-wrap break-all rounded-none bg-zinc-100 p-3 text-xs text-zinc-800 dark:bg-black/20 dark:text-zinc-200">
+      <pre class="mt-2 max-w-full whitespace-pre-wrap break-all rounded-none bg-zinc-100 p-3 text-xs text-zinc-800 dark:bg-black/20 dark:text-zinc-200">
         {printable(value)}
       </pre>
     </details>
@@ -117,7 +117,7 @@ function MessageArtifact({ text }: { text: string }) {
       {(!blocks || blocks.length === 0) &&
         typeof messageText === 'string' &&
         messageText.length > 0 && (
-          <pre class="mt-2 max-h-96 max-w-full overflow-auto whitespace-pre-wrap break-words text-sm text-zinc-800 dark:text-zinc-200">
+          <pre class="mt-2 max-w-full whitespace-pre-wrap break-all text-sm text-zinc-800 dark:text-zinc-200">
             {messageText}
           </pre>
         )}
@@ -139,7 +139,7 @@ function MessageArtifact({ text }: { text: string }) {
               return (
                 <div class="min-w-0" key={index}>
                   {typeof block.text === 'string' && (
-                    <pre class="max-h-96 max-w-full overflow-auto whitespace-pre-wrap break-words text-sm text-zinc-800 dark:text-zinc-200">
+                    <pre class="max-w-full whitespace-pre-wrap break-all text-sm text-zinc-800 dark:text-zinc-200">
                       {block.text}
                     </pre>
                   )}
@@ -226,6 +226,7 @@ function MessageEventContent({
   onOpenArtifact,
   payload,
   runId,
+  sequence,
   selection,
 }: {
   artifactId: string;
@@ -234,17 +235,42 @@ function MessageEventContent({
   onOpenArtifact: (artifactId: string) => void;
   payload: Record<string, SpansJson> | null;
   runId: string;
+  sequence: number;
   selection: ArtifactSelection | null;
 }) {
   const selected = selection?.artifactId === artifactId;
   const validArtifactId = ARTIFACT_ID_PATTERN.test(artifactId);
   const summary = textValue(payload?.summary);
+  const provenance = [
+    typeof payload?.provider === 'string'
+      ? `Provider: ${payload.provider}`
+      : null,
+    typeof payload?.sourceId === 'string'
+      ? `Source: ${payload.sourceId}`
+      : null,
+    typeof payload?.sourceGeneration === 'string' ||
+    typeof payload?.sourceGeneration === 'number'
+      ? `Source generation: ${payload.sourceGeneration}`
+      : null,
+    typeof payload?.parserVersion === 'string'
+      ? `Parser: ${payload.parserVersion}`
+      : null,
+    typeof payload?.byteStart === 'number' &&
+    typeof payload?.byteEnd === 'number'
+      ? `Source bytes: ${payload.byteStart}–${payload.byteEnd}`
+      : null,
+  ].filter((item): item is string => item !== null);
 
   return (
     <div class="mt-2 min-w-0">
       <p class="break-words text-sm text-zinc-800 dark:text-zinc-200">
         {summary || 'Message summary unavailable.'}
       </p>
+      {provenance.length > 0 && (
+        <p class="mt-1 break-all text-xs text-zinc-600 dark:text-zinc-300">
+          {provenance.join(' · ')}
+        </p>
+      )}
       {typeof payload?.nativeId === 'string' && (
         <p class="mt-1 break-all font-mono text-xs text-zinc-600 dark:text-zinc-300">
           Source message ID: {payload.nativeId}
@@ -254,7 +280,11 @@ function MessageEventContent({
       {validArtifactId ? (
         <div class="mt-2">
           <Button
+            aria-controls={
+              selected ? `conversation-message-${sequence}` : undefined
+            }
             aria-expanded={selected}
+            class="min-h-11"
             compact
             disabled={loading || (!selected && selection?.result === null)}
             onClick={() => {
@@ -269,7 +299,11 @@ function MessageEventContent({
             {selected ? 'Close full message' : 'View full message'}
           </Button>
           {selected && (
-            <div aria-live="polite" class="min-w-0">
+            <div
+              aria-live="polite"
+              class="min-w-0"
+              id={`conversation-message-${sequence}`}
+            >
               <ArtifactContent
                 artifactId={artifactId}
                 result={selection?.result ?? null}
@@ -377,6 +411,7 @@ function ConversationEvent({
           payload={payload}
           runId={runId}
           selection={selection}
+          sequence={event.sequence}
         />
       )}
       {gapEvent && <CoverageGapContent event={event} payload={payload} />}
@@ -505,8 +540,9 @@ export function SpansConversation({
         </p>
       ) : (
         <ol
+          aria-busy={loading}
           aria-label="Conversation events"
-          class="max-h-[70vh] min-w-0 divide-y divide-zinc-200 overflow-auto dark:divide-white/10"
+          class="min-w-0 divide-y divide-zinc-200 dark:divide-white/10"
         >
           {items.map((item) => {
             if (item.kind === 'links-message') {
@@ -546,7 +582,12 @@ export function SpansConversation({
       )}
       {hasMore && (
         <div class="mt-4">
-          <Button disabled={loading} onClick={onLoadMore} variant="secondary">
+          <Button
+            class="min-h-11"
+            disabled={loading}
+            onClick={onLoadMore}
+            variant="secondary"
+          >
             {loading ? 'Loading events…' : 'Load more events'}
           </Button>
         </div>

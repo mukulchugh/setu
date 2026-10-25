@@ -5,12 +5,19 @@
 // supervises a child process. It is not provider acceptance and says nothing
 // about what a real provider does.
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { observeProcessIdentity } from './process-observation.js';
 
 const args = process.argv.slice(2);
 // Process tests list every fixture they start so none can outlive its test.
 if (process.env.SETU_FIXTURE_PIDFILE) {
   appendFileSync(process.env.SETU_FIXTURE_PIDFILE, `${process.pid}\n`);
+  const proof = await observeProcessIdentity(process.pid);
+  writeFileSync(
+    `${process.env.SETU_FIXTURE_PIDFILE}.${process.pid}.identity.json`,
+    JSON.stringify(proof),
+    { mode: 0o600 }
+  );
 }
 const flag = (name) => {
   const index = args.indexOf(name);
@@ -18,12 +25,24 @@ const flag = (name) => {
 };
 
 const prompt = await new Response(Bun.stdin.stream()).text();
+let instructions = prompt;
+try {
+  const envelope = JSON.parse(prompt);
+  if (
+    envelope?.version === 1 &&
+    typeof envelope.request?.instructions === 'string'
+  ) {
+    ({ instructions } = envelope.request);
+  }
+} catch {
+  // Capability probes use ordinary text rather than a retained task envelope.
+}
 // A budget below a tenth of a cent is the capability probe, like the real one.
 // A subscription probe sets no budget; its prompt is the same short reply.
 const probing = Number(flag('--max-budget-usd') ?? '1') < 0.001;
 const subscriptionProbe =
-  !probing && prompt.startsWith('Reply with the single word ok');
-let mode = /MODE:([a-z-]+)/.exec(prompt)?.[1] ?? 'success';
+  !probing && instructions.startsWith('Reply with the single word ok');
+let mode = /MODE:([a-z-]+)/.exec(instructions)?.[1] ?? 'success';
 if (probing) {
   mode = 'probe';
 } else if (subscriptionProbe) {
@@ -61,6 +80,7 @@ emit({
   permissionMode: flag('--permission-mode'),
   prompt: prompt.slice(0, 500),
   session_id: session,
+  stdin: prompt,
   subtype: 'init',
   // A worker that ran with a different toolset than it was started with.
   tools:
@@ -99,6 +119,18 @@ if (mode === 'graceful-stop') {
 if (mode === 'hang' || mode === 'stubborn') {
   setInterval(() => undefined, 1000);
   await new Promise(() => undefined);
+}
+
+if (mode === 'controlled-success') {
+  const keepAlive = setInterval(() => undefined, 1000);
+  await new Promise((resolve) => {
+    process.once('SIGUSR2', resolve);
+    writeFileSync(
+      `${process.env.SETU_FIXTURE_PIDFILE}.${process.pid}.ready`,
+      'ready\n'
+    );
+  });
+  clearInterval(keepAlive);
 }
 
 if (mode === 'subscription-probe') {
@@ -239,6 +271,7 @@ if (
   mode === 'success' ||
   mode === 'secret' ||
   mode === 'chatty' ||
+  mode === 'controlled-success' ||
   mode === 'wrong-session'
 ) {
   await Bun.write('fixture-output.txt', 'work done by the process fixture\n');

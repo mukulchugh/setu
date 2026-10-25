@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   canAcceptSpansSearchResponse,
   readSpansSearch,
+  type SpansSearchCacheEvidence,
   SpansSearchReadError,
   type SpansSearchRequest,
   type SpansSearchResult,
@@ -171,6 +172,180 @@ function SearchPages({
         Next results
       </Button>
     </nav>
+  );
+}
+
+function formatCacheAge(ageMs: number | null): string {
+  if (ageMs === null) {
+    return 'Unavailable';
+  }
+  if (ageMs < 1000) {
+    return 'just now';
+  }
+  const units: [Intl.RelativeTimeFormatUnit, number][] = [
+    ['day', 86_400_000],
+    ['hour', 3_600_000],
+    ['minute', 60_000],
+    ['second', 1000],
+  ];
+  const selected: [Intl.RelativeTimeFormatUnit, number] = units.find(
+    ([, threshold]) => ageMs >= threshold
+  ) ?? ['second', 1000];
+  const [unit, durationMs] = selected;
+  return new Intl.RelativeTimeFormat(undefined, { numeric: 'always' }).format(
+    -Math.floor(ageMs / durationMs),
+    unit
+  );
+}
+
+function cachePersistenceLabel(persisted: boolean | 'unknown'): string {
+  if (persisted === true) {
+    return 'Saved to cache';
+  }
+  if (persisted === false) {
+    return 'Not saved to cache';
+  }
+  return 'Cache save unconfirmed';
+}
+
+function cacheDetails(
+  cache: SpansSearchCacheEvidence,
+  generation: number,
+  cacheStatus: string,
+  age: string,
+  persistence: string,
+  createdAt: string | null
+): Array<{
+  className?: string;
+  dateTime?: string;
+  label: string;
+  value: string;
+}> {
+  const details: Array<{
+    className?: string;
+    dateTime?: string;
+    label: string;
+    value: string;
+  }> = [
+    { label: 'Search', value: cacheStatus },
+    { label: 'Index generation', value: String(generation) },
+    { label: 'Cache age', value: age },
+    { label: 'Cache save', value: persistence },
+  ];
+  if (createdAt) {
+    details.push({
+      dateTime: createdAt,
+      label: 'Entry created',
+      value: createdAt,
+    });
+  }
+  if (cache.kind !== 'available') {
+    return details;
+  }
+  if (cache.missReason) {
+    details.push({ label: 'Cache miss', value: cache.missReason });
+  }
+  if (cache.persistenceReason) {
+    details.push({
+      label: 'Persistence detail',
+      value: cache.persistenceReason,
+    });
+  }
+  if (cache.key) {
+    details.push({
+      className: 'min-w-0',
+      label: 'Cache key',
+      value: cache.key,
+    });
+  }
+  if (cache.source?.parserVersion) {
+    details.push({
+      className: 'min-w-0',
+      label: 'Parser version',
+      value: cache.source.parserVersion,
+    });
+  }
+  if (cache.source?.toolVersion) {
+    details.push({
+      className: 'min-w-0',
+      label: 'Tool version',
+      value: cache.source.toolVersion,
+    });
+  }
+  if (cache.source?.corpusGeneration) {
+    details.push({
+      className: 'min-w-0',
+      label: 'Corpus generation',
+      value: cache.source.corpusGeneration,
+    });
+  }
+  if (cache.source?.corpusHash) {
+    details.push({
+      className: 'min-w-0',
+      label: 'Corpus dependency hash',
+      value: cache.source.corpusHash,
+    });
+  }
+  return details;
+}
+
+function SearchCacheReceipt({
+  cache,
+  generation,
+}: {
+  cache: SpansSearchCacheEvidence;
+  generation: number;
+}) {
+  let summary = `Cache evidence unavailable · Index generation ${generation}.`;
+  let cacheStatus = 'Unavailable';
+  let age = 'Unavailable';
+  let persistence = 'Unknown';
+  let createdAt: string | null = null;
+  if (cache.kind === 'available') {
+    cacheStatus = cache.hit ? 'Reused cached read' : 'Fresh computation';
+    age = formatCacheAge(cache.ageMs);
+    persistence = cachePersistenceLabel(cache.persisted);
+    summary = [
+      cache.hit ? 'Reused cached read' : 'Freshly computed',
+      `Index generation ${generation}`,
+      cache.ageMs === null ? 'Age unavailable' : age,
+      persistence,
+    ].join(' · ');
+    if (cache.createdAt !== null) {
+      createdAt = new Date(cache.createdAt).toISOString();
+    }
+    summary = `${summary}.`;
+  }
+  const details = cacheDetails(
+    cache,
+    generation,
+    cacheStatus,
+    age,
+    persistence,
+    createdAt
+  );
+
+  return (
+    <div class="mt-3">
+      <p class="text-sm text-zinc-600 dark:text-zinc-300" role="status">
+        {summary}
+      </p>
+      <details class="mt-1 text-sm">
+        <summary class="min-h-11 cursor-pointer py-2 text-zinc-700 dark:text-zinc-200">
+          Cache details
+        </summary>
+        <dl class="grid gap-x-4 gap-y-1 text-xs sm:grid-cols-2">
+          {details.map(({ className, dateTime, label, value }) => (
+            <div class={className} key={label}>
+              <dt class="text-zinc-500 dark:text-zinc-400">{label}</dt>
+              <dd class={className ? 'break-all' : undefined}>
+                {dateTime ? <time dateTime={dateTime}>{value}</time> : value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+    </div>
   );
 }
 
@@ -394,6 +569,12 @@ export function SpansSearch({
           onPrevious={previous}
           result={result}
         />
+        {result?.cache ? (
+          <SearchCacheReceipt
+            cache={result.cache}
+            generation={result.generation}
+          />
+        ) : null}
       </div>
     </section>
   );

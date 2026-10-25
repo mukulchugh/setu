@@ -9,6 +9,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -16,6 +17,7 @@ import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
+import { setFixtureTimesNs } from './dependency-file-fixture-times.js';
 import { dependencyFileInputs } from './dependency-file-inputs.js';
 import { createDependencyFileJournal } from './dependency-file-journal.js';
 import { createDependencyFileNative } from './dependency-file-native.js';
@@ -120,8 +122,8 @@ function makeFixture() {
 }
 
 // Explicit test-only OS seam for the prebuilt native helper. Fingerprints use
-// actual fixture descriptors; timestamp changes and the atomic exchange are
-// simulated in JavaScript. The real store, journal, and sharing factories run.
+// actual fixture descriptors; timestamps use the OS integer clock, and the
+// atomic exchange is simulated. The real store, journal, and sharing factories run.
 // This seam does not establish helper, lease, clonefile, or RENAME_SWAP support.
 function makeFixtureNative({ failFirstExchange = false } = {}) {
   const helperPath = join(tmpdir(), 'setu-test-only-dependency-file-helper');
@@ -179,11 +181,7 @@ function makeFixtureNative({ failFirstExchange = false } = {}) {
     }
     if (action === 'restore-times') {
       const path = join(root, relativePath);
-      utimesSync(
-        path,
-        Number(BigInt(atimeNs)) / 1e9,
-        Number(BigInt(mtimeNs)) / 1e9
-      );
+      setFixtureTimesNs(path, atimeNs, mtimeNs);
       const info = statSync(path, { bigint: true });
       return {
         stdout: JSON.stringify({
@@ -263,6 +261,28 @@ async function makeRuntime(f, native) {
 }
 
 const nativeOptIn = process.env.SETU_DEPENDENCY_FILE_NATIVE_REUSE === '1';
+
+test('fixture timestamp restoration preserves integer nanoseconds and refuses symlinks', () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-fixture-clock-'));
+  try {
+    const path = join(root, 'entry.js');
+    writeFileSync(path, 'fixture');
+    const atime = '1710000000123456789';
+    const mtime = '1720000000987654321';
+    setFixtureTimesNs(path, atime, mtime);
+    const before = statSync(path, { bigint: true });
+    expect(String(before.atimeNs)).toBe(atime);
+    expect(String(before.mtimeNs)).toBe(mtime);
+    const link = join(root, 'link.js');
+    symlinkSync(path, link);
+    expect(() => setFixtureTimesNs(link, '1', '2')).toThrow();
+    const after = statSync(path, { bigint: true });
+    expect(after.atimeNs).toBe(before.atimeNs);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
 
 test('independent installs reuse one canonical object while retaining target times and operation identity', async () => {
   const f = makeFixture();

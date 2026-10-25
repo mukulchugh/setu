@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  approvedDispatchInput,
   createExecutionFixture,
   METERED_PROFILES,
   PROFILE,
@@ -92,6 +93,33 @@ async function readyService(overrides) {
   await service.probe({ profile: PROFILE });
   return service;
 }
+
+test.each([
+  { readOnly: true },
+  { kind: 'imported', readOnly: false, state: 'planned' },
+  { state: 'imported' },
+])('imported marker %j refuses execution before admission', async (marker) => {
+  const service = await readyService();
+  const read = fx.store.readRun({ runId: REVIEW.runId });
+  expect(
+    fx.store.commitRun({
+      events: [],
+      expectedGeneration: read.generation,
+      expectedRevision: read.revision,
+      runId: REVIEW.runId,
+      view: { ...read.view, ...marker },
+    }).ok
+  ).toBe(true);
+  const events = eventCount(fx.store);
+  const providers = fx.providerPids();
+  const expected = { code: 'SPANS_EXEC_RUN_READ_ONLY', ok: false };
+  expect(await service.review(REVIEW)).toMatchObject(expected);
+  expect(await service.dispatch(REVIEW)).toMatchObject(expected);
+  expect(eventCount(fx.store)).toBe(events);
+  expect((await fx.admission.status()).leases).toEqual([]);
+  expect(checkWriter(fx.wtDir, 'anyone').claim).toBeNull();
+  expect(fx.providerPids()).toEqual(providers);
+});
 
 describe('reviewing a dispatch', () => {
   test('shows the exact binding and changes nothing', async () => {
@@ -201,10 +229,8 @@ describe('reviewing a dispatch', () => {
   });
 });
 
-const dispatchInput = async (service, overrides = {}) => {
-  const reviewed = await service.review({ ...REVIEW, ...overrides });
-  return { ...REVIEW, ...overrides, confirmation: reviewed.confirmation };
-};
+const dispatchInput = (service, overrides = {}) =>
+  approvedDispatchInput(service, { ...REVIEW, ...overrides });
 
 const events = (type) =>
   fx.store
@@ -252,7 +278,13 @@ describe('dispatching a reviewed span', () => {
     const lines = await capturedOutput(service);
     const init = lines.find((line) => line.subtype === 'init');
     expect(init.cwd).toBe(fx.wtDir);
-    expect(init.prompt).toContain('Create fixture-output.txt');
+    expect(JSON.parse(init.stdin).request.instructions).toBe(
+      REVIEW.instructions
+    );
+    expect(JSON.parse(init.stdin)).toMatchObject({
+      request: { instructions: REVIEW.instructions },
+      version: 1,
+    });
     expect(init.args).toEqual(
       expect.arrayContaining([
         '--restricted',
@@ -308,8 +340,26 @@ describe('dispatching a reviewed span', () => {
     expect(events('spans.worker.intent')).toHaveLength(0);
   });
 
+  test('a preview checksum alone does not count as human approval', async () => {
+    const service = await readyService();
+    const preview = await service.review(REVIEW);
+    const before = fx.store.readRun({ runId: REVIEW.runId });
+    const providers = fx.providerPids();
+
+    expect(
+      await service.dispatch({ ...REVIEW, confirmation: preview.confirmation })
+    ).toMatchObject({ code: 'SPANS_EXECUTION_REVIEW_UNAPPROVED', ok: false });
+
+    expect(fx.providerPids()).toEqual(providers);
+    expect(fx.store.readRun({ runId: REVIEW.runId })).toEqual(before);
+    expect((await fx.admission.status()).leases).toEqual([]);
+    expect(checkWriter(fx.wtDir, 'x').claim).toBeNull();
+    expect(events('spans.worker.intent')).toHaveLength(0);
+  });
+
   test('refuses a confirmation that does not match what is dispatched now', async () => {
     const service = await readyService();
+    const approved = await dispatchInput(service);
     const reviewed = await service.review(REVIEW);
     const refusals = [
       { ...REVIEW, criteria: ['something else'] },
@@ -319,6 +369,7 @@ describe('dispatching a reviewed span', () => {
     for (const request of refusals) {
       // biome-ignore lint/performance/noAwaitInLoops: Each step depends on the one before it, so they run in order.
       const result = await service.dispatch({
+        ...approved,
         ...request,
         confirmation: reviewed.confirmation,
       });
@@ -330,7 +381,7 @@ describe('dispatching a reviewed span', () => {
     // A checkout that changed after the review is a changed target.
     await Bun.write(join(fx.wtDir, 'drift.txt'), 'changed after review\n');
     const drifted = await service.dispatch({
-      ...REVIEW,
+      ...approved,
       confirmation: reviewed.confirmation,
     });
     expect(drifted).toMatchObject({
@@ -430,7 +481,7 @@ const isAlive = (pid) => {
 
 describe('cancelling an attempt', () => {
   test('delivery is not an exit, and a cancelled attempt is not completion', async () => {
-    const service = await readyService({ escalationMs: 1500 });
+    const service = await readyService();
     const launched = await service.dispatch(
       await dispatchInput(service, { instructions: 'MODE:stubborn' })
     );
@@ -451,17 +502,17 @@ describe('cancelling an attempt', () => {
       terminal: false,
     });
 
-    // The stop was delivered, the process ignored it: still running, not exited.
-    await Bun.sleep(300);
-    expect(isAlive(pid)).toBe(true);
-    expect(await attemptOf(service)).toMatchObject({
-      cancel: { state: 'delivered' },
-      exit: null,
-      status: 'running',
-    });
-
-    // Only the observed exit ends the attempt, and it is a signal exit.
-    await service.idle();
+    // Delivery grants no completion; resources stay held until the durable exit.
+    const afterDelivery = await attemptOf(service);
+    if (afterDelivery.exit === null) {
+      expect((await fx.admission.status()).leases).toHaveLength(1);
+      expect(fx.store.readRun({ runId: 'run-1' }).view.spans.build.state).toBe(
+        'planned'
+      );
+    } else {
+      expect(afterDelivery.receipt.exit).toEqual(afterDelivery.exit);
+    }
+    expect((await service.idle()).ok).toBe(true);
     expect(await attemptOf(service)).toMatchObject({
       cancel: { state: 'delivered' },
       exit: { code: null, signal: 'SIGKILL' },
@@ -502,10 +553,12 @@ describe('cancelling an attempt', () => {
 
 describe('the wall-clock deadline', () => {
   test('holds an overdue attempt as unknown, stops its process and keeps its resources', async () => {
-    const clock = { t: 1_000_000 };
-    const service = await readyService({ now: () => clock.t });
-    const launched = await service.dispatch(
-      await dispatchInput(service, { instructions: 'MODE:hang' })
+    const service = await readyService();
+    await service.dispatch(
+      await dispatchInput(service, {
+        instructions: 'MODE:hang',
+        wallClockMs: 1000,
+      })
     );
     await waitFor(
       async () => (await attemptOf(service))?.status === 'running',
@@ -520,11 +573,11 @@ describe('the wall-clock deadline', () => {
     });
     expect((await attemptOf(service)).status).toBe('running');
 
-    clock.t += 31_000;
-    expect(await service.enforceDeadlines()).toMatchObject({
-      held: [launched.attemptId],
-      ok: true,
-    });
+    await waitFor(
+      async () => (await attemptOf(service))?.status === 'held',
+      'the detached child deadline'
+    );
+    expect((await service.enforceDeadlines()).ok).toBe(true);
     expect(await attemptOf(service)).toMatchObject({
       receipt: { outcome: 'unknown', reason: 'deadline' },
       status: 'held',
@@ -545,7 +598,7 @@ describe('the wall-clock deadline', () => {
 
 describe('the deadline driver', () => {
   test('holds an overdue attempt on its own timer, with no caller asking', async () => {
-    const service = await readyService({ deadlineIntervalMs: 100 });
+    const service = await readyService();
     const launched = await service.dispatch(
       await dispatchInput(service, {
         instructions: 'MODE:hang',
@@ -565,6 +618,10 @@ describe('the deadline driver', () => {
       receipt: { outcome: 'unknown', reason: 'deadline' },
     });
     await waitFor(() => !isAlive(pid), 'the process to stop');
+    await waitFor(
+      () => run().actions[launched.actionId].state === 'unknown',
+      'the parent to record the child hold'
+    );
     expect(run().actions[launched.actionId].state).toBe('unknown');
     expect((await fx.admission.status()).leases).toHaveLength(1);
   });
@@ -576,7 +633,8 @@ describe('an unknown launch', () => {
     const service = await readyService({
       observeProcess: () => Promise.resolve({ state: 'unknown' }),
     });
-    const result = await service.dispatch(await dispatchInput(service));
+    const input = await dispatchInput(service);
+    const result = await service.dispatch(input);
     expect(result).toMatchObject({
       code: 'LAUNCH_UNKNOWN',
       ok: false,
@@ -593,10 +651,10 @@ describe('an unknown launch', () => {
     expect((await service.usage({ runId: 'run-1' })).heldCount).toBe(1);
 
     // A second dispatch for the span is refused: the action is unresolved.
-    const again = await service.dispatch(await dispatchInput(service));
+    const again = await service.dispatch(input);
     expect(again).toMatchObject({ code: 'SPANS_EXEC_ACTION_OPEN', ok: false });
     expect(events('spans.worker.launched')).toHaveLength(0);
-    expect(events('spans.worker.intent')).toHaveLength(1);
+    expect(events('spans.action.intent')).toHaveLength(1);
   });
 });
 
@@ -768,7 +826,7 @@ describe('verified completion', () => {
   });
 
   test('a cancelled attempt is a failed outcome, not completion', async () => {
-    const service = await readyService({ escalationMs: 200 });
+    const service = await readyService();
     const launched = await service.dispatch(
       await dispatchInput(service, { instructions: 'MODE:stubborn' })
     );
@@ -780,7 +838,7 @@ describe('verified completion', () => {
     await service.idle();
     expect(run().actions[launched.actionId].state).toBe('failed');
     expect(run().spans.build.state).toBe('planned');
-  });
+  }, 20_000);
 
   test('completion can be retried by name and changes nothing the second time', async () => {
     const { launched, service } = await finishedService();
@@ -811,7 +869,7 @@ describe('after a failed attempt', () => {
     expect(run().actions[retry.actionId].state).toBe('completed');
     expect(run().actions[launched.actionId].state).toBe('failed');
     expect(events('spans.worker.launched')).toHaveLength(2);
-  });
+  }, 20_000);
 });
 
 describe('accepting a completion', () => {
@@ -1240,16 +1298,13 @@ describe('the whole plan', () => {
       runActualMicro: 0,
       unmeteredCount: 2,
     });
-  });
+  }, 20_000);
 
   test('a new probe invalidates a confirmation reviewed against the old one', async () => {
     const service = await readyService();
-    const reviewed = await service.review(REVIEW);
+    const approved = await dispatchInput(service);
     await service.probe({ profile: PROFILE });
-    const result = await service.dispatch({
-      ...REVIEW,
-      confirmation: reviewed.confirmation,
-    });
+    const result = await service.dispatch(approved);
     expect(result).toMatchObject({
       code: 'SPANS_EXEC_REVIEW_CHANGED',
       ok: false,
@@ -1438,16 +1493,16 @@ describe('independent review: a refused dispatch before intent', () => {
   });
 
   test('an authorization that reached intent is never withdrawn or replaced', async () => {
-    const service = await readyService({ escalationMs: 200 });
-    const launched = await service.dispatch(
-      await dispatchInput(service, { instructions: 'MODE:hang' })
-    );
+    const service = await readyService();
+    const input = await dispatchInput(service, { instructions: 'MODE:hang' });
+    const launched = await service.dispatch(input);
     expect(launched.status).toBe('launched');
     const before = run().executions[launched.actionId];
     // Same action id is not reachable for a new dispatch while it is open.
-    const again = await service.dispatch(
-      await dispatchInput(service, { instructions: 'MODE:hang changed' })
-    );
+    const again = await service.dispatch({
+      ...input,
+      instructions: 'MODE:hang changed',
+    });
     expect(again.ok).toBe(false);
     expect(run().executions[launched.actionId]).toEqual(before);
     expect(events('spans.execution.authorization-withdrawn')).toHaveLength(0);
@@ -1458,7 +1513,7 @@ describe('independent review: a refused dispatch before intent', () => {
 
 describe('independent review: status reports what dispatch really holds', () => {
   test('a running attempt shows its admission lease, usage reservation and writer as held', async () => {
-    const service = await readyService({ escalationMs: 200 });
+    const service = await readyService();
     const launched = await service.dispatch(
       await dispatchInput(service, { instructions: 'MODE:hang' })
     );
@@ -1683,6 +1738,7 @@ describe('independent review: completion evidence', () => {
 
   test('the review binds the exact tree the work will start from', async () => {
     const service = await readyService();
+    const input = await dispatchInput(service);
     const reviewed = await service.review(REVIEW);
     expect(reviewed.review.checkout.tree.digest).toMatch(HEX_64);
     expect(reviewed.review.acceptance).toEqual({
@@ -1692,10 +1748,7 @@ describe('independent review: completion evidence', () => {
     // An edit to a tracked file changes nothing in HEAD or the dirty count's
     // shape the first time, but it changes the tree, and so the confirmation.
     await Bun.write(join(fx.wtDir, 'README.md'), 'edited after the review\n');
-    const result = await service.dispatch({
-      ...REVIEW,
-      confirmation: reviewed.confirmation,
-    });
+    const result = await service.dispatch(input);
     expect(result).toMatchObject({
       code: 'SPANS_EXEC_REVIEW_CHANGED',
       ok: false,

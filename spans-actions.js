@@ -53,6 +53,7 @@ const REFUSALS = {
   PLAN_CHANGED: 'The plan version is not the current plan version.',
   PLAN_VERSION_INVALID: 'planVersion must be an integer or explicit string.',
   RUN_READ_FAILED: 'The run could not be read.',
+  RUN_READ_ONLY: 'Imported history cannot execute or accept actions.',
   RUN_VIEW_INVALID: 'The run view does not use the expected format.',
   SENSITIVE_VALUE: 'A value that looks like a secret was not stored.',
   SPAN_ACTION_OPEN: 'Another action on this span is not finished.',
@@ -268,6 +269,13 @@ async function loadRun(store, runId) {
     view = structuredClone(read.view);
   } catch {
     return refuse('RUN_VIEW_INVALID');
+  }
+  if (
+    view?.readOnly === true ||
+    view?.kind === 'imported' ||
+    view?.state === 'imported'
+  ) {
+    return refuse('RUN_READ_ONLY');
   }
   if (!validView(view, runId, read)) {
     return refuse('RUN_VIEW_INVALID');

@@ -1,7 +1,9 @@
 // Lazy filesystem boundary for the offline Spans planning facade. The archive
 // root is always supplied by the caller; this module has no default location.
 
-import { isAbsolute } from 'node:path';
+import fs from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import { createSpansPlanning } from './spans-planning.js';
 import { openSpansStore } from './spans-store.js';
 
@@ -60,6 +62,39 @@ function didClose(handle) {
   }
 }
 
+// Provision only Setu's default location, never arbitrary caller-supplied parents.
+export function prepareSpansDefaultParent(root) {
+  const home = homedir();
+  if (root !== join(home, '.local/share/setu/spans')) {
+    return;
+  }
+  let path = home;
+  for (const part of ['.local', 'share', 'setu']) {
+    path = join(path, part);
+    try {
+      fs.mkdirSync(path, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') {
+        throw error;
+      }
+    }
+    const stat = fs.lstatSync(path);
+    // biome-ignore lint/suspicious/noBitwiseOperators: POSIX permission masks require bitwise checks.
+    const unsafeMode = (stat.mode & 0o022) !== 0;
+    // biome-ignore lint/suspicious/noBitwiseOperators: Compare the exact private directory permissions.
+    const privateMode = (stat.mode & 0o777) === 0o700;
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      (typeof process.getuid === 'function' && stat.uid !== process.getuid()) ||
+      unsafeMode ||
+      (part === 'setu' && !privateMode)
+    ) {
+      throw new Error('Spans default parent is unsafe.');
+    }
+  }
+}
+
 function createLazyStore(root) {
   let reader;
   let writer;
@@ -112,7 +147,10 @@ function createLazyStore(root) {
       }
       try {
         closeReader();
-        writer ??= openSpansStore({ root });
+        if (!writer) {
+          prepareSpansDefaultParent(root);
+          writer = openSpansStore({ root });
+        }
         return writer.commitRun(request);
       } catch {
         return unavailableResult;

@@ -16,6 +16,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setFixtureTimesNs } from './dependency-file-fixture-times.js';
 import { createDependencyFileNative } from './dependency-file-native.js';
 import { dependencyObjectKey } from './dependency-file-object.js';
 import { openDependencyFileStore } from './dependency-file-store.js';
@@ -847,11 +848,7 @@ test('real G1 factory adapter stores and stages eligible files through the host 
         }
         if (args[0] === 'restore-times') {
           const filePath = join(args[1], ...args[2].split('/'));
-          utimesSync(
-            filePath,
-            new Date(Number(BigInt(args[3])) / 1_000_000),
-            new Date(Number(BigInt(args[4])) / 1_000_000)
-          );
+          setFixtureTimesNs(filePath, args[3], args[4]);
           return {
             stderr: '',
             stdout: `${JSON.stringify({

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { Component, h, options, type VNode } from 'preact';
 import { createLinksService } from './links-service.js';
 import { LinksPage, MessageDetail } from './portal/components/links-page';
-import { linksTarget, type LinksMessage } from './portal/links-read';
+import { type LinksMessage, linksTarget } from './portal/links-read';
 
 const originalFetch = globalThis.fetch;
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
@@ -111,14 +111,8 @@ function detailButtons(
     target,
   });
   return {
-    acknowledge: find(
-      tree,
-      (vnode) => vnode.props?.children === 'Acknowledge'
-    ),
-    cancel: find(
-      tree,
-      (vnode) => vnode.props?.children === 'Cancel message'
-    ),
+    acknowledge: find(tree, (vnode) => vnode.props?.children === 'Acknowledge'),
+    cancel: find(tree, (vnode) => vnode.props?.children === 'Cancel message'),
   };
 }
 
@@ -146,12 +140,12 @@ test('message actions mirror engine eligibility and require the current recipien
     detailButtons('handed-off', { ...first, sessionId: second.sessionId })
       .acknowledge?.props.disabled
   ).toBe(true);
-  expect(detailButtons('handed-off', first, null, true).acknowledge?.props.disabled).toBe(
-    true
-  );
-  expect(detailButtons('queued', first, null, true).cancel?.props.disabled).toBe(
-    true
-  );
+  expect(
+    detailButtons('handed-off', first, null, true).acknowledge?.props.disabled
+  ).toBe(true);
+  expect(
+    detailButtons('queued', first, null, true).cancel?.props.disabled
+  ).toBe(true);
 });
 
 test('message action busy labels match their current mutation names', () => {
@@ -183,7 +177,7 @@ test('message action busy labels match their current mutation names', () => {
 
 test('a send does not start until its recovery key is saved, then retries after storage recovers', async () => {
   const values = installSessionStorage();
-  let storageAvailable = false;
+  const storageAvailable = { current: false };
   let posted = 0;
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
@@ -192,7 +186,7 @@ test('a send does not start until its recovery key is saved, then retries after 
         getItem: (key: string) => values.get(key) ?? null,
         removeItem: (key: string) => values.delete(key),
         setItem: (key: string, value: string) => {
-          if (!storageAvailable) {
+          if (Boolean(storageAvailable.current) === false) {
             throw new Error('storage unavailable');
           }
           values.set(key, value);
@@ -219,13 +213,19 @@ test('a send does not start until its recovery key is saved, then retries after 
   });
   await flush();
   tree = page.render();
-  find(tree, (vnode) => vnode.props?.children === 'Send message')?.props.onClick();
+  find(
+    tree,
+    (vnode) => vnode.props?.children === 'Send message'
+  )?.props.onClick();
   await flush();
   expect(posted).toBe(0);
   expect(JSON.stringify(page.render())).toContain('This send was not started');
-  storageAvailable = true;
+  storageAvailable.current = true;
   tree = page.render();
-  find(tree, (vnode) => vnode.props?.children === 'Send message')?.props.onClick();
+  find(
+    tree,
+    (vnode) => vnode.props?.children === 'Send message'
+  )?.props.onClick();
   await flush();
   expect(posted).toBe(1);
 });
@@ -245,7 +245,9 @@ test('a recovery key remains available when confirmed-send cleanup cannot remove
     },
   });
   globalThis.fetch = (() =>
-    Promise.resolve(Response.json({ ok: true, state: 'queued' }))) as typeof fetch;
+    Promise.resolve(
+      Response.json({ ok: true, state: 'queued' })
+    )) as typeof fetch;
   const page = renderWithHooks();
   let tree = page.render();
   const picker = find(
@@ -261,7 +263,10 @@ test('a recovery key remains available when confirmed-send cleanup cannot remove
   });
   await flush();
   tree = page.render();
-  find(tree, (vnode) => vnode.props?.children === 'Send message')?.props.onClick();
+  find(
+    tree,
+    (vnode) => vnode.props?.children === 'Send message'
+  )?.props.onClick();
   await flush();
   expect(values.get('setu-links-pending-send/v1')).toContain('keep this draft');
   expect(JSON.stringify(page.render())).toContain('could not be cleared');

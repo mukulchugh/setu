@@ -683,7 +683,10 @@ describe('projection through the service', () => {
       enginePath: ENGINE,
     });
     expect((await send(firstClient, 'real-history-1')).ok).toBe(true);
-    const service = createLinksHistoryService({ client: firstClient, spansRoot });
+    const service = createLinksHistoryService({
+      client: firstClient,
+      spansRoot,
+    });
     expect((await approveOver(service)).ok).toBe(true);
     expect(await service.project({ maxBatches: 5 })).toMatchObject({
       complete: true,
@@ -699,14 +702,21 @@ describe('projection through the service', () => {
     ]);
     const projectedIds = projected
       .filter(
-        (event) => event.type === 'links.message' || event.type === 'links.status'
+        (event) =>
+          event.type === 'links.message' || event.type === 'links.status'
       )
       .map((event) => event.eventId);
-    const restarted = createLinksHistoryService({ client: firstClient, spansRoot });
+    const restarted = createLinksHistoryService({
+      client: firstClient,
+      spansRoot,
+    });
     expect((await restarted.project({ maxBatches: 5 })).complete).toBe(true);
     expect(
       eventsOf(spansRoot)
-        .filter((event) => event.type === 'links.message' || event.type === 'links.status')
+        .filter(
+          (event) =>
+            event.type === 'links.message' || event.type === 'links.status'
+        )
         .map((event) => event.eventId)
     ).toEqual(projectedIds);
 
@@ -716,11 +726,18 @@ describe('projection through the service', () => {
     });
     expect((await send(secondClient, 'real-history-2')).ok).toBe(true);
     expect(
-      (await createLinksHistoryService({ client: secondClient, spansRoot }).project({
-        maxBatches: 5,
-      })).complete
+      (
+        await createLinksHistoryService({
+          client: secondClient,
+          spansRoot,
+        }).project({
+          maxBatches: 5,
+        })
+      ).complete
     ).toBe(true);
-    expect(eventsOf(spansRoot).filter((event) => event.type === 'links.message')).toHaveLength(2);
+    expect(
+      eventsOf(spansRoot).filter((event) => event.type === 'links.message')
+    ).toHaveLength(2);
   });
 });
 

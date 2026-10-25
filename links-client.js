@@ -6,16 +6,17 @@
 const PROTOCOL = 'setu-links/1';
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_REPLY_BYTES = 2 * 1024 * 1024;
+const PEER_ORIGIN_PATTERN = /^peer:[0-9a-f]{64}$/;
 // What to do when a mutation's outcome is not known. Only a send has an idempotency key to repeat; the
 // others are resolved by looking at the message, and none of them ever requeues anything by itself.
 const RECOVERY = {
   acknowledge: 'Check the message status; acknowledging again is safe.',
+  attention_send:
+    'Check the attention list, or repeat the request with the same idempotency key.',
   binding_invalidate:
     'Repeating it is safe: an invalidation at the same generation changes nothing more.',
   binding_publish:
     'Repeating it is safe: a publish at an unchanged generation only refreshes its validity.',
-  attention_send:
-    'Check the attention list, or repeat the request with the same idempotency key.',
   cancel: 'Check the message status; cancelling again is safe.',
   claim:
     'Anything it claimed is now handoff-unknown and is not delivered again unless redelivery is explicitly requested. Check the message status.',
@@ -73,7 +74,7 @@ function unavailable(op, reason) {
 // result is not is as untrustworthy as one with a wrong envelope.
 const isText = (value) => typeof value === 'string';
 const isCanonicalOrigin = (value) =>
-  value === 'local' || /^peer:[0-9a-f]{64}$/.test(value);
+  value === 'local' || PEER_ORIGIN_PATTERN.test(value);
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const flag = (value) => typeof value === 'boolean';
 const maybe = (check) => (value) => value === null || check(value);
@@ -176,12 +177,23 @@ const messageFields = {
 // History's extended list was introduced before transport added the local-only
 // locator and project fields, so its baseline wire reply remains accepted.
 const historyMessageFields = {
-  attempt_id: maybe(isText), attempts: count, created_at: count,
-  expires_at: count, kind: isText, message_id: isText, reason: maybe(isText),
-  recipient: messageFields.recipient, redeliveries: count, reply_to: maybe(isText),
-  run_hint: maybe(isText), sender: exactly({ kind: isText }), size: count,
-  span_hint: maybe(isText), state: (value) => DELIVERY_STATES.has(value),
-  stored_state: (value) => DELIVERY_STATES.has(value), updated_at: count,
+  attempt_id: maybe(isText),
+  attempts: count,
+  created_at: count,
+  expires_at: count,
+  kind: isText,
+  message_id: isText,
+  reason: maybe(isText),
+  recipient: messageFields.recipient,
+  redeliveries: count,
+  reply_to: maybe(isText),
+  run_hint: maybe(isText),
+  sender: exactly({ kind: isText }),
+  size: count,
+  span_hint: maybe(isText),
+  state: (value) => DELIVERY_STATES.has(value),
+  stored_state: (value) => DELIVERY_STATES.has(value),
+  updated_at: count,
 };
 // `observed_match` is the engine's own answer to "is this message addressed to the conversation I passed as
 // `observed`", true or false, or null when none was passed. Callers must ask the engine rather than compare tuples:
@@ -341,16 +353,25 @@ const RESULT_SHAPES = {
   }),
   identity: exactly({ peer_id: isText }),
   list: either(
-    exactly({ messages: listOf(exactly(messageFields, optionalMessageFields)) }),
+    exactly({
+      messages: listOf(exactly(messageFields, optionalMessageFields)),
+    }),
     exactly({ messages: listOf(exactly(historyMessageFields)) }),
     exactly({
       has_more: flag,
-      messages: listOf(exactly({ ...messageFields, origin: isCanonicalOrigin }, optionalMessageFields)),
+      messages: listOf(
+        exactly(
+          { ...messageFields, origin: isCanonicalOrigin },
+          optionalMessageFields
+        )
+      ),
       next_after: maybe(isText),
     }),
     exactly({
       has_more: flag,
-      messages: listOf(exactly({ ...historyMessageFields, origin: isCanonicalOrigin })),
+      messages: listOf(
+        exactly({ ...historyMessageFields, origin: isCanonicalOrigin })
+      ),
       next_after: maybe(isText),
     })
   ),

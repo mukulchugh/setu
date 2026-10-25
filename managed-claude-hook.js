@@ -50,6 +50,7 @@ export function claudeSettings({ hookPath }) {
 export function claudeHookProgram(ingressUrl) {
   const budget = PROMPT_HOOK_BUDGET;
   return `#!/usr/bin/env bun
+import { writeFile } from 'node:fs';
 const event = process.argv[2];
 const token = process.env.SETU_SESSION_TOKEN;
 if (!/^[A-Za-z0-9_-]{16,128}$/.test(token ?? '')) process.exit(0);
@@ -84,7 +85,8 @@ try {
   const answer = await post({provider:'claude-code', launchToken:token, payload:identity}, Math.min(${budget.claimMs}, left()));
   const mail = JSON.parse(await answer.text());
   if (mail?.ok === true && typeof mail.attemptId === 'string' && typeof mail.text === 'string' && mail.text.length > 0 && Buffer.byteLength(mail.text) <= ${budget.maxTextBytes}) {
-    await new Promise((resolve, reject) => process.stdout.write(mail.text, (error) => error ? reject(error) : resolve()));
+    // Bun 1.3.4 stdout.write can report success on a closed pipe; require the descriptor write to finish.
+    await new Promise((resolve, reject) => writeFile(1, mail.text, (error) => error ? reject(error) : resolve()));
     // The context is written. Only now is that reported, so a lost report leaves the mail unknown, never queued.
     await post({provider:'claude-code', launchToken:token, payload:identity, report:{attemptId:mail.attemptId}}, Math.min(${budget.reportMs}, left()));
   }

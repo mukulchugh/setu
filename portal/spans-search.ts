@@ -14,7 +14,29 @@ export interface SpansSearchHit {
   snippet: string;
 }
 
+export interface SpansSearchCacheSource {
+  corpusGeneration: string | null;
+  corpusHash: string | null;
+  parserVersion: string | null;
+  toolVersion: string | null;
+}
+
+export type SpansSearchCacheEvidence =
+  | { kind: 'unavailable' }
+  | {
+      ageMs: number | null;
+      createdAt: number | null;
+      hit: boolean;
+      key: string | null;
+      kind: 'available';
+      missReason: string | null;
+      persisted: boolean | 'unknown';
+      persistenceReason: string | null;
+      source: SpansSearchCacheSource | null;
+    };
+
 export interface SpansSearchResult {
+  cache?: SpansSearchCacheEvidence;
   coverage: SpansSearchCoverage;
   generation: number;
   hasMore: boolean;
@@ -36,6 +58,20 @@ export interface SpansSearchRequest {
 const MAX_QUERY_LENGTH = 512;
 const MAX_PAGE_LIMIT = 100;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CACHE_KEY_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const CACHE_REASON_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+const CACHE_TEXT_LIMIT = 160;
+const CACHE_DEPENDENCY_LIMIT = 64;
+const MAX_DATE_MILLISECONDS = 8_640_000_000_000_000;
+const hasNoControlCharacters = (value: string): boolean => {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) {
+      return false;
+    }
+  }
+  return true;
+};
 
 export class SpansSearchReadError extends Error {
   readonly code: string;
@@ -55,8 +91,22 @@ const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const count = (value: unknown): value is number =>
   Number.isSafeInteger(value) && Number(value) >= 0;
+const milliseconds = (value: unknown): value is number =>
+  typeof value === 'number' &&
+  Number.isFinite(value) &&
+  value >= 0 &&
+  value <= Number.MAX_SAFE_INTEGER;
 const identifier = (value: unknown): value is string =>
   typeof value === 'string' && IDENTIFIER_PATTERN.test(value);
+const cacheCode = (value: unknown): string | null =>
+  typeof value === 'string' && CACHE_REASON_PATTERN.test(value) ? value : null;
+const cacheText = (value: unknown): string | null =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= CACHE_TEXT_LIMIT &&
+  hasNoControlCharacters(value)
+    ? value
+    : null;
 const unavailable = (cause?: unknown) =>
   new Error(
     'History search response is unavailable.',
@@ -69,6 +119,90 @@ export function canAcceptSpansSearchResponse(
   signal: AbortSignal
 ): boolean {
   return responseKey === currentKey && !signal.aborted;
+}
+
+function decodeCacheSource(value: unknown): SpansSearchCacheSource | null {
+  if (!object(value)) {
+    return null;
+  }
+  const versions = object(value.versions) ? value.versions : null;
+  let corpus: Record<string, unknown> | null = null;
+  if (
+    Array.isArray(value.dependencies) &&
+    value.dependencies.length <= CACHE_DEPENDENCY_LIMIT
+  ) {
+    for (const dependency of value.dependencies) {
+      if (object(dependency) && dependency.kind === 'corpus') {
+        corpus = dependency;
+        break;
+      }
+    }
+  }
+  const source = {
+    corpusGeneration: cacheText(corpus?.generation),
+    corpusHash:
+      typeof corpus?.digest === 'string' &&
+      CACHE_KEY_PATTERN.test(corpus.digest)
+        ? corpus.digest
+        : null,
+    parserVersion: cacheText(versions?.parser),
+    toolVersion: cacheText(versions?.tool),
+  };
+  return Object.values(source).some((field) => field !== null) ? source : null;
+}
+
+/** Decode optional cache evidence without making it part of search validity. */
+function decodeSpansSearchCacheEvidence(
+  value: unknown,
+  corpusGeneration: string
+): SpansSearchCacheEvidence {
+  try {
+    if (!object(value)) {
+      return { kind: 'unavailable' };
+    }
+    const metadata = value;
+    if (typeof metadata.hit !== 'boolean') {
+      return { kind: 'unavailable' };
+    }
+    const ageValue = metadata.ageMs;
+    const persistedValue = metadata.persisted;
+    const createdAt =
+      milliseconds(metadata.createdAt) &&
+      metadata.createdAt <= MAX_DATE_MILLISECONDS
+        ? metadata.createdAt
+        : null;
+    const source = decodeCacheSource(metadata.manifest);
+    const key =
+      typeof metadata.key === 'string' && CACHE_KEY_PATTERN.test(metadata.key)
+        ? metadata.key
+        : null;
+    const complete = Boolean(
+      key &&
+        source?.corpusHash &&
+        source?.parserVersion &&
+        source?.toolVersion &&
+        source.corpusGeneration === corpusGeneration
+    );
+    if (metadata.hit && (!complete || persistedValue !== true)) {
+      return { kind: 'unavailable' };
+    }
+    return {
+      ageMs: milliseconds(ageValue) ? ageValue : null,
+      createdAt,
+      hit: metadata.hit,
+      key,
+      kind: 'available',
+      missReason: cacheCode(metadata.missReason),
+      persisted:
+        persistedValue === false || (persistedValue === true && complete)
+          ? persistedValue
+          : 'unknown',
+      persistenceReason: cacheCode(metadata.persistenceReason),
+      source: source?.corpusGeneration === corpusGeneration ? source : null,
+    };
+  } catch {
+    return { kind: 'unavailable' };
+  }
 }
 
 function validateRequest(request: SpansSearchRequest) {
@@ -177,6 +311,14 @@ export function decodeSpansSearch(
     throw unavailable();
   }
   return {
+    ...(Object.hasOwn(value, 'cache')
+      ? {
+          cache: decodeSpansSearchCacheEvidence(
+            value.cache,
+            `${coverageGeneration}:${indexedSequence}:${latestSequence}`
+          ),
+        }
+      : {}),
     coverage: {
       complete,
       generation: coverageGeneration,

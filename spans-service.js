@@ -23,6 +23,8 @@ const artifactIdPattern = /^sha256:[a-f0-9]{64}$/;
 // never ships a run's actions, history or checkpoint bodies.
 const summaryFields = [
   'goal',
+  'kind',
+  'readOnly',
   'owner',
   'state',
   'project',

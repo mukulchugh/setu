@@ -16,8 +16,10 @@ import { runCli } from './cli.js';
 import { handleMcpRequest, initMcpServer } from './mcp-server.js';
 import { dispatchPortalResourceRoute } from './portal-resource-services.js';
 import { PORTAL_API_ROUTES } from './portal-routes.js';
+import { createResourceAdmission } from './resource-admission.js';
 import { createSpansDrafts } from './spans-drafts.js';
 import { openSpansStore } from './spans-store.js';
+import { createWorkspaceState } from './workspace-state.js';
 
 // Synthetic fixtures only: temporary roots, fake services, fake stores. No
 // portal, provider or listening server is ever started, and no real archive
@@ -788,9 +790,21 @@ const indexPage = (indexed, indexedSequence, hasMore) => ({
   ok: true,
 });
 
-async function indexCli(argv, store) {
+async function indexCli(
+  argv,
+  store,
+  archiveWrite = async (_request, effect) => ({
+    ok: true,
+    value: await effect(),
+  })
+) {
   const run = await cli(argv, {
-    extra: { localCommand: { loadSpansStore: store.module } },
+    extra: {
+      localCommand: {
+        loadSpansStore: store.module,
+        spansArchiveWrite: archiveWrite,
+      },
+    },
   });
   const printed = run.output.length ? run.output : run.errors;
   return { ...run, result: JSON.parse(printed.join('\n')) };
@@ -809,7 +823,7 @@ test('index runs initialize, bounded pages and close once, then reports full cov
   expect(run.status).toBe(0);
   expect(run.requests).toEqual([]);
   expect(store.log).toEqual([
-    ['open', { root }],
+    ['open', { create: false, root }],
     ['initialize'],
     ['page', { limit: 50 }],
     ['page', { limit: 50 }],
@@ -1038,7 +1052,10 @@ function cliHome() {
   // A recent check time keeps the optional update nudge from starting a fetch.
   writeFileSync(
     join(home, '.setu.json'),
-    JSON.stringify({ lastUpdateCheck: Date.now() })
+    JSON.stringify({
+      lastUpdateCheck: Date.now(),
+      workspace: tempRoot('spans-index-workspace-'),
+    })
   );
   return home;
 }
@@ -1154,3 +1171,90 @@ test('subprocess: index builds the derived search on an explicit fixture archive
   }
   expect(readdirSync(home).sort()).toEqual(listing);
 }, 60_000);
+
+test('index admission refusal never opens the archive or advances a page', async () => {
+  const root = archiveRoot();
+  const store = fakeSpansStoreModule({ pages: [indexPage(1, 1, false)] });
+  const run = await indexCli(
+    ['spans', 'index', '--root', root],
+    store,
+    async () => ({ code: 'SPANS_ARCHIVE_CAPACITY_REACHED', ok: false })
+  );
+  expect(run.status).toBe(1);
+  expect(run.result.code).toBe('SPANS_ARCHIVE_CAPACITY_REACHED');
+  expect(store.log).toEqual([]);
+});
+
+test('index checks capacity again before each page and preserves completed progress', async () => {
+  const root = archiveRoot();
+  const store = fakeSpansStoreModule({ pages: [indexPage(1, 1, true)] });
+  let calls = 0;
+  const run = await indexCli(
+    ['spans', 'index', '--root', root],
+    store,
+    async (request, effect) => {
+      expect(request.root).toBe(root);
+      expect(request.maxBytes).toBeGreaterThan(0);
+      calls += 1;
+      return calls === 3
+        ? { code: 'SPANS_ARCHIVE_CAPACITY_REACHED', ok: false }
+        : { ok: true, value: await effect() };
+    }
+  );
+  expect(run.status).toBe(1);
+  expect(run.result).toMatchObject({
+    code: 'SPANS_ARCHIVE_CAPACITY_REACHED',
+    indexed: 1,
+    pages: 1,
+  });
+  expect(store.log.filter(([name]) => name === 'page')).toHaveLength(1);
+  expect(store.log.at(-1)).toEqual(['close']);
+});
+
+test('subprocess: index honors another process archive reservation without opening SQLite', async () => {
+  const home = cliHome();
+  const configPath = join(home, '.setu.json');
+  const { workspace } = JSON.parse(readFileSync(configPath, 'utf8'));
+  const root = archiveRoot();
+  const state = createWorkspaceState({
+    configPath,
+    setuDir: join(home, '.setu'),
+    workspaceRoot: workspace,
+  });
+  const admission = createResourceAdmission({
+    hostHealth: async () => ({
+      availableBytes: 30 * 1024 ** 3,
+      state: 'ready',
+    }),
+    state,
+  });
+  const target = { name: 'fixture', repo: 'fixture' };
+  const reserved = await admission.admit({
+    kind: 'headless-run',
+    operationId: 'index-reservation',
+    spansArchiveReservation: {
+      budgetBytes: 5 * 1024 ** 3,
+      reservedBytes: 5 * 1024 ** 3 - 1024 * 1024,
+      root,
+    },
+    spansBinding: {
+      actionId: 'action',
+      attemptId: 'attempt',
+      generation: 0,
+      runId: 'run',
+      spanId: 'span',
+      target,
+    },
+    target,
+  });
+  expect(reserved.ok).toBe(true);
+  const before = readFileSync(join(root, 'spans.sqlite3'));
+  const run = runCliProcess(home, ['spans', 'index', '--root', root, '--json']);
+  expect(run.status).toBe(1);
+  expect(JSON.parse(run.stdout || run.stderr).code).toBe(
+    'SPANS_ARCHIVE_CAPACITY_REACHED'
+  );
+  expect(readFileSync(join(root, 'spans.sqlite3'))).toEqual(before);
+  expect(readdirSync(root)).toEqual(['spans.sqlite3']);
+  expect((await admission.status()).leases).toHaveLength(1);
+});

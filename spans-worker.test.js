@@ -182,6 +182,9 @@ function fakeSpool(log) {
       if (fault === 'fail') {
         return { code: 'SPOOL_FULL', ok: false };
       }
+      if (fault === 'limit') {
+        return { code: 'SPOOL_LIMIT', ok: false };
+      }
       if (fault === 'retry') {
         return { ok: false, retryable: true };
       }
@@ -1169,7 +1172,43 @@ test('a spool failure holds the attempt with an explicit capture gap and stops c
   }
 });
 
-test('reaching the per-attempt capture limit holds instead of dropping', async () => {
+test('a first capture failure finalizes the known empty prefix before holding', async () => {
+  const h = harness();
+  const started = await begin(h);
+  h.spool.appendFault = () => 'fail';
+
+  const failed = await h.worker.captureChunk({
+    ...refOf(started),
+    seq: 0,
+    text: 'not persisted\n',
+  });
+
+  expect(failed).toMatchObject({
+    code: 'CAPTURE_FAILED',
+    held: true,
+    ok: false,
+  });
+  expect(h.spool.finalized).toHaveLength(1);
+  expect(h.spool.finalized[0]).toMatchObject({
+    bytes: 0,
+    chunks: 0,
+    complete: false,
+    texts: [],
+  });
+  expect(h.store.attempt()).toMatchObject({
+    capture: {
+      bytes: 0,
+      chunks: 0,
+      complete: false,
+      countsConfirmed: true,
+      gap: { fromSeq: 0, reason: 'capture-failed' },
+    },
+    status: 'held',
+  });
+  expect(h.store.attempt().capture.artifactId).toMatch(ARTIFACT_ID);
+});
+
+test('capture exhaustion records exact stop intent and result before holding the gap', async () => {
   const cases = [
     [{ maxAttemptChunks: 2 }, ['a\n', 'b\n', 'c\n']],
     [{ maxAttemptBytes: 150 }, [`${'1'.repeat(99)}\n`, `${'2'.repeat(99)}\n`]],
@@ -1187,6 +1226,7 @@ test('reaching the per-attempt capture limit holds instead of dropping', async (
       results.push(result);
     }
     expect(results.at(-1)).toMatchObject({
+      cancel: 'delivered',
       code: 'SPOOL_LIMIT',
       held: true,
       ok: false,
@@ -1200,7 +1240,100 @@ test('reaching the per-attempt capture limit holds instead of dropping', async (
       fromSeq: texts.length - 1,
       reason: 'spool-limit',
     });
+    expect(h.store.events.map((event) => event.type).slice(-3)).toEqual([
+      TYPES.cancelRequested,
+      TYPES.cancelDelivered,
+      TYPES.held,
+    ]);
+    expect(h.launcher.stops).toHaveLength(1);
+    expect(h.launcher.stops[0]).toMatchObject({
+      binding: bindingInput(),
+      processStartId: 'proc-1',
+    });
+    expect(h.log.indexOf('stop')).toBeLessThan(
+      h.log.lastIndexOf(`commit:${TYPES.held}`)
+    );
   }
+});
+
+test('capture exhaustion keeps unknown stop outcomes held without retrying', async () => {
+  for (const mode of ['missing', 'throw', 'unconfirmed']) {
+    const h = harness({
+      limits: { maxAttemptChunks: 1 },
+      withStop: mode !== 'missing',
+    });
+    // biome-ignore lint/performance/noAwaitInLoops: Each uncertainty case needs a fresh worker and durable attempt state.
+    const started = await begin(h);
+    if (mode === 'throw') {
+      h.launcher.stopBehavior = () => {
+        throw new Error('/private/provider/detail');
+      };
+    } else if (mode === 'unconfirmed') {
+      h.launcher.stopBehavior = () => ({ ok: false });
+    }
+    await h.worker.captureChunk({ ...refOf(started), seq: 0, text: 'kept\n' });
+    const result = await settled(
+      h.worker.captureChunk({ ...refOf(started), seq: 1, text: 'gap\n' })
+    );
+    expect(result).not.toBe('DEADLOCK');
+    expect(result).toMatchObject({
+      cancel: 'unknown',
+      code: 'SPOOL_LIMIT',
+      held: true,
+      ok: false,
+    });
+    expect(h.store.events.map((event) => event.type).slice(-3)).toEqual([
+      TYPES.cancelRequested,
+      TYPES.cancelUnknown,
+      TYPES.held,
+    ]);
+    expect(h.store.attempt()).toMatchObject({
+      cancel: { state: 'unknown' },
+      status: 'held',
+    });
+    expect(h.launcher.stops).toHaveLength(mode === 'missing' ? 0 : 1);
+    expect(
+      await h.worker.captureChunk({ ...refOf(started), seq: 1, text: 'gap\n' })
+    ).toMatchObject({ code: 'ATTEMPT_NOT_ACTIVE' });
+    expect(h.launcher.stops).toHaveLength(mode === 'missing' ? 0 : 1);
+  }
+});
+
+test('an explicit spool SPOOL_LIMIT response follows the same stop-before-hold path', async () => {
+  const h = harness();
+  const started = await begin(h);
+  h.spool.appendFault = (_payload, count) =>
+    count === 1 ? 'limit' : undefined;
+  const result = await h.worker.captureChunk({
+    ...refOf(started),
+    seq: 0,
+    text: 'not persisted\n',
+  });
+  expect(result).toMatchObject({
+    cancel: 'delivered',
+    code: 'SPOOL_LIMIT',
+    held: true,
+    ok: false,
+  });
+  expect(h.spool.chunks).toHaveLength(0);
+  expect(h.store.events.map((event) => event.type).slice(-3)).toEqual([
+    TYPES.cancelRequested,
+    TYPES.cancelDelivered,
+    TYPES.held,
+  ]);
+  expect(h.launcher.stops).toHaveLength(1);
+});
+
+test('generation drift at capture exhaustion prevents stop and retains the open record', async () => {
+  const h = harness({ limits: { maxAttemptChunks: 1 } });
+  const started = await begin(h);
+  await h.worker.captureChunk({ ...refOf(started), seq: 0, text: 'kept\n' });
+  h.store.bumpGeneration();
+  expect(
+    await h.worker.captureChunk({ ...refOf(started), seq: 1, text: 'gap\n' })
+  ).toMatchObject({ code: 'SPOOL_LIMIT', held: false, ok: false });
+  expect(h.launcher.stops).toHaveLength(0);
+  expect(h.store.attempt()).toMatchObject({ cancel: null, status: 'running' });
 });
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1379,26 @@ test('the deadline turns into an explicit held unknown with a receipt, without s
   expect(await h.worker.enforceDeadline(refOf(started))).toMatchObject({
     code: 'ATTEMPT_NOT_ACTIVE',
   });
+});
+
+test('a deadline hold records exact stopped-process exit without accepting the work', async () => {
+  const h = harness();
+  const started = await begin(h);
+  expect((await h.worker.cancel(refOf(started))).cancel).toBe('delivered');
+  h.clock.time = 6000;
+  expect((await h.worker.enforceDeadline(refOf(started))).held).toBe(true);
+  expect(
+    await h.launcher.sink.exit({ code: null, signal: 'SIGTERM' })
+  ).toMatchObject({
+    ok: true,
+    processExited: true,
+    status: 'held',
+  });
+  const attempt = h.store.attempt();
+  expect(attempt.exit).toEqual({ code: null, signal: 'SIGTERM' });
+  expect(attempt.capture.complete).toBe(false);
+  expect(attempt.receipt.reason).toBe('deadline');
+  expectInert(attempt.receipt);
 });
 
 test('an unusable clock neither starts nor expires anything', async () => {
@@ -1703,9 +1856,11 @@ test('cancel is unavailable without a stop adapter or a recorded process start',
   const started = await begin(noStop);
   const commits = noStop.store.commitCount;
   expect(await noStop.worker.cancel(refOf(started))).toMatchObject({
-    code: 'CANCEL_UNSUPPORTED',
+    cancel: 'unknown',
+    code: 'CANCEL_UNKNOWN',
+    unknown: true,
   });
-  expect(noStop.store.commitCount).toBe(commits);
+  expect(noStop.store.commitCount).toBe(commits + 2);
 
   const unknown = harness();
   unknown.launcher.behavior = () => Promise.reject(new Error('lost'));
@@ -1957,6 +2112,50 @@ test('the real event and model store carries the full lifecycle and survives reo
   expect(
     reopened.readRun({ runId: 'run-1' }).view.attempts['attempt-2'].status
   ).toBe('held');
+});
+
+test('the real store persists stop intent and exact process result before capture hold', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'spans-worker-'));
+  roots.push(root);
+  const store = openReal(root);
+  expect(
+    store.commitRun({
+      events: [],
+      expectedGeneration: 0,
+      expectedRevision: 0,
+      runId: 'run-1',
+      view: initialView(0),
+    }).ok
+  ).toBe(true);
+  const h = harness({
+    limits: { maxAttemptChunks: 1 },
+    store,
+  });
+  const started = await begin(h, 1, { generation: 0 });
+  await h.worker.captureChunk({ ...refOf(started), seq: 0, text: 'kept\n' });
+  const held = await h.worker.captureChunk({
+    ...refOf(started),
+    seq: 1,
+    text: 'gap\n',
+  });
+  expect(held).toMatchObject({ cancel: 'delivered', code: 'SPOOL_LIMIT' });
+  expect(h.launcher.stops).toMatchObject([
+    {
+      binding: bindingInput(1, { generation: 0 }),
+      processStartId: 'proc-1',
+    },
+  ]);
+  const run = store.readRun({ runId: 'run-1' });
+  expect(run.view.attempts['attempt-1']).toMatchObject({
+    cancel: { state: 'delivered' },
+    status: 'held',
+  });
+  const { events } = store.readEvents({ runId: 'run-1' });
+  expect(events.map((event) => event.type).slice(-3)).toEqual([
+    TYPES.cancelRequested,
+    TYPES.cancelDelivered,
+    TYPES.held,
+  ]);
 });
 
 test('the real store fences a stale generation and the attempt stays unresolved', async () => {

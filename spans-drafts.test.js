@@ -372,3 +372,42 @@ describe('offline Spans drafts', () => {
     }
   });
 });
+
+test.each([
+  { readOnly: true, state: 'imported' },
+  { kind: 'imported', readOnly: false, state: 'planned' },
+  { kind: 'imported', state: 'importing' },
+])('imported marker %j prevents plan revision', (marker) => {
+  const { drafts, store } = fixture();
+  try {
+    const input = draft('imported-history');
+    const created = drafts.createRun(input);
+    expect(created.ok).toBe(true);
+    const view = { ...created.run, ...marker };
+    expect(
+      store.commitRun({
+        events: [],
+        expectedGeneration: 0,
+        expectedRevision: 1,
+        runId: input.runId,
+        view,
+      }).ok
+    ).toBe(true);
+    expect(
+      drafts.revisePlan({
+        expectedGeneration: 0,
+        expectedRevision: 2,
+        goal: 'Do work',
+        runId: input.runId,
+        spans: input.spans,
+      })
+    ).toMatchObject({ code: 'SPANS_DRAFT_READ_ONLY', ok: false });
+    expect(store.readRun({ runId: input.runId }).revision).toBe(2);
+    expect(
+      store.listRuns({ phase: 'past' }).runs.map((row) => row.runId)
+    ).toEqual([input.runId]);
+    expect(store.listRuns({ phase: 'planned' }).runs).toEqual([]);
+  } finally {
+    store.close();
+  }
+});

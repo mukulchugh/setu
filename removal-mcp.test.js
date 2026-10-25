@@ -48,9 +48,14 @@ function toolJson(response) {
 }
 
 const TOOL_NAMES = [
+  'backup_spans_archive',
+  'restore_spans_archive',
+  'import_spans_history',
+  'import_spans_source',
   'list_spans_runs',
   'get_spans_run',
   'get_spans_events',
+  'get_spans_integrations',
   'get_spans_artifact',
   'search_spans',
   'list_spans_workflows',
@@ -142,6 +147,11 @@ test('inbound MCP initializes and discovers every supported tool without invokin
   const schema = Object.fromEntries(
     discovered.result.tools.map((tool) => [tool.name, tool.inputSchema])
   );
+  expect(schema.import_spans_source.required).toEqual(['input']);
+  expect(
+    discovered.result.tools.find((tool) => tool.name === 'import_spans_source')
+      .annotations.readOnlyHint
+  ).toBe(false);
   expect(schema.start_worktree.required.sort()).toEqual(['name', 'repo']);
   expect(schema.start_worktree.properties.container.type).toBe('boolean');
   expect(schema.remove_worktree.properties.operationId.minLength).toBe(1);
@@ -1011,4 +1021,32 @@ test('MCP dirty removal refusal preserves not-removed state without force or ret
   expect(response.result.isError).toBe(true);
   expect(response.result.structuredContent).toEqual(refusal);
   expect(calls).toEqual([['r', 'a', 'manual', false, undefined]]);
+});
+
+test('MCP setup refresh preserves its explicit choice and rejects malformed refresh flags before dispatch', async () => {
+  const calls = [];
+  initMcpServer({
+    setupRetry: (request) => {
+      calls.push(request);
+      return { ok: true, operationId: 'refresh-operation' };
+    },
+  });
+  const input = {
+    attemptId: 'completed-attempt',
+    checkoutIdentity: { known: true },
+    name: 'topic',
+    refreshDependencies: true,
+    repo: 'fixture',
+  };
+  expect(toolJson(await callTool('retry_setup', input))).toMatchObject({
+    ok: true,
+    operationId: 'refresh-operation',
+  });
+  expect(calls).toEqual([{ ...input, source: 'mcp' }]);
+  const malformed = await callTool('retry_setup', {
+    ...input,
+    refreshDependencies: 'true',
+  });
+  expect(malformed.result.isError).toBe(true);
+  expect(calls).toHaveLength(1);
 });

@@ -1312,6 +1312,7 @@ const SPANS_SEARCH_ROUTES = Object.freeze({
   '/api/spans/search/status': 'spansSearchStatus',
 });
 const SPANS_SEARCH_HTTP_STATUS = Object.freeze({
+  SPANS_ARCHIVE_NOT_INITIALIZED: 503,
   SPANS_SERVICE_BUSY: 503,
   SPANS_SERVICE_CORRUPT: 500,
   SPANS_SERVICE_INVALID: 400,
@@ -1319,6 +1320,8 @@ const SPANS_SEARCH_HTTP_STATUS = Object.freeze({
   SPANS_SERVICE_UNAVAILABLE: 503,
 });
 const SPANS_SEARCH_FAILURE_MESSAGES = Object.freeze({
+  SPANS_ARCHIVE_NOT_INITIALIZED:
+    'Save a workflow draft or import a conversation to create the local archive.',
   SPANS_SERVICE_BUSY: 'Spans history is busy; try again.',
   SPANS_SERVICE_CORRUPT: 'Spans history failed an integrity check.',
   SPANS_SERVICE_INVALID: 'Invalid spans request.',
@@ -1425,15 +1428,22 @@ async function dispatchSpansSearch(services, action, url, response) {
   );
 }
 
-const SPANS_PLANNING_POST_ROUTES = Object.freeze({
+const SPANS_POST_ROUTES = Object.freeze({
+  '/api/spans/backup': 'spansBackup',
   '/api/spans/drafts/create': 'spansDraftCreate',
+  '/api/spans/history/import': 'spansHistoryImport',
+  '/api/spans/import': 'spansImport',
+  '/api/spans/integrations/apply': 'spansIntegrationsApply',
+  '/api/spans/integrations/reconcile': 'spansIntegrationsReconcile',
+  '/api/spans/integrations/review': 'spansIntegrationsReview',
   '/api/spans/plans/revise': 'spansPlanRevise',
+  '/api/spans/restore': 'spansRestore',
   '/api/spans/workflows/create': 'spansWorkflowCreate',
   '/api/spans/workflows/preview': 'spansWorkflowPreview',
 });
-const SPANS_PLANNING_BODY_BYTES = 1024 * 1024;
+const SPANS_BODY_BYTES = 1024 * 1024;
 
-async function planningBody(request) {
+async function spansBody(request) {
   if (!request.body) {
     return null;
   }
@@ -1448,7 +1458,7 @@ async function planningBody(request) {
         break;
       }
       length += value.byteLength;
-      if (length > SPANS_PLANNING_BODY_BYTES) {
+      if (length > SPANS_BODY_BYTES) {
         await reader.cancel();
         return null;
       }
@@ -1462,20 +1472,54 @@ async function planningBody(request) {
   }
 }
 
-async function dispatchSpansPlanning(services, request, url, response) {
+function spansActionErrors(action) {
+  if (action.startsWith('spansIntegrations')) {
+    return {
+      code: 'CLIENT_INTEGRATION_INPUT_INVALID',
+      error: 'Invalid client integration request.',
+      unavailable: 'Client integrations are unavailable.',
+    };
+  }
+  if (action === 'spansImport' || action === 'spansHistoryImport') {
+    return {
+      code: 'SOURCE_IMPORT_INVALID',
+      error: 'Invalid selected history import request.',
+      unavailable: 'Selected history import is unavailable.',
+    };
+  }
+  if (action === 'spansBackup' || action === 'spansRestore') {
+    return {
+      code: 'SPANS_BACKUP_OPTIONS_INVALID',
+      error: 'Options must be exactly the required absolute root paths.',
+      unavailable: 'Spans archive maintenance is unavailable.',
+    };
+  }
+  return {
+    code: 'SPANS_DRAFT_INVALID',
+    error: 'Invalid Spans planning request.',
+    unavailable: 'Spans planning is unavailable.',
+  };
+}
+
+async function dispatchSpansAction(services, request, url, response) {
+  const getActions = {
+    '/api/spans/integrations': 'spansIntegrationsPreview',
+    '/api/spans/workflows': 'spansWorkflows',
+  };
   const action =
-    request.method === 'GET' && url.pathname === '/api/spans/workflows'
-      ? 'spansWorkflows'
-      : request.method === 'POST' && SPANS_PLANNING_POST_ROUTES[url.pathname];
+    request.method === 'GET'
+      ? getActions[url.pathname]
+      : request.method === 'POST' && SPANS_POST_ROUTES[url.pathname];
   if (!action) {
     return null;
   }
-  const body = request.method === 'POST' ? await planningBody(request) : {};
+  const errors = spansActionErrors(action);
+  const body = request.method === 'POST' ? await spansBody(request) : {};
   if (url.search || !body || typeof body !== 'object' || Array.isArray(body)) {
     return response(
       {
-        code: 'SPANS_DRAFT_INVALID',
-        error: 'Invalid Spans planning request.',
+        code: errors.code,
+        error: errors.error,
         ok: false,
       },
       400
@@ -1485,19 +1529,25 @@ async function dispatchSpansPlanning(services, request, url, response) {
     return response(
       {
         code: 'SPANS_SERVICE_UNAVAILABLE',
-        error: 'Spans planning is unavailable.',
+        error: errors.unavailable,
         ok: false,
       },
       503
     );
   }
   try {
-    return response(await services[action](body));
+    const result = await services[action](body);
+    return response(
+      result,
+      result?.ok === false && result.code === 'SPANS_BACKUP_OPTIONS_INVALID'
+        ? 400
+        : 200
+    );
   } catch {
     return response(
       {
         code: 'SPANS_SERVICE_UNAVAILABLE',
-        error: 'Spans planning is unavailable.',
+        error: errors.unavailable,
         ok: false,
       },
       503
@@ -1531,14 +1581,14 @@ export async function dispatchPortalResourceRoute(services, request) {
     });
   const read = async (serviceAction, input = query) =>
     response(await services[serviceAction](input));
-  const planning = await dispatchSpansPlanning(
+  const spansAction = await dispatchSpansAction(
     services,
     request,
     url,
     response
   );
-  if (planning) {
-    return planning;
+  if (spansAction) {
+    return spansAction;
   }
   const execution = await dispatchSpansExecutionRoute(
     services,

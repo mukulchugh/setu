@@ -1,8 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openSpansStore } from './spans-store.js';
+import { openSpansStore, SPANS_STORE_DATABASE_FILE } from './spans-store.js';
 
 const roots = [];
 const stores = [];
@@ -268,4 +274,130 @@ test('phase and literal summary search filter before cursor pagination', () => {
   ).toEqual(['a']);
   expect(store.listRuns({ query: '%' }).runs).toHaveLength(2);
   expect(store.listRuns({ phase: 'invalid' }).ok).toBe(false);
+});
+
+test('existing-only writable open refuses missing and empty archives without initialization', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'spans-existing-only-'));
+  roots.push(parent);
+  const missing = join(parent, 'missing');
+  expect(() => openSpansStore({ create: false, root: missing })).toThrow();
+  expect(existsSync(missing)).toBe(false);
+  expect(() => openSpansStore({ create: false, root: parent })).toThrow();
+  const database = join(parent, SPANS_STORE_DATABASE_FILE);
+  expect(existsSync(database)).toBe(false);
+  writeFileSync(database, '', { mode: 0o600 });
+  expect(() => openSpansStore({ create: false, root: parent })).toThrow();
+  expect(statSync(database).size).toBe(0);
+  const created = openSpansStore({ root: parent });
+  expect(created.close().ok).toBe(true);
+  const existing = openSpansStore({ create: false, root: parent });
+  expect(commit(existing, [event('existing-event')]).ok).toBe(true);
+  expect(existing.close().ok).toBe(true);
+});
+
+test('attempt effects hold the archive writer fence and reject stale or closed attempts', () => {
+  const { root, store } = open();
+  const other = openSpansStore({ busyTimeoutMs: 1, root });
+  stores.push(other);
+  const binding = {
+    actionId: 'action',
+    attemptId: 'attempt',
+    generation: 0,
+    runId: 'run-1',
+    spanId: 'span',
+    workerId: 'worker',
+  };
+  const record = { ...binding, status: 'running' };
+  const view = { attempts: { attempt: record }, generation: 0 };
+  expect(
+    store.commitRun({
+      events: [],
+      expectedGeneration: 0,
+      expectedRevision: 0,
+      runId: 'run-1',
+      view,
+    }).ok
+  ).toBe(true);
+  let effects = 0;
+  const effect = () => {
+    effects += 1;
+    expect(
+      other.commitRun({
+        events: [],
+        expectedGeneration: 0,
+        expectedRevision: 1,
+        runId: 'run-1',
+        view: { ...view, generation: 1 },
+      }).code
+    ).toBe('SPANS_MODEL_BUSY');
+    return { ok: true };
+  };
+  expect(store.withCurrentAttempt(binding, effect)).toEqual({ ok: true });
+  expect(effects).toBe(1);
+  expect(
+    other.commitRun({
+      events: [],
+      expectedGeneration: 0,
+      expectedRevision: 1,
+      runId: 'run-1',
+      view: { ...view, generation: 1 },
+    }).ok
+  ).toBe(true);
+  expect(store.withCurrentAttempt(binding, effect).code).toBe(
+    'STALE_GENERATION'
+  );
+  expect(effects).toBe(1);
+  expect(
+    store.withCurrentAttempt({ ...binding, generation: 1 }, effect).code
+  ).toBe('ATTEMPT_CLOSED');
+});
+
+test('attempt fence refuses invalid and readonly callers and releases its lock on failure', () => {
+  const { root, store } = open();
+  const binding = {
+    actionId: 'action',
+    attemptId: 'attempt',
+    generation: 0,
+    runId: 'run-1',
+    spanId: 'span',
+    workerId: 'worker',
+  };
+  const view = {
+    attempts: { attempt: { ...binding, status: 'running' } },
+    generation: 0,
+  };
+  expect(
+    store.commitRun({
+      events: [],
+      expectedGeneration: 0,
+      expectedRevision: 0,
+      runId: 'run-1',
+      view,
+    }).ok
+  ).toBe(true);
+  const reader = openSpansStore({ readonly: true, root });
+  stores.push(reader);
+  let effects = 0;
+  const effect = () => {
+    effects += 1;
+    return { ok: true };
+  };
+  expect(reader.withCurrentAttempt(binding, effect).ok).toBe(false);
+  expect(
+    store.withCurrentAttempt({ ...binding, workerId: 'foreign' }, effect).ok
+  ).toBe(false);
+  expect(store.withCurrentAttempt({ ...binding, extra: true }, effect).ok).toBe(
+    false
+  );
+  expect(effects).toBe(0);
+  expect(
+    store.withCurrentAttempt(binding, () => {
+      throw new Error('private detail');
+    }).ok
+  ).toBe(false);
+  expect(store.withCurrentAttempt(binding, effect).ok).toBe(true);
+  expect(effects).toBe(1);
+  store.close();
+  expect(store.withCurrentAttempt(binding, effect).ok).toBe(false);
+  expect(effects).toBe(1);
 });
