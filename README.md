@@ -234,7 +234,9 @@ the pilot. This is not a claim that every application toolchain is compatible.
 For reviewed targets, provision one private, owned directory with
 mode `0700` outside the managed workspace and disposable cache/temp directories.
 Set its location and installer once in `dependencySharing` in `~/.setu.json`;
-the `targets` map selects exact repository/branch names with boolean values:
+the `targets` map selects exact repository/branch names with boolean values.
+`"<repo>/*": true` opts in every worktree of a repository, including ones created
+later; an exact `"<repo>/<branch>": false` still opts one out:
 
 ```json
 {
