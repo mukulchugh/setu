@@ -102,6 +102,29 @@ test('removal allows ignored env symlinks and generated Setu excludes keep git c
   }
 });
 
+test('removal allows the .envrc Setu writes but refuses one with user lines', async () => {
+  const f = repoFixture();
+  try {
+    ensureSetuExcludes(join(f.root, 'repo', '.git'));
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport NEXT_PUBLIC_APP_BASE_URL=http://feature.quivly.local\nexport NEXT_PUBLIC_WORKOS_REDIRECT_URI=http://feature.quivly.local/callback\n'
+    );
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).resolves.toBeUndefined();
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport OPENAI_API_KEY=secret\n'
+    );
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).rejects.toMatchObject({ code: 'WORKTREE_DIRTY' });
+  } finally {
+    rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
 test('removal does not walk inside ignored directories such as node_modules', async () => {
   const f = repoFixture();
   try {
