@@ -92,6 +92,13 @@ test('each admission refreshes storage and unknown or low storage refuses new wo
       target: { name: 'topic', repo: 'repo' },
     })
   ).resolves.toMatchObject({ code: 'STORAGE_LOW', ok: false });
+  const refused = await low.admit({
+    kind: 'install',
+    operationId: 'install-low-message',
+    target: { name: 'topic', repo: 'repo' },
+  });
+  expect(refused.error).toContain('19.0 GiB free, 20.0 GiB required');
+  expect(refused.error).toContain('setu adopt');
 });
 
 test('admission records leave the user config document byte-for-byte unchanged', async () => {

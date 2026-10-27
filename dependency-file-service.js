@@ -529,7 +529,12 @@ export function createDependencyFileService({
       );
       if (!sharing?.enabled) {
         const code = 'DEPENDENCY_FILE_SHARING_DISABLED';
-        return { error: failure(code, serviceError(code).message) };
+        return {
+          error: failure(
+            code,
+            `${serviceError(code).message}; opt "${target.repo}/${target.name}" in under dependencySharing.targets in ~/.setu.json`
+          ),
+        };
       }
       return { sharing };
     } catch {
@@ -676,6 +681,12 @@ export function createDependencyFileService({
     const lockedTarget = await freshTarget(target);
     if (Object.hasOwn(lockedTarget, 'error')) {
       return { invoked: false, result: lockedTarget.error };
+    }
+    // A missing opt-in is reported before writer or runtime refusals: neither
+    // releasing a claim nor stopping a server makes a disabled worktree shareable.
+    const sharingPolicy = await configuredSharing(lockedTarget.target);
+    if (Object.hasOwn(sharingPolicy, 'error')) {
+      return { invoked: false, result: sharingPolicy.error };
     }
     const identity = operationIdentity(action, parsed.value);
     const guardDetails = { phase: action };

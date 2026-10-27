@@ -22,6 +22,7 @@ import {
   createWorktree,
   ensureSetuExcludes,
   envLocalPath,
+  linkMainEnv,
   linkWorktreeEnv,
   localDomain,
   PACKAGE_VERSION,
@@ -196,6 +197,27 @@ test('worktree environment links use a native symlink from main .env.local', () 
     writeFileSync(occupied, 'do not replace\n');
     expect(linkWorktreeEnv(mainEnv, occupied)).toBe(false);
     expect(readFileSync(occupied, 'utf8')).toBe('do not replace\n');
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test('main env links into a worktree without one and never replaces an existing file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'setu-main-env-'));
+  try {
+    const mainEnv = join(root, 'repo', 'main', '.env.local');
+    mkdirSync(join(root, 'repo', 'main'), { recursive: true });
+    mkdirSync(join(root, 'repo', 'topic'), { recursive: true });
+    mkdirSync(join(root, 'repo', 'own'), { recursive: true });
+    const topic = join(root, 'repo', 'topic');
+    expect(linkMainEnv(root, 'repo', topic)).toBe(false);
+    writeFileSync(mainEnv, 'SECRET=fixture\n');
+    expect(linkMainEnv(root, 'repo', topic)).toBe(true);
+    expect(readlinkSync(join(topic, '.env.local'))).toBe(mainEnv);
+    const own = join(root, 'repo', 'own', '.env.local');
+    writeFileSync(own, 'KEEP=1\n');
+    expect(linkMainEnv(root, 'repo', join(root, 'repo', 'own'))).toBe(false);
+    expect(readFileSync(own, 'utf8')).toBe('KEEP=1\n');
   } finally {
     rmSync(root, { force: true, recursive: true });
   }

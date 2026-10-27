@@ -798,7 +798,7 @@ export function createPortalResourceServices({
     if (owner.state !== 'clear') {
       refuseDependencyFile(
         'ACTIVE_WRITER',
-        'A writer claim is active on this worktree'
+        'A writer claim is active on this worktree; the claim holder releases it (`setu release` or release_worktree), runs dependency sharing, then claims again'
       );
     }
   }

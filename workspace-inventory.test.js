@@ -66,6 +66,10 @@ function adoptionFixture(overrides = {}) {
       return true;
     },
     isRegisteredProject: (repo) => repo === 'r',
+    linkEnv: (...args) => {
+      calls.push(['linkEnv', ...args]);
+      return true;
+    },
     readRecords: async () => structuredClone(records),
     registeredPort: () => port,
     validateTarget: (repo, name, path) => ({
@@ -113,6 +117,7 @@ test('adoption verifies a managed linked checkout before allocating its port and
     ['isLinkedWorktree', 'r', '/workspace/r/topic'],
     ['assignPort', 'r', 'topic'],
     ['writeRouting', 'r', 'topic', 3201],
+    ['linkEnv', 'r', '/workspace/r/topic'],
   ]);
 });
 
