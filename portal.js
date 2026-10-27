@@ -5695,8 +5695,8 @@ export async function createPortalRuntime(options = {}) {
     config: () => portalState.read('config'),
     getWorktrees,
     log: (...parts) => console.log('[auto-cleanup]', ...parts),
-    removeWorktree: (repo, name) =>
-      removeWorktree(repo, name, 'merged', false, undefined, 'portal'),
+    removeWorktree: (repo, name, reason) =>
+      removeWorktree(repo, name, reason, false, undefined, 'portal'),
   });
 
   // ── WebSocket push (real-time sync) ─────────────────────────────────────────

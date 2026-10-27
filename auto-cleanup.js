@@ -2,8 +2,9 @@
 // ~/.setu.json "autoCleanup" on every tick so edits apply without a restart:
 //   1. Generated caches (.next, turbopack) of stopped worktrees idle for
 //      cacheIdleHours go through the reviewed worktree-cache prepare/execute.
-//   2. Opt-in: merged, clean, fully pushed, unclaimed, stopped worktrees idle
-//      for removeMergedAfterHours are removed (the branch itself is kept).
+//   2. Opt-in: clean, fully pushed, unclaimed, stopped worktrees are removed
+//      once idle for removeMergedAfterHours (PR merged) or
+//      removeIdleAfterHours (any other state). The branch itself is kept.
 import { execFile } from 'node:child_process';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -15,6 +16,8 @@ const HOUR = 3_600_000;
 export const AUTO_CLEANUP_DEFAULTS = Object.freeze({
   cacheIdleHours: 2,
   enabled: true,
+  removeIdle: false,
+  removeIdleAfterHours: 168,
   removeMerged: false,
   removeMergedAfterHours: 24,
 });
@@ -29,6 +32,11 @@ export function autoCleanupSettings(config) {
       AUTO_CLEANUP_DEFAULTS.cacheIdleHours
     ),
     enabled: raw.enabled !== false,
+    removeIdle: raw.removeIdle === true,
+    removeIdleAfterHours: hours(
+      raw.removeIdleAfterHours,
+      AUTO_CLEANUP_DEFAULTS.removeIdleAfterHours
+    ),
     removeMerged: raw.removeMerged === true,
     removeMergedAfterHours: hours(
       raw.removeMergedAfterHours,
@@ -115,16 +123,24 @@ export function createAutoCleanup({
     log('cache', worktree.key, result?.ok ? 'cleaned' : result?.code);
   }
 
-  async function removable(worktree, settings, claimed, used) {
-    return (
-      worktree.name !== 'main' &&
-      worktree.pr?.state === 'merged' &&
-      worktree.dirty === 0 &&
-      !claimed.has(worktree.wtDir) &&
-      now() - Math.max(used, (worktree.lastCommitAt ?? 0) * 1000) >=
-        settings.removeMergedAfterHours * HOUR &&
-      (await unpushed(worktree.wtDir)) === 0
-    );
+  // Returns the removal reason, or null when the worktree must stay.
+  async function removalReason(worktree, settings, claimed, used) {
+    const merged = worktree.pr?.state === 'merged';
+    const afterHours = merged
+      ? settings.removeMerged && settings.removeMergedAfterHours
+      : settings.removeIdle && settings.removeIdleAfterHours;
+    if (
+      afterHours === false ||
+      worktree.name === 'main' ||
+      worktree.dirty !== 0 ||
+      claimed.has(worktree.wtDir) ||
+      now() - Math.max(used, (worktree.lastCommitAt ?? 0) * 1000) <
+        afterHours * HOUR ||
+      (await unpushed(worktree.wtDir)) !== 0
+    ) {
+      return null;
+    }
+    return merged ? 'merged and idle' : 'idle';
   }
 
   async function tick() {
@@ -145,12 +161,19 @@ export function createAutoCleanup({
         // biome-ignore lint/performance/noAwaitInLoops: one worktree at a time keeps disk and git load low.
         const used = await usedAt(worktree.wtDir);
         try {
-          if (
-            settings.removeMerged &&
-            (await removable(worktree, settings, claimed, used))
-          ) {
-            await removeWorktree(worktree.repo, worktree.name);
-            log('remove', worktree.key, 'merged and idle');
+          const reason = await removalReason(
+            worktree,
+            settings,
+            claimed,
+            used
+          );
+          if (reason) {
+            await removeWorktree(
+              worktree.repo,
+              worktree.name,
+              reason === 'idle' ? 'manual' : 'merged'
+            );
+            log('remove', worktree.key, reason);
             continue;
           }
           if (

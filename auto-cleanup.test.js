@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { autoCleanupSettings, createAutoCleanup } from './auto-cleanup.js';
 
 const HOUR = 3_600_000;
-const NOW = 100 * HOUR;
+const NOW = 1000 * HOUR;
 const worktree = (over) => ({
   dirty: 0,
   key: `r/${over.name}`,
@@ -42,6 +42,8 @@ test('settings default to cache cleanup on, merged removal off', () => {
   expect(autoCleanupSettings({})).toEqual({
     cacheIdleHours: 2,
     enabled: true,
+    removeIdle: false,
+    removeIdleAfterHours: 168,
     removeMerged: false,
     removeMergedAfterHours: 24,
   });
@@ -98,4 +100,24 @@ test('disabled config does nothing', async () => {
     worktrees: [worktree({ name: 'idle' })],
   });
   expect(calls.executed).toEqual([]);
+});
+
+test('removes unmerged worktrees only after the longer idle window, when opted in', async () => {
+  const worktrees = [
+    worktree({ name: 'stale' }),
+    worktree({ name: 'week-minus' }),
+  ];
+  const used = {
+    '/w/stale': NOW - 170 * HOUR,
+    '/w/week-minus': NOW - 100 * HOUR,
+  };
+  const merged = { autoCleanup: { removeMerged: true } };
+  expect((await run({ config: merged, used, worktrees })).removed).toEqual([]);
+  const idle = { autoCleanup: { removeIdle: true } };
+  expect((await run({ config: idle, used, worktrees })).removed).toEqual([
+    'stale',
+  ]);
+  expect(
+    (await run({ config: idle, unpushed: 2, used, worktrees })).removed
+  ).toEqual([]);
 });
