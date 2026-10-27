@@ -2134,11 +2134,7 @@ export async function createWorktree(
     const port = await assignPort(c.workspace, repo, name);
     await configureWorktreeEnv(c, repo, name, port, tunnel);
 
-    const mainEnv = envLocalPath(repo, join(c.workspace, repo, 'main'));
-    const wtEnv = envLocalPath(repo, wtDir);
-    if (existsSync(mainEnv) && !existsSync(wtEnv)) {
-      linkWorktreeEnv(mainEnv, wtEnv);
-    }
+    linkMainEnv(c.workspace, repo, wtDir);
 
     const mainDir = join(c.workspace, repo, 'main');
     syncIncludedFiles(mainDir, wtDir, loadFileSyncGlobs(c.workspace, repo));
@@ -2155,6 +2151,17 @@ export async function createWorktree(
       wtDir,
     };
   });
+}
+
+// Shares main's .env.local into a worktree that has none. Used by `new` and
+// `adopt`; never overwrites an existing file or link.
+export function linkMainEnv(workspace, repo, wtDir, options) {
+  const mainEnv = envLocalPath(repo, join(workspace, repo, 'main'));
+  const wtEnv = envLocalPath(repo, wtDir);
+  if (!existsSync(mainEnv) || existsSync(wtEnv)) {
+    return false;
+  }
+  return linkWorktreeEnv(mainEnv, wtEnv, options);
 }
 
 // The old `ln -sf` result was deliberately ignored. Keep setup non-fatal when
