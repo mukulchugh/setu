@@ -28,6 +28,7 @@ export function createWorktreeAdoption({
   inspectIdentity,
   isLinkedWorktree,
   isRegisteredProject,
+  linkEnv,
   readRecords,
   registeredPort,
   validateTarget,
@@ -186,6 +187,14 @@ export function createWorktreeAdoption({
     }
     delete state.records[state.key];
     await writeRecords(state.records);
+    // Same shared .env.local link `setu new` makes; skipped when the checkout
+    // already has one and never fatal. Without it the dev server boots with
+    // no app env.
+    try {
+      await linkEnv(target.repo, target.wtDir);
+    } catch {
+      // Not fatal: the checkout is adopted either way.
+    }
     return {
       name: target.name,
       ok: true,

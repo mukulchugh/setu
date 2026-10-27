@@ -63,6 +63,7 @@ import {
   installedStateValue,
   isSidecarApproved,
   createWorktree as libCreateWorktree,
+  linkMainEnv,
   loadAllSidecars,
   loadArchivedWorktrees,
   loadCustomAgents,
@@ -1696,6 +1697,7 @@ export async function createPortalRuntime(options = {}) {
       ),
     isLinkedWorktree: linkedWorktree,
     isRegisteredProject: (repo) => Object.hasOwn(readProjects(), repo),
+    linkEnv: (repo, wtDir) => linkMainEnv(WORKSPACE, repo, wtDir),
     readRecords: readAdoptionRecords,
     registeredPort: (repo, name) => getPort(WORKSPACE, repo, name),
     validateTarget: (repo, name) =>

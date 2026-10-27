@@ -56,6 +56,7 @@ afterEach(() => {
 });
 
 function fixture({
+  config,
   engineOverrides = {},
   guard,
   admission,
@@ -126,16 +127,18 @@ function fixture({
       guards.push({ key: value.key, ...details });
       return guard?.(value, details);
     },
-    config: async () => ({
-      dependencySharing: {
-        enabled: true,
-        executable: '/opt/setu/bin/bun',
-        storeRoot: '/private/setu/dependencies',
-        targets: { 'r/topic': true },
-        version: '1.3.14',
-      },
-      workspace: '/workspace',
-    }),
+    config:
+      config ??
+      (async () => ({
+        dependencySharing: {
+          enabled: true,
+          executable: '/opt/setu/bin/bun',
+          storeRoot: '/private/setu/dependencies',
+          targets: { 'r/topic': true },
+          version: '1.3.14',
+        },
+        workspace: '/workspace',
+      })),
     engineFactory: (input) => {
       engineCreations += 1;
       calls.push({ input, kind: 'create' });
@@ -481,6 +484,34 @@ test('dependency file service refuses stale checkout identity before lock or eng
     code: 'CHECKOUT_IDENTITY_CHANGED',
     ok: false,
   });
+});
+
+test('a target that is not opted in reports the missing opt-in before an active writer claim', async () => {
+  const fx = fixture({
+    config: async () => ({
+      dependencySharing: {
+        enabled: true,
+        executable: '/opt/setu/bin/bun',
+        storeRoot: '/private/setu/dependencies',
+        targets: {},
+        version: '1.3.14',
+      },
+      workspace: '/workspace',
+    }),
+    guard: () => ({
+      code: 'ACTIVE_WRITER',
+      error: 'A writer claim is active on this worktree',
+      ok: false,
+    }),
+  });
+  const result = await fx.service.prepare(fx.target, {});
+  expect(result).toMatchObject({
+    code: 'DEPENDENCY_FILE_SHARING_DISABLED',
+    ok: false,
+  });
+  expect(result.error).toContain('dependencySharing.targets');
+  expect(fx.guards).toEqual([]);
+  expect(fx.engineCreations()).toBe(0);
 });
 
 test('dependency file service requires a mutable-target guard and preserves unknown outcomes', async () => {

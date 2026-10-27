@@ -644,13 +644,15 @@ export function createResourceAdmission({
         'Storage is unknown; new managed work was not admitted.'
       );
     }
-    if (health.availableBytes < current().lowStorageFloorBytes) {
+    const floor = current().lowStorageFloorBytes;
+    if (health.availableBytes < floor) {
+      const gib = (bytes) => (bytes / 1024 ** 3).toFixed(1);
       return refusal(
         'STORAGE_LOW',
-        'Storage is below the managed-work reserve; new work was not admitted.',
+        `Storage is below the managed-work reserve (${gib(health.availableBytes)} GiB free, ${gib(floor)} GiB required); new work was not admitted. Free space, or register an existing linked checkout with \`setu adopt\`, which installs nothing.`,
         {
           availableBytes: health.availableBytes,
-          minimumAvailableBytes: current().lowStorageFloorBytes,
+          minimumAvailableBytes: floor,
         }
       );
     }

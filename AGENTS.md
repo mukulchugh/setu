@@ -668,7 +668,7 @@ carry JSON must contain JSON.
 | `actions save` | `--input <file\|->` | Save a reviewed connected-tool mapping. |
 | `actions preflight` | `--action <id> --input <file\|->` | Produce a token bound to the action revision and input. |
 | `actions invoke` | `--action <id> --input <file\|-> --confirmation <token>` | Invoke only the exact reviewed external-tool input. |
-| `adopt <repo> <branch>` | `--path <linked-checkout>` | Register an existing verified linked worktree without setup or start. |
+| `adopt <repo> <branch>` | `--path <linked-checkout>` | Register an existing verified linked worktree without setup or start; links main's `.env.local` when the checkout has none. |
 | `review handoff <repo> <branch>` | `--session <id> --checkout <file\|-> --artifact <file\|-> --findings <file\|->` | Paste selected records into an exact owned terminal without submitting text. |
 | `path <repo> <branch>`, `cd <repo> <branch>` | none | Print the registered worktree path; `cd` is normally a shell wrapper. |
 | `update` | `--restart`, `--include-untracked` | Run guarded Setu update. A running portal requires explicit `--restart`; this is CLI only. |
@@ -868,7 +868,7 @@ never downloads a provider tool to make a deployment possible.
 | `POST` | `/api/workspace-storage/inspect` | T or `storeId`; explicit server-resolved inspection. | H W C M |
 | `POST` | `/api/worktree-cache/execute` | T plus `manifestId`,`confirmation`; execute only after user confirms the reviewed manifest. | H W C M |
 | `POST` | `/api/worktree-cache/prepare` | T; create the cleanup manifest for review. | H W C M |
-| `POST` | `/api/worktrees/adopt` | T plus verified linked-worktree `path`; no install/start. | H W C M |
+| `POST` | `/api/worktrees/adopt` | T plus verified linked-worktree `path`; no install/start; links main's `.env.local` when missing. | H W C M |
 | `GET` | `/api/worktrees` | List worktrees; `snapshot=1` adds observations/status. | H W M R |
 | `GET` | `/api/worktrees/archived` | List archived worktrees. | H W |
 <!-- PORTAL_API_ROUTES_END -->
@@ -885,7 +885,7 @@ checkout identity. `review token` means preflight first and no edited input.
 | `claim_worktree`, `release_worktree`, `list_claims` | T plus claim owner fields; release session; none | Writer ownership, release, and listing. Claim needs agent/session/task/pid. |
 | `list_worktrees`, `list_projects`, `list_ports`, `get_doctor` | none | Read core local state. |
 | `create_worktree` | T, `tunnel?` | Create without starting. |
-| `adopt_worktree` | T, `path` | Verify and register linked checkout only. |
+| `adopt_worktree` | T, `path` | Verify and register linked checkout; links main's `.env.local` when missing. |
 | `start_worktree`, `stop_worktree` | T, `container?` for start | Start with sticky default or stop/dequeue. Observe queued outcomes. |
 | `enable_tunnel`, `disable_tunnel` | T | Move/release the shared tunnel. |
 | `start_inngest`, `stop_inngest`, `start_trigger`, `stop_trigger`, `start_convex`, `stop_convex` | T | Control first-class runtimes. |

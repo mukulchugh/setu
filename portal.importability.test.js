@@ -10,14 +10,14 @@ import { createPortalRuntime } from './portal.js';
 import { createWorkspaceState } from './workspace-state.js';
 import { createWorktreeLifecycle } from './worktree-lifecycle.js';
 
-async function fixture(options = {}) {
+async function fixture({ extraConfig, ...options } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'setu-portal-runtime-'));
   const state = createWorkspaceState({
     configPath: join(root, 'config.json'),
     setuDir: root,
     workspaceRoot: root,
   });
-  const config = { tunnel: 'fixture', workspace: root };
+  const config = { tunnel: 'fixture', workspace: root, ...extraConfig };
   await state.replace('config', config);
   const portal = await createPortalRuntime({
     config,
@@ -678,6 +678,17 @@ test('retry of unknown enrollment never enters new installation admission or inv
 
 test('dependency conversion refuses retained listeners after their observation becomes unknown', async () => {
   const fx = await fixture({
+    // Opted in, so the refusal under test is the runtime one, not the
+    // missing opt-in that is reported first.
+    extraConfig: {
+      dependencySharing: {
+        enabled: true,
+        executable: '/opt/setu/bin/bun',
+        storeRoot: '/private/setu/dependencies',
+        targets: { 'fixture/topic': true },
+        version: '1.3.14',
+      },
+    },
     listenerObservation: {
       observation: () => ({ observedAt: Date.now(), state: 'unknown' }),
       read: () => Promise.resolve([]),
