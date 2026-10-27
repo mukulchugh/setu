@@ -7,7 +7,9 @@ import { inspectSpansCapacity } from './spans-capacity.js';
 // lease is durable coordination, while the target lock only protects one checkout.
 
 export const DEFAULT_MANAGED_SESSION_LIMIT = 2;
-export const DEFAULT_LOW_STORAGE_FLOOR_BYTES = 20 * 1024 ** 3;
+// Override per machine in ~/.setu.json:
+// "resourceAdmission": { "lowStorageFloorBytes": N, "maxManagedSessions": N }
+export const DEFAULT_LOW_STORAGE_FLOOR_BYTES = 8 * 1024 ** 3;
 export const SPANS_ARCHIVE_BUDGET_BYTES = 5 * 1024 ** 3;
 
 const ADMISSION_DOCUMENT = 'resourceAdmission';
@@ -588,6 +590,18 @@ export function createResourceAdmission({
   archiveCapacity = inspectSpansCapacity,
 } = {}) {
   const configured = policy(limits);
+  // Explicit limits win (tests, workers); otherwise re-read ~/.setu.json on
+  // every check so a config edit applies without a portal restart.
+  const current = () => {
+    if (limits) {
+      return policy(limits);
+    }
+    try {
+      return policy(state?.read?.('config')?.resourceAdmission ?? {}) ?? configured;
+    } catch {
+      return configured;
+    }
+  };
   const dependenciesValid =
     typeof hostHealth === 'function' &&
     state &&
@@ -630,13 +644,13 @@ export function createResourceAdmission({
         'Storage is unknown; new managed work was not admitted.'
       );
     }
-    if (health.availableBytes < configured.lowStorageFloorBytes) {
+    if (health.availableBytes < current().lowStorageFloorBytes) {
       return refusal(
         'STORAGE_LOW',
         'Storage is below the managed-work reserve; new work was not admitted.',
         {
           availableBytes: health.availableBytes,
-          minimumAvailableBytes: configured.lowStorageFloorBytes,
+          minimumAvailableBytes: current().lowStorageFloorBytes,
         }
       );
     }
@@ -700,7 +714,7 @@ export function createResourceAdmission({
       MANAGED_SESSION_KINDS.has(candidate.kind) &&
       active.filter((activeLease) =>
         MANAGED_SESSION_KINDS.has(activeLease.kind)
-      ).length >= configured.maxManagedSessions
+      ).length >= current().maxManagedSessions
     ) {
       return refusal(
         'SESSION_CAPACITY_REACHED',
@@ -1168,7 +1182,7 @@ export function createResourceAdmission({
       );
       return Object.freeze({
         leases: Object.freeze(listed),
-        limits: Object.freeze({ ...configured }),
+        limits: Object.freeze({ ...current() }),
         ok: true,
       });
     } catch {

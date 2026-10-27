@@ -18,6 +18,7 @@ import {
 import identityFs from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { createAutoCleanup } from './auto-cleanup.js';
 import { agentStatus } from './agent.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { getCostsSummary } from './costs.js';
@@ -2065,6 +2066,7 @@ export async function createPortalRuntime(options = {}) {
         runtimeTimers.clearInterval(logRetentionTimer);
         runtimeTimers.clearInterval(memoryCheckTimer);
         runtimeTimers.clearInterval(idleCheckTimer);
+        runtimeTimers.clearInterval(autoCleanupTimer);
         setupInstallProcesses.close();
         lifecycle.dispose();
         await closeApplicationServices();
@@ -5683,6 +5685,19 @@ export async function createPortalRuntime(options = {}) {
   }
 
   let idleCheckTimer = null;
+  let autoCleanupTimer = null;
+  const AUTO_CLEANUP_INTERVAL = 15 * 60_000;
+  const autoCleanup = createAutoCleanup({
+    cacheExecute: (input) => portalB205.cacheExecute(input),
+    cachePrepare: (input) => portalB205.cachePrepare(input),
+    claims: () =>
+      listWriterClaims(writerClaimPaths(WORKSPACE), { includeStale: true }),
+    config: () => portalState.read('config'),
+    getWorktrees,
+    log: (...parts) => console.log('[auto-cleanup]', ...parts),
+    removeWorktree: (repo, name) =>
+      removeWorktree(repo, name, 'merged', false, undefined, 'portal'),
+  });
 
   // ── WebSocket push (real-time sync) ─────────────────────────────────────────
   // Replaces client HTTP polling of /api/worktrees, /api/status and /api/logs
@@ -6094,6 +6109,14 @@ export async function createPortalRuntime(options = {}) {
         console.error('Idle timeout check failed:', error);
       }
     }, IDLE_CHECK_INTERVAL);
+    autoCleanupTimer = runtimeTimers.setInterval(() => {
+      if (!updateControl.stopping()) {
+        autoCleanup.tick().catch((error) => {
+          console.error('Auto cleanup failed:', error);
+        });
+      }
+    }, AUTO_CLEANUP_INTERVAL);
+    autoCleanupTimer.unref?.();
   }
 
   function start() {
@@ -6164,7 +6187,12 @@ export async function createPortalRuntime(options = {}) {
       process.off(event, listener);
     }
     processHooks.clear();
-    for (const timer of [logRetentionTimer, memoryCheckTimer, idleCheckTimer]) {
+    for (const timer of [
+      logRetentionTimer,
+      memoryCheckTimer,
+      idleCheckTimer,
+      autoCleanupTimer,
+    ]) {
       if (timer !== null) {
         runtimeTimers.clearInterval(timer);
       }
