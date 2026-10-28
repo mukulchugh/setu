@@ -2,11 +2,13 @@
 // ~/.setu.json "autoCleanup" on every tick so edits apply without a restart:
 //   1. Generated caches (.next, turbopack) of stopped worktrees idle for
 //      cacheIdleHours go through the reviewed worktree-cache prepare/execute.
-//   2. Opt-in: clean, fully pushed, unclaimed, stopped worktrees are removed
+//   2. The whole .next output of worktrees stopped for nextIdleHours
+//      (default 24) is deleted; Next rebuilds it on the next dev start.
+//   3. Opt-in: clean, fully pushed, unclaimed, stopped worktrees are removed
 //      once idle for removeMergedAfterHours (PR merged) or
 //      removeIdleAfterHours (any other state). The branch itself is kept.
 import { execFile } from 'node:child_process';
-import { readdir, stat } from 'node:fs/promises';
+import { lstat, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -16,6 +18,7 @@ const HOUR = 3_600_000;
 export const AUTO_CLEANUP_DEFAULTS = Object.freeze({
   cacheIdleHours: 2,
   enabled: true,
+  nextIdleHours: 24,
   removeIdle: false,
   removeIdleAfterHours: 168,
   removeMerged: false,
@@ -32,6 +35,10 @@ export function autoCleanupSettings(config) {
       AUTO_CLEANUP_DEFAULTS.cacheIdleHours
     ),
     enabled: raw.enabled !== false,
+    nextIdleHours: hours(
+      raw.nextIdleHours,
+      AUTO_CLEANUP_DEFAULTS.nextIdleHours
+    ),
     removeIdle: raw.removeIdle === true,
     removeIdleAfterHours: hours(
       raw.removeIdleAfterHours,
@@ -53,8 +60,34 @@ async function mtimeMs(path) {
   }
 }
 
-// A running dev server keeps writing into .next, so the newest mtime of the
-// worktree's .next dirs (root and apps/*) tracks when it was last used.
+// Real .next directories at the root and under apps/*; symlinks are skipped
+// so a link can never redirect deletion outside the checkout.
+export async function nextDirectories(wtDir) {
+  const candidates = [join(wtDir, '.next')];
+  try {
+    for (const app of await readdir(join(wtDir, 'apps'))) {
+      candidates.push(join(wtDir, 'apps', app, '.next'));
+    }
+  } catch {
+    // No apps/ directory: a single-app repo.
+  }
+  const found = await Promise.all(
+    candidates.map(async (path) => {
+      try {
+        const info = await lstat(path);
+        return info.isDirectory() && !info.isSymbolicLink() ? path : null;
+      } catch {
+        return null;
+      }
+    })
+  );
+  return found.filter(Boolean);
+}
+
+// A running dev server keeps writing into .next itself (event files) and
+// .next/dev (trace, manifests), so their newest mtime tracks when it was last
+// used. Cache directories are deliberately not part of the signal: cleaning
+// them would otherwise reset the idle clock it is measured by.
 export async function lastUsedAt(wtDir) {
   const roots = [join(wtDir, '.next')];
   try {
@@ -67,8 +100,9 @@ export async function lastUsedAt(wtDir) {
   const times = await Promise.all(
     roots.flatMap((root) => [
       mtimeMs(root),
-      mtimeMs(join(root, 'dev', 'cache', 'turbopack')),
-      mtimeMs(join(root, 'cache')),
+      mtimeMs(join(root, 'dev')),
+      mtimeMs(join(root, 'dev', 'trace')),
+      mtimeMs(join(root, 'trace')),
     ])
   );
   return Math.max(...times);
@@ -104,6 +138,8 @@ export function createAutoCleanup({
   now = Date.now,
   usedAt = lastUsedAt,
   unpushed = unpushedCommits,
+  nextDirs = nextDirectories,
+  removeDir = (path) => rm(path, { force: true, recursive: true }),
   log = () => {},
 }) {
   let running = false;
@@ -161,27 +197,35 @@ export function createAutoCleanup({
         // biome-ignore lint/performance/noAwaitInLoops: one worktree at a time keeps disk and git load low.
         const used = await usedAt(worktree.wtDir);
         try {
-          const reason = await removalReason(
-            worktree,
-            settings,
-            claimed,
-            used
-          );
+          const reason = await removalReason(worktree, settings, claimed, used);
           if (reason) {
-            await removeWorktree(
+            const removed = await removeWorktree(
               worktree.repo,
               worktree.name,
               reason === 'idle' ? 'manual' : 'merged'
             );
-            log('remove', worktree.key, reason);
+            if (removed && removed.ok === false) {
+              log(
+                'error',
+                worktree.key,
+                removed.error ?? removed.code ?? 'removal not completed'
+              );
+            } else {
+              log('remove', worktree.key, reason);
+            }
             continue;
           }
-          if (
-            used > 0 &&
-            !claimed.has(worktree.wtDir) &&
-            now() - used >= settings.cacheIdleHours * HOUR
-          ) {
-            await cleanCache(worktree);
+          const idleFor = now() - used;
+          if (used > 0 && !claimed.has(worktree.wtDir)) {
+            if (idleFor >= settings.nextIdleHours * HOUR) {
+              for (const dir of await nextDirs(worktree.wtDir)) {
+                // biome-ignore lint/performance/noAwaitInLoops: at most a few app directories per worktree.
+                await removeDir(dir);
+              }
+              log('next', worktree.key, 'removed .next');
+            } else if (idleFor >= settings.cacheIdleHours * HOUR) {
+              await cleanCache(worktree);
+            }
           }
         } catch (error) {
           log('error', worktree.key, error?.message ?? String(error));
