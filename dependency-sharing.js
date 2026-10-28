@@ -332,6 +332,11 @@ async function dependencyInstallPlan(
 }
 
 // Targets select participation; store and installer settings are central.
+// How hoisted checkouts share: "sibling-clone" (default) clones node_modules
+// from an identical sibling worktree before install; "hoisted-cow" is the
+// per-file journaled enrollment into the store.
+export const HOISTED_STRATEGIES = ['sibling-clone', 'hoisted-cow'];
+
 export function dependencySharingForTarget(config, repo, name) {
   const key = `${repo}/${name}`;
   const central = config?.dependencySharing;
@@ -399,7 +404,18 @@ export function dependencySharingForTarget(config, repo, name) {
     ...(Object.hasOwn(central, 'storeIdentity')
       ? { storeIdentity: central.storeIdentity }
       : {}),
+    ...(Object.hasOwn(central, 'hoistedStrategy')
+      ? { hoistedStrategy: central.hoistedStrategy }
+      : {}),
   };
+  if (
+    resolved.hoistedStrategy !== undefined &&
+    !HOISTED_STRATEGIES.includes(resolved.hoistedStrategy)
+  ) {
+    throw new Error(
+      `dependencySharing.hoistedStrategy must be one of ${HOISTED_STRATEGIES.join(', ')}`
+    );
+  }
   assertValidSharingFields(resolved);
   return resolved;
 }

@@ -129,6 +129,7 @@ async function fixture() {
   const sharing = {
     enabled: true,
     executable,
+    hoistedStrategy: 'hoisted-cow',
     storeIdentity: {
       device: statSync(storeRoot).dev,
       mountPath: realpathSync(root),
@@ -379,6 +380,7 @@ test('fresh setup composes through the real G6 service and native status seam', 
       dependencySharing: {
         enabled: true,
         executable: f.executable,
+        hoistedStrategy: 'hoisted-cow',
         storeRoot: f.sharing.storeRoot,
         targets: { 'repo/topic': true },
         version: '1.3.14',
