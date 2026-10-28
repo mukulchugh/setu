@@ -18,8 +18,8 @@ import {
 import identityFs from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { createAutoCleanup } from './auto-cleanup.js';
 import { agentStatus } from './agent.js';
+import { createAutoCleanup } from './auto-cleanup.js';
 import { inspectCheckoutIdentity } from './checkout-identity.js';
 import { getCostsSummary } from './costs.js';
 import { createDependencyFileNative } from './dependency-file-native.js';
@@ -5696,7 +5696,15 @@ export async function createPortalRuntime(options = {}) {
       listWriterClaims(writerClaimPaths(WORKSPACE), { includeStale: true }),
     config: () => portalState.read('config'),
     getWorktrees,
-    log: (...parts) => console.log('[auto-cleanup]', ...parts),
+    log: (kind, key, detail) => {
+      const [repo, ...rest] = String(key ?? '').split('/');
+      logAction(
+        `auto-cleanup:${kind}`,
+        { name: rest.join('/') || null, repo: repo || null },
+        kind !== 'error',
+        kind === 'error' ? detail : undefined
+      );
+    },
     removeWorktree: (repo, name, reason) =>
       removeWorktree(repo, name, reason, false, undefined, 'portal'),
   });

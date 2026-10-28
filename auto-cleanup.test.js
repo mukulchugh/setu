@@ -1,5 +1,13 @@
 import { expect, test } from 'bun:test';
-import { autoCleanupSettings, createAutoCleanup } from './auto-cleanup.js';
+import { mkdirSync, mkdtempSync, symlinkSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  autoCleanupSettings,
+  createAutoCleanup,
+  lastUsedAt,
+  nextDirectories,
+} from './auto-cleanup.js';
 
 const HOUR = 3_600_000;
 const NOW = 1000 * HOUR;
@@ -15,7 +23,7 @@ const worktree = (over) => ({
 });
 
 function run({ config = {}, worktrees, used = {}, claims = [], unpushed = 0 }) {
-  const calls = { executed: [], removed: [] };
+  const calls = { executed: [], logged: [], nextRemoved: [], removed: [] };
   const cleanup = createAutoCleanup({
     cacheExecute: async (input) => {
       calls.executed.push(input.name);
@@ -28,7 +36,12 @@ function run({ config = {}, worktrees, used = {}, claims = [], unpushed = 0 }) {
     claims: async () => claims.map((wtDir) => ({ wtDir })),
     config: () => config,
     getWorktrees: async () => worktrees,
+    log: (...parts) => calls.logged.push(parts),
+    nextDirs: async (dir) => [`${dir}/apps/web/.next`],
     now: () => NOW,
+    removeDir: async (path) => {
+      calls.nextRemoved.push(path);
+    },
     removeWorktree: async (_repo, name) => {
       calls.removed.push(name);
     },
@@ -42,12 +55,15 @@ test('settings default to cache cleanup on, merged removal off', () => {
   expect(autoCleanupSettings({})).toEqual({
     cacheIdleHours: 2,
     enabled: true,
+    nextIdleHours: 24,
     removeIdle: false,
     removeIdleAfterHours: 168,
     removeMerged: false,
     removeMergedAfterHours: 24,
   });
-  expect(autoCleanupSettings({ autoCleanup: { cacheIdleHours: -1 } })).toMatchObject({
+  expect(
+    autoCleanupSettings({ autoCleanup: { cacheIdleHours: -1 } })
+  ).toMatchObject({
     cacheIdleHours: 2,
   });
 });
@@ -120,4 +136,71 @@ test('removes unmerged worktrees only after the longer idle window, when opted i
   expect(
     (await run({ config: idle, unpushed: 2, used, worktrees })).removed
   ).toEqual([]);
+});
+
+test('deletes the whole .next after nextIdleHours and logs it, instead of a cache-only clean', async () => {
+  const calls = await run({
+    used: {
+      '/w/day-old': NOW - 30 * HOUR,
+      '/w/few-hours': NOW - 5 * HOUR,
+    },
+    worktrees: [worktree({ name: 'day-old' }), worktree({ name: 'few-hours' })],
+  });
+  expect(calls.nextRemoved).toEqual(['/w/day-old/apps/web/.next']);
+  expect(calls.executed).toEqual(['few-hours']);
+  expect(calls.logged).toContainEqual(['next', 'r/day-old', 'removed .next']);
+});
+
+test('a claimed worktree keeps its .next however long it is idle', async () => {
+  const calls = await run({
+    claims: ['/w/held'],
+    used: { '/w/held': NOW - 90 * HOUR },
+    worktrees: [worktree({ name: 'held' })],
+  });
+  expect(calls.nextRemoved).toEqual([]);
+});
+
+test('nextDirectories finds real .next dirs and skips symlinked ones', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'setu-next-'));
+  mkdirSync(join(dir, 'apps', 'web', '.next'), { recursive: true });
+  mkdirSync(join(dir, 'apps', 'docs'), { recursive: true });
+  mkdirSync(join(dir, 'elsewhere'));
+  symlinkSync(join(dir, 'elsewhere'), join(dir, 'apps', 'docs', '.next'));
+  expect(await nextDirectories(dir)).toEqual([
+    join(dir, 'apps', 'web', '.next'),
+  ]);
+});
+
+test('cleaning a cache does not count as using the worktree', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'setu-used-'));
+  const next = join(dir, 'apps', 'web', '.next');
+  mkdirSync(join(next, 'dev', 'cache', 'turbopack'), { recursive: true });
+  const old = new Date(Date.now() - 30 * HOUR);
+  for (const path of [next, join(next, 'dev')]) {
+    utimesSync(path, old, old);
+  }
+  // A fresh write inside the cache, as a cleanup would cause.
+  utimesSync(join(next, 'dev', 'cache', 'turbopack'), new Date(), new Date());
+  utimesSync(join(next, 'dev', 'cache'), new Date(), new Date());
+  expect(Date.now() - (await lastUsedAt(dir))).toBeGreaterThan(29 * HOUR);
+});
+
+test('a removal that does not complete is logged as an error, not a removal', async () => {
+  const logged = [];
+  const cleanup = createAutoCleanup({
+    cacheExecute: async () => ({ ok: true }),
+    cachePrepare: async () => ({ manifest: { entries: [] }, ok: true }),
+    claims: async () => [],
+    config: () => ({ autoCleanup: { removeMerged: true } }),
+    getWorktrees: async () => [
+      worktree({ name: 'stuck', pr: { state: 'merged' } }),
+    ],
+    log: (...parts) => logged.push(parts),
+    now: () => NOW,
+    removeWorktree: async () => ({ code: 'REMOVAL_PENDING', ok: false }),
+    unpushed: async () => 0,
+    usedAt: async () => NOW - 30 * HOUR,
+  });
+  await cleanup.tick();
+  expect(logged).toEqual([['error', 'r/stuck', 'REMOVAL_PENDING']]);
 });
