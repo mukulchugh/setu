@@ -311,7 +311,7 @@ function registerTools(server) {
     'adopt_worktree',
     {
       description:
-        'Register an existing linked Git worktree without installing dependencies or starting a server. The only file it adds is the shared .env.local link from main, when the checkout has none. The path must be a verified worktree of the registered repo.',
+        'Register an existing linked Git worktree without installing dependencies or starting a server. The only file it adds is a .env.local that points at the one in main, when the checkout has none. The path must be a verified worktree of the registered repo.',
       inputSchema: {
         name: z.string(),
         path: z.string().min(1),
