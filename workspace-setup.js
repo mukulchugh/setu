@@ -11,10 +11,37 @@ import {
   sharedDependencyInstall,
 } from './dependency-sharing.js';
 import { assertStorageHeadroom } from './host-health.js';
+import { cloneSiblingNodeModules } from './sibling-clone.js';
 
 const worktreePathPattern = /^worktree (.+)$/m;
 const worktreeBranchPattern = /^branch refs\/heads\/(.+)$/m;
 const HOISTED_ENROLLMENT_STAGE = 'dependency-enrollment';
+
+// Hoisted checkouts share dependencies by cloning node_modules from an
+// identical sibling (see sibling-clone.js) instead of the per-file hoisted-cow
+// enrollment, whose journal and per-file swaps do not scale to monorepos.
+// A clone failure is never fatal: the ordinary install still runs.
+async function shareHoistedBySiblingClone({
+  wtDir,
+  shared,
+  progress,
+  setup,
+  clone = cloneSiblingNodeModules,
+}) {
+  try {
+    const outcome = await clone(wtDir);
+    await setupStage(
+      progress,
+      setup,
+      outcome.cloned
+        ? `dependency-clone:${outcome.source}`
+        : `dependency-clone-skipped:${outcome.reason}`
+    );
+  } catch {
+    await setupStage(progress, setup, 'dependency-clone-skipped:error');
+  }
+  return shared?.strategy === 'hoisted-cow' ? null : shared;
+}
 
 function dependencyInstallCommand(wtDir, exists) {
   if (exists(join(wtDir, 'package.json'))) {
@@ -884,6 +911,60 @@ export async function withSetupAdmission({
   }
 }
 
+// Chooses how this setup shares dependencies: the isolated store plan, the
+// legacy per-file hoisted enrollment (only with hoistedStrategy "hoisted-cow"),
+// or, for hoisted checkouts by default, a clone from an identical sibling.
+async function setupDependencySharing({
+  admissionOperationId,
+  assertStoreStorage,
+  bunInstaller,
+  finalizeHoistedDependencySharing,
+  prepareHoistedDependencySharing,
+  progress,
+  refreshDependencies,
+  setup,
+  sharing,
+  state,
+  target,
+  wtDir,
+}) {
+  let shared;
+  if (bunInstaller && sharing?.enabled) {
+    const resolvedSharing = sharingForSetup(sharing, state);
+    const view = await inspectDependencyView(wtDir, resolvedSharing);
+    await setupStage(progress, setup, `dependency-view:${view.state}`);
+    requireFreshSharedView(view, resolvedSharing, wtDir, refreshDependencies);
+    shared = await sharedDependencyInstall(
+      wtDir,
+      resolvedSharing,
+      assertStoreStorage,
+      refreshDependencies === undefined
+        ? undefined
+        : { refreshOwnedView: refreshDependencies }
+    );
+  }
+  const legacyHoisted = sharing?.hoistedStrategy === 'hoisted-cow';
+  if (shared?.strategy === 'hoisted-cow' && legacyHoisted) {
+    await prepareFreshHoistedEnrollment({
+      admissionOperationId,
+      finalize: finalizeHoistedDependencySharing,
+      prepare: prepareHoistedDependencySharing,
+      progress,
+      setup,
+      target,
+    });
+    return shared;
+  }
+  if (
+    bunInstaller &&
+    !legacyHoisted &&
+    (!shared || shared.strategy === 'hoisted-cow')
+  ) {
+    return shareHoistedBySiblingClone({ progress, setup, shared, wtDir });
+  }
+  return shared;
+}
+
 async function prepareSetupInstall({
   admissionOperationId,
   assertStorage,
@@ -903,34 +984,20 @@ async function prepareSetupInstall({
   try {
     await setupStage(progress, setup, 'storage-check');
     await assertStorage(res.wtDir);
-    let shared;
-    if (bunInstaller && sharing?.enabled) {
-      const resolvedSharing = sharingForSetup(sharing, state);
-      const view = await inspectDependencyView(res.wtDir, resolvedSharing);
-      await setupStage(progress, setup, `dependency-view:${view.state}`);
-      requireFreshSharedView(
-        view,
-        resolvedSharing,
-        res.wtDir,
-        refreshDependencies
-      );
-      shared = await sharedDependencyInstall(
-        res.wtDir,
-        resolvedSharing,
-        assertStoreStorage,
-        { refreshOwnedView: refreshDependencies }
-      );
-      if (shared?.strategy === 'hoisted-cow') {
-        await prepareFreshHoistedEnrollment({
-          admissionOperationId,
-          finalize: finalizeHoistedDependencySharing,
-          prepare: prepareHoistedDependencySharing,
-          progress,
-          setup,
-          target,
-        });
-      }
-    }
+    const shared = await setupDependencySharing({
+      admissionOperationId,
+      assertStoreStorage,
+      bunInstaller,
+      finalizeHoistedDependencySharing,
+      prepareHoistedDependencySharing,
+      progress,
+      refreshDependencies,
+      setup,
+      sharing,
+      state,
+      target,
+      wtDir: res.wtDir,
+    });
     const selectedBunVersion = bunVersionForInstall(bunInstaller, shared);
     const installInputs = selectedBunVersion
       ? await captureBunInstallInputs(res.wtDir, selectedBunVersion)
@@ -1226,27 +1293,19 @@ export async function installWorktreeDependencies(
   try {
     await setupStage(progress, setup, 'storage-check');
     await assertStorage(wtDir);
-    if (command[0] === 'bun' && sharing?.enabled) {
-      const resolvedSharing = sharingForSetup(sharing, state);
-      const view = await inspectDependencyView(wtDir, resolvedSharing);
-      await setupStage(progress, setup, `dependency-view:${view.state}`);
-      requireFreshSharedView(view, resolvedSharing, wtDir);
-      shared = await sharedDependencyInstall(
-        wtDir,
-        resolvedSharing,
-        assertStoreStorage
-      );
-      if (shared?.strategy === 'hoisted-cow') {
-        await prepareFreshHoistedEnrollment({
-          admissionOperationId,
-          finalize: finalizeHoistedDependencySharing,
-          prepare: prepareHoistedDependencySharing,
-          progress,
-          setup,
-          target,
-        });
-      }
-    }
+    shared = await setupDependencySharing({
+      admissionOperationId,
+      assertStoreStorage,
+      bunInstaller,
+      finalizeHoistedDependencySharing,
+      prepareHoistedDependencySharing,
+      progress,
+      setup,
+      sharing,
+      state,
+      target,
+      wtDir,
+    });
     if (command[0] === 'bun') {
       installInputs = await captureBunInstallInputs(
         wtDir,
