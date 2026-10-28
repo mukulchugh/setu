@@ -196,6 +196,21 @@ test('prepare and execute also clean an Nx app cache under apps/<name>/.next', a
   );
 });
 
+test('execute verifies a cache with nested directories, like Turbopack version folders', async () => {
+  const f = fixture();
+  generated(f, {
+    'v16.3.0-d73f5622/00000013.sst': 'sst',
+    'v16.3.0-d73f5622/CURRENT': '1',
+  });
+
+  const prepared = await f.cache.prepare(f.target);
+  expect(prepared.ok).toBe(true);
+  await expect(
+    f.cache.execute(prepared.manifest.id, prepared.manifest.id)
+  ).resolves.toMatchObject({ ok: true });
+  expect(fs.existsSync(join(f.output, 'v16.3.0-d73f5622'))).toBe(false);
+});
+
 test('prepare skips a symlinked app directory instead of following it', async () => {
   const f = fixture();
   generated(f);

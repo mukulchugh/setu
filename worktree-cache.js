@@ -633,8 +633,10 @@ export function createWorktreeCache({
       const names = await namesIn(directory, budget);
       const expectedNames = remaining
         .filter(
+          // Direct children only: a parent's relative path is "..", which
+          // has no separator but is not a member of this directory.
           (child) =>
-            relative(entry.path, child.path) &&
+            child.path.startsWith(`${entry.path}${sep}`) &&
             !relative(entry.path, child.path).includes(sep)
         )
         .map((child) => relative(entry.path, child.path))

@@ -45,8 +45,12 @@ const JOURNAL_DIRECTORY = 'dependency-files';
 const DIRECTORY_MODE = 0o700;
 const RECORD_MODE = 0o600;
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
-const MAX_MANIFEST_BYTES = 256 * 1024 * 1024;
-const MAX_MANIFEST_ENTRIES = 250_000;
+// ~1 KB per planned file (5 digests + 3 paths); quivly-app's 272k files make a
+// 278 MB plan, so size this for MAX_MANIFEST_ENTRIES.
+const MAX_MANIFEST_BYTES = 1024 * 1024 * 1024;
+// Matches MAX_SCAN_ENTRIES in dependency-file-sharing.js: a hoisted monorepo
+// node_modules (quivly-app: ~272k files) must fit in one plan.
+const MAX_MANIFEST_ENTRIES = 1_000_000;
 // Keep every individually accepted manifest cacheable. The same hard byte
 // limit bounds total cached serialized plans, while the manifest entry limit
 // bounds the parsed object graph.

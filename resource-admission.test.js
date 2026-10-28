@@ -84,7 +84,7 @@ test('each admission refreshes storage and unknown or low storage refuses new wo
     })
   ).resolves.toMatchObject({ code: 'STORAGE_UNKNOWN', ok: false });
 
-  const low = fixture({ availableBytes: 19 * GiB }).admission();
+  const low = fixture({ availableBytes: 7 * GiB }).admission();
   await expect(
     low.admit({
       kind: 'install',
@@ -97,8 +97,33 @@ test('each admission refreshes storage and unknown or low storage refuses new wo
     operationId: 'install-low-message',
     target: { name: 'topic', repo: 'repo' },
   });
-  expect(refused.error).toContain('19.0 GiB free, 20.0 GiB required');
+  expect(refused.error).toContain('7.0 GiB free, 8.0 GiB required');
   expect(refused.error).toContain('setu adopt');
+});
+
+test('the storage floor and session cap come from the live config document', async () => {
+  const f = fixture({ availableBytes: 7 * GiB });
+  const admission = f.admission();
+  await f.state.replace('config', {
+    resourceAdmission: { lowStorageFloorBytes: 5 * GiB },
+  });
+  await expect(
+    admission.admit({
+      kind: 'install',
+      operationId: 'install-config-floor',
+      target: { name: 'topic', repo: 'repo' },
+    })
+  ).resolves.toMatchObject({ ok: true });
+  await f.state.replace('config', {
+    resourceAdmission: { lowStorageFloorBytes: 'bad' },
+  });
+  await expect(
+    admission.admit({
+      kind: 'install',
+      operationId: 'install-default-floor',
+      target: { name: 'other', repo: 'repo' },
+    })
+  ).resolves.toMatchObject({ code: 'STORAGE_LOW', ok: false });
 });
 
 test('admission records leave the user config document byte-for-byte unchanged', async () => {
