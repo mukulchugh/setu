@@ -478,8 +478,9 @@ test('explicit startup binds one injected server, installs dependency MCP handle
       })
     );
     expect(routes['/links']).toBeDefined();
-    // Log retention, memory ceilings, idle timeouts and the Links presence round.
-    expect(timers.size).toBe(4);
+    // Log retention, memory ceilings, idle timeouts, auto cleanup and the Links
+    // presence round.
+    expect(timers.size).toBe(5);
     expect(process.listenerCount('SIGTERM')).toBe(before + 1);
     const address = { requestIP: () => ({ address: '127.0.0.1' }) };
     expect(
