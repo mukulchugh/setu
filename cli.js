@@ -20,6 +20,7 @@ import {
   realpath as realpathAsync,
   stat as statAsync,
 } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -95,6 +96,7 @@ import {
   requestRemoval,
   runRemoveCommand,
 } from './remove-command.js';
+import { heavyJobLimit, runHeavy } from './heavy-gate.js';
 import { createResourceAdmission } from './resource-admission.js';
 import { createSetupInstallProcesses } from './setup-install-process.js';
 import { createSetupProgress } from './setup-progress.js';
@@ -293,6 +295,14 @@ export async function runCli(
   try {
     process.exitCode = 0;
     const [cmdRaw, ...rest] = argv;
+    if (cmdRaw === 'heavy') {
+      // The wrapped command's own flags must reach it unparsed.
+      process.exitCode = await runHeavy(rest, {
+        dir: join(homedir(), '.setu-heavy'),
+        max: heavyJobLimit(loadConfig()),
+      });
+      return;
+    }
     const cmd = { '--version': 'version', '-v': 'version' }[cmdRaw] ?? cmdRaw;
     ({ args, flags } = parseArgs(rest));
     asJson = !!flags.json;
@@ -4682,6 +4692,8 @@ function cmdHelp() {
     setu tunnel <repo> <branch> stop      Release it
     setu sync   <repo> <branch>      Merge the resolved base branch in (clean merges only —
                                       aborts and reports what would conflict, never leaves it mid-merge)
+    setu heavy <command...>          Run a heavy job (typecheck/lint/test) under the machine-wide cap
+                                      (~/.setu.json heavyJobs.max, default 2); waits for a free slot
     setu trigger <repo> <branch>     Start Trigger through the running portal
     setu trigger <repo> <branch> stop     Stop Trigger through the running portal
     setu logs  <repo> <branch> [--type dev|inngest|trigger|...] [--lines N] [--json]
