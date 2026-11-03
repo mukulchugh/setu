@@ -99,6 +99,8 @@ import {
   spawnText,
   splitKey,
   syncWithBase,
+  triggerBranchEnv,
+  triggerDevBranch,
   tunnelEnabled,
   validateWorktreeNames,
   workspaceInventoryRegistry,
@@ -201,6 +203,7 @@ const WHITESPACE_RE = /\s+/;
 const MEMORY_USAGE_RE = /^([\d.]+)\s*(MiB|GiB)/;
 const PID_RE = /^\d+$/;
 const TRIGGER_PROCESS_RE = /^\s*(\d+)\s+.*\.bin\/trigger dev\b/;
+const TRIGGER_BRANCH_ARG_RE = /\s(?:--branch|-b)(?:=|\s+)(\S+)/;
 const CONVEX_PROCESS_RE = /^\s*(\d+)\s+.*\bconvex dev\b/;
 const GITHUB_HTTPS_PREFIX_RE = /^https?:\/\/github\.com\//;
 const GITHUB_SSH_PREFIX_RE = /^git@github\.com:/;
@@ -1557,6 +1560,7 @@ export async function createPortalRuntime(options = {}) {
           starting: !!procEntry?.reserved && !procEntry.stopping && !active,
           stopping: !!procEntry?.stopping,
           triggerActive: triggerProcs.has(key),
+          triggerBranch: triggerProcs.get(key)?.branch ?? null,
           tunnelOn,
           tunnelRunning: tunnelProc !== null && activeTunnelMap.has(key),
           vercelDeploy: vercelStatus(repo, name),
@@ -1871,6 +1875,7 @@ export async function createPortalRuntime(options = {}) {
         ...process.env,
         PORT: String(target.port),
         ...parseEnvFile(join(target.wtDir, '.envrc')),
+        ...triggerBranchEnv(target.name, target.wtDir),
       }),
       prepareContainer: (target, spec) =>
         writeDockerCompose(
@@ -2351,28 +2356,57 @@ export async function createPortalRuntime(options = {}) {
   // accurate across a portal restart instead.
   const TRIGGER_MAX_CONCURRENT_RUNS = 2;
 
+  function triggerBranchMismatch(key, actual, expected) {
+    const where = actual
+      ? `dev branch "${actual}"`
+      : 'the shared default dev environment';
+    return {
+      code: 'TRIGGER_BRANCH_MISMATCH',
+      error: `A trigger dev process for ${key} is on ${where}, not "${expected}". Stop it, then start Trigger again.`,
+      ok: false,
+    };
+  }
+
   async function startTrigger(repo, name) {
     const key = `${repo}/${name}`;
     await (options.reconcileTriggerSidecars ?? reconcileTriggerSidecars)();
-    if (triggerProcs.has(key)) {
-      return { error: 'already running', ok: false };
-    }
     const wtDir = wtPath(repo, name);
+    const { branch, supported } = triggerDevBranch(name, wtDir);
+    const running = triggerProcs.get(key);
+    if (running) {
+      return supported && running.branch !== branch
+        ? triggerBranchMismatch(key, running.branch, branch)
+        : { error: 'already running', ok: false };
+    }
+    const version = pinnedTriggerVersion(wtDir);
     const fd = openLogFd(repo, name, 'trigger');
-    // trigger tasks import Supabase keys etc. from the shared .env.local at load time
-    const env = { ...process.env, ...parseEnvFile(envLocalPath(repo, wtDir)) };
+    const warning = supported
+      ? null
+      : `@trigger.dev/sdk ${version} has no dev-branch support, so this worktree shares the default dev environment with any other trigger dev session.`;
+    if (warning) {
+      appendFileSync(logPath(repo, name, 'trigger'), `[setu] ${warning}\n`);
+    }
+    // trigger tasks import Supabase keys etc. from the shared .env.local at load
+    // time; the branch env goes last so .env.local cannot redirect task triggers
+    const env = {
+      ...process.env,
+      ...parseEnvFile(envLocalPath(repo, wtDir)),
+      ...triggerBranchEnv(name, wtDir),
+    };
     const proc = spawnWithLog(
       [
         'bunx',
-        `trigger.dev@${pinnedTriggerVersion(wtDir)}`,
+        `trigger.dev@${version}`,
         'dev',
         '--max-concurrent-runs',
         String(TRIGGER_MAX_CONCURRENT_RUNS),
+        // a flag, not only env: it shows in `ps`, which reconciliation reads
+        ...(supported ? ['--branch', branch] : []),
       ],
       { cwd: wtDir, detached: true, env },
       fd
     );
-    const entry = wrapProc(proc);
+    const entry = { ...wrapProc(proc), branch: supported ? branch : null };
     triggerProcs.set(key, entry);
     watchOwnedProcessExit(
       triggerProcs,
@@ -2381,7 +2415,7 @@ export async function createPortalRuntime(options = {}) {
       proc.exited,
       (ownedHandle) => devRuntime.observe(null, ownedHandle)
     );
-    return { ok: true };
+    return { branch: entry.branch, ok: true, ...(warning ? { warning } : {}) };
   }
 
   async function stopTrigger(repo, name) {
@@ -2467,7 +2501,11 @@ export async function createPortalRuntime(options = {}) {
             'Trigger process identity is unknown; retry after reconciliation'
           );
         }
-        triggerProcs.set(key, { ...wrapPid(pid), evidence });
+        // Adopted with the branch it actually runs on, so startTrigger can
+        // report a worker on the wrong (or default) dev env instead of
+        // treating it as this worktree's isolated worker.
+        const branch = line.match(TRIGGER_BRANCH_ARG_RE)?.[1] ?? null;
+        triggerProcs.set(key, { ...wrapPid(pid), branch, evidence });
       }
     }
   }
@@ -6259,6 +6297,7 @@ export async function createPortalRuntime(options = {}) {
       },
       setPrReady,
       settingsRoutes,
+      startTrigger,
       trimLog,
       waitForOutcomes: () => Promise.all([...pendingOutcomes]),
       worktreeContains,
