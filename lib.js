@@ -438,6 +438,11 @@ export async function allowDirenvAsync(
 
 export async function configureWorktreeEnv(c, repo, name, port, withTunnel) {
   const wtDir = join(c.workspace, repo, name);
+  // Every .envrc write path (create, tunnel toggle) keeps it git-ignored.
+  const repoDir = join(c.workspace, `${repo}.git`);
+  if (existsSync(repoDir)) {
+    ensureSetuExcludes(repoDir);
+  }
   if (withTunnel) {
     const pd = publicDomain(c);
     await writeEnvrc(wtDir, port, `https://${pd}`);
@@ -2235,6 +2240,19 @@ export async function assertRemovableWorktree(
   if (force) {
     return;
   }
+  // Worktrees created before Setu wrote its excludes (or in repos it never
+  // re-registered) show Setu's own .envrc as untracked. Excluding it here makes
+  // both this check and the later `git worktree remove` treat it as ignored, so
+  // a clean worktree is not refused and the removal does not fail halfway.
+  ensureSetuExcludes(
+    (
+      await gitFetchAsync(wtDir, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-common-dir',
+      ])
+    ).trim()
+  );
   const dirty = await gitFetchAsync(wtDir, [
     '--no-optional-locks',
     'status',

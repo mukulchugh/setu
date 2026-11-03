@@ -127,6 +127,43 @@ test('removal allows the .envrc Setu writes but refuses one with user lines', as
   }
 });
 
+test('a repo without Setu excludes still removes cleanly with only the .envrc Setu wrote', async () => {
+  const f = repoFixture();
+  try {
+    // No ensureSetuExcludes: the worktree predates Setu writing its excludes.
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport NEXT_PUBLIC_APP_BASE_URL=http://feature.quivly.local\n'
+    );
+    expect(git(f.wt, ['status', '--porcelain'])).toBe('?? .envrc');
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).resolves.toBeUndefined();
+    // The later non-forced git removal must accept it too, or the removal
+    // stops halfway with a pending operation.
+    git(join(f.root, 'repo'), ['worktree', 'remove', f.wt]);
+    expect(existsSync(f.wt)).toBe(false);
+  } finally {
+    rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
+test('a repo without Setu excludes still refuses an .envrc with user lines', async () => {
+  const f = repoFixture();
+  try {
+    writeFileSync(
+      join(f.wt, '.envrc'),
+      'export PORT=3001\nexport OPENAI_API_KEY=secret\n'
+    );
+    await expect(
+      assertRemovableWorktree(f.c, f.repo, 'feature')
+    ).rejects.toMatchObject({ code: 'WORKTREE_DIRTY' });
+    expect(existsSync(join(f.wt, '.envrc'))).toBe(true);
+  } finally {
+    rmSync(f.root, { force: true, recursive: true });
+  }
+});
+
 test('runtime container mode follows the live runtime, then the compose file, never the start default', () => {
   const root = mkdtempSync(join(tmpdir(), 'setu-runtime-mode-'));
   try {
