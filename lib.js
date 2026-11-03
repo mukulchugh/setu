@@ -350,6 +350,43 @@ export function pinnedTriggerVersion(wtDir) {
   }
 }
 
+// Trigger.dev gives each project ONE default dev environment, and two
+// `trigger dev` sessions on it split each other's runs. Dev branches isolate
+// them: the worker joins with `--branch`, the app's SDK selects the same branch
+// via TRIGGER_PREVIEW_BRANCH (the documented carrier, checked first) and
+// TRIGGER_DEV_BRANCH. Both sides must agree or runs queue with no worker, so
+// branches are only used when the worktree's installed SDK reads the variable
+// (@trigger.dev/core 4.8.1 does, 4.4.6 does not).
+const TRIGGER_BRANCH_PROBES = [
+  'node_modules/@trigger.dev/core/dist/esm/v3/apiClientManager/index.js',
+  'node_modules/@trigger.dev/core/dist/commonjs/v3/apiClientManager/index.js',
+];
+
+export function triggerDevBranch(name, wtDir) {
+  // "default" is Trigger's sentinel for the shared root dev environment.
+  const branch = name === 'default' ? 'setu-default' : name;
+  const supported = TRIGGER_BRANCH_PROBES.some((probe) => {
+    try {
+      return readFileSync(join(wtDir, probe), 'utf8').includes(
+        'TRIGGER_DEV_BRANCH'
+      );
+    } catch {
+      return false;
+    }
+  });
+  return { branch, supported };
+}
+
+// Env every Setu-spawned process for a worktree (app and Trigger worker) gets,
+// applied last so .env.local cannot override it. An empty
+// VERCEL_GIT_COMMIT_REF would otherwise shadow TRIGGER_DEV_BRANCH in the SDK.
+export function triggerBranchEnv(name, wtDir) {
+  const { branch, supported } = triggerDevBranch(name, wtDir);
+  return supported
+    ? { TRIGGER_DEV_BRANCH: branch, TRIGGER_PREVIEW_BRANCH: branch }
+    : {};
+}
+
 export function readEnvrc(wtDir) {
   try {
     return readFileSync(join(wtDir, '.envrc'), 'utf8');
@@ -1549,7 +1586,10 @@ export async function writeDockerCompose(
   }
   const yaml = renderDockerCompose(spec, {
     cacheDir: bunCacheDir(c.workspace),
-    env: parseEnvFile(join(wtDir, '.envrc')),
+    env: {
+      ...parseEnvFile(join(wtDir, '.envrc')),
+      ...triggerBranchEnv(name, wtDir),
+    },
     envLocal,
     wtDir,
   });
