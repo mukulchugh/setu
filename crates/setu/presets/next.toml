@@ -1,0 +1,23 @@
+# Next.js: build and dev caches are regenerated on the next dev/build run.
+priority = 20
+
+[detect]
+any_of = ["next.config.*", "*/next.config.*", "*/*/next.config.*"]
+
+[[disk.item]]
+name = "next-dev-cache"
+kind = "cache"
+paths = [".next/dev/cache", "*/.next/dev/cache", "*/*/.next/dev/cache"]
+clean_after = "24h"
+
+[[disk.item]]
+name = "next-build-cache"
+kind = "cache"
+paths = [".next/cache", "*/.next/cache", "*/*/.next/cache"]
+clean_after = "24h"
+
+[[disk.item]]
+name = "next-dev-output"
+kind = "output"
+paths = [".next/dev", "*/.next/dev", "*/*/.next/dev"]
+clean_after = "7d"

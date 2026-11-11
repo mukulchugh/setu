@@ -83,6 +83,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?,
             s(req, "value"),
         ),
+        "disk.report" => d.disk_report(req.get("deps").and_then(Value::as_bool).unwrap_or(false)).await,
+        "disk.clean" => {
+            d.disk_clean(
+                req.get("apply").and_then(Value::as_bool).unwrap_or(false),
+                req.get("include_unmanaged").and_then(Value::as_bool).unwrap_or(false),
+            )
+            .await
+        }
         other => bail!("unknown cmd {other}"),
     }
 }

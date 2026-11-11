@@ -1,7 +1,8 @@
 //! Project config loading, env layers, template rendering and run resolution.
 #![allow(dead_code)]
 
-use crate::model::{ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, PROXY_PORT};
+use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, PROXY_PORT};
+use crate::presets::{self, RawItem};
 use crate::{naming, paths};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -23,6 +24,47 @@ struct RawProject {
     env: BTreeMap<String, String>,
     #[serde(default)]
     procs: BTreeMap<String, RawProc>,
+    preset: Option<RawPresetSel>,
+    #[serde(default)]
+    disk: RawDisk,
+}
+
+/// `preset = "next"` or `preset = ["auto", "next"]`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawPresetSel {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// The `[[disk.item]]` / `[[disk.store]]` tables; shared by project configs and preset files.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawDisk {
+    #[serde(default)]
+    pub item: Vec<RawDiskItem>,
+    #[serde(default)]
+    pub store: Vec<RawDiskStore>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawDiskItem {
+    name: String,
+    kind: Option<DiskKind>,
+    #[serde(default)]
+    paths: Vec<String>,
+    clean_after: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawDiskStore {
+    name: String,
+    path: String,
+    warn_below: Option<String>,
 }
 
 /// Port options are reserved for later; only empty tables are accepted.
@@ -44,17 +86,98 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
-    let n: u64 = num.parse().map_err(|_| anyhow!("invalid duration {s:?}: expected e.g. 90s, 30m, 2h"))?;
+    let n: u64 = num.parse().map_err(|_| anyhow!("invalid duration {s:?}: expected e.g. 90s, 30m, 2h, 7d"))?;
     let mult = match unit {
         "s" => 1,
         "m" => 60,
         "h" => 3600,
-        _ => bail!("invalid duration {s:?}: unit must be s, m or h"),
+        "d" => 86400,
+        _ => bail!("invalid duration {s:?}: unit must be s, m, h or d"),
     };
     Ok(Duration::from_secs(n * mult))
 }
 
+/// Parse a size like "1GiB", "500MB", "2048KiB" or "512" (bytes). SI units are powers of 1000,
+/// IEC units (KiB, MiB, GiB, TiB) powers of 1024. Decimals are allowed ("1.5GiB").
+pub fn parse_size(s: &str) -> Result<u64> {
+    let t = s.trim();
+    let split = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: f64 = num.parse().map_err(|_| anyhow!("invalid size {s:?}: expected e.g. 1GiB, 500MB, 2048KiB"))?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "kb" => 1e3,
+        "mb" => 1e6,
+        "gb" => 1e9,
+        "tb" => 1e12,
+        "kib" => 1024.0,
+        "mib" => 1048576.0,
+        "gib" => 1073741824.0,
+        "tib" => 1099511627776.0,
+        _ => bail!("invalid size {s:?}: unknown unit {:?}", unit.trim()),
+    };
+    Ok((n * mult) as u64)
+}
+
+/// A disk path must be relative, without `..`, empty segments or a leading `/`; `*` is only
+/// allowed as a whole segment.
+pub fn validate_disk_path(p: &str) -> Result<()> {
+    if p.is_empty() {
+        bail!("empty path");
+    }
+    if p.starts_with('/') {
+        bail!("path {p:?} must be relative (no leading '/')");
+    }
+    for seg in p.split('/') {
+        if seg.is_empty() {
+            bail!("path {p:?} has an empty segment");
+        }
+        if seg == ".." {
+            bail!("path {p:?} must not contain '..'");
+        }
+        if seg.contains('*') && seg != "*" {
+            bail!("path {p:?}: '*' is only allowed as a whole segment");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn convert_item(r: RawDiskItem) -> Result<RawItem> {
+    let name = r.name;
+    let ctx = || format!("disk item {name:?}");
+    if r.disabled {
+        // A disabled item only needs its name; it removes a preset item of that name.
+        let item = DiskItem { name: name.clone(), kind: r.kind.unwrap_or(DiskKind::Cache), paths: vec![], clean_after: None };
+        return Ok(RawItem { item, disabled: true });
+    }
+    let kind = r.kind.ok_or_else(|| anyhow!("kind is required (deps, output or cache)")).with_context(ctx)?;
+    if r.paths.is_empty() {
+        return Err(anyhow!("paths is required and must not be empty")).with_context(ctx);
+    }
+    for p in &r.paths {
+        validate_disk_path(p).with_context(ctx)?;
+    }
+    let clean_after = r.clean_after.as_deref().map(parse_duration).transpose().with_context(ctx)?;
+    Ok(RawItem { item: DiskItem { name: name.clone(), kind, paths: r.paths, clean_after }, disabled: false })
+}
+
+pub(crate) fn convert_store(r: RawDiskStore) -> Result<DiskStore> {
+    let warn_below = r.warn_below.as_deref().map(parse_size).transpose().with_context(|| format!("disk store {:?}", r.name))?;
+    Ok(DiskStore { name: r.name, path: paths::expand(&r.path), warn_below })
+}
+
+pub(crate) fn convert_disk(d: RawDisk) -> Result<(Vec<RawItem>, Vec<DiskStore>)> {
+    let items = d.item.into_iter().map(convert_item).collect::<Result<_>>()?;
+    let stores = d.store.into_iter().map(convert_store).collect::<Result<_>>()?;
+    Ok((items, stores))
+}
+
 fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
+    parse_project_in(text, file, |_| None)
+}
+
+/// Parse a project; `checkout` maps the repo to the checkout root used for preset detection.
+fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Option<PathBuf>) -> Result<ProjectConfig> {
     let raw: RawProject = toml::from_str(text).with_context(|| format!("invalid project config {}", file.display()))?;
     let idle = parse_duration(raw.idle.as_deref().unwrap_or("30m")).with_context(|| format!("in {}", file.display()))?;
     let mut procs = BTreeMap::new();
@@ -66,9 +189,22 @@ fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
         }
         procs.insert(name, ProcSpec { run: p.run, port: p.port, mise: p.mise, cwd: p.cwd });
     }
+    let requested: Vec<String> = match raw.preset {
+        None => vec!["auto".into()],
+        Some(RawPresetSel::One(s)) => vec![s],
+        Some(RawPresetSel::Many(v)) => v,
+    };
+    let (items, stores) = convert_disk(raw.disk).with_context(|| format!("in {}", file.display()))?;
+    let repo = paths::expand(&raw.repo);
+    let checkout = if requested.iter().any(|r| r == "auto") { checkout(&repo) } else { None };
+    let (presets, disk_items, stores) = presets::resolve(&requested, checkout.as_deref(), &items, &stores)
+        .with_context(|| format!("in {}", file.display()))?;
     Ok(ProjectConfig {
         project: raw.project,
-        repo: paths::expand(&raw.repo),
+        repo,
+        presets,
+        disk_items,
+        stores,
         domain: raw.domain,
         idle,
         max_running: raw.max_running.unwrap_or(3),
@@ -80,7 +216,16 @@ fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
 
 pub fn load_project(path: &Path) -> Result<ProjectConfig> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_project(&text, path)
+    parse_project_in(&text, path, main_checkout)
+}
+
+/// The repo's main worktree if present, else its first worktree; errors mean "no checkout".
+fn main_checkout(repo: &Path) -> Option<PathBuf> {
+    let main = naming::project_dir(repo).join("main");
+    if main.is_dir() {
+        return Some(main);
+    }
+    naming::list_worktrees(repo).ok()?.into_iter().next()
 }
 
 fn load_dir(dir: &Path) -> Result<Vec<ProjectConfig>> {
@@ -273,7 +418,8 @@ run = "bun worker {{literal}}"
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
         assert!(parse_duration("10").is_err());
         assert!(parse_duration("x5m").is_err());
-        assert!(parse_duration("5d").is_err());
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604800));
+        assert!(parse_duration("5w").is_err());
         assert!(parse_duration("").is_err());
     }
 
@@ -386,5 +532,70 @@ run = "bun worker {{literal}}"
         let id = RunId { project: "p".into(), run: "r".into() };
         assert!(worktree_env_path(&id).ends_with("env/p/r.toml"));
         assert!(global_env_path().ends_with("env/global.toml"));
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("1GiB").unwrap(), 1 << 30);
+        assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
+        assert_eq!(parse_size("500MB").unwrap(), 500_000_000);
+        assert_eq!(parse_size("2048KiB").unwrap(), 2 << 20);
+        assert_eq!(parse_size("1.5GiB").unwrap(), 3 << 29);
+        assert_eq!(parse_size("42").unwrap(), 42);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("GiB").is_err());
+        assert!(parse_size("5 parsecs").is_err());
+    }
+
+    #[test]
+    fn disk_path_validation() {
+        for ok in ["a", ".next/cache", "*/.next", "*/*/node_modules/.vite"] {
+            validate_disk_path(ok).unwrap();
+        }
+        for bad in ["", "/abs", "../x", "a/../b", "a//b", "a/", "x*", "*.log", "a/b*/c"] {
+            assert!(validate_disk_path(bad).is_err(), "{bad}");
+        }
+    }
+
+    const BASE: &str = "project='p'\nrepo='/r'\ndomain='d'\n";
+
+    #[test]
+    fn disk_config_round_trip() {
+        let t = format!(
+            "{BASE}preset = \"rust-cargo\"\n[[disk.item]]\nname='x'\nkind='output'\npaths=['out','*/out']\nclean_after='2h'\n\
+             [[disk.item]]\nname='cargo-target'\ndisabled=true\n\
+             [[disk.store]]\nname='s'\npath='~/cache'\nwarn_below='1GiB'\n"
+        );
+        let c = parse_project(&t, Path::new("t")).unwrap();
+        assert_eq!(c.presets, vec!["rust-cargo".to_string()]);
+        assert_eq!(c.disk_items.len(), 1);
+        let i = &c.disk_items[0];
+        assert_eq!((i.name.as_str(), i.kind, i.clean_after), ("x", DiskKind::Output, Some(Duration::from_secs(7200))));
+        assert_eq!(i.paths, ["out", "*/out"]);
+        assert_eq!(c.stores[0].warn_below, Some(1 << 30));
+        assert_eq!(c.stores[0].path, paths::expand("~/cache"));
+    }
+
+    #[test]
+    fn preset_selection_forms() {
+        let none = parse_project(&format!("{BASE}preset = []\n"), Path::new("t")).unwrap();
+        assert!(none.presets.is_empty() && none.disk_items.is_empty());
+        let auto = parse_project(BASE, Path::new("t")).unwrap();
+        assert!(auto.presets.is_empty());
+        let many = parse_project(&format!("{BASE}preset = ['go', 'node-npm']\n"), Path::new("t")).unwrap();
+        assert_eq!(many.presets, ["go", "node-npm"]);
+        assert!(parse_project(&format!("{BASE}preset = 'nope'\n"), Path::new("t")).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_disk_config() {
+        let bad = |extra: &str| parse_project(&format!("{BASE}{extra}"), Path::new("t")).is_err();
+        assert!(bad("[[disk.item]]\nname='x'\npaths=['a']\n")); // kind required
+        assert!(bad("[[disk.item]]\nname='x'\nkind='cache'\n")); // paths required
+        assert!(bad("[[disk.item]]\nname='x'\nkind='cache'\npaths=['../a']\n"));
+        assert!(bad("[[disk.item]]\nname='x'\nkind='cache'\npaths=['a']\nbogus=1\n"));
+        assert!(bad("[[disk.item]]\nname='x'\nkind='junk'\npaths=['a']\n"));
+        assert!(bad("[[disk.store]]\nname='s'\npath='/p'\nwarn_below='x'\n"));
+        assert!(bad("[disk]\nbogus=1\n"));
     }
 }

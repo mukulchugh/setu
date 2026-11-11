@@ -3,6 +3,8 @@
 use crate::activity::ActivityTracker;
 use crate::config;
 use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes, PROXY_PORT};
+use crate::disk;
+use crate::disk_measure;
 use crate::naming;
 use crate::paths;
 use crate::ports;
@@ -127,6 +129,7 @@ impl Daemon {
             self.set(&k, |r| {
                 r.status = RunStatus::Stopped;
                 r.procs.clear();
+                r.stopped_at = Some(crate::disk::now_secs());
                 r.note = Some("stopped after a daemon restart".into());
             });
         }
@@ -209,6 +212,7 @@ impl Daemon {
                 pinned: false,
                 procs: vec![],
                 note: None,
+                stopped_at: None,
             });
             rec.spec = spec;
             inner.rebuild_hosts();
@@ -320,6 +324,7 @@ impl Daemon {
         self.set(k, |r| {
             r.status = end;
             r.procs.clear();
+            r.stopped_at = Some(crate::disk::now_secs());
             if let Err(e) = &result {
                 r.note = Some(format!("stop incomplete: {e:#}"));
             }
@@ -465,6 +470,78 @@ impl Daemon {
         }
     }
 
+    /// Every worktree of every configured project, with what Setu knows about it.
+    fn snapshot(&self) -> (Vec<ProjectConfig>, BTreeMap<String, RunRecord>) {
+        let inner = self.lock();
+        (inner.configs.clone(), inner.state.runs.clone())
+    }
+
+    /// `disk.report`: declared items per worktree, stores health, volume free space.
+    pub async fn disk_report(&self, measure_deps: bool) -> Result<Value> {
+        let (configs, runs) = self.snapshot();
+        tokio::task::spawn_blocking(move || {
+            let policy = disk::Policy { measure: true, measure_deps, include_unmanaged: false };
+            let now = disk::now_secs();
+            let mut worktrees = Vec::new();
+            let mut stores = Vec::new();
+            let mut free = 0;
+            for (cfg, wt) in all_worktrees(&configs, &runs) {
+                free = disk::free_bytes(&wt.worktree);
+                let items = disk::candidates(&cfg, &wt, policy, now);
+                if items.is_empty() {
+                    continue;
+                }
+                worktrees.push(json!({
+                    "run": format!("{}/{}", wt.project, wt.run),
+                    "worktree": wt.worktree,
+                    "status": wt.status,
+                    "stopped_at": wt.stopped_at,
+                    "items": items,
+                }));
+            }
+            for cfg in &configs {
+                for st in &cfg.stores {
+                    let size = disk_measure::measure(&st.path);
+                    let low = st.warn_below.is_some_and(|w| size.logical < w);
+                    stores.push(json!({ "project": cfg.project, "name": st.name, "path": st.path, "logical": size.logical, "low": low }));
+                }
+            }
+            Ok(json!({ "free_bytes": free, "worktrees": worktrees, "stores": stores }))
+        })
+        .await?
+    }
+
+    /// `disk.clean`: delete eligible items (or list them when `apply` is false).
+    pub async fn disk_clean(&self, apply: bool, include_unmanaged: bool) -> Result<Value> {
+        let (configs, runs) = self.snapshot();
+        tokio::task::spawn_blocking(move || {
+            let policy = disk::Policy { measure: !apply, measure_deps: false, include_unmanaged };
+            let now = disk::now_secs();
+            let mut done = Vec::new();
+            let mut freed_total: i64 = 0;
+            for (cfg, wt) in all_worktrees(&configs, &runs) {
+                // Deepest paths first, so a nested item (.next/dev/cache) goes before its parent (.next/dev).
+                let mut eligible: Vec<_> = disk::candidates(&cfg, &wt, policy, now).into_iter().filter(|c| c.eligible).collect();
+                eligible.sort_by_key(|c| std::cmp::Reverse(c.path.components().count()));
+                for c in eligible {
+                    if !apply {
+                        done.push(json!({ "run": c.run, "path": c.path, "item": c.item, "size": c.size, "reason": c.reason }));
+                        continue;
+                    }
+                    match disk::clean_one(&cfg, &wt, &c.path, policy) {
+                        Ok(freed) => {
+                            freed_total += freed;
+                            done.push(json!({ "run": c.run, "path": c.path, "item": c.item, "freed_bytes": freed }));
+                        }
+                        Err(e) => done.push(json!({ "run": c.run, "path": c.path, "item": c.item, "error": format!("{e:#}") })),
+                    }
+                }
+            }
+            Ok(json!({ "applied": apply, "items": done, "freed_bytes": freed_total }))
+        })
+        .await?
+    }
+
     pub fn running_keys(&self) -> Vec<String> {
         self.lock()
             .state
@@ -474,6 +551,29 @@ impl Daemon {
             .map(|(k, _)| k.clone())
             .collect()
     }
+}
+
+/// Every worktree of every project, paired with Setu's record of it (blocking: runs git).
+fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) -> Vec<(ProjectConfig, disk::WorktreeInfo)> {
+    let mut out = Vec::new();
+    for cfg in configs {
+        let pdir = naming::project_dir(&cfg.repo);
+        for wt in naming::list_worktrees(&cfg.repo).unwrap_or_default() {
+            let run = naming::run_name(&pdir, &wt);
+            let rec = runs.get(&format!("{}/{run}", cfg.project));
+            out.push((
+                cfg.clone(),
+                disk::WorktreeInfo {
+                    project: cfg.project.clone(),
+                    run,
+                    worktree: wt,
+                    status: rec.map(|r| r.status),
+                    stopped_at: rec.and_then(|r| r.stopped_at),
+                },
+            ));
+        }
+    }
+    out
 }
 
 fn write_env_layer(path: &Path, env: &BTreeMap<String, String>) -> Result<()> {
@@ -595,9 +695,18 @@ pub async fn run() -> Result<()> {
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut tick = tokio::time::interval(SWEEP_EVERY);
+    // Hourly: clean regenerable items of stopped, Setu-managed runs past their policy.
+    let mut disk_tick = tokio::time::interval(Duration::from_secs(3600));
     loop {
         tokio::select! {
             _ = tick.tick() => daemon.sweep().await,
+            _ = disk_tick.tick() => {
+                match daemon.disk_clean(true, false).await {
+                    Ok(v) if v["items"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("setu: auto disk clean: {v}"),
+                    Err(e) => eprintln!("setu: auto disk clean failed: {e:#}"),
+                    _ => {}
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = term.recv() => break,
         }

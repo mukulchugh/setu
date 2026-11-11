@@ -120,6 +120,9 @@ mod tests {
             ports: vec![],
             env: BTreeMap::new(),
             procs: BTreeMap::new(),
+            presets: vec![],
+            disk_items: vec![],
+            stores: vec![],
         }
     }
 

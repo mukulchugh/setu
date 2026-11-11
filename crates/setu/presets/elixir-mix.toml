@@ -1,0 +1,16 @@
+# Mix projects: _build is output, deps/ is fetched dependencies.
+priority = 10
+
+[detect]
+any_of = ["mix.exs"]
+
+[[disk.item]]
+name = "mix-build"
+kind = "output"
+paths = ["_build"]
+clean_after = "7d"
+
+[[disk.item]]
+name = "mix-deps"
+kind = "deps"
+paths = ["deps"]

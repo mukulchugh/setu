@@ -27,6 +27,40 @@ pub struct ProjectConfig {
     pub env: BTreeMap<String, String>,
     /// Ordered by name.
     pub procs: BTreeMap<String, ProcSpec>,
+    /// Preset names requested by the project ("auto" = detect from marker files).
+    pub presets: Vec<String>,
+    /// Declared disk items after preset merge (see docs/slices/02-disk.md).
+    pub disk_items: Vec<DiskItem>,
+    /// Shared package stores to watch (never cleaned by Setu).
+    pub stores: Vec<DiskStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskKind {
+    Deps,
+    Output,
+    Cache,
+}
+
+/// A regenerable directory inside a worktree, declared by a preset or the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskItem {
+    pub name: String,
+    pub kind: DiskKind,
+    /// Relative to the worktree root; `*` matches exactly one path segment. No `..`, no absolute paths.
+    pub paths: Vec<String>,
+    /// Auto-clean this long after the run's recorded stop; None = never auto-clean.
+    pub clean_after: Option<Duration>,
+}
+
+/// A shared store outside worktrees (e.g. a package manager cache). Watched, never cleaned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskStore {
+    pub name: String,
+    pub path: PathBuf,
+    /// Warn when the store's logical size is below this (an emptied cache means slow, large re-downloads).
+    pub warn_below: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +162,9 @@ pub struct RunRecord {
     pub procs: Vec<ProcRecord>,
     /// Last error or crash note, if any.
     pub note: Option<String>,
+    /// Unix seconds when Setu last saw this run stop. Disk policies age from this, never from mtimes.
+    #[serde(default)]
+    pub stopped_at: Option<u64>,
 }
 
 /// What the proxy learns about a Host.
