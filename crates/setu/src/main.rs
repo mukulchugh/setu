@@ -10,6 +10,7 @@ mod disk;
 mod disk_measure;
 mod env;
 mod model;
+mod mcp;
 mod naming;
 mod paths;
 mod ports;

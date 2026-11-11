@@ -18,5 +18,5 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server", "tokio", 
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "process", "macros", "signal", "fs"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "sync", "process", "macros", "signal", "fs"] }
 toml = "1"

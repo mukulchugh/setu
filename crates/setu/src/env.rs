@@ -113,8 +113,8 @@ pub fn layer_map(scope: &Scope) -> Result<BTreeMap<String, String>> {
     Ok(read_layer(scope)?.into_iter().map(|v| (v.name, v.value)).collect())
 }
 
-/// Names marked secret across the given layers (read errors are skipped), for redaction.
-#[allow(dead_code)] // used by MCP log redaction (slice 4)
+/// Names marked secret across the given layers (read errors are skipped).
+#[allow(dead_code)] // kept for tests; MCP redaction reads layers directly
 pub fn secret_names(scopes: &[Scope]) -> BTreeSet<String> {
     scopes
         .iter()

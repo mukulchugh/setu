@@ -29,7 +29,11 @@ pub fn run_name(project_dir: &Path, worktree: &Path) -> String {
     // report either form.
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let (project_dir, worktree) = (canon(project_dir), canon(worktree));
-    let rel = worktree.strip_prefix(&project_dir).unwrap_or(&worktree);
+    // A worktree outside the project folder is named after its own directory.
+    let rel = worktree
+        .strip_prefix(&project_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| worktree.file_name().map(PathBuf::from).unwrap_or_default());
     let lower = rel.to_string_lossy().to_lowercase();
     let mut out = String::new();
     for c in lower.chars() {

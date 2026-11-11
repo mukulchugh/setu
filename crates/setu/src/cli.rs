@@ -24,6 +24,7 @@ setu-rs: run every worktree's app and workers at its own local URL
   setu-rs env unset <scope> [target] NAME
   setu-rs env import <scope> [target] <file> [--preview] [--overwrite]
   setu-rs env reveal <scope> [target] NAME          prints one value (audited)
+  setu-rs mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
 pub fn main() -> i32 {
@@ -69,6 +70,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("daemon") => crate::daemon::run().await,
+        Some("mcp") => crate::mcp::run().await,
         Some("up") => {
             let path = match args.get(1) {
                 Some(p) => std::path::Path::new(p).canonicalize()?.display().to_string(),

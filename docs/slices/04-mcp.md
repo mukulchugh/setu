@@ -31,3 +31,15 @@ How these tools treat secrets:
 - Drive the server with an MCP client script over stdio: initialize, tools/list, and call each tool against a sandbox project.
 - Grep every response for the test secret's value. It must never appear.
 - Connect a real client with `claude mcp add` in a scratch session if possible, and list runs.
+
+## Verification results (2026-11-11)
+- **Server.** `setu-rs mcp` is a hand-rolled stdio JSON-RPC server: initialize, ping, tools/list and tools/call. rmcp would have pulled in about 92 crates. The release binary grew by 49.7 KB, to 1.42 MB.
+- **Tools.** 13 tools. None can reveal a value.
+- **End to end** (`crates/setu/e2e/mcp-e2e.sh`), re-run by the coordinator:
+  - 19 MCP responses were checked, and the sandbox secret never appears.
+  - `run_logs` shows `[redacted:API_TOKEN]`.
+  - `env_set` without a value returns `pending_user_input`.
+  - A raw `env.reveal` with actor `mcp` is refused.
+  - The audit log records `actor:"mcp"` and `client:"e2e-client"`, and no values.
+- **Run naming fix.** A worktree outside its project folder is now named after its own directory, not its full path.
+- **Not done.** Connecting a real client with `claude mcp add` happens after install, so it uses the installed binary.

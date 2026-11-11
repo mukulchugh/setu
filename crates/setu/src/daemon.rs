@@ -23,6 +23,11 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(300);
 const SWEEP_EVERY: Duration = Duration::from_secs(10);
 const LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_LOG_LINES: usize = 500;
+/// Only this much of a log file's end is read for `logs`.
+const LOG_TAIL_BYTES: u64 = 512 * 1024;
+/// Secret values shorter than this are not redacted (they would mangle ordinary text).
+const MIN_REDACT_LEN: usize = 6;
 
 pub struct Daemon {
     inner: Mutex<Inner>,
@@ -533,20 +538,20 @@ impl Daemon {
         Ok(json!({ "run": k, "vars": vars }))
     }
 
-    pub fn env_set(&self, actor: &str, scope: &env::Scope, name: &str, value: &str, secret: Option<bool>) -> Result<Value> {
+    pub fn env_set(&self, actor: &str, client: Option<&str>, scope: &env::Scope, name: &str, value: &str, secret: Option<bool>) -> Result<Value> {
         let stored_secret = env::write_var(scope, name, value, secret)?;
-        env::audit(actor, "set", scope, Some(name), Some(json!({ "secret": stored_secret })));
+        env::audit(actor, "set", scope, Some(name), Some(with_client(json!({ "secret": stored_secret }), client)));
         Ok(json!({ "name": name, "secret": stored_secret, "applies": "on the next start of each affected run" }))
     }
 
-    pub fn env_unset(&self, actor: &str, scope: &env::Scope, name: &str) -> Result<Value> {
+    pub fn env_unset(&self, actor: &str, client: Option<&str>, scope: &env::Scope, name: &str) -> Result<Value> {
         let existed = env::unset_var(scope, name)?;
-        env::audit(actor, "unset", scope, Some(name), None);
+        env::audit(actor, "unset", scope, Some(name), Some(with_client(json!({}), client)));
         Ok(json!({ "name": name, "existed": existed }))
     }
 
     /// Parse a dotenv file or text inside the daemon; replies carry names only.
-    pub fn env_import(&self, actor: &str, scope: &env::Scope, path: Option<&str>, text: Option<&str>, preview: bool, overwrite: bool) -> Result<Value> {
+    pub fn env_import(&self, actor: &str, client: Option<&str>, scope: &env::Scope, path: Option<&str>, text: Option<&str>, preview: bool, overwrite: bool) -> Result<Value> {
         let body = match (path, text) {
             (Some(p), _) => std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
             (None, Some(t)) => t.to_string(),
@@ -554,7 +559,7 @@ impl Daemon {
         };
         let report = env::import(scope, &body, preview, overwrite)?;
         if !preview {
-            env::audit(actor, "import", scope, None, Some(json!({ "names": report.imported })));
+            env::audit(actor, "import", scope, None, Some(with_client(json!({ "names": report.imported }), client)));
         }
         Ok(serde_json::to_value(report)?)
     }
@@ -567,6 +572,52 @@ impl Daemon {
         let value = env::get_value(scope, name)?.ok_or_else(|| anyhow!("{name} is not set in this layer"))?;
         env::audit(actor, "reveal", scope, Some(name), None);
         Ok(json!({ "name": name, "value": value }))
+    }
+
+    /// Last `lines` lines of a run's proc logs with every current secret value redacted.
+    /// Several procs are prefixed with `[proc] `.
+    pub fn logs(&self, wanted: &str, proc: Option<&str>, lines: usize) -> Result<Value> {
+        let k = self.resolve(wanted)?;
+        let id = self.lock().state.runs.get(&k).map(|r| r.spec.id.clone()).ok_or_else(|| anyhow!("unknown run {k}"))?;
+        let lines = lines.clamp(1, MAX_LOG_LINES);
+        let dir = paths::logs_dir().join(&k);
+        let mut names: Vec<String> = match proc {
+            Some(p) => {
+                if p.is_empty() || !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) || p.starts_with('.') {
+                    bail!("bad proc name");
+                }
+                vec![p.to_string()]
+            }
+            None => std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".log")).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        names.sort();
+        if names.is_empty() {
+            bail!("no logs yet for {k}");
+        }
+        let multi = proc.is_none() && names.len() > 1;
+        let mut out = Vec::new();
+        for name in &names {
+            let text = tail_lines(&dir.join(format!("{name}.log")), lines).with_context(|| format!("no log for proc {name}"))?;
+            for l in text {
+                out.push(if multi { format!("[{name}] {l}") } else { l });
+            }
+        }
+        let mut secrets: Vec<(String, String)> = Vec::new();
+        for scope in [env::Scope::Global, env::Scope::Project(id.project.clone()), env::Scope::Worktree(id)] {
+            for v in env::read_layer(&scope).unwrap_or_default() {
+                if v.secret {
+                    secrets.push((v.name, v.value));
+                }
+            }
+        }
+        let text = redact(&out.join("\n"), &secrets);
+        Ok(json!({ "run": k, "lines": text.lines().count(), "text": text }))
     }
 
     /// Every worktree of every configured project, with what Setu knows about it.
@@ -653,6 +704,44 @@ impl Daemon {
 }
 
 /// Every worktree of every project, paired with Setu's record of it (blocking: runs git).
+/// Add the MCP client name (from its initialize handshake) to an audit entry.
+fn with_client(mut extra: Value, client: Option<&str>) -> Value {
+    if let (Some(c), Some(o)) = (client, extra.as_object_mut()) {
+        o.insert("client".into(), json!(c));
+    }
+    extra
+}
+
+/// The last `n` lines of a file, reading at most `LOG_TAIL_BYTES` from its end.
+fn tail_lines(path: &Path, n: usize) -> Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(LOG_TAIL_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.take(LOG_TAIL_BYTES).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // probably cut mid-line
+    }
+    let skip = lines.len().saturating_sub(n);
+    Ok(lines[skip..].iter().map(|l| l.to_string()).collect())
+}
+
+/// Replace every occurrence of each secret value with `[redacted:NAME]`. Values shorter than
+/// `MIN_REDACT_LEN` are skipped; longer values go first so a prefix cannot expose the rest.
+pub fn redact(text: &str, secrets: &[(String, String)]) -> String {
+    let mut list: Vec<&(String, String)> = secrets.iter().filter(|(_, v)| v.len() >= MIN_REDACT_LEN).collect();
+    list.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    let mut out = text.to_string();
+    for (name, value) in list {
+        out = out.replace(value.as_str(), &format!("[redacted:{name}]"));
+    }
+    out
+}
+
 fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) -> Vec<(ProjectConfig, disk::WorktreeInfo)> {
     let mut out = Vec::new();
     for cfg in configs {

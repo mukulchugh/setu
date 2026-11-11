@@ -74,6 +74,21 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             d.stop(&k, RunStatus::Stopped).await?;
             d.describe(&k)
         }
+        "start" => {
+            let k = target(d, req)?;
+            d.start(&k).await?;
+            d.describe(&k)
+        }
+        "restart" => {
+            let k = target(d, req)?;
+            d.stop(&k, RunStatus::Stopped).await?;
+            d.start(&k).await?;
+            d.describe(&k)
+        }
+        "logs" => {
+            let lines = req.get("lines").and_then(Value::as_u64).unwrap_or(100) as usize;
+            d.logs(s(req, "run").ok_or_else(|| anyhow!("logs needs a run"))?, s(req, "proc"), lines)
+        }
         "pin" | "unpin" => d.pin(&target(d, req)?, cmd == "pin"),
         "resolve" => Ok(json!(target(d, req)?)),
         "env.list" => d.env_list(&scope(d, req)?),
@@ -82,15 +97,17 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             let secret = req.get("secret").and_then(Value::as_bool);
             d.env_set(
                 actor(req),
+                client(req),
                 &scope(d, req)?,
                 s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?,
                 s(req, "value").ok_or_else(|| anyhow!("env.set needs a value"))?,
                 secret,
             )
         }
-        "env.unset" => d.env_unset(actor(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.unset needs a name"))?),
+        "env.unset" => d.env_unset(actor(req), client(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.unset needs a name"))?),
         "env.import" => d.env_import(
             actor(req),
+            client(req),
             &scope(d, req)?,
             s(req, "path"),
             s(req, "text"),
@@ -117,6 +134,11 @@ fn actor(req: &Value) -> &str {
         Some("app") => "app",
         _ => "cli",
     }
+}
+
+/// MCP client name from the initialize handshake, for the audit log. Length-capped.
+fn client(req: &Value) -> Option<&str> {
+    s(req, "client").filter(|c| !c.is_empty() && c.len() <= 80)
 }
 
 fn scope(d: &Arc<Daemon>, req: &Value) -> Result<crate::env::Scope> {
