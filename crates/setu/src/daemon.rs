@@ -1,0 +1,611 @@
+//! The daemon: owns state, starts and stops runs, answers the proxy and the socket API.
+
+use crate::activity::ActivityTracker;
+use crate::config;
+use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes, PROXY_PORT};
+use crate::naming;
+use crate::paths;
+use crate::ports;
+use crate::state::{self, State};
+use crate::supervisor::{self, ExitEvent, ExitTx};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// First compile of a large Next app can take minutes.
+const START_TIMEOUT: Duration = Duration::from_secs(300);
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
+const LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+pub struct Daemon {
+    inner: Mutex<Inner>,
+    /// Highest state version written to disk; older snapshots are skipped.
+    written: Arc<Mutex<u64>>,
+    pub activity: Arc<ActivityTracker>,
+    exits: ExitTx,
+}
+
+struct Inner {
+    configs: Vec<ProjectConfig>,
+    state: State,
+    /// host -> run key
+    hosts: HashMap<String, String>,
+    version: u64,
+}
+
+fn key(id: &RunId) -> String {
+    id.to_string()
+}
+
+impl Inner {
+    fn rebuild_hosts(&mut self) {
+        self.hosts = self.state.runs.iter().map(|(k, r)| (r.spec.host.clone(), k.clone())).collect();
+    }
+    fn config(&self, project: &str) -> Result<ProjectConfig> {
+        self.configs
+            .iter()
+            .find(|c| c.project == project)
+            .cloned()
+            .ok_or_else(|| anyhow!("no project config named {project}"))
+    }
+    fn up_count(&self, project: &str) -> usize {
+        self.state
+            .runs
+            .values()
+            .filter(|r| r.spec.id.project == project && matches!(r.status, RunStatus::Running | RunStatus::Starting))
+            .count()
+    }
+    /// Exact `project/run`, or a run name that is unique across projects.
+    fn resolve_key(&self, wanted: &str) -> Result<String> {
+        if self.state.runs.contains_key(wanted) {
+            return Ok(wanted.to_string());
+        }
+        let hits: Vec<&String> = self.state.runs.iter().filter(|(_, r)| r.spec.id.run == wanted).map(|(k, _)| k).collect();
+        match hits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => bail!("no run named {wanted}; see `setu-rs ls`"),
+            _ => bail!("{wanted} matches several projects; use project/run"),
+        }
+    }
+}
+
+/// Project env file layer (set from the app or MCP): `env/<project>.toml`.
+fn project_env_path(project: &str) -> std::path::PathBuf {
+    paths::env_dir().join(format!("{project}.toml"))
+}
+
+/// Build the RunSpec fresh, so env and config edits apply on every start.
+fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>) -> Result<RunSpec> {
+    let id = RunId { project: cfg.project.clone(), run: run.to_string() };
+    let k = key(&id);
+    let lease = ports::lease(leases, &k, &cfg.ports, ports::port_free)?;
+    leases.insert(k, lease.clone());
+    let mut layered = cfg.clone();
+    for (name, value) in config::load_env_layer(&project_env_path(&cfg.project))? {
+        layered.env.insert(name, value);
+    }
+    let global = config::load_env_layer(&config::global_env_path())?;
+    let worktree_env = config::load_env_layer(&config::worktree_env_path(&id))?;
+    config::resolve_run(&layered, worktree, run, &lease, &global, &worktree_env)
+}
+
+impl Daemon {
+    pub fn new(exits: ExitTx) -> Result<Arc<Self>> {
+        let configs = config::load_all()?;
+        let state = state::load(&paths::state_file()).context("state.json is unreadable; refusing to start")?;
+        let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0 };
+        inner.rebuild_hosts();
+        Ok(Arc::new(Self {
+            inner: Mutex::new(inner),
+            written: Arc::new(Mutex::new(0)),
+            activity: ActivityTracker::new(),
+            exits,
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// After a restart: keep runs whose processes are provably ours and alive; stop the rest.
+    pub async fn adopt(self: &Arc<Self>) {
+        let runs: Vec<(String, RunRecord)> = self.lock().state.runs.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+        for (k, rec) in runs {
+            if rec.procs.is_empty() {
+                continue;
+            }
+            let all_alive = rec.procs.iter().all(supervisor::owned_and_alive);
+            if all_alive && rec.status == RunStatus::Running {
+                self.activity.touch(&rec.spec.id);
+                continue;
+            }
+            let _ = supervisor::stop_procs(&rec.procs, STOP_GRACE).await;
+            self.set(&k, |r| {
+                r.status = RunStatus::Stopped;
+                r.procs.clear();
+                r.note = Some("stopped after a daemon restart".into());
+            });
+        }
+    }
+
+    fn set(&self, k: &str, f: impl FnOnce(&mut RunRecord)) {
+        {
+            let mut inner = self.lock();
+            if let Some(r) = inner.state.runs.get_mut(k) {
+                f(r);
+            }
+        }
+        self.persist();
+    }
+
+    /// Snapshot under the lock, write (with fsync) on the blocking pool. Snapshots are
+    /// versioned so a slow older write can never overwrite a newer one.
+    fn persist(&self) {
+        let (snap, ver) = {
+            let mut inner = self.lock();
+            inner.version += 1;
+            (inner.state.clone(), inner.version)
+        };
+        let written = self.written.clone();
+        let job = move || {
+            let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
+            if ver > *w {
+                match state::save(&snap, &paths::state_file()) {
+                    Ok(()) => *w = ver,
+                    Err(e) => eprintln!("setu: saving state failed: {e:#}"),
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(job);
+            }
+            Err(_) => job(),
+        }
+    }
+
+    /// Register the run for a worktree path (if new) and start it.
+    pub async fn up(self: &Arc<Self>, path: &Path) -> Result<Value> {
+        // Config reads and `git worktree list` run on the blocking pool, never under the lock.
+        let p = path.to_path_buf();
+        let (cfg, worktree) = tokio::task::spawn_blocking(move || -> Result<(ProjectConfig, std::path::PathBuf)> {
+            let configs = config::load_all()?;
+            let (cfg, wt) = naming::find_worktree(&configs, &p)?
+                .ok_or_else(|| anyhow!("{} is not inside a worktree of any configured project", p.display()))?;
+            Ok((cfg.clone(), wt))
+        })
+        .await??;
+        let run = naming::run_name(&naming::project_dir(&cfg.repo), &worktree);
+        let k = {
+            let mut inner = self.lock();
+            if let Ok(fresh) = config::load_all() {
+                inner.configs = fresh;
+            }
+            let cfg = &cfg;
+            let mut leases = inner.state.leases.clone();
+            let spec = build_spec(cfg, &worktree, &run, &mut leases)?;
+            inner.state.leases = leases;
+            let k = key(&spec.id);
+            if let Some(other) = inner.hosts.get(&spec.host) {
+                if other != &k {
+                    bail!("host {} already belongs to run {other}", spec.host);
+                }
+            }
+            if let Some(existing) = inner.state.runs.get(&k) {
+                if existing.spec.worktree != worktree {
+                    bail!(
+                        "run name {k} already belongs to {}; rename one of the worktrees",
+                        existing.spec.worktree.display()
+                    );
+                }
+            }
+            let rec = inner.state.runs.entry(k.clone()).or_insert_with(|| RunRecord {
+                spec: spec.clone(),
+                status: RunStatus::Stopped,
+                pinned: false,
+                procs: vec![],
+                note: None,
+            });
+            rec.spec = spec;
+            inner.rebuild_hosts();
+            drop(inner);
+            self.persist();
+            k
+        };
+        self.start(&k).await?;
+        self.describe(&k)
+    }
+
+    /// Start a registered run: spawn every proc, then wait for the web port.
+    pub async fn start(self: &Arc<Self>, k: &str) -> Result<()> {
+        let spec = {
+            let mut inner = self.lock();
+            let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
+            match rec.status {
+                RunStatus::Running | RunStatus::Starting => return Ok(()),
+                RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
+                _ => {}
+            }
+            let cfg = inner.config(&rec.spec.id.project)?;
+            if inner.up_count(&cfg.project) >= cfg.max_running {
+                bail!("{} already has {} runs up (max_running); stop one first", cfg.project, cfg.max_running);
+            }
+            let mut leases = inner.state.leases.clone();
+            let spec = build_spec(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases)?;
+            inner.state.leases = leases;
+            if let Some(r) = inner.state.runs.get_mut(k) {
+                r.spec = spec.clone();
+                r.status = RunStatus::Starting;
+                r.note = None;
+                r.procs.clear();
+            }
+            inner.rebuild_hosts();
+            drop(inner);
+            self.persist();
+            spec
+        };
+        for port in spec.ports.values() {
+            if !ports::port_free(*port) {
+                self.set(k, |r| {
+                    r.status = RunStatus::Crashed;
+                    r.note = Some(format!("port {port} is in use by another process"));
+                });
+                bail!("port {port} for {k} is in use by another process");
+            }
+        }
+        self.activity.touch(&spec.id);
+        for proc in &spec.procs {
+            match supervisor::spawn_proc(&spec, proc, self.exits.clone()).await {
+                Ok(rec) => self.set(k, |r| r.procs.push(rec)),
+                Err(e) => {
+                    let procs = self.lock().state.runs.get(k).map(|r| r.procs.clone()).unwrap_or_default();
+                    let _ = supervisor::stop_procs(&procs, STOP_GRACE).await;
+                    self.set(k, |r| {
+                        r.status = RunStatus::Crashed;
+                        r.procs.clear();
+                        r.note = Some(format!("could not start {}: {e:#}", proc.name));
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        let me = Arc::clone(self);
+        let k2 = k.to_string();
+        // This waiter belongs to this incarnation only; a stop or restart in between makes it a no-op.
+        let generation: Vec<i32> = self.lock().state.runs.get(k).map(|r| r.procs.iter().map(|p| p.pid).collect()).unwrap_or_default();
+        tokio::spawn(async move {
+            let ready = match spec.web_port {
+                Some(p) => supervisor::wait_port(p, START_TIMEOUT).await,
+                None => true,
+            };
+            let current: Vec<i32> = me.lock().state.runs.get(&k2).map(|r| r.procs.iter().map(|p| p.pid).collect()).unwrap_or_default();
+            if current != generation {
+                return;
+            }
+            me.set(&k2, |r| {
+                if r.status == RunStatus::Starting {
+                    if ready {
+                        r.status = RunStatus::Running;
+                    } else {
+                        r.note = Some("web port never opened; see `setu-rs logs`".into());
+                    }
+                }
+            });
+            if !ready {
+                let _ = me.stop(&k2, RunStatus::Crashed).await;
+            }
+        });
+        Ok(())
+    }
+
+    pub async fn stop(self: &Arc<Self>, k: &str, end: RunStatus) -> Result<()> {
+        let procs = {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get_mut(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            if r.status == RunStatus::Stopping {
+                return Ok(());
+            }
+            r.status = RunStatus::Stopping;
+            let procs = r.procs.clone();
+            drop(inner);
+            self.persist();
+            procs
+        };
+        let result = supervisor::stop_procs(&procs, STOP_GRACE).await;
+        let id = self.lock().state.runs.get(k).map(|r| r.spec.id.clone());
+        self.set(k, |r| {
+            r.status = end;
+            r.procs.clear();
+            if let Err(e) = &result {
+                r.note = Some(format!("stop incomplete: {e:#}"));
+            }
+        });
+        if let Some(id) = id {
+            self.activity.forget(&id);
+        }
+        result
+    }
+
+    /// A proc exited on its own.
+    pub async fn on_exit(self: &Arc<Self>, ev: ExitEvent) {
+        let k = key(&ev.run);
+        let (web, status) = {
+            let inner = self.lock();
+            let Some(r) = inner.state.runs.get(&k) else { return };
+            if !r.procs.iter().any(|p| p.pid == ev.pid) {
+                return; // an earlier incarnation
+            }
+            let cfg_web = inner.config(&r.spec.id.project).ok().and_then(|c| c.web_proc().map(|(n, _)| n.to_string()));
+            (cfg_web, r.status)
+        };
+        if !matches!(status, RunStatus::Running | RunStatus::Starting) {
+            return;
+        }
+        let note = format!("{} exited ({})", ev.proc, ev.code.map(|c| format!("code {c}")).unwrap_or_else(|| "signal".into()));
+        if web.as_deref() == Some(ev.proc.as_str()) {
+            let _ = self.stop(&k, RunStatus::Crashed).await;
+            self.set(&k, |r| r.note = Some(note));
+        } else {
+            self.set(&k, |r| {
+                r.procs.retain(|p| p.pid != ev.pid);
+                r.note = Some(note);
+            });
+        }
+    }
+
+    /// Every SWEEP_EVERY: idle stop, crash detection for adopted procs, log rotation.
+    pub async fn sweep(self: &Arc<Self>) {
+        let runs: Vec<(String, RunRecord)> = self.lock().state.runs.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+        for (k, r) in runs {
+            for p in &r.spec.procs {
+                let _ = supervisor::rotate_log(&p.log_path, LOG_MAX_BYTES);
+            }
+            if r.status != RunStatus::Running {
+                continue;
+            }
+            // Track children that left their group, so stop can still reach them.
+            let mut procs = r.procs.clone();
+            procs.iter_mut().for_each(supervisor::refresh_escaped);
+            if procs != r.procs {
+                self.set(&k, |x| {
+                    if x.procs.iter().map(|p| p.pid).eq(procs.iter().map(|p| p.pid)) {
+                        x.procs = procs.clone();
+                    }
+                });
+            }
+            // Adopted runs have no exit watcher: a dead web proc means the run is down.
+            let web_name = r.spec.procs.iter().find(|p| p.port.is_some() && p.port == r.spec.web_port).map(|p| p.name.clone());
+            let web_dead = match &web_name {
+                Some(n) => !r.procs.iter().any(|p| &p.name == n && supervisor::owned_and_alive(p)),
+                None => !r.procs.iter().any(supervisor::owned_and_alive),
+            };
+            if web_dead {
+                let _ = self.stop(&k, RunStatus::Crashed).await;
+                self.set(&k, |x| x.note = Some("the web process is gone".into()));
+                continue;
+            }
+            if r.pinned {
+                continue;
+            }
+            if self.activity.claim_idle_stop(&r.spec.id, r.spec.idle) {
+                let _ = self.stop(&k, RunStatus::Stopped).await;
+                self.set(&k, |x| x.note = Some("stopped after idle".into()));
+                self.activity.release_idle_stop(&r.spec.id);
+            }
+        }
+    }
+
+    pub fn describe(&self, k: &str) -> Result<Value> {
+        let inner = self.lock();
+        let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+        Ok(run_json(k, r))
+    }
+
+    pub fn list(&self) -> Value {
+        let inner = self.lock();
+        Value::Array(inner.state.runs.iter().map(|(k, r)| run_json(k, r)).collect())
+    }
+
+    pub fn pin(&self, wanted: &str, on: bool) -> Result<Value> {
+        let k = self.lock().resolve_key(wanted)?;
+        self.set(&k, |r| r.pinned = on);
+        self.describe(&k)
+    }
+
+    pub fn resolve(&self, wanted: &str) -> Result<String> {
+        self.lock().resolve_key(wanted)
+    }
+
+    pub fn run_for_path(&self, path: &Path) -> Result<String> {
+        let configs = self.lock().configs.clone();
+        let (cfg, worktree) = naming::find_worktree(&configs, path)?
+            .ok_or_else(|| anyhow!("{} is not inside a configured worktree", path.display()))?;
+        let run = naming::run_name(&naming::project_dir(&cfg.repo), &worktree);
+        Ok(format!("{}/{run}", cfg.project))
+    }
+
+    /// Env layers for the app/MCP. scope: global | project | worktree.
+    pub fn env_get(&self, scope: &str, target: Option<&str>) -> Result<Value> {
+        let path = self.env_path(scope, target)?;
+        Ok(json!({ "scope": scope, "path": path, "env": config::load_env_layer(&path)? }))
+    }
+
+    pub fn env_set(&self, scope: &str, target: Option<&str>, name: &str, value: Option<&str>) -> Result<Value> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!("env names may only use letters, digits and _");
+        }
+        let path = self.env_path(scope, target)?;
+        let mut env = config::load_env_layer(&path)?;
+        match value {
+            Some(v) => env.insert(name.to_string(), v.to_string()),
+            None => env.remove(name),
+        };
+        write_env_layer(&path, &env)?;
+        Ok(json!({ "scope": scope, "path": path, "env": env, "applies": "on the next start of each affected run" }))
+    }
+
+    fn env_path(&self, scope: &str, target: Option<&str>) -> Result<std::path::PathBuf> {
+        match scope {
+            "global" => Ok(config::global_env_path()),
+            "project" => {
+                let p = target.ok_or_else(|| anyhow!("project scope needs a project name"))?;
+                self.lock().config(p)?;
+                Ok(project_env_path(p))
+            }
+            "worktree" => {
+                let k = self.resolve(target.ok_or_else(|| anyhow!("worktree scope needs a run"))?)?;
+                let id = self.lock().state.runs[&k].spec.id.clone();
+                Ok(config::worktree_env_path(&id))
+            }
+            _ => bail!("scope must be global, project or worktree"),
+        }
+    }
+
+    pub fn running_keys(&self) -> Vec<String> {
+        self.lock()
+            .state
+            .runs
+            .iter()
+            .filter(|(_, r)| !r.procs.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+fn write_env_layer(path: &Path, env: &BTreeMap<String, String>) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| anyhow!("bad env path"))?;
+    std::fs::create_dir_all(dir)?;
+    let text = toml::to_string(env)?;
+    let tmp = path.with_extension("toml.tmp");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn run_json(k: &str, r: &RunRecord) -> Value {
+    let ram = if r.procs.is_empty() { 0 } else { supervisor::run_footprint(&r.procs) };
+    json!({
+        "run": k,
+        "url": r.spec.url,
+        "status": r.status,
+        "pinned": r.pinned,
+        "ram_bytes": ram,
+        "ports": r.spec.ports,
+        "worktree": r.spec.worktree,
+        "procs": r.procs.iter().map(|p| json!({"name": p.name, "pid": p.pid})).collect::<Vec<_>>(),
+        "note": r.note,
+    })
+}
+
+impl Routes for Daemon {
+    fn lookup(&self, host: &str) -> Lookup {
+        let inner = self.lock();
+        let Some(k) = inner.hosts.get(host) else { return Lookup::Unknown };
+        let Some(r) = inner.state.runs.get(k) else { return Lookup::Unknown };
+        let run = r.spec.id.clone();
+        match (r.status, r.spec.web_port) {
+            (RunStatus::Running, Some(port)) => Lookup::Up { run, port },
+            (RunStatus::Starting, _) | (RunStatus::Stopping, _) => Lookup::Starting { run },
+            _ => Lookup::Down { run },
+        }
+    }
+
+    fn request_start(&self, run: &RunId) -> std::result::Result<(), String> {
+        // Needs an Arc to spawn; the daemon registers itself in `handle()` at startup.
+        let me = SELF.get().cloned().ok_or("daemon not ready")?;
+        let k = key(run);
+        {
+            let inner = self.lock();
+            let r = inner.state.runs.get(&k).ok_or("unknown run")?;
+            if !matches!(r.status, RunStatus::Running | RunStatus::Starting) {
+                let cfg = inner.config(&run.project).map_err(|e| e.to_string())?;
+                if inner.up_count(&run.project) >= cfg.max_running {
+                    return Err(format!(
+                        "{} already has {} runs up. Stop one with `setu-rs down <run>` first.",
+                        run.project, cfg.max_running
+                    ));
+                }
+            }
+        }
+        tokio::spawn(async move {
+            if let Err(e) = me.start(&k).await {
+                eprintln!("setu: on-demand start of {k} failed: {e:#}");
+            }
+        });
+        Ok(())
+    }
+}
+
+static SELF: std::sync::OnceLock<Arc<Daemon>> = std::sync::OnceLock::new();
+
+/// flock(2) on state_dir/daemon.lock; released by the kernel when the daemon exits.
+fn single_instance_lock() -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = paths::state_dir();
+    std::fs::create_dir_all(&dir)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("daemon.lock"))?;
+    // SAFETY: flock on a valid fd we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("another setu-rs daemon is already running");
+    }
+    Ok(f)
+}
+
+/// Run the daemon until SIGINT/SIGTERM. Stops every run it started on the way out.
+pub async fn run() -> Result<()> {
+    // One daemon only: hold an exclusive lock for our lifetime, before touching state.
+    let _lock = single_instance_lock()?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", PROXY_PORT))
+        .await
+        .with_context(|| format!("binding the proxy on 127.0.0.1:{PROXY_PORT}"))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExitEvent>();
+    let daemon = Daemon::new(tx)?;
+    let _ = SELF.set(Arc::clone(&daemon));
+    daemon.adopt().await;
+    let routes: Arc<dyn Routes> = daemon.clone();
+    let activity = daemon.activity.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::proxy::serve(listener, routes, activity).await {
+            eprintln!("setu: proxy stopped: {e:#}");
+        }
+    });
+    let api_daemon = daemon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::api::serve(api_daemon).await {
+            eprintln!("setu: api stopped: {e:#}");
+        }
+    });
+    let exit_daemon = daemon.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            exit_daemon.on_exit(ev).await;
+        }
+    });
+    eprintln!("setu-rs daemon: proxy on http://127.0.0.1:{PROXY_PORT}, socket {}", paths::socket_path().display());
+
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut tick = tokio::time::interval(SWEEP_EVERY);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => daemon.sweep().await,
+            _ = tokio::signal::ctrl_c() => break,
+            _ = term.recv() => break,
+        }
+    }
+    eprintln!("setu-rs daemon: stopping runs");
+    for k in daemon.running_keys() {
+        let _ = daemon.stop(&k, RunStatus::Stopped).await;
+    }
+    let _ = std::fs::remove_file(paths::socket_path());
+    Ok(())
+}

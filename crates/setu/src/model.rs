@@ -1,0 +1,150 @@
+//! Shared types. Every module codes against these; change them only in the coordinator.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Port the proxy listens on in slice 1 (`http://<host>:7777`).
+pub const PROXY_PORT: u16 = 7777;
+/// Leased app ports live here: above v1's 3000-3999, clear of its 8288-9287 Inngest range.
+pub const PORT_RANGE: std::ops::RangeInclusive<u16> = 4000..=4999;
+
+/// One project, parsed from `~/.config/setu/projects/<project>.toml`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectConfig {
+    pub project: String,
+    /// Bare repo; worktrees are discovered with `git worktree list --porcelain`.
+    pub repo: PathBuf,
+    /// Run hosts are `<run>.<domain>`; the `main` worktree is `<project>.<domain>`.
+    pub domain: String,
+    pub idle: Duration,
+    /// Max runs up at once across this project (default 3).
+    pub max_running: usize,
+    /// Named ports leased per run, e.g. "web", "inngest". Values are reserved for later options.
+    pub ports: Vec<String>,
+    /// Project env layer (unrendered templates).
+    pub env: BTreeMap<String, String>,
+    /// Ordered by name.
+    pub procs: BTreeMap<String, ProcSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcSpec {
+    /// Shell command, unrendered (templates allowed).
+    pub run: String,
+    /// Name of the leased port this proc listens on. The proc with a port that receives
+    /// proxied traffic is the one named by `ProjectConfig::web_proc()`.
+    pub port: Option<String>,
+    /// Prefix the command with `mise exec --` so toolchains resolve per worktree.
+    pub mise: bool,
+    /// Working directory relative to the worktree root (default ".").
+    pub cwd: Option<String>,
+}
+
+impl ProjectConfig {
+    /// The proc that receives proxied HTTP: the first proc (by name) whose port is "web",
+    /// else the first proc with any port.
+    pub fn web_proc(&self) -> Option<(&str, &ProcSpec)> {
+        self.procs
+            .iter()
+            .find(|(_, p)| p.port.as_deref() == Some("web"))
+            .or_else(|| self.procs.iter().find(|(_, p)| p.port.is_some()))
+            .map(|(n, p)| (n.as_str(), p))
+    }
+}
+
+/// `project/run`, e.g. `quivly-app/feat-x`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RunId {
+    pub project: String,
+    pub run: String,
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.project, self.run)
+    }
+}
+
+/// Everything needed to start a run, fully rendered. Built by `config::resolve_run`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSpec {
+    pub id: RunId,
+    pub worktree: PathBuf,
+    /// Lowercase host without port, e.g. `feat-x.quivly.local`.
+    pub host: String,
+    /// `http://<host>:<PROXY_PORT>`
+    pub url: String,
+    pub ports: BTreeMap<String, u16>,
+    /// Final env after all layers and templates (global < project < worktree < computed).
+    pub env: BTreeMap<String, String>,
+    pub procs: Vec<ResolvedProc>,
+    /// Port of the proc that receives proxied traffic.
+    pub web_port: Option<u16>,
+    pub idle: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedProc {
+    pub name: String,
+    /// Rendered shell command (run via `sh -c`).
+    pub command: String,
+    pub cwd: PathBuf,
+    pub port: Option<u16>,
+    pub log_path: PathBuf,
+}
+
+/// A process Setu started. `pgid == pid` because every proc leads its own session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcRecord {
+    pub name: String,
+    pub pid: i32,
+    /// Process start time from the kernel (`procinfo::start_time`), used to refuse
+    /// signalling a recycled pid.
+    pub start_time: u64,
+    /// Descendants that left the group (setsid/daemonized children), seen while the
+    /// proc was alive: (pid, start_time). Stop signals them only if the start time still matches.
+    #[serde(default)]
+    pub escaped: Vec<(i32, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunStatus {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Crashed,
+}
+
+/// Persisted per run in state.json.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub spec: RunSpec,
+    pub status: RunStatus,
+    pub pinned: bool,
+    pub procs: Vec<ProcRecord>,
+    /// Last error or crash note, if any.
+    pub note: Option<String>,
+}
+
+/// What the proxy learns about a Host.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Lookup {
+    Up { run: RunId, port: u16 },
+    Starting { run: RunId },
+    /// Registered but stopped/crashed: the proxy may ask for an on-demand start.
+    Down { run: RunId },
+    Unknown,
+}
+
+/// Implemented by the daemon; the proxy only talks to this.
+pub trait Routes: Send + Sync + 'static {
+    /// Pure in-memory lookup by host (port already stripped, lowercase).
+    fn lookup(&self, host: &str) -> Lookup;
+    /// Non-blocking: ask the daemon to start a Down run. Returns false if refused
+    /// (for example the max-running cap); the proxy then shows `refusal`.
+    fn request_start(&self, run: &RunId) -> Result<(), String>;
+}
