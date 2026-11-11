@@ -1,7 +1,7 @@
 //! Project config loading, env layers, template rendering and run resolution.
 #![allow(dead_code)]
 
-use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, PROXY_PORT};
+use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec};
 use crate::presets::{self, RawItem};
 use crate::{naming, paths};
 use anyhow::{anyhow, bail, Context, Result};
@@ -317,7 +317,8 @@ pub fn resolve_run(
     worktree_env: &BTreeMap<String, String>,
 ) -> Result<RunSpec> {
     let host = naming::host_for(cfg, run);
-    let url = format!("http://{host}:{PROXY_PORT}");
+    let port = crate::globalcfg::proxy_port();
+    let url = if port == 80 { format!("http://{host}") } else { format!("http://{host}:{port}") };
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     vars.insert("project".into(), cfg.project.clone());
     vars.insert("run".into(), run.to_string());

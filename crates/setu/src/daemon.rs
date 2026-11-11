@@ -2,7 +2,7 @@
 
 use crate::activity::ActivityTracker;
 use crate::config;
-use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes, PROXY_PORT};
+use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes};
 use crate::disk;
 use crate::env;
 use crate::disk_measure;
@@ -189,6 +189,7 @@ impl Daemon {
         let k = {
             let mut inner = self.lock();
             if let Ok(fresh) = config::load_all() {
+                domains_refresh(&fresh);
                 inner.configs = fresh;
             }
             let cfg = &cfg;
@@ -820,6 +821,19 @@ impl Routes for Daemon {
 
 static SELF: std::sync::OnceLock<Arc<Daemon>> = std::sync::OnceLock::new();
 
+/// Domains the built-in DNS answers for: every project domain except *.localhost.
+fn dns_domains() -> Arc<std::sync::RwLock<Vec<String>>> {
+    static D: std::sync::OnceLock<Arc<std::sync::RwLock<Vec<String>>>> = std::sync::OnceLock::new();
+    D.get_or_init(|| Arc::new(std::sync::RwLock::new(Vec::new()))).clone()
+}
+
+fn domains_refresh(configs: &[ProjectConfig]) {
+    let list: Vec<String> = configs.iter().map(|c| c.domain.to_lowercase()).filter(|d| !d.ends_with("localhost")).collect();
+    if let Ok(mut w) = dns_domains().write() {
+        *w = list;
+    }
+}
+
 /// flock(2) on state_dir/daemon.lock; released by the kernel when the daemon exits.
 fn single_instance_lock() -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
@@ -837,9 +851,13 @@ fn single_instance_lock() -> Result<std::fs::File> {
 pub async fn run() -> Result<()> {
     // One daemon only: hold an exclusive lock for our lifetime, before touching state.
     let _lock = single_instance_lock()?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", PROXY_PORT))
+    let proxy_port = crate::globalcfg::proxy_port();
+    // Port 80 can only be bound unprivileged on the wildcard address; the proxy still
+    // drops every non-loopback peer. Any other port binds loopback only.
+    let bind_ip = if proxy_port < 1024 { "0.0.0.0" } else { "127.0.0.1" };
+    let listener = tokio::net::TcpListener::bind((bind_ip, proxy_port))
         .await
-        .with_context(|| format!("binding the proxy on 127.0.0.1:{PROXY_PORT}"))?;
+        .with_context(|| format!("binding the proxy on {bind_ip}:{proxy_port}"))?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExitEvent>();
     let daemon = Daemon::new(tx)?;
     let _ = SELF.set(Arc::clone(&daemon));
@@ -863,7 +881,16 @@ pub async fn run() -> Result<()> {
             exit_daemon.on_exit(ev).await;
         }
     });
-    eprintln!("setu-rs daemon: proxy on http://127.0.0.1:{PROXY_PORT}, socket {}", paths::socket_path().display());
+    // DNS for custom project domains (not *.localhost), for /etc/resolver/<domain>.
+    let dns_port = crate::globalcfg::GlobalConfig::load().map(|c| c.dns_port).unwrap_or(15353);
+    let domains = dns_domains();
+    domains_refresh(&daemon.lock().configs);
+    tokio::spawn(async move {
+        if let Err(e) = crate::dns::serve(dns_port, domains).await {
+            eprintln!("setu: DNS on 127.0.0.1:{dns_port} unavailable: {e:#}");
+        }
+    });
+    eprintln!("setu-rs daemon: proxy on http://{bind_ip}:{proxy_port}, socket {}", paths::socket_path().display());
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut tick = tokio::time::interval(SWEEP_EVERY);

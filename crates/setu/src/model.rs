@@ -5,8 +5,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Port the proxy listens on in slice 1 (`http://<host>:7777`).
-pub const PROXY_PORT: u16 = 7777;
 /// Leased app ports live here: above v1's 3000-3999, clear of its 8288-9287 Inngest range.
 pub const PORT_RANGE: std::ops::RangeInclusive<u16> = 4000..=4999;
 

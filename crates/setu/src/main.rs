@@ -8,7 +8,10 @@ mod config;
 mod daemon;
 mod disk;
 mod disk_measure;
+mod dns;
+mod doctor;
 mod env;
+mod globalcfg;
 mod model;
 mod mcp;
 mod naming;
@@ -17,6 +20,7 @@ mod ports;
 mod presets;
 mod procinfo;
 mod proxy;
+mod setup;
 mod state;
 mod supervisor;
 

@@ -52,3 +52,19 @@ Research: `05-install-research.md`.
    - `dist build` produces the tarball and formula;
    - a local tap (`brew tap-new`) installs from the local tarball, and `brew install` then `setu-rs --version` works;
    - `brew uninstall` and `brew untap` clean up.
+
+## Verification results (2026-11-11)
+- **Unit tests:** 102 pass. They cover the DNS responder, the plist, setup plan/apply/undo against a fake system, marker-only removal, and the doctor checks.
+- **DNS on this Mac:** `dig @127.0.0.1 -p 15353 feat-x.quivly.local` returns 127.0.0.1, and `::1` for AAAA. `example.com` is REFUSED.
+- **`setup --dry-run`:** two steps, PATH capture and the LaunchAgent, and no sudo, because `quivly.local` already resolves.
+- **`doctor`:**
+  - Correctly flags the missing LaunchAgent and PATH snapshot, each with its exact fix, and exits 1.
+  - Reports the daemon, proxy, domain and bun store as ok.
+- **Homebrew:**
+  - `dist` 0.34.0 (from Homebrew) generated `.github/workflows/release.yml` and the formula, and built `setu-aarch64-apple-darwin.tar.xz` (624 KB).
+  - A local tap installed it with `brew install`: `/opt/homebrew/bin/setu-rs --version` printed 0.1.0, and `setup` from the Homebrew binary targets `/opt/homebrew/opt/setu/bin/setu-rs`.
+  - `brew uninstall` and `brew untap` left nothing behind.
+- **Not done by the agent:**
+  - `setu-rs setup` itself. Installing a LaunchAgent is blocked for the agent as persistence, so Mukul runs it.
+  - Publishing. It needs a public repo or a public releases repo, plus a `mukulchugh/homebrew-tap` repo and a `HOMEBREW_TAP_TOKEN` secret.
+- **Follow-ups:** a crate README for the tarball (it currently ships the repo root README), and a formula caveat pointing to `setu-rs setup`.

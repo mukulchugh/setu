@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Runs every worktree's app and workers side by side, each at its own local URL"
+repository = "https://github.com/mukulchugh/setu"
+homepage = "https://github.com/mukulchugh/setu"
+license = "UNLICENSED"
 
 [[bin]]
 name = "setu-rs"
@@ -20,3 +23,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "sync", "process", "macros", "signal", "fs"] }
 toml = "1"
+
+[package.metadata.dist]
+dist = true

@@ -42,6 +42,13 @@ pub async fn spawn_proc(spec: &RunSpec, proc: &ResolvedProc, exits: ExitTx) -> a
         env.insert("PORT".into(), p.to_string());
     }
 
+    // Use the login-shell PATH captured by `setu-rs setup` (launchd's own PATH is minimal),
+    // unless the run's env sets PATH itself.
+    if !env.contains_key("PATH") {
+        if let Some(p) = crate::globalcfg::login_path() {
+            env.insert("PATH".into(), p);
+        }
+    }
     let mut cmd = tokio::process::Command::new("/bin/sh");
     // Don't leak the shell that started the daemon into the run: a stale PORT, direnv
     // state or a parent npm/nx context would point the proc at the wrong place.

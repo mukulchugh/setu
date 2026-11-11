@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 const USAGE: &str = "\
 setu-rs: run every worktree's app and workers at its own local URL
 
+  setu-rs setup [--dry-run] [--yes] [--undo]
+                                     one-time setup: login PATH, start at login, custom domains
+  setu-rs doctor [--json]            check every layer and print the exact fix
   setu-rs daemon                     run the daemon in the foreground
   setu-rs up [path]                  start the run for a worktree (default: current dir)
   setu-rs down [run]                 stop a run (default: the current worktree's)
@@ -120,6 +123,12 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         }
         Some("logs") => logs(&args[1..]).await,
         Some("disk") => disk(&args[1..]).await,
+        Some("setup") => setup_cmd(&args[1..]).await,
+        Some("doctor") => doctor_cmd(&args[1..]).await,
+        Some("--version" | "version") => {
+            println!("setu-rs {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("env") => env(&args[1..]).await,
         Some(other) => bail!("unknown command {other}\n\n{USAGE}"),
     }
@@ -361,5 +370,100 @@ async fn disk(args: &[String]) -> Result<()> {
         human_bytes(reclaim),
         human_bytes(out["free_bytes"].as_u64().unwrap_or(0))
     );
+    Ok(())
+}
+
+async fn setup_cmd(args: &[String]) -> Result<()> {
+    use crate::globalcfg::GlobalConfig;
+    use crate::setup::{self, Layout, RealSys};
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let sys = RealSys;
+    let layout = Layout::real();
+    if flag("--undo") {
+        for line in setup::undo(&layout, &sys)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    let mut gcfg = GlobalConfig::load()?;
+    let domains: Vec<String> = crate::config::load_all()?.into_iter().map(|c| c.domain).collect();
+    let binary = setup::stable_binary_path();
+    let steps = setup::plan(&gcfg, &domains, &binary, &sys);
+    if steps.is_empty() {
+        println!("everything is already set up. `setu-rs doctor` checks it.");
+        return Ok(());
+    }
+    println!("setu-rs setup will:");
+    for s in &steps {
+        println!("  {} {}", if s.sudo { "[sudo]" } else { "      " }, s.description);
+    }
+    if flag("--dry-run") {
+        return Ok(());
+    }
+    if !flag("--yes") {
+        use std::io::{BufRead, Write};
+        print!("continue? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            println!("nothing changed");
+            return Ok(());
+        }
+    }
+    let record = setup::apply(&steps, &mut gcfg, &binary, &layout, &sys)?;
+    println!("done. Recorded in {}. Undo with `setu-rs setup --undo`.", setup::record_path().display());
+    if let Some(p) = record.plist {
+        println!("daemon starts at login from {p}");
+    }
+    Ok(())
+}
+
+async fn doctor_cmd(args: &[String]) -> Result<()> {
+    use crate::doctor::{self, DoctorInputs};
+    use crate::globalcfg::GlobalConfig;
+    use crate::setup::{RealSys, Sys, LABEL};
+    let sys = RealSys;
+    let gcfg = GlobalConfig::load()?;
+    let daemon_ping = api::call(json!({ "cmd": "ping" }))
+        .await
+        .ok()
+        .and_then(|v| v["version"].as_str().map(String::from));
+    let launch_agent_loaded = sys
+        .run("launchctl", &["print", &format!("gui/{}/{LABEL}", sys.uid())])
+        .map(|(code, _)| code == 0)
+        .unwrap_or(false);
+    let proxy_listening = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], gcfg.proxy_port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok();
+    let checks = doctor::run(
+        DoctorInputs {
+            daemon_ping,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            launch_agent_loaded,
+            gcfg,
+            projects: crate::config::load_all()?,
+            proxy_listening,
+        },
+        &sys,
+    );
+    let failed = checks.iter().filter(|c| !c.ok).count();
+    if args.iter().any(|a| a == "--json") {
+        let v: Vec<Value> = checks.iter().map(|c| json!({ "name": c.name, "ok": c.ok, "detail": c.detail, "fix": c.fix })).collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        for c in &checks {
+            println!("{} {:<34} {}", if c.ok { "ok  " } else { "FAIL" }, c.name, c.detail);
+            if let (false, Some(fix)) = (c.ok, &c.fix) {
+                println!("       fix: {fix}");
+            }
+        }
+        println!("{}", if failed == 0 { "all good".to_string() } else { format!("{failed} check(s) failed") });
+    }
+    if failed > 0 {
+        bail!("doctor found {failed} problem(s)");
+    }
     Ok(())
 }
