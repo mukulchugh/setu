@@ -71,6 +71,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "down" => {
             let k = target(d, req)?;
+            d.check_holder(&k, s(req, "holder"))?;
             d.stop(&k, RunStatus::Stopped).await?;
             d.describe(&k)
         }
@@ -81,6 +82,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "restart" => {
             let k = target(d, req)?;
+            d.check_holder(&k, s(req, "holder"))?;
             d.stop(&k, RunStatus::Stopped).await?;
             d.start(&k).await?;
             d.describe(&k)
@@ -123,6 +125,32 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             )
             .await
         }
+        "worktree.new" => {
+            d.worktree_new(
+                actor(req),
+                client(req),
+                s(req, "project").ok_or_else(|| anyhow!("worktree.new needs a project"))?,
+                s(req, "branch").ok_or_else(|| anyhow!("worktree.new needs a branch"))?,
+                s(req, "base").filter(|b| !b.is_empty()),
+                req.get("start").and_then(Value::as_bool).unwrap_or(false),
+            )
+            .await
+        }
+        "worktree.adopt" => d.worktree_adopt(actor(req), client(req), &PathBuf::from(s(req, "path").ok_or_else(|| anyhow!("worktree.adopt needs a path"))?)).await,
+        "worktree.rm" => {
+            let force = req.get("force").and_then(Value::as_bool).unwrap_or(false);
+            if force && actor(req) == "mcp" {
+                bail!("force removal is not available to agents; ask the user to run `setu-rs rm --force` themselves");
+            }
+            d.worktree_rm(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.rm needs a run"))?, force).await
+        }
+        "worktree.restore" => d.worktree_restore(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.restore needs a run"))?).await,
+        "claim" => {
+            let pid = req.get("pid").and_then(Value::as_i64).map(|p| p as i32);
+            d.claim(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("claim needs a run"))?, s(req, "holder").ok_or_else(|| anyhow!("claim needs a holder"))?, pid)
+        }
+        "release" => d.release(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("release needs a run"))?, s(req, "holder")),
+        "claims" => Ok(d.claims_list()),
         other => bail!("unknown cmd {other}"),
     }
 }

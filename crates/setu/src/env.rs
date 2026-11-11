@@ -359,7 +359,7 @@ pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Resu
     Ok(rep)
 }
 
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

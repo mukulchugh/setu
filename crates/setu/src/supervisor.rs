@@ -103,8 +103,8 @@ pub async fn spawn_proc(spec: &RunSpec, proc: &ResolvedProc, exits: ExitTx) -> a
 }
 
 /// Env names never inherited from the daemon's own environment.
-const LEAKY_ENV: &[&str] = &["PORT", "INIT_CWD", "OLDPWD", "PWD"];
-const LEAKY_PREFIXES: &[&str] = &["npm_", "NX_", "DIRENV_", "__MISE"];
+pub(crate) const LEAKY_ENV: &[&str] = &["PORT", "INIT_CWD", "OLDPWD", "PWD"];
+pub(crate) const LEAKY_PREFIXES: &[&str] = &["npm_", "NX_", "DIRENV_", "__MISE"];
 
 /// Record descendants that have left the proc's group, so a later stop (even after a
 /// daemon restart) can still find them. Keeps entries whose start time still matches.

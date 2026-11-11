@@ -3,6 +3,7 @@
 
 mod activity;
 mod api;
+mod claims;
 mod cli;
 mod config;
 mod daemon;
@@ -23,6 +24,7 @@ mod proxy;
 mod setup;
 mod state;
 mod supervisor;
+mod worktree;
 
 fn main() {
     std::process::exit(cli::main());

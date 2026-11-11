@@ -27,6 +27,15 @@ setu-rs: run every worktree's app and workers at its own local URL
   setu-rs env unset <scope> [target] NAME
   setu-rs env import <scope> [target] <file> [--preview] [--overwrite]
   setu-rs env reveal <scope> [target] NAME          prints one value (audited)
+  setu-rs new <project> <branch> [--from <base>] [--start]
+                                     create a worktree (fetch, link/copy files, setup steps)
+  setu-rs adopt <path>               register an existing worktree (changes nothing in it)
+  setu-rs rm <run> [--force]         stop, check guards, archive ignored data, remove (branch kept)
+  setu-rs restore <run>              bring a removed worktree back, with its archived files
+  setu-rs claim <run> [--as name] [--pid N]
+                                     mark a worktree as being edited by you (default pid: the parent shell)
+  setu-rs release <run> [--as name]  drop a claim (without --as: whatever claim is there)
+  setu-rs claims                     who holds which worktree
   setu-rs mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
@@ -60,6 +69,31 @@ fn target(arg: Option<&String>) -> Result<Value> {
     })
 }
 
+/// Remove `--as <name>` from the args.
+fn extract_as(args: &[String]) -> Result<(Vec<String>, Option<String>)> {
+    extract_opt(args, "--as")
+}
+
+/// Remove `<flag> <value>` from the args and return the value.
+fn extract_opt(args: &[String], flag: &str) -> Result<(Vec<String>, Option<String>)> {
+    let mut rest = Vec::new();
+    let mut val = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            val = Some(it.next().ok_or_else(|| anyhow!("{flag} needs a value"))?.clone());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((rest, val))
+}
+
+/// Holder name when `--as` is absent: `$SETU_HOLDER`, else "cli".
+fn default_holder() -> String {
+    std::env::var("SETU_HOLDER").map(|h| crate::claims::sanitize_holder(&h)).unwrap_or_else(|_| "cli".into())
+}
+
 fn with_cmd(cmd: &str, mut v: Value) -> Value {
     v["cmd"] = json!(cmd);
     v
@@ -85,7 +119,12 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("down") => {
-            let run = api::call(with_cmd("down", target(args.get(1))?)).await?;
+            let (rest, holder) = extract_as(&args[1..])?;
+            let mut req = target(rest.first())?;
+            if let Some(h) = holder {
+                req["holder"] = json!(h);
+            }
+            let run = api::call(with_cmd("down", req)).await?;
             println!("{} stopped", run["run"].as_str().unwrap_or("?"));
             Ok(())
         }
@@ -115,9 +154,119 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                     r["url"].as_str().unwrap_or(""),
                     r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
                 );
+                if let Some(h) = r["claim"]["holder"].as_str() {
+                    println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
+                }
                 if r["stale_env"].as_bool() == Some(true) {
                     println!("    env changed since this run started; `setu-rs down` then `setu-rs up` to apply");
                 }
+            }
+            Ok(())
+        }
+        Some("new") => {
+            let (rest, from) = extract_opt(&args[1..], "--from")?;
+            let start = rest.iter().any(|a| a == "--start");
+            let pos: Vec<&String> = rest.iter().filter(|a| *a != "--start").collect();
+            let (project, branch) = match pos.as_slice() {
+                [p, b] => (p.to_string(), b.to_string()),
+                _ => bail!("usage: setu-rs new <project> <branch> [--from <base>] [--start]"),
+            };
+            let mut req = json!({ "project": project, "branch": branch, "start": start });
+            if let Some(f) = from {
+                req["base"] = json!(f);
+            }
+            let out = api::call(with_cmd("worktree.new", req)).await?;
+            let n = &out["worktree_new"];
+            println!("{} created at {} (branch {} from {})", out["run"].as_str().unwrap_or("?"), n["path"].as_str().unwrap_or("?"), n["branch"].as_str().unwrap_or("?"), n["base"].as_str().unwrap_or("?"));
+            for w in n["warnings"].as_array().cloned().unwrap_or_default() {
+                println!("  note: {}", w.as_str().unwrap_or(""));
+            }
+            for st in n["setup"].as_array().cloned().unwrap_or_default() {
+                println!("  setup {}: {}", st["name"].as_str().unwrap_or("?"), if st["ok"].as_bool() == Some(true) { "ok" } else { "failed" });
+            }
+            println!("  {}", if start { "starting; `setu-rs ls` shows when it is up" } else { "start it with `setu-rs up` in that directory" });
+            Ok(())
+        }
+        Some("adopt") => {
+            let p = args.get(1).ok_or_else(|| anyhow!("usage: setu-rs adopt <path>"))?;
+            let path = std::path::Path::new(p).canonicalize()?.display().to_string();
+            let out = api::call(json!({ "cmd": "worktree.adopt", "path": path })).await?;
+            println!("{} registered ({}); nothing in the worktree was changed", out["run"].as_str().unwrap_or("?"), out["worktree"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Some("rm") => {
+            let force = args.iter().any(|a| a == "--force");
+            let run = args.iter().skip(1).find(|a| !a.starts_with("--")).ok_or_else(|| anyhow!("usage: setu-rs rm <run> [--force]"))?;
+            let out = api::call(json!({ "cmd": "worktree.rm", "run": run, "force": force })).await?;
+            if out["already"].as_bool() == Some(true) {
+                println!("{} was already removed", out["run"].as_str().unwrap_or("?"));
+            } else {
+                println!("{} removed; branch {} kept", out["run"].as_str().unwrap_or("?"), out["branch"].as_str().unwrap_or("(detached)"));
+            }
+            if let Some(a) = out["archive"].as_str() {
+                println!("  {} ignored file(s) archived to {a}; `setu-rs restore {}` brings them back", out["archived_files"].as_u64().unwrap_or(0), out["run"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        Some("restore") => {
+            let run = args.get(1).ok_or_else(|| anyhow!("usage: setu-rs restore <run>"))?;
+            let out = api::call(json!({ "cmd": "worktree.restore", "run": run })).await?;
+            let r = &out["restore"];
+            println!("{} restored at {}", out["run"].as_str().unwrap_or("?"), r["path"].as_str().unwrap_or("?"));
+            if let Some(a) = r["restored_from"].as_str() {
+                println!("  archived files put back from {a}");
+            }
+            for w in r["warnings"].as_array().cloned().unwrap_or_default() {
+                println!("  note: {}", w.as_str().unwrap_or(""));
+            }
+            println!("  dependencies are not reinstalled; run the project's install, then `setu-rs up`");
+            Ok(())
+        }
+        Some("claim") => {
+            let (rest, holder) = extract_as(&args[1..])?;
+            let (rest, pid) = extract_opt(&rest, "--pid")?;
+            let run = rest.first().ok_or_else(|| anyhow!("usage: setu-rs claim <run> [--as name] [--pid N]"))?;
+            let holder = holder.unwrap_or_else(default_holder);
+            // The CLI exits at once, so default to the shell that ran it.
+            let pid: i64 = match pid {
+                Some(p) => p.parse().map_err(|_| anyhow!("--pid needs a number"))?,
+                // SAFETY: getppid has no preconditions.
+                None => unsafe { libc::getppid() as i64 },
+            };
+            let out = api::call(json!({ "cmd": "claim", "run": run, "holder": holder, "pid": pid })).await?;
+            println!("{} {} by {holder} (pid {pid}); claims go stale after 2h without a refresh or when the pid exits", out["run"].as_str().unwrap_or("?"), out["result"].as_str().unwrap_or("claimed"));
+            Ok(())
+        }
+        Some("release") => {
+            let (rest, holder) = extract_as(&args[1..])?;
+            let run = rest.first().ok_or_else(|| anyhow!("usage: setu-rs release <run> [--as name]"))?;
+            let mut req = json!({ "run": run });
+            if let Some(h) = holder {
+                req["holder"] = json!(h);
+            }
+            let out = api::call(with_cmd("release", req)).await?;
+            match out["holder"].as_str() {
+                Some(h) => println!("{} released (was held by {h})", out["run"].as_str().unwrap_or("?")),
+                None => println!("{} had no claim", out["run"].as_str().unwrap_or("?")),
+            }
+            Ok(())
+        }
+        Some("claims") => {
+            let out = api::call(json!({ "cmd": "claims" })).await?;
+            let list = out.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no claims");
+            }
+            let now = crate::claims::now();
+            for c in list {
+                println!(
+                    "{:<44} {:<24} pid {:<8} heartbeat {}s ago{}",
+                    c["run"].as_str().unwrap_or("?"),
+                    c["holder"].as_str().unwrap_or("?"),
+                    c["pid"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    now.saturating_sub(c["heartbeat"].as_u64().unwrap_or(now)),
+                    if c["stale"].as_bool() == Some(true) { "  STALE (can be taken over)" } else { "" }
+                );
             }
             Ok(())
         }

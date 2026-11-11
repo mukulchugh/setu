@@ -34,6 +34,21 @@ pub fn state_file() -> PathBuf {
     state_dir().join("state.json")
 }
 
+/// Writer claims: `<state>/claims/<project>/<run>.json`.
+pub fn claims_dir() -> PathBuf {
+    state_dir().join("claims")
+}
+
+/// Worktree operation records and removal markers: `<state>/worktrees/<project>/<run>.json`.
+pub fn worktree_ops_dir() -> PathBuf {
+    state_dir().join("worktrees")
+}
+
+/// `~/.local/share/setu/archive/<project>/<run>/<ts>.tar`
+pub fn archive_dir() -> PathBuf {
+    root_override().map(|r| r.join("archive")).unwrap_or_else(|| home().join(".local/share/setu/archive"))
+}
+
 /// Unix socket. macOS sun_path is 104 bytes including NUL; `api` checks the length.
 pub fn socket_path() -> PathBuf {
     state_dir().join("d.sock")

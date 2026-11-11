@@ -31,6 +31,32 @@ pub struct ProjectConfig {
     pub disk_items: Vec<DiskItem>,
     /// Shared package stores to watch (never cleaned by Setu).
     pub stores: Vec<DiskStore>,
+    /// `[worktree]` table: base ref, linked and copied files, free-space floor.
+    pub worktree: WorktreeCfg,
+    /// `[[setup.step]]`, run in order in a new worktree.
+    pub setup_steps: Vec<SetupStep>,
+}
+
+/// `[worktree]` in a project config (slice 7).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorktreeCfg {
+    /// Base ref for `new`; default is origin/staging if it exists, else origin/<default branch>.
+    pub base: Option<String>,
+    /// Paths (relative to the worktree root) symlinked from the main worktree, e.g. env files.
+    pub link: Vec<String>,
+    /// Ignored files copied from the main worktree.
+    pub copy: Vec<String>,
+    /// Refuse `new` when the volume has less free space than this.
+    pub min_free: Option<u64>,
+}
+
+/// One `[[setup.step]]`: a shell command run in the new worktree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupStep {
+    pub name: String,
+    pub run: String,
+    /// Reserved for skip logic (files whose content decides whether the step reruns).
+    pub inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

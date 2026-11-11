@@ -122,8 +122,8 @@ pub fn tools() -> Vec<Value> {
             }),
             &[],
         ),
-        tool("run_stop", "Stop a run and all its processes.", json!({ "run": run.clone() }), &["run"]),
-        tool("run_restart", "Stop then start a run. Use after env changes (see stale_env in run_list).", json!({ "run": run.clone() }), &["run"]),
+        tool("run_stop", "Stop a run and all its processes. Refused while another holder has a live claim on it.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }), &["run"]),
+        tool("run_restart", "Stop then start a run. Use after env changes (see stale_env in run_list). Refused while another holder has a live claim on it.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }), &["run"]),
         tool(
             "run_logs",
             "Recent log lines of a run. Known secret values are replaced with [redacted:NAME]. With no `proc`, all processes are shown, each line prefixed with [proc].",
@@ -157,6 +157,36 @@ pub fn tools() -> Vec<Value> {
             })),
             &["scope", "path"],
         ),
+        tool(
+            "worktree_new",
+            "Create a worktree for a branch in a configured project: fetches, branches from the project's base (origin/staging or the default branch, or `base`), links and copies the project's declared files, runs its setup steps (output goes to setup.log, see run_logs). Refuses an existing branch, run name or a nearly full disk. Add start=true to start it.",
+            json!({
+                "project": { "type": "string", "description": "Project name from run_list's run prefix." },
+                "branch": { "type": "string", "description": "New branch name, e.g. feat/x. The worktree lives at <project dir>/<branch>." },
+                "base": { "type": "string", "description": "Optional base ref, e.g. origin/main." },
+                "start": { "type": "boolean", "description": "Start the run after creating it." }
+            }),
+            &["project", "branch"],
+        ),
+        tool("worktree_adopt", "Register an existing worktree of a configured project. Installs nothing and changes nothing in it.", json!({ "path": { "type": "string", "description": "Absolute path of the worktree." } }), &["path"]),
+        tool(
+            "worktree_remove",
+            "Remove a worktree: stops the run, refuses if it is main, dirty (including untracked), has commits on no remote, has processes inside, is claimed, or is running; archives irreplaceable ignored files; keeps the branch. Never forces. Safe to retry after a failure.",
+            json!({ "run": run.clone() }),
+            &["run"],
+        ),
+        tool(
+            "worktree_claim",
+            "Claim a worktree before editing it so other agents stay out. Claim, edit, refresh by calling again with the same holder, then worktree_release. Pass your own process id so the claim ends when you do. Another live claim refuses; a stale one is taken over.",
+            json!({
+                "run": run.clone(),
+                "holder": { "type": "string", "description": "Your name, a-z 0-9 and '-', max 40. Defaults to your MCP client name." },
+                "pid": { "type": "integer", "description": "Your agent's process id." }
+            }),
+            &["run"],
+        ),
+        tool("worktree_release", "Release your claim on a worktree.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "The name you claimed with. Defaults to your MCP client name." } }), &["run"]),
+        tool("worktree_claims", "Who holds which worktree, with heartbeat age and whether each claim is stale.", json!({}), &[]),
         tool("disk_report", "What each worktree's declared items (node_modules, build caches) really cost on disk, and what is cleanable.", json!({ "deps": { "type": "boolean", "description": "Also measure dependency directories (slower)." } }), &[]),
         tool("disk_clean", "Delete regenerable items of stopped runs that are past policy. Dry run unless apply=true.", json!({ "apply": { "type": "boolean", "description": "Actually delete. Default false lists what would be freed." } }), &[]),
     ]
@@ -190,6 +220,11 @@ fn scope_req(cmd: &str, args: &Value) -> Result<Value> {
     Ok(req)
 }
 
+/// The claim holder name: the `holder` argument, else the MCP client name.
+fn holder(args: &Value, client: Option<&str>) -> String {
+    crate::claims::sanitize_holder(str_arg(args, "holder").or(client).unwrap_or("agent"))
+}
+
 fn abs(path: &str) -> Result<String> {
     Ok(std::path::Path::new(path).canonicalize().map_err(|e| anyhow!("{path}: {e}"))?.display().to_string())
 }
@@ -202,8 +237,24 @@ async fn call_tool(name: &str, args: &Value, client: Option<&str>) -> Result<Val
             (None, Some(r)) => daemon(json!({ "cmd": "start", "run": r }), client, true).await,
             _ => bail!("give `path` (a worktree) or `run` (a registered run)"),
         },
-        "run_stop" => daemon(json!({ "cmd": "down", "run": need(args, "run")? }), client, true).await,
-        "run_restart" => daemon(json!({ "cmd": "restart", "run": need(args, "run")? }), client, true).await,
+        "run_stop" => daemon(json!({ "cmd": "down", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
+        "run_restart" => daemon(json!({ "cmd": "restart", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
+        "worktree_new" => {
+            let mut req = json!({ "cmd": "worktree.new", "project": need(args, "project")?, "branch": need(args, "branch")?, "start": args.get("start").and_then(Value::as_bool).unwrap_or(false) });
+            if let Some(b) = str_arg(args, "base") {
+                req["base"] = json!(b);
+            }
+            daemon(req, client, true).await
+        }
+        "worktree_adopt" => daemon(json!({ "cmd": "worktree.adopt", "path": abs(need(args, "path")?)? }), client, true).await,
+        "worktree_remove" => daemon(json!({ "cmd": "worktree.rm", "run": need(args, "run")? }), client, true).await,
+        "worktree_claim" => {
+            // The shim lives as long as the agent's session, so its pid is a good default.
+            let pid = args.get("pid").and_then(Value::as_i64).unwrap_or(std::process::id() as i64);
+            daemon(json!({ "cmd": "claim", "run": need(args, "run")?, "holder": holder(args, client), "pid": pid }), client, true).await
+        }
+        "worktree_release" => daemon(json!({ "cmd": "release", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
+        "worktree_claims" => daemon(json!({ "cmd": "claims" }), client, false).await,
         "run_logs" => {
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(100).clamp(1, MAX_LOG_LINES);
             let mut req = json!({ "cmd": "logs", "run": need(args, "run")?, "lines": lines });
@@ -266,7 +317,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_object_schema() {
         let list = tools();
-        assert_eq!(list.len(), 13);
+        assert_eq!(list.len(), 19);
         for t in &list {
             let name = t["name"].as_str().unwrap();
             assert!(!t["description"].as_str().unwrap().is_empty(), "{name}");
@@ -296,7 +347,7 @@ mod tests {
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&note, &mut client).await.is_none());
         let l = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &mut client).await.unwrap();
-        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 19);
         let bad = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "env_reveal" } }), &mut client).await.unwrap();
         assert_eq!(bad["error"]["code"], -32602);
     }

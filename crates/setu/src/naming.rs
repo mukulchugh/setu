@@ -126,6 +126,8 @@ mod tests {
             procs: BTreeMap::new(),
             presets: vec![],
             disk_items: vec![],
+            worktree: Default::default(),
+            setup_steps: vec![],
             stores: vec![],
         }
     }

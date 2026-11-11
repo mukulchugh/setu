@@ -1,7 +1,9 @@
 //! The daemon: owns state, starts and stops runs, answers the proxy and the socket API.
 
 use crate::activity::ActivityTracker;
+use crate::claims;
 use crate::config;
+use crate::worktree;
 use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes};
 use crate::disk;
 use crate::env;
@@ -174,6 +176,45 @@ impl Daemon {
         }
     }
 
+
+    /// Register (or refresh) the run record for a worktree and return its key and spec.
+    /// Shared by `up`, `worktree.new`, `worktree.adopt` and `worktree.restore`.
+    fn register(&self, cfg: &ProjectConfig, worktree: &Path, run: &str) -> Result<(String, RunSpec)> {
+        let mut inner = self.lock();
+        if let Ok(fresh) = config::load_all() {
+            domains_refresh(&fresh);
+            inner.configs = fresh;
+        }
+        let mut leases = inner.state.leases.clone();
+        let spec = build_spec(cfg, worktree, run, &mut leases)?;
+        inner.state.leases = leases;
+        let k = key(&spec.id);
+        if let Some(other) = inner.hosts.get(&spec.host) {
+            if other != &k {
+                bail!("host {} already belongs to run {other}", spec.host);
+            }
+        }
+        if let Some(existing) = inner.state.runs.get(&k) {
+            if existing.spec.worktree != worktree {
+                bail!("run name {k} already belongs to {}; rename one of the worktrees", existing.spec.worktree.display());
+            }
+        }
+        let rec = inner.state.runs.entry(k.clone()).or_insert_with(|| RunRecord {
+            spec: spec.clone(),
+            status: RunStatus::Stopped,
+            pinned: false,
+            procs: vec![],
+            note: None,
+            stopped_at: None,
+            env_hash: None,
+        });
+        rec.spec = spec.clone();
+        inner.rebuild_hosts();
+        drop(inner);
+        self.persist();
+        Ok((k, spec))
+    }
+
     /// Register the run for a worktree path (if new) and start it.
     pub async fn up(self: &Arc<Self>, path: &Path) -> Result<Value> {
         // Config reads and `git worktree list` run on the blocking pool, never under the lock.
@@ -186,45 +227,7 @@ impl Daemon {
         })
         .await??;
         let run = naming::run_name(&naming::project_dir(&cfg.repo), &worktree);
-        let k = {
-            let mut inner = self.lock();
-            if let Ok(fresh) = config::load_all() {
-                domains_refresh(&fresh);
-                inner.configs = fresh;
-            }
-            let cfg = &cfg;
-            let mut leases = inner.state.leases.clone();
-            let spec = build_spec(cfg, &worktree, &run, &mut leases)?;
-            inner.state.leases = leases;
-            let k = key(&spec.id);
-            if let Some(other) = inner.hosts.get(&spec.host) {
-                if other != &k {
-                    bail!("host {} already belongs to run {other}", spec.host);
-                }
-            }
-            if let Some(existing) = inner.state.runs.get(&k) {
-                if existing.spec.worktree != worktree {
-                    bail!(
-                        "run name {k} already belongs to {}; rename one of the worktrees",
-                        existing.spec.worktree.display()
-                    );
-                }
-            }
-            let rec = inner.state.runs.entry(k.clone()).or_insert_with(|| RunRecord {
-                spec: spec.clone(),
-                status: RunStatus::Stopped,
-                pinned: false,
-                procs: vec![],
-                note: None,
-                stopped_at: None,
-                env_hash: None,
-            });
-            rec.spec = spec;
-            inner.rebuild_hosts();
-            drop(inner);
-            self.persist();
-            k
-        };
+        let (k, _) = self.register(&cfg, &worktree, &run)?;
         self.start(&k).await?;
         self.describe(&k)
     }
@@ -234,6 +237,9 @@ impl Daemon {
         let spec = {
             let mut inner = self.lock();
             let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
+            if worktree::pending_removal(&paths::worktree_ops_dir(), k) {
+                bail!("a removal of {k} is pending; retry `setu-rs rm {k}` to finish it");
+            }
             match rec.status {
                 RunStatus::Running | RunStatus::Starting => return Ok(()),
                 RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
@@ -693,6 +699,166 @@ impl Daemon {
         .await?
     }
 
+
+    // ------------------------------------------------------------ slice 7: worktrees and claims
+
+    /// Refuse a destructive action by someone who is not the claim holder.
+    pub fn check_holder(&self, k: &str, holder: Option<&str>) -> Result<()> {
+        if let Some(h) = claims::live_holder(&paths::claims_dir(), k, claims::now()) {
+            if holder != Some(h.as_str()) {
+                bail!(
+                    "{k} has a live writer claim held by {h}; only {h} can do this. Ask it to release, or run `setu-rs release {k}` yourself"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn project_config(&self, project: &str) -> Result<ProjectConfig> {
+        let fresh = config::load_all()?;
+        fresh.into_iter().find(|c| c.project == project).ok_or_else(|| anyhow!("no project config named {project}"))
+    }
+
+    pub async fn worktree_new(self: &Arc<Self>, actor: &str, client: Option<&str>, project: &str, branch: &str, from: Option<&str>, start: bool) -> Result<Value> {
+        let cfg = self.project_config(project)?;
+        let existing: std::collections::BTreeSet<String> = self.lock().state.runs.keys().cloned().collect();
+        let me = Arc::clone(self);
+        let (b, f) = (branch.to_string(), from.map(String::from));
+        let out = tokio::task::spawn_blocking(move || {
+            worktree::create(&cfg, &b, f.as_deref(), &existing, &paths::worktree_ops_dir(), &paths::logs_dir(), |path, run| {
+                let wt = path.canonicalize()?;
+                let (_, spec) = me.register(&cfg, &wt, run)?;
+                Ok(spec.env)
+            })
+        })
+        .await?;
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                worktree::audit(actor, client, "new-failed", &format!("{project}/{branch}"), json!({ "error": format!("{e:#}") }));
+                return Err(e);
+            }
+        };
+        let k = format!("{project}/{}", out.run);
+        worktree::audit(actor, client, "new", &k, json!({ "branch": out.branch, "base": out.base, "path": out.path }));
+        if start {
+            self.start(&k).await?;
+        }
+        let mut v = self.describe(&k)?;
+        v["worktree_new"] = serde_json::to_value(&out)?;
+        Ok(v)
+    }
+
+    pub async fn worktree_adopt(self: &Arc<Self>, actor: &str, client: Option<&str>, path: &Path) -> Result<Value> {
+        let p = path.to_path_buf();
+        let (cfg, wt, run) = tokio::task::spawn_blocking(move || -> Result<(ProjectConfig, std::path::PathBuf, String)> {
+            let configs = config::load_all()?;
+            let (cfg, found) = naming::find_worktree(&configs, &p)?.ok_or_else(|| anyhow!("{} is not inside a worktree of any configured project", p.display()))?;
+            let (wt, run) = worktree::adopt_check(cfg, &found)?;
+            Ok((cfg.clone(), wt, run))
+        })
+        .await??;
+        let (k, _) = self.register(&cfg, &wt, &run)?;
+        worktree::audit(actor, client, "adopt", &k, json!({ "path": wt }));
+        self.describe(&k)
+    }
+
+    pub async fn worktree_rm(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str, force: bool) -> Result<Value> {
+        let ops = paths::worktree_ops_dir();
+        // The run may already be gone from state (a retry after DropState): fall back to the record.
+        let (key, project, run, wt) = {
+            let inner = self.lock();
+            match inner.resolve_key(wanted) {
+                Ok(k) => {
+                    let r = &inner.state.runs[&k];
+                    (k.clone(), r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone())
+                }
+                Err(e) => match worktree::load_op(&ops, wanted) {
+                    Ok(Some(rec)) => (wanted.to_string(), rec.project, rec.run, rec.worktree),
+                    _ => return Err(e),
+                },
+            }
+        };
+        let cfg = self.project_config(&project)?;
+        let declared: Vec<String> = cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
+        let host = DaemonHost { d: Arc::clone(self), key: key.clone(), rt: tokio::runtime::Handle::current() };
+        let archive_root = paths::archive_dir();
+        let result = tokio::task::spawn_blocking(move || {
+            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, ops_dir: &ops, force, host: &host })
+        })
+        .await?;
+        match result {
+            Ok(o) => {
+                worktree::audit(actor, client, "rm", &key, json!({ "force": force, "archive": o.archive, "archived_files": o.archived_files, "already": o.already }));
+                Ok(serde_json::to_value(o)?)
+            }
+            Err(e) => {
+                worktree::audit(actor, client, "rm-refused", &key, json!({ "force": force, "error": format!("{e:#}") }));
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn worktree_restore(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str) -> Result<Value> {
+        let ops = paths::worktree_ops_dir();
+        let configs = config::load_all()?;
+        let (cfg, run) = if let Some((p, r)) = wanted.split_once('/') {
+            (configs.into_iter().find(|c| c.project == p).ok_or_else(|| anyhow!("no project config named {p}"))?, r.to_string())
+        } else {
+            let hits: Vec<_> = configs.into_iter().filter(|c| matches!(worktree::load_op(&ops, &format!("{}/{wanted}", c.project)), Ok(Some(_)))).collect();
+            match hits.len() {
+                1 => (hits.into_iter().next().unwrap_or_else(|| unreachable!()), wanted.to_string()),
+                0 => bail!("no removal record for {wanted}"),
+                _ => bail!("{wanted} matches several projects; use project/run"),
+            }
+        };
+        let archive_root = paths::archive_dir();
+        let (c2, r2) = (cfg.clone(), run.clone());
+        let out = tokio::task::spawn_blocking(move || worktree::restore(&c2, &r2, &ops, &archive_root)).await??;
+        let (k, _) = self.register(&cfg, &out.path, &run)?;
+        worktree::audit(actor, client, "restore", &k, json!({ "branch": out.branch, "archive": out.restored_from }));
+        let mut v = self.describe(&k)?;
+        v["restore"] = serde_json::to_value(&out)?;
+        Ok(v)
+    }
+
+    pub fn claim(&self, actor: &str, client: Option<&str>, wanted: &str, holder: &str, pid: Option<i32>) -> Result<Value> {
+        let k = self.resolve(wanted)?;
+        let (c, outcome) = claims::claim(&paths::claims_dir(), &k, holder, pid, claims::now())?;
+        let how = match &outcome {
+            claims::Outcome::Created => "claimed",
+            claims::Outcome::Refreshed => "refreshed",
+            claims::Outcome::TookOver { .. } => "took over a stale claim",
+        };
+        let extra = match &outcome {
+            claims::Outcome::TookOver { from } => json!({ "holder": holder, "took_over_from": from.holder }),
+            _ => json!({ "holder": holder, "pid": pid }),
+        };
+        worktree::audit(actor, client, "claim", &k, extra);
+        Ok(json!({ "run": k, "result": how, "claim": c }))
+    }
+
+    /// `holder = None` is a person at the CLI or app releasing whatever claim is there; MCP must name the holder.
+    pub fn release(&self, actor: &str, client: Option<&str>, wanted: &str, holder: Option<&str>) -> Result<Value> {
+        if actor == "mcp" && holder.is_none() {
+            bail!("release needs `holder`: the name you claimed with");
+        }
+        let k = self.resolve(wanted)?;
+        let removed = claims::release(&paths::claims_dir(), &k, holder, claims::now())?;
+        worktree::audit(actor, client, "release", &k, json!({ "holder": removed.as_ref().map(|c| c.holder.clone()) }));
+        Ok(json!({ "run": k, "released": removed.is_some(), "holder": removed.map(|c| c.holder) }))
+    }
+
+    pub fn claims_list(&self) -> Value {
+        let now = claims::now();
+        Value::Array(
+            claims::list(&paths::claims_dir(), now)
+                .into_iter()
+                .map(|c| json!({ "run": c.run, "holder": c.holder, "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat, "stale": claims::is_stale(&c, now) }))
+                .collect(),
+        )
+    }
+
     pub fn running_keys(&self) -> Vec<String> {
         self.lock()
             .state
@@ -754,15 +920,25 @@ fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) 
                 cfg.clone(),
                 disk::WorktreeInfo {
                     project: cfg.project.clone(),
-                    run,
+                    run: run.clone(),
                     worktree: wt,
                     status: rec.map(|r| r.status),
                     stopped_at: rec.and_then(|r| r.stopped_at),
+                    claimed_by: claims::live_holder(&paths::claims_dir(), &format!("{}/{run}", cfg.project), claims::now()),
                 },
             ));
         }
     }
     out
+}
+
+/// `{holder, stale, pid, since}` for the run's claim, or null.
+fn claim_json(k: &str) -> Value {
+    match claims::get(&paths::claims_dir(), k) {
+        Ok(Some(c)) => json!({ "holder": c.holder, "stale": claims::is_stale(&c, claims::now()), "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat }),
+        Ok(None) => Value::Null,
+        Err(_) => json!({ "holder": "(unreadable)", "stale": false }),
+    }
 }
 
 fn run_json(k: &str, r: &RunRecord) -> Value {
@@ -777,6 +953,7 @@ fn run_json(k: &str, r: &RunRecord) -> Value {
         "worktree": r.spec.worktree,
         "procs": r.procs.iter().map(|p| json!({"name": p.name, "pid": p.pid})).collect::<Vec<_>>(),
         "note": r.note,
+        "claim": claim_json(k),
     })
 }
 
@@ -815,6 +992,52 @@ impl Routes for Daemon {
                 eprintln!("setu: on-demand start of {k} failed: {e:#}");
             }
         });
+        Ok(())
+    }
+}
+
+
+/// Plugs the daemon's state into `worktree::rm`. Runs on the blocking pool; `stop` re-enters the runtime.
+struct DaemonHost {
+    d: Arc<Daemon>,
+    key: String,
+    rt: tokio::runtime::Handle,
+}
+
+impl worktree::RmHost for DaemonHost {
+    fn stop(&self) -> Result<()> {
+        if !self.d.lock().state.runs.contains_key(&self.key) {
+            return Ok(());
+        }
+        self.rt.block_on(self.d.stop(&self.key, RunStatus::Stopped))
+    }
+    fn claim_holder(&self) -> Option<String> {
+        claims::live_holder(&paths::claims_dir(), &self.key, claims::now())
+    }
+    fn running(&self) -> Option<String> {
+        let inner = self.d.lock();
+        match inner.state.runs.get(&self.key).map(|r| r.status) {
+            Some(st @ (RunStatus::Running | RunStatus::Starting | RunStatus::Stopping)) => Some(format!("{st:?}").to_lowercase()),
+            _ => None,
+        }
+    }
+    fn drop_state(&self) -> Result<()> {
+        let id = {
+            let mut inner = self.d.lock();
+            let id = inner.state.runs.remove(&self.key).map(|r| r.spec.id);
+            inner.rebuild_hosts();
+            id
+        };
+        if let Some(id) = id {
+            self.d.activity.forget(&id);
+        }
+        self.d.persist();
+        claims::release(&paths::claims_dir(), &self.key, None, claims::now())?;
+        Ok(())
+    }
+    fn release_lease(&self) -> Result<()> {
+        self.d.lock().state.leases.remove(&self.key);
+        self.d.persist();
         Ok(())
     }
 }

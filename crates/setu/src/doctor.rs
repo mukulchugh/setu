@@ -200,6 +200,8 @@ mod tests {
             procs: map,
             presets: vec![],
             disk_items: vec![],
+            worktree: Default::default(),
+            setup_steps: vec![],
             stores,
         }
     }

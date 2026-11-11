@@ -1,7 +1,7 @@
 //! Project config loading, env layers, template rendering and run resolution.
 #![allow(dead_code)]
 
-use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec};
+use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, SetupStep, WorktreeCfg};
 use crate::presets::{self, RawItem};
 use crate::{naming, paths};
 use anyhow::{anyhow, bail, Context, Result};
@@ -27,6 +27,37 @@ struct RawProject {
     preset: Option<RawPresetSel>,
     #[serde(default)]
     disk: RawDisk,
+    #[serde(default)]
+    worktree: RawWorktree,
+    #[serde(default)]
+    setup: RawSetup,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawWorktree {
+    base: Option<String>,
+    #[serde(default)]
+    link: Vec<String>,
+    #[serde(default)]
+    copy: Vec<String>,
+    min_free: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawSetup {
+    #[serde(default)]
+    step: Vec<RawSetupStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSetupStep {
+    name: String,
+    run: String,
+    #[serde(default)]
+    inputs: Vec<String>,
 }
 
 /// `preset = "next"` or `preset = ["auto", "next"]`.
@@ -172,6 +203,23 @@ pub(crate) fn convert_disk(d: RawDisk) -> Result<(Vec<RawItem>, Vec<DiskStore>)>
     Ok((items, stores))
 }
 
+fn convert_worktree(r: RawWorktree) -> Result<WorktreeCfg> {
+    for p in r.link.iter().chain(r.copy.iter()) {
+        // `*` has no meaning here; reject it instead of guessing.
+        if p.contains('*') {
+            bail!("[worktree] path {p:?} must not contain '*'");
+        }
+        validate_disk_path(p).context("[worktree] link/copy")?;
+    }
+    if let Some(b) = &r.base {
+        if b.is_empty() || b.starts_with('-') {
+            bail!("[worktree] base {b:?} is not a valid ref");
+        }
+    }
+    let min_free = r.min_free.as_deref().map(parse_size).transpose().context("[worktree] min_free")?;
+    Ok(WorktreeCfg { base: r.base, link: r.link, copy: r.copy, min_free })
+}
+
 fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
     parse_project_in(text, file, |_| None)
 }
@@ -195,6 +243,20 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
         Some(RawPresetSel::Many(v)) => v,
     };
     let (items, stores) = convert_disk(raw.disk).with_context(|| format!("in {}", file.display()))?;
+    let worktree = convert_worktree(raw.worktree).with_context(|| format!("in {}", file.display()))?;
+    let mut setup_steps = Vec::new();
+    for st in raw.setup.step {
+        if st.name.trim().is_empty() || st.run.trim().is_empty() {
+            bail!("{}: every [[setup.step]] needs a name and a run", file.display());
+        }
+        if setup_steps.iter().any(|o: &SetupStep| o.name == st.name) {
+            bail!("{}: duplicate setup step {:?}", file.display(), st.name);
+        }
+        for p in &st.inputs {
+            validate_disk_path(p).with_context(|| format!("setup step {:?} inputs", st.name))?;
+        }
+        setup_steps.push(SetupStep { name: st.name, run: st.run, inputs: st.inputs });
+    }
     let repo = paths::expand(&raw.repo);
     let checkout = if requested.iter().any(|r| r == "auto") { checkout(&repo) } else { None };
     let (presets, disk_items, stores) = presets::resolve(&requested, checkout.as_deref(), &items, &stores)
@@ -205,6 +267,8 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
         presets,
         disk_items,
         stores,
+        worktree,
+        setup_steps,
         domain: raw.domain,
         idle,
         max_running: raw.max_running.unwrap_or(3),
@@ -410,6 +474,24 @@ run = "bun worker {{literal}}"
 
     fn map(v: &[(&str, &str)]) -> BTreeMap<String, String> {
         v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn worktree_and_setup_tables() {
+        let text = format!(
+            "{SAMPLE}\n[worktree]\nbase = \"origin/develop\"\nlink = [\"apps/web/.env.local\"]\ncopy = [\"data/seed.db\"]\nmin_free = \"1GiB\"\n\n[[setup.step]]\nname = \"install\"\nrun = \"bun install --frozen-lockfile\"\ninputs = [\"bun.lock\"]\n\n[[setup.step]]\nname = \"gen\"\nrun = \"bun gen\"\n"
+        );
+        let c = parse_project(&text, Path::new("t.toml")).unwrap();
+        assert_eq!(c.worktree.base.as_deref(), Some("origin/develop"));
+        assert_eq!(c.worktree.link, ["apps/web/.env.local"]);
+        assert_eq!(c.worktree.copy, ["data/seed.db"]);
+        assert_eq!(c.worktree.min_free, Some(1 << 30));
+        assert_eq!(c.setup_steps.len(), 2);
+        assert_eq!(c.setup_steps[0].inputs, ["bun.lock"]);
+        assert!(sample().setup_steps.is_empty() && sample().worktree.link.is_empty());
+        for bad in ["[worktree]\nlink = [\"../x\"]", "[worktree]\ncopy = [\"/abs\"]", "[worktree]\nbase = \"-x\"", "[worktree]\nlink = [\"a/*\"]", "[[setup.step]]\nname = \"a\"\nrun = \"\"", "[worktree]\nnope = 1"] {
+            assert!(parse_project(&format!("{SAMPLE}\n{bad}"), Path::new("t.toml")).is_err(), "{bad}");
+        }
     }
 
     #[test]

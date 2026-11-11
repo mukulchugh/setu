@@ -21,6 +21,8 @@ pub struct WorktreeInfo {
     /// None when Setu has never run this worktree.
     pub status: Option<RunStatus>,
     pub stopped_at: Option<u64>,
+    /// Holder of a live writer claim (slice 7): destructive actions refuse while set.
+    pub claimed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +87,9 @@ pub fn candidates(cfg: &ProjectConfig, wt: &WorktreeInfo, policy: Policy, now: u
 
 /// Some(reason) when the worktree is in use: by Setu, or by any process whose cwd is inside it.
 fn liveness(wt: &WorktreeInfo) -> Option<String> {
+    if let Some(holder) = &wt.claimed_by {
+        return Some(format!("a live writer claim is held by {holder}; release it first"));
+    }
     if matches!(wt.status, Some(RunStatus::Running | RunStatus::Starting | RunStatus::Stopping)) {
         return Some("the run is up".into());
     }
@@ -293,11 +298,27 @@ mod tests {
                 clean_after: after,
             }],
             stores: vec![],
+            worktree: Default::default(),
+            setup_steps: vec![],
         }
     }
 
     fn wt(dir: &Path, stopped_at: Option<u64>) -> WorktreeInfo {
-        WorktreeInfo { project: "p".into(), run: "r".into(), worktree: dir.to_path_buf(), status: Some(RunStatus::Stopped), stopped_at }
+        WorktreeInfo { project: "p".into(), run: "r".into(), worktree: dir.to_path_buf(), status: Some(RunStatus::Stopped), stopped_at, claimed_by: None }
+    }
+
+    #[test]
+    fn live_claim_blocks_candidates_and_clean_one() {
+        let d = git_repo();
+        let c = cfg(&[".next/dev/cache"], Some(Duration::from_secs(60)));
+        let mut w = wt(d.path(), Some(now_secs() - 120));
+        w.claimed_by = Some("agent-a".into());
+        let cands = candidates(&c, &w, Policy::default(), now_secs());
+        assert!(cands.iter().all(|x| !x.eligible && x.reason.contains("claim is held by agent-a")), "{cands:?}");
+        let target = d.path().join(".next/dev/cache");
+        let err = clean_one(&c, &w, &target, Policy::default()).unwrap_err().to_string();
+        assert!(err.contains("agent-a"), "{err}");
+        assert!(target.exists());
     }
 
     #[test]
