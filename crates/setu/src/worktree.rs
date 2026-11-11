@@ -63,7 +63,7 @@ impl Out {
 
 /// Run `cmd` with piped output and a deadline. The child leads its own process group, so a
 /// timeout kills it and everything it spawned.
-fn exec(mut cmd: Command, timeout: Duration) -> std::result::Result<Out, ExecError> {
+pub fn exec(mut cmd: Command, timeout: Duration) -> std::result::Result<Out, ExecError> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().map_err(|e| ExecError::Unknown(format!("could not run {:?}: {e}", cmd.get_program())))?;
     let mut so = child.stdout.take();
@@ -133,7 +133,7 @@ fn git_probe(dir: &Path, args: &[&str]) -> Result<bool> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, v: &T) -> Result<()> {
+pub fn write_json_atomic<T: Serialize>(path: &Path, v: &T) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| anyhow!("bad path {}", path.display()))?;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
@@ -1108,13 +1108,13 @@ pub fn audit(actor: &str, client: Option<&str>, op: &str, run: &str, extra: serd
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{DiskItem, DiskKind};
     use std::fs;
     use std::sync::Mutex;
 
-    fn g(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn g(dir: &Path, args: &[&str]) -> String {
         let o = Command::new("git")
             .current_dir(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"])
@@ -1125,15 +1125,15 @@ mod tests {
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
-    struct Fx {
-        root: PathBuf,
-        origin: PathBuf,
-        repo: PathBuf,
-        pdir: PathBuf,
-        ops: PathBuf,
-        logs: PathBuf,
-        archives: PathBuf,
-        cfg: ProjectConfig,
+    pub(crate) struct Fx {
+        pub(crate) root: PathBuf,
+        pub(crate) origin: PathBuf,
+        pub(crate) repo: PathBuf,
+        pub(crate) pdir: PathBuf,
+        pub(crate) ops: PathBuf,
+        pub(crate) logs: PathBuf,
+        pub(crate) archives: PathBuf,
+        pub(crate) cfg: ProjectConfig,
     }
 
     impl Drop for Fx {
@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     /// origin.git (bare) <- app.git (bare clone WITH a remote-tracking refspec) + app/main worktree.
-    fn fx(tag: &str) -> Fx {
+    pub(crate) fn fx(tag: &str) -> Fx {
         let root = canon(&std::env::temp_dir()).join(format!("setu-wt-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let seed = root.join("seed");
@@ -1182,7 +1182,7 @@ mod tests {
         Fx { origin: root.join("origin.git"), ops: root.join("ops"), logs: root.join("logs"), archives: root.join("archives"), root, repo, pdir, cfg }
     }
 
-    fn new_wt(f: &Fx, branch: &str) -> NewOutcome {
+    pub(crate) fn new_wt(f: &Fx, branch: &str) -> NewOutcome {
         create(&f.cfg, branch, None, &BTreeSet::new(), &f.ops, &f.logs, |_, _| Ok(BTreeMap::new())).unwrap()
     }
 

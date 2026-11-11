@@ -36,6 +36,7 @@ setu-rs: run every worktree's app and workers at its own local URL
                                      mark a worktree as being edited by you (default pid: the parent shell)
   setu-rs release <run> [--as name]  drop a claim (without --as: whatever claim is there)
   setu-rs claims                     who holds which worktree
+  setu-rs autoremove [--dry-run]     evaluate auto-removal now (needs [auto_remove] enabled) and print every decision
   setu-rs mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
@@ -99,6 +100,17 @@ fn with_cmd(cmd: &str, mut v: Value) -> Value {
     v
 }
 
+/// "will be removed in 5h (merged, idle 2d)" from the candidate's `removes_after`.
+fn removal_note(removes_after: u64, now: u64, reason: &str) -> String {
+    let left = removes_after.saturating_sub(now);
+    let when = match left {
+        0 => "at the next hourly check".to_string(),
+        s if s >= 3600 => format!("in {}h", s.div_ceil(3600)),
+        s => format!("in {}m", s.div_ceil(60)),
+    };
+    format!("will be removed {when} ({reason})")
+}
+
 async fn dispatch(args: Vec<String>) -> Result<()> {
     let first = args.first().map(String::as_str);
     match first {
@@ -157,6 +169,9 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                 if let Some(h) = r["claim"]["holder"].as_str() {
                     println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
                 }
+                if let (Some(after), Some(why)) = (r["removal"]["removes_after"].as_u64(), r["removal"]["reason"].as_str()) {
+                    println!("    {}; `setu-rs pin {}` to keep", removal_note(after, crate::disk::now_secs(), why), r["run"].as_str().unwrap_or("<run>"));
+                }
                 if r["stale_env"].as_bool() == Some(true) {
                     println!("    env changed since this run started; `setu-rs down` then `setu-rs up` to apply");
                 }
@@ -185,6 +200,22 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                 println!("  setup {}: {}", st["name"].as_str().unwrap_or("?"), if st["ok"].as_bool() == Some(true) { "ok" } else { "failed" });
             }
             println!("  {}", if start { "starting; `setu-rs ls` shows when it is up" } else { "start it with `setu-rs up` in that directory" });
+            Ok(())
+        }
+        Some("autoremove") => {
+            let dry = args.iter().any(|a| a == "--dry-run");
+            let out = api::call(json!({ "cmd": "autoremove", "dry_run": dry })).await?;
+            let list = out["decisions"].as_array().cloned().unwrap_or_default();
+            if dry {
+                println!("dry run: nothing was removed or recorded");
+            }
+            if list.is_empty() {
+                println!("no decisions: nothing is a candidate, nothing changed");
+            }
+            for d in &list {
+                println!("{:<44} {:<16} {}", d["run"].as_str().unwrap_or("?"), d["action"].as_str().unwrap_or("?"), d["reason"].as_str().unwrap_or(""));
+            }
+            println!("removed today: {} of {}; archives pruned: {}", out["removed_today"], out["daily_cap"], out["pruned_archives"]);
             Ok(())
         }
         Some("adopt") => {

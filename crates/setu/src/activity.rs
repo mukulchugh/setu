@@ -15,6 +15,12 @@ struct Entry {
     in_flight: usize,
     last_activity: Instant,
     idle_stopping: bool,
+    /// Wall-clock unix seconds of the last real proxied request (not `touch`). Feeds auto-removal.
+    last_request: Option<u64>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +46,7 @@ impl ActivityTracker {
             in_flight: 0,
             last_activity: Instant::now(),
             idle_stopping: false,
+            last_request: None,
         })
     }
 
@@ -52,6 +59,7 @@ impl ActivityTracker {
         }
         e.in_flight += 1;
         e.last_activity = Instant::now();
+        e.last_request = Some(unix_now());
         Some(ActivityGuard {
             tracker: self.clone(),
             run: run.clone(),
@@ -92,6 +100,11 @@ impl ActivityTracker {
         e.last_activity = Instant::now();
     }
 
+    /// Unix seconds of the last proxied request, or None if there has been none since tracking began.
+    pub fn last_request_unix(&self, run: &RunId) -> Option<u64> {
+        self.inner.lock().unwrap().get(run).and_then(|e| e.last_request)
+    }
+
     pub fn forget(&self, run: &RunId) {
         self.inner.lock().unwrap().remove(run);
     }
@@ -108,6 +121,7 @@ impl Drop for ActivityGuard {
         if let Some(e) = map.get_mut(&self.run) {
             e.in_flight = e.in_flight.saturating_sub(1);
             e.last_activity = Instant::now();
+            e.last_request = Some(unix_now());
         }
     }
 }
@@ -175,6 +189,21 @@ mod tests {
         assert_eq!(t.snapshot(&run()).in_flight, 1);
         drop(g);
         assert_eq!(t.snapshot(&run()).in_flight, 0);
+    }
+
+    #[test]
+    fn last_request_is_wall_clock_and_only_set_by_real_requests() {
+        let t = ActivityTracker::new();
+        assert_eq!(t.last_request_unix(&run()), None);
+        t.touch(&run()); // a start, not a request
+        assert_eq!(t.last_request_unix(&run()), None);
+        let g = t.begin(&run()).unwrap();
+        let at = t.last_request_unix(&run()).unwrap();
+        assert!(at > 1_700_000_000);
+        drop(g);
+        assert!(t.last_request_unix(&run()).unwrap() >= at);
+        t.forget(&run());
+        assert_eq!(t.last_request_unix(&run()), None);
     }
 
     #[test]

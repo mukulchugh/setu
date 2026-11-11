@@ -151,6 +151,14 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "release" => d.release(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("release needs a run"))?, s(req, "holder")),
         "claims" => Ok(d.claims_list()),
+        "autoremove" => {
+            let dry = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            if !dry && actor(req) == "mcp" {
+                bail!("agents can only preview auto-removal; ask the user to run `setu-rs autoremove`");
+            }
+            d.autoremove(dry).await
+        }
+        "autoremove.candidates" => d.autoremove_candidates(),
         other => bail!("unknown cmd {other}"),
     }
 }

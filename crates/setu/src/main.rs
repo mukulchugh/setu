@@ -2,6 +2,7 @@
 //! Slice 1 plan: docs/slices/01-run-and-route.md
 
 mod activity;
+mod autoremove;
 mod api;
 mod claims;
 mod cli;

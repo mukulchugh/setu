@@ -192,6 +192,13 @@ pub struct RunRecord {
     /// Hash of the env the running procs were started with (for "restart to apply env changes").
     #[serde(default)]
     pub env_hash: Option<u64>,
+    /// Unix seconds when Setu last started this run. With `stopped_at` and `last_request_at`
+    /// this is the only input to auto-removal's idle age; all three missing means "unknown".
+    #[serde(default)]
+    pub last_started_at: Option<u64>,
+    /// Unix seconds of the last request the proxy served for this run (updated at most once a minute).
+    #[serde(default)]
+    pub last_request_at: Option<u64>,
 }
 
 /// What the proxy learns about a Host.

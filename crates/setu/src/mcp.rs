@@ -187,6 +187,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool("worktree_release", "Release your claim on a worktree.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "The name you claimed with. Defaults to your MCP client name." } }), &["run"]),
         tool("worktree_claims", "Who holds which worktree, with heartbeat age and whether each claim is stale.", json!({}), &[]),
+        tool("worktree_removal_candidates", "Worktrees that auto-removal will delete after their grace period, with when and why. Read-only: it evaluates nothing and removes nothing. Pinned worktrees are never removed.", json!({}), &[]),
         tool("disk_report", "What each worktree's declared items (node_modules, build caches) really cost on disk, and what is cleanable.", json!({ "deps": { "type": "boolean", "description": "Also measure dependency directories (slower)." } }), &[]),
         tool("disk_clean", "Delete regenerable items of stopped runs that are past policy. Dry run unless apply=true.", json!({ "apply": { "type": "boolean", "description": "Actually delete. Default false lists what would be freed." } }), &[]),
     ]
@@ -255,6 +256,7 @@ async fn call_tool(name: &str, args: &Value, client: Option<&str>) -> Result<Val
         }
         "worktree_release" => daemon(json!({ "cmd": "release", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
         "worktree_claims" => daemon(json!({ "cmd": "claims" }), client, false).await,
+        "worktree_removal_candidates" => daemon(json!({ "cmd": "autoremove.candidates" }), client, false).await,
         "run_logs" => {
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(100).clamp(1, MAX_LOG_LINES);
             let mut req = json!({ "cmd": "logs", "run": need(args, "run")?, "lines": lines });
@@ -317,7 +319,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_object_schema() {
         let list = tools();
-        assert_eq!(list.len(), 19);
+        assert_eq!(list.len(), 20);
         for t in &list {
             let name = t["name"].as_str().unwrap();
             assert!(!t["description"].as_str().unwrap().is_empty(), "{name}");
@@ -347,7 +349,7 @@ mod tests {
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&note, &mut client).await.is_none());
         let l = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &mut client).await.unwrap();
-        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 20);
         let bad = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "env_reveal" } }), &mut client).await.unwrap();
         assert_eq!(bad["error"]["code"], -32602);
     }

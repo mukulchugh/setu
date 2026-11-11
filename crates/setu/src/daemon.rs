@@ -1,6 +1,8 @@
 //! The daemon: owns state, starts and stops runs, answers the proxy and the socket API.
 
 use crate::activity::ActivityTracker;
+use crate::autoremove;
+use crate::globalcfg;
 use crate::claims;
 use crate::config;
 use crate::worktree;
@@ -37,6 +39,8 @@ pub struct Daemon {
     written: Arc<Mutex<u64>>,
     pub activity: Arc<ActivityTracker>,
     exits: ExitTx,
+    /// One auto-remove evaluation at a time (hourly tick vs `setu-rs autoremove`).
+    ar_lock: Mutex<()>,
 }
 
 struct Inner {
@@ -111,6 +115,7 @@ impl Daemon {
             written: Arc::new(Mutex::new(0)),
             activity: ActivityTracker::new(),
             exits,
+            ar_lock: Mutex::new(()),
         }))
     }
 
@@ -207,6 +212,8 @@ impl Daemon {
             note: None,
             stopped_at: None,
             env_hash: None,
+            last_started_at: None,
+            last_request_at: None,
         });
         rec.spec = spec.clone();
         inner.rebuild_hosts();
@@ -256,6 +263,7 @@ impl Daemon {
                 r.spec = spec.clone();
                 r.env_hash = Some(env::env_hash(&spec.env));
                 r.status = RunStatus::Starting;
+                r.last_started_at = Some(crate::disk::now_secs());
                 r.note = None;
                 r.procs.clear();
             }
@@ -333,10 +341,15 @@ impl Daemon {
         };
         let result = supervisor::stop_procs(&procs, STOP_GRACE).await;
         let id = self.lock().state.runs.get(k).map(|r| r.spec.id.clone());
+        // The tracker is forgotten below; keep its last request time (auto-removal's idle age).
+        let last_req = id.as_ref().and_then(|id| self.activity.last_request_unix(id));
         self.set(k, |r| {
             r.status = end;
             r.procs.clear();
             r.stopped_at = Some(crate::disk::now_secs());
+            if let Some(t) = last_req {
+                r.last_request_at = Some(r.last_request_at.map_or(t, |p| p.max(t)));
+            }
             if let Err(e) = &result {
                 r.note = Some(format!("stop incomplete: {e:#}"));
             }
@@ -374,8 +387,30 @@ impl Daemon {
         }
     }
 
+    /// Copy each run's last proxied-request time from the in-memory tracker into its record,
+    /// at most once a minute per run (the record is persisted on every change).
+    fn record_request_times(&self) {
+        let updates: Vec<(String, u64)> = {
+            let inner = self.lock();
+            inner
+                .state
+                .runs
+                .iter()
+                .filter_map(|(k, r)| {
+                    let t = self.activity.last_request_unix(&r.spec.id)?;
+                    let due = r.last_request_at.is_none_or(|p| t >= p + 60);
+                    due.then(|| (k.clone(), t))
+                })
+                .collect()
+        };
+        for (k, t) in updates {
+            self.set(&k, |r| r.last_request_at = Some(t));
+        }
+    }
+
     /// Every SWEEP_EVERY: idle stop, crash detection for adopted procs, log rotation.
     pub async fn sweep(self: &Arc<Self>) {
+        self.record_request_times();
         let runs: Vec<(String, RunRecord)> = self.lock().state.runs.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
         for (k, r) in runs {
             for p in &r.spec.procs {
@@ -423,6 +458,8 @@ impl Daemon {
     }
 
     pub fn list(&self) -> Value {
+        let gcfg = globalcfg::GlobalConfig::load().ok();
+        let auto = autoremove::load_state(&autoremove::state_path()).ok();
         let inner = self.lock();
         let mut leases = inner.state.leases.clone();
         Value::Array(
@@ -440,6 +477,10 @@ impl Daemon {
                             .is_ok_and(|spec| Some(env::env_hash(&spec.env)) != r.env_hash);
                     let mut v = run_json(k, r);
                     v["stale_env"] = json!(stale);
+                    v["removal"] = match (&gcfg, &auto) {
+                        (Some(g), Some(a)) => autoremove::removal_json(a, k, &g.auto_remove, r.pinned),
+                        _ => Value::Null,
+                    };
                     v
                 })
                 .collect(),
@@ -822,6 +863,63 @@ impl Daemon {
         Ok(v)
     }
 
+    /// Read-only: the current auto-removal candidates and the daily count. No fetch, no evaluation.
+    pub fn autoremove_candidates(&self) -> Result<Value> {
+        let gcfg = globalcfg::GlobalConfig::load()?;
+        let st = autoremove::load_state(&autoremove::state_path())?;
+        autoremove::candidates_json(&st, &gcfg.auto_remove)
+    }
+
+    /// One auto-removal evaluation now (the hourly tick calls this too). `dry_run` decides and
+    /// reports without removing, auditing or saving. Blocking work runs on the blocking pool with a deadline.
+    pub async fn autoremove(self: &Arc<Self>, dry_run: bool) -> Result<Value> {
+        let gcfg = globalcfg::GlobalConfig::load()?;
+        if !gcfg.auto_remove.enabled && !dry_run {
+            bail!("auto_remove is off. Set `enabled = true` under [auto_remove] in {}, or preview with `setu-rs autoremove --dry-run`", globalcfg::config_path().display());
+        }
+        let policy = autoremove::check_cfg(&gcfg.auto_remove)?;
+        self.record_request_times();
+        let runs = self.lock().state.runs.clone();
+        let cfgs = config::load_all()?;
+        let me = Arc::clone(self);
+        let rt = tokio::runtime::Handle::current();
+        let job = tokio::task::spawn_blocking(move || -> Result<Value> {
+            let _guard = me.ar_lock.try_lock().map_err(|_| anyhow!("an auto-remove evaluation is already running"))?;
+            let items = autoremove::items_from(&cfgs, &runs, |k| claims::live_holder(&paths::claims_dir(), k, claims::now()));
+            let path = autoremove::state_path();
+            let mut st = autoremove::load_state(&path)?;
+            let now = crate::disk::now_secs();
+            let audit = |op: &str, run: &str, extra: Value| worktree::audit("autoremove", None, op, run, extra);
+            let remove = |it: &autoremove::Item| -> Result<()> {
+                // Re-check against live state right before deleting: pinned, or anything happened since the snapshot.
+                {
+                    let inner = me.lock();
+                    let r = inner.state.runs.get(&it.key).ok_or_else(|| anyhow!("run is no longer registered"))?;
+                    if r.pinned {
+                        bail!("pinned since the evaluation started");
+                    }
+                    if autoremove::Events::from_record(r) != it.events || !matches!(r.status, RunStatus::Stopped | RunStatus::Crashed) {
+                        bail!("the run was used since the evaluation started");
+                    }
+                }
+                rt.block_on(me.worktree_rm("autoremove", None, &it.key, false)).map(|_| ())
+            };
+            let save = |s: &autoremove::AutoState| autoremove::save_state(&path, s);
+            let deps = autoremove::Deps { now, day: autoremove::local_day(now), gh: &autoremove::real_gh, audit: &audit, remove: &remove, save: &save, dry_run };
+            let decisions = autoremove::sweep(&items, &policy, &mut st, &deps);
+            let mut pruned = Vec::new();
+            if !dry_run {
+                autoremove::save_state(&path, &st)?;
+                pruned = autoremove::prune_archives(&paths::archive_dir(), now);
+                for p in &pruned {
+                    worktree::audit("autoremove", None, "autoremove-pruned-archive", "", json!({ "archive": p }));
+                }
+            }
+            Ok(json!({ "dry_run": dry_run, "decisions": decisions, "removed_today": st.removals.count, "daily_cap": policy.daily_cap, "pruned_archives": pruned.len() }))
+        });
+        tokio::time::timeout(Duration::from_secs(3600), job).await.map_err(|_| anyhow!("auto-remove evaluation timed out after an hour"))??
+    }
+
     pub fn claim(&self, actor: &str, client: Option<&str>, wanted: &str, holder: &str, pid: Option<i32>) -> Result<Value> {
         let k = self.resolve(wanted)?;
         let (c, outcome) = claims::claim(&paths::claims_dir(), &k, holder, pid, claims::now())?;
@@ -1119,6 +1217,8 @@ pub async fn run() -> Result<()> {
     let mut tick = tokio::time::interval(SWEEP_EVERY);
     // Hourly: clean regenerable items of stopped, Setu-managed runs past their policy.
     let mut disk_tick = tokio::time::interval(Duration::from_secs(3600));
+    // Hourly, and not at startup: opt-in auto-removal of merged or long-idle worktrees.
+    let mut ar_tick = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(3600), Duration::from_secs(3600));
     loop {
         tokio::select! {
             _ = tick.tick() => daemon.sweep().await,
@@ -1127,6 +1227,18 @@ pub async fn run() -> Result<()> {
                     Ok(v) if v["items"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("setu: auto disk clean: {v}"),
                     Err(e) => eprintln!("setu: auto disk clean failed: {e:#}"),
                     _ => {}
+                }
+            }
+            _ = ar_tick.tick() => {
+                if globalcfg::GlobalConfig::load().is_ok_and(|c| c.auto_remove.enabled) {
+                    let d = daemon.clone();
+                    tokio::spawn(async move {
+                        match d.autoremove(false).await {
+                            Ok(v) if v["decisions"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("setu: auto-remove: {}", v["decisions"]),
+                            Err(e) => eprintln!("setu: auto-remove failed: {e:#}"),
+                            _ => {}
+                        }
+                    });
                 }
             }
             _ = tokio::signal::ctrl_c() => break,

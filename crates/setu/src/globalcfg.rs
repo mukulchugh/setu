@@ -20,11 +20,34 @@ pub struct GlobalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_captured_at: Option<u64>,
     pub dns_port: u16,
+    /// `[auto_remove]`: opt-in removal of merged or long-idle worktrees (slice 7, part 2).
+    pub auto_remove: AutoRemoveCfg,
 }
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        GlobalConfig { proxy_port: 7777, path: None, path_captured_at: None, dns_port: 15353 }
+        GlobalConfig { proxy_port: 7777, path: None, path_captured_at: None, dns_port: 15353, auto_remove: AutoRemoveCfg::default() }
+    }
+}
+
+/// `[auto_remove]` in `config.toml`. Durations are `90s`, `30m`, `24h`, `14d`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoRemoveCfg {
+    pub enabled: bool,
+    /// A merged worktree must be idle at least this long.
+    pub merged_after: String,
+    /// An unmerged worktree must be idle at least this long.
+    pub idle_after: String,
+    /// How long a candidate stays visible before removal.
+    pub grace: String,
+    /// At most this many removals per local day.
+    pub daily_cap: u32,
+}
+
+impl Default for AutoRemoveCfg {
+    fn default() -> Self {
+        AutoRemoveCfg { enabled: false, merged_after: "24h".into(), idle_after: "14d".into(), grace: "24h".into(), daily_cap: 5 }
     }
 }
 
