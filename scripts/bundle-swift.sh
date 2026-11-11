@@ -20,6 +20,11 @@ rm -rf "${APP:?}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/SetuApp"
 cp "$RS_BIN" "$APP/Contents/Resources/bin/setu-rs"
+# App icon from the brand kit (brand/icon/Setu.iconset, made from brand/icon/setu-icon-1024.png).
+ICONSET="$ROOT/brand/icon/Setu.iconset"
+if [ -d "$ICONSET" ]; then
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Setu.icns"
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,6 +35,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Setu</string>
   <key>CFBundleDisplayName</key><string>Setu</string>
   <key>CFBundleExecutable</key><string>SetuApp</string>
+  <key>CFBundleIconFile</key><string>Setu</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>

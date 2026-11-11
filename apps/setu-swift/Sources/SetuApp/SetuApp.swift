@@ -40,6 +40,7 @@ struct MainWindow: View {
             }
         }
         .frame(minWidth: 760, minHeight: 440)
+        .tint(Brand.iris)
         .alert("Setu", isPresented: Binding(get: { store.alertMessage != nil }, set: { if !$0 { store.alertMessage = nil } })) {
             Button("OK") {}
         } message: {
@@ -64,7 +65,7 @@ struct StatusLabel: View {
     var body: some View {
         let up = store.upCount
         HStack(spacing: 3) {
-            Image(systemName: up > 0 ? "square.stack.3d.up.fill" : "square.stack.3d.up")
+            Image(nsImage: Brand.glyph(running: up > 0))
             if up > 0 { Text("\(up)") }
         }
         .accessibilityLabel(up > 0 ? "Setu, \(up) running" : "Setu, nothing running")
@@ -77,7 +78,7 @@ struct SetuApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuView().environment(store)
+            MenuView().environment(store).tint(Brand.iris)
         } label: {
             StatusLabel().environment(store)
         }
@@ -97,7 +98,7 @@ struct SetuApp: App {
         }
 
         Settings {
-            SetupView().environment(store).frame(width: 640, height: 300)
+            SetupView().environment(store).frame(width: 640, height: 300).tint(Brand.iris)
         }
     }
 

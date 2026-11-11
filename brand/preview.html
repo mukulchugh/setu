@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setu brand kit</title>
+<style>
+  :root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f4f7;color:#19171f}
+  *{box-sizing:border-box}body{max-width:1120px;margin:0 auto;padding:48px 24px 80px}h1{font-size:40px;letter-spacing:-1.5px;margin:0 0 12px}h2{font-size:20px;margin:40px 0 16px}p{line-height:1.6;max-width:680px}a{color:#6550c7}figure{margin:0}figcaption{font-size:13px;padding-top:12px;line-height:1.5}.concepts{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}.concepts img{display:block;width:100%;border-radius:24px}.hero{display:flex;gap:40px;align-items:center}.hero img{width:min(46%,360px)}.hero h2{margin-top:0}.proof{display:grid;grid-template-columns:1fr 1fr;gap:20px}.surface{min-height:140px;border-radius:20px;padding:28px;display:flex;gap:22px;align-items:center;flex-wrap:wrap}.light{background:#fff;color:#19171f;box-shadow:inset 0 0 0 1px #19171f12}.dark{background:#19171f;color:#f5f4f7}.surface figure{text-align:center}.surface figcaption{font-size:11px}.surface img{display:block;object-fit:contain}.glyph{display:block;overflow:visible}.glyph path{stroke:currentColor}.glyph.fill path{stroke:none;fill:currentColor}.swatches{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.swatch{height:72px;border-radius:14px;border:1px solid #8883}.note{font-size:13px;color:#68646f}.links{display:flex;gap:24px;flex-wrap:wrap}code{font-size:12px}
+  @media(prefers-color-scheme:dark){:root{background:#100f14;color:#f5f4f7}a{color:#b3a0ff}.note{color:#b9b3c4}}
+  @media(max-width:640px){body{padding:28px 16px}.concepts{gap:12px}.proof{grid-template-columns:1fr}.hero{gap:16px}.hero img{width:44%}.hero h2{font-size:18px}.swatches{grid-template-columns:repeat(2,1fr)}}
+</style>
+<h1>Setu</h1>
+<p>Parallel work. One calm bridge.</p>
+<div class="hero">
+  <img src="icon/setu-icon-1024.png" width="360" height="360" alt="Three violet glass lanes rising into one span on a charcoal rounded-square tile">
+  <div><h2>Confluence</h2><p>Three distinct lanes rise into a shared span. The mark connects parallel worktrees to a calm, reachable surface.</p><p class="note">The same enclosed charcoal icon works on light and dark desktops.</p></div>
+</div>
+<h2>Three concepts</h2>
+<div class="concepts">
+  <figure><img src="concepts/icon-a.png" width="1024" height="1024" alt="Two violet arches joined by a deck"><figcaption>A · Parallel span<br>Two arches, one steady connection.</figcaption></figure>
+  <figure><img src="concepts/icon-b.png" width="1024" height="1024" alt="Three flowing violet lanes on a pale glass tile"><figcaption>B · Confluence · Selected<br>Many lanes, one shared span.</figcaption></figure>
+  <figure><img src="concepts/icon-c.png" width="1024" height="1024" alt="An arch joining three stacked glass planes"><figcaption>C · Joined planes<br>One bridge through distinct worktrees.</figcaption></figure>
+</div>
+<h2>App icon at actual CSS sizes</h2>
+<p class="note">View at 100% browser zoom. Retina displays use the matching 2× source.</p>
+<div class="proof">
+  <div class="surface light">
+    <figure><img src="icon/Setu.iconset/icon_16x16.png" srcset="icon/Setu.iconset/icon_16x16@2x.png 2x" width="16" height="16" alt="Setu at 16 pixels"><figcaption>16</figcaption></figure>
+    <figure><img src="icon/Setu.iconset/icon_32x32.png" srcset="icon/Setu.iconset/icon_32x32@2x.png 2x" width="32" height="32" alt="Setu at 32 pixels"><figcaption>32</figcaption></figure>
+    <figure><img src="icon/Setu.iconset/icon_128x128.png" srcset="icon/Setu.iconset/icon_128x128@2x.png 2x" width="64" height="64" alt="Setu at 64 pixels"><figcaption>64</figcaption></figure>
+  </div>
+  <div class="surface dark">
+    <figure><img src="icon/Setu.iconset/icon_16x16.png" srcset="icon/Setu.iconset/icon_16x16@2x.png 2x" width="16" height="16" alt="Setu at 16 pixels"><figcaption>16</figcaption></figure>
+    <figure><img src="icon/Setu.iconset/icon_32x32.png" srcset="icon/Setu.iconset/icon_32x32@2x.png 2x" width="32" height="32" alt="Setu at 32 pixels"><figcaption>32</figcaption></figure>
+    <figure><img src="icon/Setu.iconset/icon_128x128.png" srcset="icon/Setu.iconset/icon_128x128@2x.png 2x" width="64" height="64" alt="Setu at 64 pixels"><figcaption>64</figcaption></figure>
+  </div>
+</div>
+<h2>Template glyph at actual CSS sizes</h2>
+<p class="note">Single-colour vectors, shown as native dark or light ink. Filled means running.</p>
+<div class="proof" id="glyph-proof"></div>
+<h2>One accent, two neutrals</h2>
+<div class="swatches">
+  <figure><div class="swatch" style="background:#6550c7"></div><figcaption>Iris light<br><code>#6550C7</code> · 5.96:1 on white</figcaption></figure>
+  <figure><div class="swatch" style="background:#b3a0ff"></div><figcaption>Iris dark<br><code>#B3A0FF</code> · 7.93:1 on charcoal</figcaption></figure>
+  <figure><div class="swatch" style="background:#f5f4f7"></div><figcaption>Porcelain<br><code>#F5F4F7</code></figcaption></figure>
+  <figure><div class="swatch" style="background:#19171f"></div><figcaption>Charcoal<br><code>#19171F</code></figcaption></figure>
+</div>
+<h2>Files</h2>
+<div class="links"><a href="BRAND.md">Brand guide</a><a href="palette.json">Palette</a><a href="glyph/setu-glyph.svg">Regular glyph</a><a href="glyph/setu-glyph-fill.svg">Running glyph</a><a href="icon/Setu.iconset/">macOS iconset</a></div>
+<script>
+  // Inline vector definitions keep the proof usable from a local file without requests.
+  const regular='M2.5 8H5.2C8.8 8 9.2 4 13.2 4H15.5M2.5 11H5.2C9.2 11 9.4 4 13.2 4H15.5M2.5 14H5.2C9.6 14 9.6 4 13.2 4H15.5';
+  const filled='M2.5 6.875H5.2C8.1 6.875 8.8 2.875 13.2 2.875H15.5Q16.625 2.875 16.625 4Q16.625 5.125 15.5 5.125H13.2C10.3 5.125 10.3 15.125 5.2 15.125H2.5Q1.375 15.125 1.375 14Q1.375 12.875 2.5 12.875H5.2C8.5 12.875 8.8 7.9 10.4 5.8C8.8 7.7 8.7 12.125 5.2 12.125H2.5Q1.375 12.125 1.375 11Q1.375 9.875 2.5 9.875H5.2C8 9.875 8.5 6.7 10 5.4C8.5 6.5 8.1 9.125 5.2 9.125H2.5Q1.375 9.125 1.375 8Q1.375 6.875 2.5 6.875Z';
+  for(const appearance of ['light','dark']){
+    const surface=document.createElement('div');surface.className='surface '+appearance;
+    for(const size of [16,18])for(const isFilled of [false,true]){
+      const f=document.createElement('figure');
+      f.innerHTML=`<svg class="glyph ${isFilled?'fill':''}" xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 18 18" role="img" aria-label="Setu ${isFilled?'running':'regular'} glyph"><path d="${isFilled?filled:regular}" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><figcaption>${size} · ${isFilled?'Running':'Regular'}</figcaption>`;
+      surface.append(f);
+    }
+    document.querySelector('#glyph-proof').append(surface);
+  }
+</script>
+</html>

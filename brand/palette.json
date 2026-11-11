@@ -1,0 +1,32 @@
+{
+  "name": "Setu Iris",
+  "colourSpace": "sRGB",
+  "accent": {
+    "light": "#6550C7",
+    "dark": "#B3A0FF",
+    "usage": "Primary actions, selection and brand artwork. Use the light value on light surfaces and the dark value on dark surfaces."
+  },
+  "neutrals": {
+    "porcelain": "#F5F4F7",
+    "charcoal": "#19171F"
+  },
+  "status": {
+    "running": { "light": "#34C759", "dark": "#30D158", "native": "systemGreen" },
+    "starting": { "light": "#FF9500", "dark": "#FF9F0A", "native": "systemOrange" },
+    "stopped": { "light": "#8E8E93", "dark": "#98989D", "native": "secondaryLabelColor" },
+    "crashed": { "light": "#FF3B30", "dark": "#FF453A", "native": "systemRed" }
+  },
+  "statusNote": "Hex colours are familiar system-like fallbacks for static artwork. Use native dynamic NSColor values in the app; stopped follows secondaryLabelColor. These are not exact macOS colour specifications or text colours.",
+  "contrast": {
+    "method": "WCAG relative luminance using linearized sRGB; (Llighter + 0.05) / (Ldarker + 0.05), opaque solid colours.",
+    "whiteReference": "#FFFFFF",
+    "nearBlackReference": "#19171F",
+    "checks": [
+      { "foreground": "#6550C7", "background": "#FFFFFF", "ratio": 5.9566, "normalTextAA": true, "usage": "Approved light appearance pairing" },
+      { "foreground": "#6550C7", "background": "#19171F", "ratio": 2.9784, "normalTextAA": false, "usage": "Do not use; switch to dark accent" },
+      { "foreground": "#B3A0FF", "background": "#FFFFFF", "ratio": 2.2366, "normalTextAA": false, "usage": "Do not use; switch to light accent" },
+      { "foreground": "#B3A0FF", "background": "#19171F", "ratio": 7.9321, "normalTextAA": true, "usage": "Approved dark appearance pairing" }
+    ],
+    "scope": "These ratios apply to the solid colour pairs only, not glass gradients, translucent composites, semantic statuses or arbitrary system accent surfaces."
+  }
+}
