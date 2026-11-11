@@ -1,0 +1,1 @@
+{"data":{"lines":5,"run":"acme-web/main","text":"127.0.0.1 - - [11/Nov/2026 20:21:48] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [11/Nov/2026 20:21:48] code 404, message File not found\n127.0.0.1 - - [11/Nov/2026 20:21:48] \"GET /favicon.ico HTTP/1.1\" 404 -\n[setu] 1794409820 start web: echo serving; exec python3 -m http.server 4513 --bind 127.0.0.1\nserving"},"ok":true}

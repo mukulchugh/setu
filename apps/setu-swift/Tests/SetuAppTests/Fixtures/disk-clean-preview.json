@@ -1,0 +1,1 @@
+{"data":{"applied":false,"freed_bytes":0,"items":[{"item":"build-cache","path":"/private/tmp/setu-ui/ws/demo/feat/checkout-flow/.cache","reason":"stopped 36m ago (policy 1m)","run":"acme-web/feat-checkout-flow","size":{"errors":0,"files":1,"logical":6000000,"private":6000640}}]},"ok":true}
