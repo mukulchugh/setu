@@ -71,7 +71,7 @@ mod tests {
             web_port: Some(4001),
             idle: Duration::from_secs(60),
         };
-        s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None });
+        s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None, env_hash: None });
         s.leases.insert("p/r".into(), BTreeMap::from([("web".to_string(), 4001u16)]));
         s
     }

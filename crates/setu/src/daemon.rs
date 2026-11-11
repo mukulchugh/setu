@@ -4,6 +4,7 @@ use crate::activity::ActivityTracker;
 use crate::config;
 use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes, PROXY_PORT};
 use crate::disk;
+use crate::env;
 use crate::disk_measure;
 use crate::naming;
 use crate::paths;
@@ -75,10 +76,6 @@ impl Inner {
     }
 }
 
-/// Project env file layer (set from the app or MCP): `env/<project>.toml`.
-fn project_env_path(project: &str) -> std::path::PathBuf {
-    paths::env_dir().join(format!("{project}.toml"))
-}
 
 /// Build the RunSpec fresh, so env and config edits apply on every start.
 fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>) -> Result<RunSpec> {
@@ -86,12 +83,13 @@ fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTre
     let k = key(&id);
     let lease = ports::lease(leases, &k, &cfg.ports, ports::port_free)?;
     leases.insert(k, lease.clone());
+    // Layers: global < project config [env] < project layer < worktree layer < computed.
     let mut layered = cfg.clone();
-    for (name, value) in config::load_env_layer(&project_env_path(&cfg.project))? {
+    for (name, value) in env::layer_map(&env::Scope::Project(cfg.project.clone()))? {
         layered.env.insert(name, value);
     }
-    let global = config::load_env_layer(&config::global_env_path())?;
-    let worktree_env = config::load_env_layer(&config::worktree_env_path(&id))?;
+    let global = env::layer_map(&env::Scope::Global)?;
+    let worktree_env = env::layer_map(&env::Scope::Worktree(id.clone()))?;
     config::resolve_run(&layered, worktree, run, &lease, &global, &worktree_env)
 }
 
@@ -213,6 +211,7 @@ impl Daemon {
                 procs: vec![],
                 note: None,
                 stopped_at: None,
+                env_hash: None,
             });
             rec.spec = spec;
             inner.rebuild_hosts();
@@ -243,6 +242,7 @@ impl Daemon {
             inner.state.leases = leases;
             if let Some(r) = inner.state.runs.get_mut(k) {
                 r.spec = spec.clone();
+                r.env_hash = Some(env::env_hash(&spec.env));
                 r.status = RunStatus::Starting;
                 r.note = None;
                 r.procs.clear();
@@ -412,7 +412,26 @@ impl Daemon {
 
     pub fn list(&self) -> Value {
         let inner = self.lock();
-        Value::Array(inner.state.runs.iter().map(|(k, r)| run_json(k, r)).collect())
+        let mut leases = inner.state.leases.clone();
+        Value::Array(
+            inner
+                .state
+                .runs
+                .iter()
+                .map(|(k, r)| {
+                    // A running run whose env would differ if started now needs a restart.
+                    let stale = matches!(r.status, RunStatus::Running | RunStatus::Starting)
+                        && r.env_hash.is_some()
+                        && inner
+                            .config(&r.spec.id.project)
+                            .and_then(|cfg| build_spec(&cfg, &r.spec.worktree, &r.spec.id.run, &mut leases))
+                            .is_ok_and(|spec| Some(env::env_hash(&spec.env)) != r.env_hash);
+                    let mut v = run_json(k, r);
+                    v["stale_env"] = json!(stale);
+                    v
+                })
+                .collect(),
+        )
     }
 
     pub fn pin(&self, wanted: &str, on: bool) -> Result<Value> {
@@ -433,41 +452,121 @@ impl Daemon {
         Ok(format!("{}/{run}", cfg.project))
     }
 
-    /// Env layers for the app/MCP. scope: global | project | worktree.
-    pub fn env_get(&self, scope: &str, target: Option<&str>) -> Result<Value> {
-        let path = self.env_path(scope, target)?;
-        Ok(json!({ "scope": scope, "path": path, "env": config::load_env_layer(&path)? }))
-    }
-
-    pub fn env_set(&self, scope: &str, target: Option<&str>, name: &str, value: Option<&str>) -> Result<Value> {
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            bail!("env names may only use letters, digits and _");
-        }
-        let path = self.env_path(scope, target)?;
-        let mut env = config::load_env_layer(&path)?;
-        match value {
-            Some(v) => env.insert(name.to_string(), v.to_string()),
-            None => env.remove(name),
-        };
-        write_env_layer(&path, &env)?;
-        Ok(json!({ "scope": scope, "path": path, "env": env, "applies": "on the next start of each affected run" }))
-    }
-
-    fn env_path(&self, scope: &str, target: Option<&str>) -> Result<std::path::PathBuf> {
+    /// Parse `scope` + `target` from a request into an env scope.
+    pub fn env_scope(&self, scope: &str, target: Option<&str>) -> Result<env::Scope> {
         match scope {
-            "global" => Ok(config::global_env_path()),
+            "global" => Ok(env::Scope::Global),
             "project" => {
                 let p = target.ok_or_else(|| anyhow!("project scope needs a project name"))?;
                 self.lock().config(p)?;
-                Ok(project_env_path(p))
+                Ok(env::Scope::Project(p.to_string()))
             }
             "worktree" => {
                 let k = self.resolve(target.ok_or_else(|| anyhow!("worktree scope needs a run"))?)?;
-                let id = self.lock().state.runs[&k].spec.id.clone();
-                Ok(config::worktree_env_path(&id))
+                Ok(env::Scope::Worktree(self.lock().state.runs[&k].spec.id.clone()))
             }
             _ => bail!("scope must be global, project or worktree"),
         }
+    }
+
+    /// Names, secret flags and masked previews. Never values.
+    pub fn env_list(&self, scope: &env::Scope) -> Result<Value> {
+        let vars: Vec<Value> = env::read_layer(scope)?
+            .into_iter()
+            .map(|v| {
+                let preview = if v.secret { env::mask(&v.value) } else { Some(v.value.clone()) };
+                json!({ "name": v.name, "secret": v.secret, "preview": preview })
+            })
+            .collect();
+        Ok(json!({ "scope": scope.label(), "vars": vars }))
+    }
+
+    /// Every name a run receives, with the layer it comes from. Secrets masked.
+    pub fn env_effective(&self, wanted: &str) -> Result<Value> {
+        let k = self.resolve(wanted)?;
+        let (cfg, rec) = {
+            let inner = self.lock();
+            let rec = inner.state.runs.get(&k).cloned().ok_or_else(|| anyhow!("unknown run {k}"))?;
+            (inner.config(&rec.spec.id.project)?, rec)
+        };
+        let mut leases = self.lock().state.leases.clone();
+        let spec = build_spec(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases)?;
+        let layers: Vec<(&str, BTreeMap<String, String>, std::collections::BTreeSet<String>)> = {
+            let mut out = Vec::new();
+            for (label, scope) in [
+                ("global", env::Scope::Global),
+                ("project", env::Scope::Project(cfg.project.clone())),
+                ("worktree", env::Scope::Worktree(spec.id.clone())),
+            ] {
+                let vars = env::read_layer(&scope)?;
+                let secrets = vars.iter().filter(|v| v.secret).map(|v| v.name.clone()).collect();
+                out.push((label, vars.into_iter().map(|v| (v.name, v.value)).collect(), secrets));
+            }
+            out
+        };
+        const COMPUTED: &[&str] = &["PORT", "SETU_PROJECT", "SETU_RUN", "SETU_URL"];
+        let vars: Vec<Value> = spec
+            .env
+            .iter()
+            .map(|(name, value)| {
+                let mut sources: Vec<&str> = Vec::new();
+                if layers[0].1.contains_key(name) {
+                    sources.push("global");
+                }
+                if cfg.env.contains_key(name) {
+                    sources.push("project-config");
+                }
+                for (label, map, _) in &layers[1..] {
+                    if map.contains_key(name) {
+                        sources.push(label);
+                    }
+                }
+                if COMPUTED.contains(&name.as_str()) {
+                    sources.push("computed");
+                }
+                let source = sources.last().copied().unwrap_or("computed");
+                let secret = layers.iter().any(|(_, _, s)| s.contains(name)) || env::is_secret_name(name);
+                let preview = if secret { env::mask(value) } else { Some(value.clone()) };
+                json!({ "name": name, "source": source, "overrides": &sources[..sources.len().saturating_sub(1)], "secret": secret, "preview": preview })
+            })
+            .collect();
+        Ok(json!({ "run": k, "vars": vars }))
+    }
+
+    pub fn env_set(&self, actor: &str, scope: &env::Scope, name: &str, value: &str, secret: Option<bool>) -> Result<Value> {
+        let stored_secret = env::write_var(scope, name, value, secret)?;
+        env::audit(actor, "set", scope, Some(name), Some(json!({ "secret": stored_secret })));
+        Ok(json!({ "name": name, "secret": stored_secret, "applies": "on the next start of each affected run" }))
+    }
+
+    pub fn env_unset(&self, actor: &str, scope: &env::Scope, name: &str) -> Result<Value> {
+        let existed = env::unset_var(scope, name)?;
+        env::audit(actor, "unset", scope, Some(name), None);
+        Ok(json!({ "name": name, "existed": existed }))
+    }
+
+    /// Parse a dotenv file or text inside the daemon; replies carry names only.
+    pub fn env_import(&self, actor: &str, scope: &env::Scope, path: Option<&str>, text: Option<&str>, preview: bool, overwrite: bool) -> Result<Value> {
+        let body = match (path, text) {
+            (Some(p), _) => std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
+            (None, Some(t)) => t.to_string(),
+            (None, None) => bail!("import needs a path or text"),
+        };
+        let report = env::import(scope, &body, preview, overwrite)?;
+        if !preview {
+            env::audit(actor, "import", scope, None, Some(json!({ "names": report.imported })));
+        }
+        Ok(serde_json::to_value(report)?)
+    }
+
+    /// The only call that returns a value. Never allowed for MCP; always audited.
+    pub fn env_reveal(&self, actor: &str, scope: &env::Scope, name: &str) -> Result<Value> {
+        if actor == "mcp" {
+            bail!("reveal is not available to agents; ask the user to run `setu-rs env reveal` themselves");
+        }
+        let value = env::get_value(scope, name)?.ok_or_else(|| anyhow!("{name} is not set in this layer"))?;
+        env::audit(actor, "reveal", scope, Some(name), None);
+        Ok(json!({ "name": name, "value": value }))
     }
 
     /// Every worktree of every configured project, with what Setu knows about it.
@@ -574,22 +673,6 @@ fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) 
         }
     }
     out
-}
-
-fn write_env_layer(path: &Path, env: &BTreeMap<String, String>) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| anyhow!("bad env path"))?;
-    std::fs::create_dir_all(dir)?;
-    let text = toml::to_string(env)?;
-    let tmp = path.with_extension("toml.tmp");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 fn run_json(k: &str, r: &RunRecord) -> Value {

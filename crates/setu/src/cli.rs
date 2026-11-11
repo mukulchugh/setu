@@ -18,8 +18,12 @@ setu-rs: run every worktree's app and workers at its own local URL
   setu-rs disk clean [--apply] [--include-unmanaged]
                                      delete regenerable items of stopped runs past policy
   setu-rs env ls <scope> [target]    scope: global | project <name> | worktree <run>
-  setu-rs env set <scope> [target] NAME=value
+  setu-rs env effective [run]        every var a run gets, and which layer it comes from
+  setu-rs env set <scope> [target] NAME=value [--secret|--plain]
+  setu-rs env set <scope> [target] NAME --secret      type the value hidden
   setu-rs env unset <scope> [target] NAME
+  setu-rs env import <scope> [target] <file> [--preview] [--overwrite]
+  setu-rs env reveal <scope> [target] NAME          prints one value (audited)
 ";
 
 pub fn main() -> i32 {
@@ -106,6 +110,9 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                     r["url"].as_str().unwrap_or(""),
                     r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
                 );
+                if r["stale_env"].as_bool() == Some(true) {
+                    println!("    env changed since this run started; `setu-rs down` then `setu-rs up` to apply");
+                }
             }
             Ok(())
         }
@@ -145,42 +152,133 @@ async fn logs(args: &[String]) -> Result<()> {
 }
 
 async fn env(args: &[String]) -> Result<()> {
-    let action = args.first().map(String::as_str).ok_or_else(|| anyhow!("env needs ls, set or unset"))?;
-    let scope = args.get(1).map(String::as_str).ok_or_else(|| anyhow!("env needs a scope: global, project or worktree"))?;
-    let (target, rest) = if scope == "global" { (None, &args[2..]) } else { (args.get(2).cloned(), args.get(3..).unwrap_or(&[])) };
+    let action = args.first().map(String::as_str).ok_or_else(|| anyhow!("env needs ls, effective, set, unset, import or reveal"))?;
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let pos: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+    if action == "effective" {
+        let run = match pos.first() {
+            Some(r) => r.to_string(),
+            None => api::call(json!({ "cmd": "resolve", "path": cwd()? })).await?.as_str().unwrap_or_default().to_string(),
+        };
+        let out = api::call(json!({ "cmd": "env.effective", "run": run })).await?;
+        println!("# env for {}", out["run"].as_str().unwrap_or(""));
+        for v in out["vars"].as_array().cloned().unwrap_or_default() {
+            let over = v["overrides"].as_array().filter(|a| !a.is_empty()).map(|a| {
+                format!("  (overrides {})", a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            });
+            println!(
+                "{:<36} {:<15} {}{}",
+                v["name"].as_str().unwrap_or(""),
+                v["source"].as_str().unwrap_or(""),
+                preview(&v),
+                over.unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+    // <scope> [target] ...: global takes no target.
+    let scope = pos.first().map(|s| s.as_str()).ok_or_else(|| anyhow!("env {action} needs a scope: global, project <name> or worktree <run>"))?;
+    let (target, rest): (Option<String>, Vec<&String>) = if scope == "global" {
+        (None, pos[1..].to_vec())
+    } else {
+        (pos.get(1).map(|s| s.to_string()), pos.get(2..).map(|r| r.to_vec()).unwrap_or_default())
+    };
     let mut req = json!({ "scope": scope });
     if let Some(t) = &target {
         req["target"] = json!(t);
     }
     match action {
         "ls" => {
-            let out = api::call(with_cmd("env.get", req)).await?;
-            println!("# {}", out["path"].as_str().unwrap_or(""));
-            if let Some(env) = out["env"].as_object() {
-                for (k, v) in env {
-                    println!("{k}={}", v.as_str().unwrap_or(""));
-                }
+            let out = api::call(with_cmd("env.list", req)).await?;
+            for v in out["vars"].as_array().cloned().unwrap_or_default() {
+                println!("{:<36} {}{}", v["name"].as_str().unwrap_or(""), preview(&v), if v["secret"].as_bool() == Some(true) { "  [secret]" } else { "" });
             }
             Ok(())
         }
         "set" => {
-            let pair = rest.first().ok_or_else(|| anyhow!("env set needs NAME=value"))?;
-            let (name, value) = pair.split_once('=').ok_or_else(|| anyhow!("env set needs NAME=value"))?;
+            let arg = rest.first().ok_or_else(|| anyhow!("env set needs NAME=value, or NAME --secret to type it hidden"))?;
+            let (name, value) = match arg.split_once('=') {
+                Some((n, v)) => (n.to_string(), v.to_string()),
+                None => (arg.to_string(), read_hidden(&format!("value for {arg}: "))?),
+            };
             req["name"] = json!(name);
             req["value"] = json!(value);
-            api::call(with_cmd("env.set", req)).await?;
-            println!("set {name} ({scope}); applies the next time each affected run starts");
+            if flag("--secret") {
+                req["secret"] = json!(true);
+            } else if flag("--plain") {
+                req["secret"] = json!(false);
+            }
+            let out = api::call(with_cmd("env.set", req)).await?;
+            println!(
+                "set {name} in {scope}{} ({}); applies the next time each affected run starts",
+                target.map(|t| format!(" {t}")).unwrap_or_default(),
+                if out["secret"].as_bool() == Some(true) { "secret" } else { "plain" }
+            );
             Ok(())
         }
         "unset" => {
-            let name = rest.first().ok_or_else(|| anyhow!("env unset needs NAME"))?;
-            req["name"] = json!(name);
-            api::call(with_cmd("env.set", req)).await?;
-            println!("unset {name} ({scope})");
+            req["name"] = json!(rest.first().ok_or_else(|| anyhow!("env unset needs NAME"))?);
+            let out = api::call(with_cmd("env.unset", req)).await?;
+            println!("{}", if out["existed"].as_bool() == Some(true) { "unset" } else { "was not set" });
             Ok(())
         }
-        _ => bail!("env needs ls, set or unset"),
+        "import" => {
+            let file = rest.first().ok_or_else(|| anyhow!("env import <scope> [target] <file> [--preview] [--overwrite]"))?;
+            req["path"] = json!(std::path::Path::new(file.as_str()).canonicalize()?.display().to_string());
+            req["preview"] = json!(flag("--preview"));
+            req["overwrite"] = json!(flag("--overwrite"));
+            let out = api::call(with_cmd("env.import", req)).await?;
+            let names = |k: &str| out[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            let verb = if flag("--preview") { "would import" } else { "imported" };
+            println!("{verb}: {}", names("imported"));
+            if !names("skipped").is_empty() {
+                println!("skipped (already set; use --overwrite): {}", names("skipped"));
+            }
+            if !names("secrets").is_empty() {
+                println!("stored as secrets: {}", names("secrets"));
+            }
+            if !names("problems").is_empty() {
+                println!("problems: {}", names("problems"));
+            }
+            Ok(())
+        }
+        "reveal" => {
+            req["name"] = json!(rest.first().ok_or_else(|| anyhow!("env reveal needs NAME"))?);
+            let out = api::call(with_cmd("env.reveal", req)).await?;
+            println!("{}", out["value"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        _ => bail!("env needs ls, effective, set, unset, import or reveal"),
     }
+}
+
+fn preview(v: &Value) -> String {
+    match (v["secret"].as_bool(), v["preview"].as_str()) {
+        (Some(true), Some(p)) => p.to_string(),
+        (Some(true), None) => "••••••".into(),
+        (_, Some(p)) => p.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Read a value from the terminal without echo (falls back to a plain stdin line).
+fn read_hidden(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let tty = std::process::Command::new("stty").arg("-echo").stdin(std::fs::File::open("/dev/tty")?).status();
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if tty.is_ok() {
+        let _ = std::process::Command::new("stty").arg("echo").stdin(std::fs::File::open("/dev/tty")?).status();
+        eprintln!();
+    }
+    read?;
+    let value = line.trim_end_matches(['\n', '\r']).to_string();
+    if value.is_empty() {
+        bail!("no value entered");
+    }
+    Ok(value)
 }
 
 async fn disk(args: &[String]) -> Result<()> {

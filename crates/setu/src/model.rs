@@ -165,6 +165,9 @@ pub struct RunRecord {
     /// Unix seconds when Setu last saw this run stop. Disk policies age from this, never from mtimes.
     #[serde(default)]
     pub stopped_at: Option<u64>,
+    /// Hash of the env the running procs were started with (for "restart to apply env changes").
+    #[serde(default)]
+    pub env_hash: Option<u64>,
 }
 
 /// What the proxy learns about a Host.

@@ -76,13 +76,28 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "pin" | "unpin" => d.pin(&target(d, req)?, cmd == "pin"),
         "resolve" => Ok(json!(target(d, req)?)),
-        "env.get" => d.env_get(s(req, "scope").unwrap_or("global"), s(req, "target")),
-        "env.set" => d.env_set(
-            s(req, "scope").unwrap_or("global"),
-            s(req, "target"),
-            s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?,
-            s(req, "value"),
+        "env.list" => d.env_list(&scope(d, req)?),
+        "env.effective" => d.env_effective(s(req, "run").ok_or_else(|| anyhow!("env.effective needs a run"))?),
+        "env.set" => {
+            let secret = req.get("secret").and_then(Value::as_bool);
+            d.env_set(
+                actor(req),
+                &scope(d, req)?,
+                s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?,
+                s(req, "value").ok_or_else(|| anyhow!("env.set needs a value"))?,
+                secret,
+            )
+        }
+        "env.unset" => d.env_unset(actor(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.unset needs a name"))?),
+        "env.import" => d.env_import(
+            actor(req),
+            &scope(d, req)?,
+            s(req, "path"),
+            s(req, "text"),
+            req.get("preview").and_then(Value::as_bool).unwrap_or(false),
+            req.get("overwrite").and_then(Value::as_bool).unwrap_or(false),
         ),
+        "env.reveal" => d.env_reveal(actor(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.reveal needs a name"))?),
         "disk.report" => d.disk_report(req.get("deps").and_then(Value::as_bool).unwrap_or(false)).await,
         "disk.clean" => {
             d.disk_clean(
@@ -93,6 +108,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         other => bail!("unknown cmd {other}"),
     }
+}
+
+/// Who is asking: "cli" (default), "app" or "mcp". The MCP shim always sets "mcp".
+fn actor(req: &Value) -> &str {
+    match s(req, "actor") {
+        Some("mcp") => "mcp",
+        Some("app") => "app",
+        _ => "cli",
+    }
+}
+
+fn scope(d: &Arc<Daemon>, req: &Value) -> Result<crate::env::Scope> {
+    d.env_scope(s(req, "scope").unwrap_or("global"), s(req, "target"))
 }
 
 /// `run` (project/run or a unique run name) or `path` (a worktree path).

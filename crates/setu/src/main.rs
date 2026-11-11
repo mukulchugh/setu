@@ -8,6 +8,7 @@ mod config;
 mod daemon;
 mod disk;
 mod disk_measure;
+mod env;
 mod model;
 mod naming;
 mod paths;
