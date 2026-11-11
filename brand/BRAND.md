@@ -91,3 +91,6 @@ For mixed states, show **Crashed → Starting → Running → Stopped** in that 
 Verified PNG dimensions and sRGB profiles, all ten iconset filenames and sizes, both SVGs' single-path structure and 18-unit viewBox, the proof's matching path data, all four contrast calculations and local preview links. Inspected the 16, 32 and 128 pixel app icons and the 16 and 18 pixel glyph rasters. Review ran locally without a GUI application or screenshots.
 
 The files are supplied as a brand kit. Native menu-bar template behaviour, actual accessibility settings and an installed app's Dock appearance still require application integration review.
+
+## Decision
+Approved by the owner on 2026-11-11: **Confluence** is the Setu mark.
