@@ -617,6 +617,12 @@ impl Daemon {
         let me = Arc::clone(self);
         let (layers, fresh_cfg, need) = tokio::task::spawn_blocking(move || -> Result<(Layers, ProjectConfig, deps::Need)> {
             let cfg = me.fresh_config(&id.project)?;
+            // Declared links (shared env files such as .env.local) are repaired before every start:
+            // only missing ones are created, nothing existing is ever replaced.
+            match worktree::link_files(&cfg, &wt_path) {
+                Ok(w) => w.iter().filter(|w| !w.contains("already exists")).for_each(|w| eprintln!("setu: {id}: {w}")),
+                Err(e) => eprintln!("setu: {id}: linking declared files failed: {e:#}"),
+            }
             // Missing dependencies (cheap directory check) are restored before the procs start.
             let need = deps::plan(&cfg, &wt_path);
             Ok((read_layers(&id.project, &id)?, cfg, need))
@@ -1594,6 +1600,10 @@ impl Daemon {
             let configs = config::load_all()?;
             let (cfg, found) = naming::find_worktree(&configs, &p)?.ok_or_else(|| anyhow!("{} is not inside a worktree of any configured project", p.display()))?;
             let (wt, run) = worktree::adopt_check(cfg, &found)?;
+            // Adopting also adds any declared links (e.g. a shared .env.local) that are missing.
+            if let Err(e) = worktree::link_files(cfg, &wt) {
+                eprintln!("setu: adopt {}: linking declared files failed: {e:#}", wt.display());
+            }
             Ok((cfg.clone(), wt, run))
         })
         .await??;
@@ -2805,6 +2815,43 @@ mod tests {
         assert_eq!(rec.status, RunStatus::SetupFailed);
         assert!(rec.note.as_deref().is_some_and(|n| n.contains("no lockfile") && n.contains("bun.lock")), "{:?}", rec.note);
         assert!(!bun.log.exists(), "no unfrozen install was attempted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_adds_a_missing_declared_link_and_never_replaces_a_worktrees_own_file() {
+        // The old Setu linked apps/<app>/.env.local from main into every worktree; adopted worktrees
+        // that never got it would start without their env. Starting repairs only what is missing.
+        let sb = sandbox();
+        let repo = sb.dir.join("lk.git");
+        assert!(std::process::Command::new("git").args(["init", "-q", "--bare"]).arg(&repo).status().unwrap().success());
+        let main_env = sb.dir.join("lk/main/app/.env.local");
+        std::fs::create_dir_all(main_env.parent().unwrap()).unwrap();
+        std::fs::write(&main_env, "SHARED=1\n").unwrap();
+        let toml = format!(
+            "project = \"lk\"\nrepo = '{}'\ndomain = \"lk.local\"\nauto_install = false\n[worktree]\nlink = [\"app/.env.local\"]\n[procs.w]\nrun = 'exec sleep 300811'\n",
+            repo.display()
+        );
+        std::fs::create_dir_all(paths::projects_dir()).unwrap();
+        std::fs::write(paths::projects_dir().join("lk.toml"), toml).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::new(tx).unwrap();
+        let cfg = config::load_all().unwrap().into_iter().find(|c| c.project == "lk").unwrap();
+        let (a, b) = (sb.dir.join("lk/feat-a"), sb.dir.join("lk/feat-b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(b.join("app")).unwrap();
+        std::fs::write(b.join("app/.env.local"), "OWN=1\n").unwrap();
+        let (ka, _) = d.register(&cfg, &a, "feat-a").unwrap();
+        let (kb, _) = d.register(&cfg, &b, "feat-b").unwrap();
+        d.start(&ka).await.unwrap();
+        d.start(&kb).await.unwrap();
+        let la = a.join("app/.env.local");
+        assert!(std::fs::symlink_metadata(&la).unwrap().file_type().is_symlink(), "missing link is created on start");
+        assert_eq!(std::fs::read_link(&la).unwrap(), main_env);
+        assert_eq!(std::fs::read_to_string(b.join("app/.env.local")).unwrap(), "OWN=1\n", "a worktree's own file is never replaced");
+        let exclude = std::fs::read_to_string(repo.join("info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == "/app/.env.local"), "the link never shows as a change in git");
+        d.stop(&ka, RunStatus::Stopped).await.unwrap();
+        d.stop(&kb, RunStatus::Stopped).await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
