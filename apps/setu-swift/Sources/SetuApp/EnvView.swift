@@ -33,6 +33,14 @@ struct EnvRow: Identifiable, Hashable {
 struct EditorItem: Identifiable {
     let id = UUID()
     var existing: EnvRow?
+    /// The scope the editor was opened for; saving goes here even if the selection changes.
+    var layer: EnvLayer
+}
+
+struct RemoveItem: Identifiable {
+    let row: EnvRow
+    let layer: EnvLayer
+    var id: String { row.name }
 }
 
 private func sourceSymbol(_ s: String) -> String {
@@ -49,17 +57,16 @@ struct EnvView: View {
     @State private var kind: EnvKind = .global
     @State private var project = ""
     @State private var runName = ""
-    @State private var rows: [EnvRow] = []
-    @State private var loading = false
-    @State private var error: String?
+    @State private var loader = EnvLoader()
     @State private var tick = 0
     @State private var query = ""
     @State private var editor: EditorItem?
-    @State private var removing: EnvRow?
+    @State private var removing: RemoveItem?
     @State private var importPlan: ImportPlan?
 
     struct ImportPlan {
         var path: String
+        var layer: EnvLayer
         var report: ImportReport
     }
 
@@ -68,16 +75,23 @@ struct EnvView: View {
     private var effProject: String { project.isEmpty ? (projects.first ?? "") : project }
     private var effRun: String { runName.isEmpty ? (runNames.first ?? "") : runName }
 
-    /// Wire fields for the layer being viewed. nil when the scope has no target.
-    private var layer: [String: Any]? { layerFor(kind) }
+    private var rows: [EnvRow] { loader.rows }
+    private var loading: Bool { loader.loading }
+    private var error: String? { loader.error }
 
-    private func layerFor(_ k: EnvKind) -> [String: Any]? {
-        switch k {
-        case .global: ["scope": "global"]
-        case .project: effProject.isEmpty ? nil : ["scope": "project", "target": effProject]
-        case .worktree: effRun.isEmpty ? nil : ["scope": "worktree", "target": effRun]
+    /// The layer being viewed. nil when the scope has no target.
+    private var layer: EnvLayer? {
+        switch kind {
+        case .global: EnvLayer(scope: "global")
+        case .project: effProject.isEmpty ? nil : EnvLayer(scope: "project", target: effProject)
+        case .worktree: effRun.isEmpty ? nil : EnvLayer(scope: "worktree", target: effRun)
         case .effective: nil
         }
+    }
+
+    /// What `load()` fetches: the layer, or the effective view of a run.
+    private var loadScope: EnvLayer? {
+        kind == .effective ? (effRun.isEmpty ? nil : EnvLayer(scope: "effective", target: effRun)) : layer
     }
 
     private var loadKey: String { "\(kind.rawValue)|\(effProject)|\(effRun)|\(tick)|\(store.runs.isEmpty)" }
@@ -95,17 +109,17 @@ struct EnvView: View {
             .task(id: loadKey) { await load() }
             .sheet(item: $editor) { item in
                 EnvEditor(existing: item.existing) { name, value, secret in
-                    await save(item.existing, name: name, value: value, secret: secret)
+                    await save(item.existing, in: item.layer, name: name, value: value, secret: secret)
                 }
             }
-            .confirmationDialog("Remove \(removing?.name ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { row in
-                Button("Remove", role: .destructive) { Task { await remove(row) } }
+            .confirmationDialog("Remove \(removing?.row.name ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { item in
+                Button("Remove", role: .destructive) { Task { await remove(item) } }
             } message: { _ in
                 Text("Runs pick this up the next time they start.")
             }
             .confirmationDialog(importTitle, isPresented: Binding(get: { importPlan != nil }, set: { if !$0 { importPlan = nil } }), titleVisibility: .visible, presenting: importPlan) { plan in
                 Button("Import") { Task { await runImport(plan, overwrite: false) } }
-                if !plan.report.overwritten.isEmpty {
+                if plan.report.canOverwrite {
                     Button("Import and overwrite", role: .destructive) { Task { await runImport(plan, overwrite: true) } }
                 }
             } message: { plan in
@@ -115,12 +129,7 @@ struct EnvView: View {
 
     private var importTitle: String { "Import variables?" }
 
-    private func importBody(_ r: ImportReport) -> String {
-        var s = "\(r.imported.count) new, \(r.overwritten.count) already set, \(r.secrets.count) secret."
-        if !r.imported.isEmpty { s += "\n" + r.imported.prefix(30).joined(separator: ", ") }
-        if !r.problems.isEmpty { s += "\nProblems: " + r.problems.prefix(5).joined(separator: "; ") }
-        return s
-    }
+    private func importBody(_ r: ImportReport) -> String { r.summary }
 
     @ViewBuilder private var content: some View {
         if kind == .effective ? runNames.isEmpty : layer == nil {
@@ -136,7 +145,7 @@ struct EnvView: View {
                 Label("No variables", systemImage: "list.bullet.rectangle")
             } actions: {
                 if kind != .effective {
-                    Button("Add", systemImage: "plus") { editor = EditorItem() }
+                    Button("Add", systemImage: "plus") { openEditor(nil) }
                 }
             }
         } else {
@@ -172,9 +181,9 @@ struct EnvView: View {
             if r.secret, revealLayer(r) != nil {
                 IconButton(symbol: "eye", label: "Reveal and copy", subject: r.name) { Task { await reveal(r) } }
             }
-            if kind != .effective {
-                IconButton(symbol: "pencil", label: "Edit", subject: r.name) { editor = EditorItem(existing: r) }
-                IconButton(symbol: "trash", label: "Remove", subject: r.name) { removing = r }
+            if kind != .effective, let l = loader.rowsScope {
+                IconButton(symbol: "pencil", label: "Edit", subject: r.name) { editor = EditorItem(existing: r, layer: l) }
+                IconButton(symbol: "trash", label: "Remove", subject: r.name) { removing = RemoveItem(row: r, layer: l) }
             }
         }
     }
@@ -204,7 +213,7 @@ struct EnvView: View {
         }
         ToolbarItemGroup {
             if kind != .effective {
-                ToolbarBtn("Add", "plus", disabled: layer == nil) { editor = EditorItem() }
+                ToolbarBtn("Add", "plus", disabled: layer == nil) { openEditor(nil) }
                 ToolbarBtn("Import", "square.and.arrow.down", disabled: layer == nil) { Task { await startImport() } }
             }
             ToolbarBtn("Refresh", "arrow.clockwise") { tick += 1 }
@@ -213,34 +222,35 @@ struct EnvView: View {
 
     // MARK: data
 
+    private func openEditor(_ row: EnvRow?) {
+        guard let layer else { return }
+        editor = EditorItem(existing: row, layer: layer)
+    }
+
     private func load() async {
-        loading = true
-        defer { loading = false }
-        do {
+        let scope = loadScope
+        let run = effRun
+        await loader.load(scope) {
             if kind == .effective {
-                guard !effRun.isEmpty else { rows = []; return }
-                let e: EnvEffective = try await store.daemon.call(request("env.effective", ["run": effRun]))
-                rows = e.vars.map { EnvRow(name: $0.name, secret: $0.secret, preview: $0.preview, source: $0.source, overrides: $0.overrides) }
-            } else {
-                guard let layer else { rows = []; return }
-                let l: EnvList = try await store.daemon.call(request("env.list", layer))
-                rows = l.vars.map { EnvRow(name: $0.name, secret: $0.secret, preview: $0.preview) }
+                let e: EnvEffective = try await store.daemon.call(request("env.effective", ["run": run]))
+                return e.vars.map { EnvRow(name: $0.name, secret: $0.secret, preview: $0.preview, source: $0.source, overrides: $0.overrides) }
             }
-            error = nil
-        } catch is CancellationError {
-        } catch {
-            self.error = (error as? LocalizedError)?.errorDescription ?? "Could not load."
+            let l: EnvList = try await store.daemon.call(request("env.list", scope?.wire ?? [:]))
+            return l.vars.map { EnvRow(name: $0.name, secret: $0.secret, preview: $0.preview) }
         }
     }
 
+    /// Reveal targets the scope the rows were loaded for, never the current selection.
     private func revealLayer(_ r: EnvRow) -> [String: Any]? {
-        guard kind == .effective else { return layer }
+        guard let scope = loader.rowsScope else { return nil }
+        guard scope.scope == "effective" else { return scope.wire }
+        let run = scope.target ?? ""
         switch r.source ?? "" {
         case "global": return ["scope": "global"]
         case "project":
-            let p = store.runs.first { $0.run == effRun }?.project ?? ""
+            let p = store.runs.first { $0.run == run }?.project ?? ""
             return p.isEmpty ? nil : ["scope": "project", "target": p]
-        case "worktree": return ["scope": "worktree", "target": effRun]
+        case "worktree": return ["scope": "worktree", "target": run]
         default: return nil
         }
     }
@@ -254,8 +264,8 @@ struct EnvView: View {
         }
     }
 
-    private func save(_ ex: EnvRow?, name: String, value: String, secret: Bool) async {
-        guard var f = layer else { return }
+    private func save(_ ex: EnvRow?, in layer: EnvLayer, name: String, value: String, secret: Bool) async {
+        var f = layer.wire
         f["name"] = name
         var v = value
         if v.isEmpty, let ex {
@@ -274,25 +284,26 @@ struct EnvView: View {
         tick += 1
     }
 
-    private func remove(_ r: EnvRow) async {
-        guard var f = layer else { return }
-        f["name"] = r.name
+    private func remove(_ item: RemoveItem) async {
+        var f = item.layer.wire
+        f["name"] = item.row.name
         _ = await store.work { () -> Ignored in try await store.daemon.call(request("env.unset", f)) }
         tick += 1
     }
 
     private func startImport() async {
-        guard var f = layer, let url = await choose(files: true, message: "Choose a .env file to import") else { return }
+        guard let target = layer, let url = await choose(files: true, message: "Choose a .env file to import") else { return }
+        var f = target.wire
         f["path"] = url.path
         f["preview"] = true
         f["overwrite"] = false
         if let rep: ImportReport = await store.work({ try await store.daemon.call(request("env.import", f)) }) {
-            importPlan = ImportPlan(path: url.path, report: rep)
+            importPlan = ImportPlan(path: url.path, layer: target, report: rep)
         }
     }
 
     private func runImport(_ plan: ImportPlan, overwrite: Bool) async {
-        guard var f = layer else { return }
+        var f = plan.layer.wire
         f["path"] = plan.path
         f["preview"] = false
         f["overwrite"] = overwrite

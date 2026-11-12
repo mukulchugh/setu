@@ -238,8 +238,10 @@ struct LogsPane: View {
                 .defaultScrollAnchor(.bottom)
                 .task(id: run.id) {
                     // Logs are fetched only while this pane is on screen.
+                    text = ""
                     while !Task.isCancelled {
-                        if let l: LogsReply = try? await store.daemon.call(request("logs", ["run": run.run, "lines": 200]), timeout: 5) {
+                        if let l: LogsReply = try? await store.daemon.call(request("logs", ["run": run.run, "lines": 200]), timeout: 5),
+                           !Task.isCancelled {
                             if l.text != text { text = l.text }
                         }
                         try? await Task.sleep(for: .seconds(2))

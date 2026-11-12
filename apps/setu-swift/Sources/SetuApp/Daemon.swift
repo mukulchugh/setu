@@ -62,6 +62,8 @@ func request(_ cmd: String, _ fields: [String: Any] = [:]) -> Data {
 /// One request, one reply, a fresh connection each time.
 actor Daemon {
     func call<T: Decodable & Sendable>(_ req: Data, as type: T.Type = T.self, timeout: Int = 180) async throws -> T {
+        // A request whose caller already moved on is never sent.
+        try Task.checkCancellation()
         let path = socketPath()
         var line: Data
         do {

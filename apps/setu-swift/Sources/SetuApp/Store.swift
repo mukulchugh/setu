@@ -55,6 +55,11 @@ final class Store {
     @ObservationIgnored private var windowVisible = false
     @ObservationIgnored private var menuVisible = false
     @ObservationIgnored private var checking = false
+    /// Newest-wins: a slow reply to an older request must not overwrite a newer one.
+    @ObservationIgnored private var refreshSeq = 0
+    @ObservationIgnored private var diskSeq = 0
+    /// Bumped when the window closes; replies that started before it are dropped.
+    @ObservationIgnored private var windowEpoch = 0
 
     var upCount: Int { daemonUp ? runs.filter(\.isUp).count : 0 }
     var failingChecks: Int { checks?.filter { !$0.ok }.count ?? 0 }
@@ -70,6 +75,8 @@ final class Store {
 
     /// The window closed: drop everything only it needed so it costs nothing while hidden.
     private func releaseWindowState() {
+        windowEpoch += 1
+        diskSeq += 1
         disk = nil
         checks = nil
         showLogs = false
@@ -114,11 +121,15 @@ final class Store {
     }
 
     func refresh() async {
+        refreshSeq += 1
+        let seq = refreshSeq
         do {
             let r: [Run] = try await daemon.call(request("ls"), timeout: 5)
+            guard seq == refreshSeq else { return }
             runs = r
             daemonUp = true
         } catch DaemonError.down {
+            guard seq == refreshSeq else { return }
             daemonUp = false
             runs = []
         } catch {
@@ -172,7 +183,8 @@ final class Store {
     // MARK: worktree lifecycle
 
     func loadProjects() async {
-        if let p: [ProjectInfo] = try? await daemon.call(request("projects"), timeout: 10) { projects = p }
+        let epoch = windowEpoch
+        if let p: [ProjectInfo] = try? await daemon.call(request("projects"), timeout: 10), epoch == windowEpoch { projects = p }
     }
 
     /// Create a worktree. Returns the daemon's message on failure so the sheet can show it inline.
@@ -213,7 +225,8 @@ final class Store {
     }
 
     func loadRemoved() async {
-        if let r: [RemovedRun] = try? await daemon.call(request("worktree.removed"), timeout: 10) { removed = r }
+        let epoch = windowEpoch
+        if let r: [RemovedRun] = try? await daemon.call(request("worktree.removed"), timeout: 10), epoch == windowEpoch { removed = r }
     }
 
     /// Restore a removed worktree. Returns the daemon's message on failure.
@@ -231,7 +244,9 @@ final class Store {
     }
 
     func refreshDisk() async {
-        if let d: DiskReport = await work({ try await daemon.call(request("disk.report", ["deps": false])) }) {
+        diskSeq += 1
+        let seq = diskSeq
+        if let d: DiskReport = await work({ try await daemon.call(request("disk.report", ["deps": false])) }), seq == diskSeq {
             disk = d
         }
     }
@@ -247,9 +262,10 @@ final class Store {
         if checking { return }
         checking = true
         busy += 1
+        let epoch = windowEpoch
         Task {
             let result = await Task.detached { Self.doctor() }.value
-            checks = result
+            if epoch == windowEpoch { checks = result }
             busy -= 1
             checking = false
         }
