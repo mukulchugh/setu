@@ -245,6 +245,7 @@ mod tests {
             kind: DiskKind::Cache,
             paths: paths.iter().map(|s| s.to_string()).collect(),
             clean_after: Some(Duration::from_secs(60)),
+            install: None,
         };
         RawItem { item, disabled }
     }

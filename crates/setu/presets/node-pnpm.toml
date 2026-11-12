@@ -8,6 +8,8 @@ any_of = ["pnpm-lock.yaml"]
 name = "node_modules"
 kind = "deps"
 paths = ["node_modules", "*/node_modules", "*/*/node_modules"]
+install = "pnpm install --frozen-lockfile"
+lockfiles = ["pnpm-lock.yaml"]
 
 [[disk.store]]
 name = "pnpm-store"

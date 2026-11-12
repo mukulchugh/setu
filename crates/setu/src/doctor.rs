@@ -22,6 +22,10 @@ pub struct DoctorInputs {
     pub gcfg: GlobalConfig,
     pub projects: Vec<ProjectConfig>,
     pub proxy_listening: bool,
+    /// What the daemon says it bound (`proxy.json`); `None` when no daemon has published one.
+    pub proxy_binding: Option<crate::globalcfg::ProxyBinding>,
+    /// The port the proxy is expected on (binding, else config, else :80).
+    pub proxy_port: u16,
 }
 
 const BUILTINS: &[&str] = &[
@@ -60,7 +64,7 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
     let mut out = Vec::new();
 
     out.push(match &inp.daemon_ping {
-        None => bad("daemon", "not answering", "setu-rs setup   (or: setu-rs daemon)"),
+        None => bad("daemon", "not answering", "setu setup   (or: setu daemon)"),
         Some(v) if *v == inp.cli_version => ok("daemon", format!("answering, version {v}")),
         Some(v) => bad("daemon", format!("version {v} differs from CLI {}", inp.cli_version), format!("launchctl kickstart -k gui/{}/{}", sys.uid(), setup::LABEL)),
     });
@@ -68,18 +72,18 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
     out.push(if inp.launch_agent_loaded {
         ok("launch agent", format!("{} loaded", setup::LABEL))
     } else {
-        bad("launch agent", format!("{} not loaded", setup::LABEL), "setu-rs setup")
+        bad("launch agent", format!("{} not loaded", setup::LABEL), "setu setup")
     });
 
     let captured = match (&inp.gcfg.path, inp.gcfg.path_captured_at) {
         (None, _) => {
-            out.push(bad("login PATH", "no PATH snapshot", "setu-rs setup"));
+            out.push(bad("login PATH", "no PATH snapshot", "setu setup"));
             None
         }
         (Some(p), at) => {
             let age = at.map(|t| now_secs().saturating_sub(t));
             let detail = match age {
-                Some(a) if a > PATH_MAX_AGE_SECS => format!("{} dirs captured {} days ago; consider refreshing with `setu-rs setup`", p.split(':').count(), a / 86400),
+                Some(a) if a > PATH_MAX_AGE_SECS => format!("{} dirs captured {} days ago; consider refreshing with `setu setup`", p.split(':').count(), a / 86400),
                 Some(a) => format!("{} dirs captured {} days ago", p.split(':').count(), a / 86400),
                 None => format!("{} dirs captured (time unknown)", p.split(':').count()),
             };
@@ -100,13 +104,19 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
                 }
                 for w in words {
                     let label = format!("{}/{} command `{w}`", pc.project, name);
-                    let found = if w.contains('/') { is_exec(Path::new(w)) } else { on_path(w, path) };
+                    // The shell that runs procs expands a leading `~`; the daemon also puts its own
+                    // directory on procs' PATH, so `setu x …` always resolves.
+                    let expanded = match w.strip_prefix("~/") {
+                        Some(rest) => std::env::var_os("HOME").map(|h| Path::new(&h).join(rest)).unwrap_or_else(|| Path::new(w).to_path_buf()),
+                        None => Path::new(w).to_path_buf(),
+                    };
+                    let found = if w == "setu" { true } else if w.contains('/') { is_exec(&expanded) } else { on_path(w, path) };
                     if found {
                         out.push(ok(label, "found"));
                     } else if w.contains('/') {
                         out.push(bad(label, "file not found or not executable", format!("check `run` of proc {name} in the {} project config", pc.project)));
                     } else {
-                        out.push(bad(label, "not on the captured PATH", format!("install {w}, then run: setu-rs setup   (re-captures PATH)")));
+                        out.push(bad(label, "not on the captured PATH", format!("install {w}, then run: setu setup   (re-captures PATH)")));
                     }
                 }
             }
@@ -114,10 +124,17 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
     }
 
     out.push(if inp.proxy_listening {
-        ok("proxy", format!("listening on :{}", inp.gcfg.proxy_port))
+        ok("proxy", format!("listening on :{}", inp.proxy_port))
     } else {
-        bad("proxy", format!("nothing listening on :{}", inp.gcfg.proxy_port), "setu-rs setup   (or: setu-rs daemon)")
+        bad("proxy", format!("nothing listening on :{}", inp.proxy_port), "setu setup   (or: setu daemon)")
     });
+    if let Some(why) = inp.proxy_binding.as_ref().and_then(|b| b.fallback_reason.as_ref()) {
+        out.push(bad(
+            "proxy port",
+            format!("serving on :{} instead of :80 because {why}", inp.proxy_port),
+            "free port 80 (for the old Caddy: brew services stop caddy), then restart the daemon: launchctl kickstart -k gui/<uid>/dev.setu.daemon",
+        ));
+    }
 
     let mut seen = std::collections::BTreeSet::new();
     for pc in &inp.projects {
@@ -129,7 +146,7 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
         if sys.resolves_to_loopback(&format!("setu-probe.{d}")) {
             out.push(ok(name, "resolves to loopback"));
         } else {
-            out.push(bad(name, "does not resolve to 127.0.0.1", "setu-rs setup"));
+            out.push(bad(name, "does not resolve to 127.0.0.1", "setu setup"));
         }
     }
 
@@ -194,6 +211,7 @@ mod tests {
             repo: PathBuf::from("/r"),
             domain: domain.into(),
             idle: Duration::from_secs(1),
+            aliases: vec![],
             max_running: 3,
             ports: vec![],
             env: BTreeMap::new(),
@@ -202,6 +220,7 @@ mod tests {
             disk_items: vec![],
             worktree: Default::default(),
             setup_steps: vec![],
+            auto_install: true,
             stores,
         }
     }
@@ -214,11 +233,22 @@ mod tests {
             gcfg: GlobalConfig { path, path_captured_at: Some(now_secs()), ..Default::default() },
             projects,
             proxy_listening: true,
+            proxy_binding: None,
+            proxy_port: 7777,
         }
     }
 
     fn find<'a>(cs: &'a [Check], needle: &str) -> &'a Check {
         cs.iter().find(|c| c.name.contains(needle)).unwrap_or_else(|| panic!("no check {needle}: {cs:?}"))
+    }
+
+    #[test]
+    fn explains_proxy_fallback() {
+        let mut i = inputs(None, vec![]);
+        i.proxy_binding = Some(crate::globalcfg::ProxyBinding { port: 7777, fallback_reason: Some("port 80 is held by caddy (pid 42)".into()) });
+        let cs = run(i, &FakeSys { resolving: vec![] });
+        let c = find(&cs, "proxy port");
+        assert!(!c.ok && c.detail.contains("held by caddy (pid 42)") && c.fix.is_some());
     }
 
     #[test]
@@ -295,7 +325,7 @@ mod tests {
         let p = project(&[], "x.test", stores);
         let cs = run(inputs(Some("/usr/bin".into()), vec![p]), &FakeSys { resolving: vec![] });
         let dom = find(&cs, "domain x.test");
-        assert!(!dom.ok && dom.fix.as_deref() == Some("setu-rs setup"));
+        assert!(!dom.ok && dom.fix.as_deref() == Some("setu setup"));
         assert!(!find(&cs, "small").ok);
         assert!(find(&cs, "fine").ok);
         assert!(!cs.iter().any(|c| c.name.contains("unwatched")));

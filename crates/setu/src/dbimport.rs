@@ -237,12 +237,13 @@ mod tests {
             procs: vec![],
             web_port: Some(4123),
             idle: Duration::from_secs(60),
+            aliases: vec![],
         };
         let rec = RunRecord {
             spec,
             status: RunStatus::Running,
             pinned: true,
-            procs: vec![ProcRecord { name: "web".into(), pid: 4242, start_time: 99, escaped: vec![] }],
+            procs: vec![ProcRecord { name: "web".into(), pid: 4242, start_time: 99, escaped: vec![], members: vec![] }],
             note: Some("hello".into()),
             stopped_at: Some(11),
             env_hash: Some(u64::MAX - 5),

@@ -169,12 +169,12 @@ pub fn plist(binary: &Path, path_env: &str, log: &Path) -> String {
 
 /// Homebrew's stable symlink if present (survives upgrades), else this binary.
 pub fn stable_binary_path() -> PathBuf {
-    for p in ["/opt/homebrew/opt/setu/bin/setu-rs", "/usr/local/opt/setu/bin/setu-rs"] {
+    for p in ["/opt/homebrew/opt/setu/bin/setu", "/usr/local/opt/setu/bin/setu"] {
         if Path::new(p).exists() {
             return PathBuf::from(p);
         }
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("setu-rs"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("setu"));
     exe.canonicalize().unwrap_or(exe)
 }
 
@@ -391,7 +391,7 @@ mod tests {
     fn plan_localhost_custom_and_resolving() {
         let l = layout("plan");
         let g = GlobalConfig::default();
-        let bin = Path::new("/bin/setu-rs");
+        let bin = Path::new("/bin/setu");
         let fake = Fake { resolving: vec!["quivly.local".into()], ..Default::default() };
         let steps = plan_in(&g, &doms(&["a.localhost", "quivly.local", "demo.test", "demo.test"]), bin, &fake, &l);
         assert_eq!(ids(&steps), ["capture-path", "launch-agent", "resolver:demo.test"]);
@@ -402,7 +402,7 @@ mod tests {
     fn plan_skips_loaded_identical_agent() {
         let l = layout("skip");
         let g = GlobalConfig { path: Some("/x:/y".into()), ..Default::default() };
-        let bin = Path::new("/bin/setu-rs");
+        let bin = Path::new("/bin/setu");
         std::fs::create_dir_all(l.plist.parent().unwrap()).unwrap();
         std::fs::write(&l.plist, plist(bin, "/x:/y", &l.log)).unwrap();
         let loaded = Fake { loaded: true, ..Default::default() };
@@ -417,7 +417,7 @@ mod tests {
     fn apply_records_and_undo_removes_only_marker_files() {
         let l = layout("apply");
         let mut g = GlobalConfig::default();
-        let bin = Path::new("/bin/setu-rs");
+        let bin = Path::new("/bin/setu");
         let fake = Fake::default();
         let steps = plan_in(&g, &doms(&["demo.test"]), bin, &fake, &l);
         let rec = apply(&steps, &mut g, bin, &l, &fake).unwrap();
@@ -467,7 +467,7 @@ mod tests {
         // review #22
         let l = layout("domainpath");
         let g = GlobalConfig::default();
-        let bin = Path::new("/bin/setu-rs");
+        let bin = Path::new("/bin/setu");
         let fake = Fake::default();
         let steps = plan_in(&g, &doms(&["/etc/sudoers", "../../etc/hosts", "a/b.test", "ok.test", "bad name.test"]), bin, &fake, &l);
         assert_eq!(ids(&steps), ["capture-path", "launch-agent", "resolver:ok.test"]);
@@ -517,11 +517,11 @@ mod tests {
 
     #[test]
     fn plist_is_well_formed_and_escaped() {
-        let p = plist(Path::new("/a&b/setu-rs"), "/x:/y&z", Path::new("/l/daemon.log"));
+        let p = plist(Path::new("/a&b/setu"), "/x:/y&z", Path::new("/l/daemon.log"));
         for k in ["<key>Label</key>", "dev.setu.daemon", "<key>ProgramArguments</key>", "<string>daemon</string>", "<key>RunAtLoad</key>", "<key>KeepAlive</key>", "<key>SuccessfulExit</key>", "<key>StandardOutPath</key>", "<key>StandardErrorPath</key>", "<key>EnvironmentVariables</key>", "<key>PATH</key>", "<key>ProcessType</key>", "<string>Background</string>"] {
             assert!(p.contains(k), "missing {k}");
         }
-        assert!(p.contains("/a&amp;b/setu-rs") && p.contains("/x:/y&amp;z"));
+        assert!(p.contains("/a&amp;b/setu") && p.contains("/x:/y&amp;z"));
         assert!(!p.contains("a&b"));
         assert_eq!(p.matches("<dict>").count(), p.matches("</dict>").count());
         assert_eq!(p.matches("<string>").count(), p.matches("</string>").count());

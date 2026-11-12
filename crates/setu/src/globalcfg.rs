@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalConfig {
-    pub proxy_port: u16,
+    /// Explicit proxy port. Unset: try :80, fall back to 7777 (see `daemon::bind_proxy`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
     /// Login-shell PATH captured by `setup`; the daemon spawns procs with it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -22,11 +24,15 @@ pub struct GlobalConfig {
     pub dns_port: u16,
     /// `[auto_remove]`: opt-in removal of merged or long-idle worktrees (slice 7, part 2).
     pub auto_remove: AutoRemoveCfg,
+    /// Stop Setu-started runs when the daemon exits. Off by default: an upgrade or
+    /// `launchctl kickstart` leaves dev servers running, and the next daemon adopts them.
+    /// Servers Setu only took over (external) are never stopped by a daemon exit.
+    pub stop_runs_on_exit: bool,
 }
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        GlobalConfig { proxy_port: 7777, path: None, path_captured_at: None, dns_port: 15353, auto_remove: AutoRemoveCfg::default() }
+        GlobalConfig { proxy_port: None, path: None, path_captured_at: None, dns_port: 15353, auto_remove: AutoRemoveCfg::default(), stop_runs_on_exit: false }
     }
 }
 
@@ -169,7 +175,7 @@ mod tests {
         let d = tmp("missing");
         let c = GlobalConfig::load_from(&d.join("config.toml")).unwrap();
         assert_eq!(c, GlobalConfig::default());
-        assert_eq!((c.proxy_port, c.dns_port), (7777, 15353));
+        assert_eq!((c.proxy_port, c.dns_port), (None, 15353));
     }
 
     #[test]
@@ -187,7 +193,7 @@ mod tests {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "proxy_port = 80\n").unwrap();
         let mut c = GlobalConfig::load_from(&p).unwrap();
-        assert_eq!((c.proxy_port, c.dns_port), (80, 15353));
+        assert_eq!((c.proxy_port, c.dns_port), (Some(80), 15353));
         c.path = Some("/a:/b".into());
         c.path_captured_at = Some(42);
         c.save_to(&p).unwrap();
@@ -216,13 +222,55 @@ mod tests {
     }
 }
 
-/// Proxy port for this process (read once). URLs omit the port when it is 80.
-pub fn proxy_port() -> u16 {
-    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-    *PORT.get_or_init(|| GlobalConfig::load().map(|c| c.proxy_port).unwrap_or(7777))
+/// Preferred proxy port when the config does not set one.
+pub const DEFAULT_PROXY_PORT: u16 = 80;
+/// Where the proxy goes when the preferred port is taken.
+pub const FALLBACK_PROXY_PORT: u16 = 7777;
+
+/// What the daemon actually bound, published for the CLI and doctor (`state_dir/proxy.json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyBinding {
+    pub port: u16,
+    /// Set when the proxy fell back: why the preferred port was not used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
-/// The login-shell PATH captured by `setu-rs setup`, read fresh so a re-run applies at the next spawn.
+pub fn proxy_binding_path() -> PathBuf {
+    paths::state_dir().join("proxy.json")
+}
+
+pub fn read_proxy_binding() -> Option<ProxyBinding> {
+    serde_json::from_str(&std::fs::read_to_string(proxy_binding_path()).ok()?).ok()
+}
+
+static EFFECTIVE_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// The daemon calls this once, after binding.
+pub fn set_effective_proxy_port(port: u16) {
+    let _ = EFFECTIVE_PORT.set(port);
+}
+
+/// Proxy port for URLs. Daemon: what it bound. CLI: the daemon's published binding, else the
+/// config, else the preferred port. URLs omit the port when it is 80.
+pub fn proxy_port() -> u16 {
+    #[cfg(test)]
+    {
+        FALLBACK_PROXY_PORT
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(p) = EFFECTIVE_PORT.get() {
+            return *p;
+        }
+        if let Some(b) = read_proxy_binding() {
+            return b.port;
+        }
+        GlobalConfig::load().ok().and_then(|c| c.proxy_port).unwrap_or(DEFAULT_PROXY_PORT)
+    }
+}
+
+/// The login-shell PATH captured by `setu setup`, read fresh so a re-run applies at the next spawn.
 pub fn login_path() -> Option<String> {
     GlobalConfig::load().ok().and_then(|c| c.path)
 }

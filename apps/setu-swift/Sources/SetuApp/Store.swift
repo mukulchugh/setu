@@ -160,7 +160,7 @@ final class Store {
     }
 
     func startDaemon() {
-        let p = setuRsProcess(["daemon"])
+        let p = setuProcess(["daemon"])
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
@@ -272,13 +272,13 @@ final class Store {
     }
 
     nonisolated private static func doctor() -> [Check] {
-        let p = setuRsProcess(["doctor", "--json"])
+        let p = setuProcess(["doctor", "--json"])
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
         do { try p.run() } catch {
-            return [Check(name: "Config check", ok: false, detail: "Could not run setu-rs.", fix: nil)]
+            return [Check(name: "Config check", ok: false, detail: "Could not run setu.", fix: nil)]
         }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
@@ -304,23 +304,23 @@ struct Refusal: Identifiable {
     var id: String { run }
 }
 
-/// `setu-rs` inside the bundle, next to the executable, or on PATH.
-func setuRsURL() -> URL {
+/// `setu` inside the bundle, next to the executable, or on PATH.
+func setuURL() -> URL {
     if let exe = Bundle.main.executableURL {
         let dir = exe.deletingLastPathComponent()
-        let bundled = dir.appendingPathComponent("../Resources/bin/setu-rs").standardized
+        let bundled = dir.appendingPathComponent("../Resources/bin/setu").standardized
         if FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
-        let sibling = dir.appendingPathComponent("setu-rs")
+        let sibling = dir.appendingPathComponent("setu")
         if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
     }
     return URL(fileURLWithPath: "/usr/bin/env")
 }
 
-func setuRsProcess(_ args: [String]) -> Process {
+func setuProcess(_ args: [String]) -> Process {
     let p = Process()
-    let u = setuRsURL()
+    let u = setuURL()
     p.executableURL = u
-    p.arguments = u.lastPathComponent == "env" ? ["setu-rs"] + args : args
+    p.arguments = u.lastPathComponent == "env" ? ["setu"] + args : args
     return p
 }
 
@@ -371,6 +371,8 @@ func statusSymbol(_ r: Run) -> (name: String, color: Color, word: String) {
     case "starting": ("circle.dotted", .orange, "Starting")
     case "stopping": ("circle.dotted", .orange, "Stopping")
     case "crashed": ("exclamationmark.circle.fill", .red, "Crashed")
+    case "preparing": ("circle.dotted", .orange, "Preparing")
+    case "setup-failed": ("exclamationmark.triangle.fill", .red, "Setup failed")
     default: ("circle", .secondary, "Stopped")
     }
 }

@@ -1,7 +1,7 @@
 //! Project config loading, env layers, template rendering and run resolution.
 #![allow(dead_code)]
 
-use crate::model::{DiskItem, DiskKind, DiskStore, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, SetupStep, WorktreeCfg};
+use crate::model::{DiskItem, DiskKind, DiskStore, Install, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, SetupStep, WorktreeCfg};
 use crate::presets::{self, RawItem};
 use crate::{naming, paths};
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +16,8 @@ struct RawProject {
     project: String,
     repo: String,
     domain: String,
+    #[serde(default)]
+    aliases: Vec<String>,
     idle: Option<String>,
     max_running: Option<usize>,
     #[serde(default)]
@@ -31,6 +33,8 @@ struct RawProject {
     worktree: RawWorktree,
     #[serde(default)]
     setup: RawSetup,
+    /// `auto_install = false` opts out of reinstalling missing dependencies on start.
+    auto_install: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -49,6 +53,8 @@ struct RawWorktree {
 struct RawSetup {
     #[serde(default)]
     step: Vec<RawSetupStep>,
+    /// Same switch as the top-level `auto_install`; either one set to false turns it off.
+    auto_install: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +94,10 @@ pub(crate) struct RawDiskItem {
     clean_after: Option<String>,
     #[serde(default)]
     disabled: bool,
+    /// Deps items: command that restores the item when its path is missing.
+    install: Option<String>,
+    #[serde(default)]
+    lockfiles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -178,7 +188,7 @@ pub(crate) fn convert_item(r: RawDiskItem) -> Result<RawItem> {
     let ctx = || format!("disk item {name:?}");
     if r.disabled {
         // A disabled item only needs its name; it removes a preset item of that name.
-        let item = DiskItem { name: name.clone(), kind: r.kind.unwrap_or(DiskKind::Cache), paths: vec![], clean_after: None };
+        let item = DiskItem { name: name.clone(), kind: r.kind.unwrap_or(DiskKind::Cache), paths: vec![], clean_after: None, install: None };
         return Ok(RawItem { item, disabled: true });
     }
     let kind = r.kind.ok_or_else(|| anyhow!("kind is required (deps, output or cache)")).with_context(ctx)?;
@@ -189,7 +199,22 @@ pub(crate) fn convert_item(r: RawDiskItem) -> Result<RawItem> {
         validate_disk_path(p).with_context(ctx)?;
     }
     let clean_after = r.clean_after.as_deref().map(parse_duration).transpose().with_context(ctx)?;
-    Ok(RawItem { item: DiskItem { name: name.clone(), kind, paths: r.paths, clean_after }, disabled: false })
+    let install = match r.install {
+        None => None,
+        Some(run) => {
+            if kind != DiskKind::Deps {
+                return Err(anyhow!("install is only valid on a deps item")).with_context(ctx);
+            }
+            if run.trim().is_empty() {
+                return Err(anyhow!("install must not be empty")).with_context(ctx);
+            }
+            for l in &r.lockfiles {
+                validate_disk_path(l).with_context(ctx)?;
+            }
+            Some(Install { run, lockfiles: r.lockfiles })
+        }
+    };
+    Ok(RawItem { item: DiskItem { name: name.clone(), kind, paths: r.paths, clean_after, install }, disabled: false })
 }
 
 pub(crate) fn convert_store(r: RawDiskStore) -> Result<DiskStore> {
@@ -220,7 +245,7 @@ fn convert_worktree(r: RawWorktree) -> Result<WorktreeCfg> {
     Ok(WorktreeCfg { base: r.base, link: r.link, copy: r.copy, min_free })
 }
 
-fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
+pub(crate) fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
     parse_project_in(text, file, |_| None)
 }
 
@@ -229,6 +254,17 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
     let raw: RawProject = toml::from_str(text).with_context(|| format!("invalid project config {}", file.display()))?;
     validate_project_name(&raw.project).with_context(|| format!("in {}", file.display()))?;
     validate_domain(&raw.domain).with_context(|| format!("in {}", file.display()))?;
+    let mut aliases: Vec<String> = Vec::new();
+    for a in &raw.aliases {
+        let a = a.to_ascii_lowercase();
+        validate_domain(&a).with_context(|| format!("alias {a:?} in {}", file.display()))?;
+        if !a.ends_with(&format!(".{}", raw.domain.to_ascii_lowercase())) {
+            bail!("{}: alias {a:?} must be a host under the project domain {:?} (Setu's DNS only answers that domain)", file.display(), raw.domain);
+        }
+        if !aliases.contains(&a) {
+            aliases.push(a);
+        }
+    }
     let idle = parse_duration(raw.idle.as_deref().unwrap_or("30m")).with_context(|| format!("in {}", file.display()))?;
     let mut procs = BTreeMap::new();
     for (name, p) in raw.procs {
@@ -246,6 +282,7 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
     };
     let (items, stores) = convert_disk(raw.disk).with_context(|| format!("in {}", file.display()))?;
     let worktree = convert_worktree(raw.worktree).with_context(|| format!("in {}", file.display()))?;
+    let auto_install = raw.auto_install != Some(false) && raw.setup.auto_install != Some(false);
     let mut setup_steps = Vec::new();
     for st in raw.setup.step {
         if st.name.trim().is_empty() || st.run.trim().is_empty() {
@@ -271,7 +308,9 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
         stores,
         worktree,
         setup_steps,
+        auto_install,
         domain: raw.domain,
+        aliases,
         idle,
         max_running: raw.max_running.unwrap_or(3),
         ports: raw.ports.into_keys().collect(),
@@ -311,9 +350,8 @@ fn load_dir(dir: &Path) -> Result<Vec<ProjectConfig>> {
         if out.iter().any(|o| o.project == c.project) {
             bail!("duplicate project name {:?} ({})", c.project, f.display());
         }
-        if out.iter().any(|o| o.domain == c.domain) {
-            bail!("duplicate domain {:?} ({})", c.domain, f.display());
-        }
+        // Projects may share a domain (v1 put every project on `quivly.local`); a host that two
+        // runs would both claim is refused when the second one registers.
         out.push(c);
     }
     Ok(out)
@@ -378,16 +416,19 @@ pub fn worktree_env_path(id: &RunId) -> PathBuf {
     paths::env_dir().join(&id.project).join(format!("{}.toml", id.run))
 }
 
+/// Render `{name}` placeholders. Errors never quote the template: an unknown placeholder in a
+/// secret-looking config value may itself be a credential, so diagnostics carry only a fixed
+/// message and a byte offset (the caller's context names the env variable or proc).
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String> {
     let mut out = String::with_capacity(template.len());
-    let mut it = template.chars().peekable();
-    while let Some(c) = it.next() {
+    let mut it = template.char_indices().peekable();
+    while let Some((at, c)) = it.next() {
         match c {
-            '{' if it.peek() == Some(&'{') => {
+            '{' if matches!(it.peek(), Some((_, '{'))) => {
                 it.next();
                 out.push('{');
             }
-            '}' if it.peek() == Some(&'}') => {
+            '}' if matches!(it.peek(), Some((_, '}'))) => {
                 it.next();
                 out.push('}');
             }
@@ -395,17 +436,17 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String>
                 let mut name = String::new();
                 loop {
                     match it.next() {
-                        Some('}') => break,
-                        Some(ch) => name.push(ch),
-                        None => bail!("unterminated '{{' in a template value"),
+                        Some((_, '}')) => break,
+                        Some((_, ch)) => name.push(ch),
+                        None => bail!("unterminated '{{' at byte offset {at} in a template value (contents not shown)"),
                     }
                 }
                 match vars.get(name.trim()) {
                     Some(v) => out.push_str(v),
-                    None => bail!("unknown template variable {{{name}}}"),
+                    None => bail!("unknown template variable at byte offset {at} (contents not shown)"),
                 }
             }
-            '}' => bail!("stray '}}' in a template value (use '}}}}' for a literal brace)"),
+            '}' => bail!("stray '}}' at byte offset {at} in a template value (use '}}}}' for a literal brace)"),
             c => out.push(c),
         }
     }
@@ -477,6 +518,7 @@ pub fn resolve_run(
         procs,
         web_port,
         idle: cfg.idle,
+        aliases: if run == "main" { cfg.aliases.clone() } else { Vec::new() },
     })
 }
 
@@ -577,7 +619,7 @@ run = "bun worker {{literal}}"
         assert_eq!(render("x{a}y{port.web}", &v).unwrap(), "x1y4000");
         assert_eq!(render("{{a}} {{ }}", &v).unwrap(), "{a} { }");
         let e = render("{nope}", &v).unwrap_err().to_string();
-        assert!(e.contains("nope"));
+        assert!(e.contains("byte offset 0") && !e.contains("nope"), "{e}");
         assert!(render("{a", &v).is_err());
         assert!(render("a}", &v).is_err());
     }
@@ -646,7 +688,8 @@ run = "bun worker {{literal}}"
         std::fs::write(d.join("b.toml"), "project='a'\nrepo='/r'\ndomain='y'\n").unwrap();
         assert!(format!("{:#}", load_dir(&d).unwrap_err()).contains("duplicate project"));
         std::fs::write(d.join("b.toml"), "project='b'\nrepo='/r'\ndomain='x'\n").unwrap();
-        assert!(format!("{:#}", load_dir(&d).unwrap_err()).contains("duplicate domain"));
+        // a shared domain is allowed
+        assert_eq!(load_dir(&d).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -755,5 +798,46 @@ run = "bun worker {{literal}}"
             let e = format!("{:#}", render(t, &v).unwrap_err());
             assert!(!e.contains("CANARY"), "{e}");
         }
+    }
+
+    #[test]
+    fn b4_unknown_placeholder_contents_never_appear_in_the_error() {
+        let v = map(&[("a", "1")]);
+        let e = format!("{:#}", render("x {CANARY-CREDENTIAL} y", &v).unwrap_err());
+        assert!(!e.contains("CANARY") && !e.contains("CREDENTIAL"), "{e}");
+        assert!(e.contains("byte offset 2"), "{e}");
+        // through resolve_run the error names the env variable, still without the contents
+        let mut cfg = sample();
+        cfg.env.insert("API_TOKEN".into(), "{CANARY-CREDENTIAL}".into());
+        let leases = map_ports();
+        let e = format!("{:#}", resolve_run(&cfg, Path::new("/w"), "r", &leases, &BTreeMap::new(), &BTreeMap::new()).unwrap_err());
+        assert!(e.contains("env API_TOKEN") && !e.contains("CANARY"), "{e}");
+    }
+
+    fn map_ports() -> BTreeMap<String, u16> {
+        [("web".to_string(), 3000u16), ("inngest".to_string(), 3001u16)].into_iter().collect()
+    }
+
+    #[test]
+    fn a_short_value_under_a_secret_looking_name_is_ordinary_config() {
+        // `MAX_TOKENS = "50"` must not stop a project from loading; it is not a credential.
+        let t = "project = \"p\"\nrepo = \"/r\"\ndomain = \"p.local\"\n[env]\nMAX_TOKENS = \"50\"\nAPI_TOKEN = \"12345\"\n";
+        let cfg = parse_project(t, Path::new("p.toml")).unwrap();
+        assert!(!crate::env::looks_secret("MAX_TOKENS", &cfg.env["MAX_TOKENS"]));
+        assert!(crate::env::looks_secret("API_TOKEN", &cfg.env["API_TOKEN"]));
+    }
+
+    #[test]
+    fn aliases_must_be_hosts_under_the_domain_and_only_main_gets_them() {
+        let t = |a: &str| format!("project = \"p\"\nrepo = \"/r\"\ndomain = \"q.local\"\naliases = [{a}]\n");
+        let cfg = parse_project(&t("\"My.Site2.0.q.local\""), Path::new("p.toml")).unwrap();
+        assert_eq!(cfg.aliases, vec!["my.site2.0.q.local".to_string()]);
+        for bad in ["\"other.example\"", "\"q.local\"", "\"../x.q.local\"", "\"a b.q.local\""] {
+            assert!(parse_project(&t(bad), Path::new("p.toml")).is_err(), "{bad}");
+        }
+        let main = resolve_run(&cfg, Path::new("/w"), "main", &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert_eq!(main.aliases, cfg.aliases);
+        let feat = resolve_run(&cfg, Path::new("/w"), "feat-x", &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert!(feat.aliases.is_empty());
     }
 }

@@ -175,7 +175,7 @@ pub fn items_from(cfgs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>, cl
     for (key, r) in runs {
         let Some(cfg) = cfgs.iter().find(|c| c.project == r.spec.id.project) else { continue };
         let running = match r.status {
-            RunStatus::Running | RunStatus::Starting | RunStatus::Stopping => Some(format!("{:?}", r.status).to_lowercase()),
+            RunStatus::Running | RunStatus::Starting | RunStatus::Stopping | RunStatus::Preparing => Some(format!("{:?}", r.status).to_lowercase()),
             _ => None,
         };
         out.push(Item {
@@ -300,9 +300,16 @@ fn merged_offline(worktree: &Path, head: &str, base: &str) -> Option<&'static st
 }
 
 /// Is the branch proven merged? Every failure, timeout or doubt is `No` (or `GhUnavailable`).
-fn merged_how(it: &Item, fetch_ok: bool, d: &Deps) -> Merged {
-    let Some(head) = git(&it.worktree, &["rev-parse", "HEAD"], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|h| !h.is_empty()) else { return Merged::No };
-    let branch = match git(&it.worktree, &["symbolic-ref", "--short", "-q", "HEAD"], GIT_QUICK) {
+/// Evaluation is read-only unless `record_pushed` (an applying sweep): the "was pushed" fact is
+/// then remembered in the repo config (review B22: a dry run must not write git config).
+#[allow(clippy::too_many_arguments)]
+fn merge_proof(worktree: &Path, repo: &Path, main_dir: &Path, wt_cfg: &WorktreeCfg, fetch_ok: bool, expected_head: Option<&str>, record_pushed: bool, gh: &dyn Fn(&Path, &str) -> std::result::Result<String, String>) -> Merged {
+    let Some(head) = git(worktree, &["rev-parse", "HEAD"], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|h| !h.is_empty()) else { return Merged::No };
+    // The proof is for exactly the tip the removal was planned for.
+    if expected_head.is_some_and(|h| h != head) {
+        return Merged::No;
+    }
+    let branch = match git(worktree, &["symbolic-ref", "--short", "-q", "HEAD"], GIT_QUICK) {
         Ok(o) => o.text().trim().to_string(),
         Err(_) => return Merged::No,
     };
@@ -312,26 +319,45 @@ fn merged_how(it: &Item, fetch_ok: bool, d: &Deps) -> Merged {
     // "Was pushed" must survive GitHub deleting the branch on merge (a pruning fetch then drops
     // origin/<branch>), so it is remembered in the repo config once seen, and an upstream setting counts too.
     let (pushed_key, fork_key) = (format!("branch.{branch}.setu-pushed"), format!("branch.{branch}.setu-fork"));
-    let seen_now = git(&it.worktree, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")], GIT_QUICK).is_ok();
-    if seen_now && git_cfg(&it.repo, &pushed_key).is_none() {
-        let _ = git(&it.repo, &["config", "--local", &pushed_key, "true"], GIT_QUICK);
+    let seen_now = git(worktree, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")], GIT_QUICK).is_ok();
+    if record_pushed && seen_now && git_cfg(repo, &pushed_key).is_none() {
+        let _ = git(repo, &["config", "--local", &pushed_key, "true"], GIT_QUICK);
     }
-    let pushed = seen_now || git_cfg(&it.repo, &pushed_key).is_some() || (git_cfg(&it.repo, &format!("branch.{branch}.remote")).is_some() && git_cfg(&it.repo, &format!("branch.{branch}.merge")).is_some());
+    let pushed = seen_now || git_cfg(repo, &pushed_key).is_some() || (git_cfg(repo, &format!("branch.{branch}.remote")).is_some() && git_cfg(repo, &format!("branch.{branch}.merge")).is_some());
     // A branch still at its fork point has nothing of its own to be "merged".
-    let has_own_commits = git_cfg(&it.repo, &fork_key).is_none_or(|fork| fork != head);
-    let base = worktree::resolve_base(&it.repo, &it.wt_cfg, None).ok();
+    let has_own_commits = git_cfg(repo, &fork_key).is_none_or(|fork| fork != head);
+    let base = worktree::resolve_base(repo, wt_cfg, None).ok();
     if fetch_ok && pushed && has_own_commits {
         if let Some(base) = &base {
-            if let Some(how) = merged_offline(&it.worktree, &head, base) {
+            if let Some(how) = merged_offline(worktree, &head, base) {
                 return Merged::Yes(how);
             }
         }
     }
+    // A merged pull request for exactly this head also proves it was pushed, whatever the refs say.
+    // Without a fresh base there is no proof of anything.
+    if !fetch_ok {
+        return Merged::No;
+    }
     let base_branch = base.as_deref().map(|b| b.strip_prefix("origin/").unwrap_or(b).to_string()).unwrap_or_default();
-    match (d.gh)(&it.main_dir, &branch) {
-        Ok(out) if gh_says_merged(&out, &head, &base_branch, origin_owner(&it.repo).as_deref()) => Merged::Yes("pull request"),
+    match gh(main_dir, &branch) {
+        Ok(out) if gh_says_merged(&out, &head, &base_branch, origin_owner(repo).as_deref()) => Merged::Yes("pull request"),
         Ok(_) => Merged::No,
         Err(e) => Merged::GhUnavailable(e.lines().next().unwrap_or("").chars().take(120).collect()),
+    }
+}
+
+fn merged_how(it: &Item, fetch_ok: bool, d: &Deps) -> Merged {
+    merge_proof(&it.worktree, &it.repo, &it.main_dir, &it.wt_cfg, fetch_ok, None, !d.dry_run, d.gh)
+}
+
+/// The proof the final removal checks (see `RmCtx::merge_proof`). Without a fetch just before,
+/// it fetches first: the base must be fresh. Any failure is no proof. Never writes git config.
+pub fn rm_proof(cfg: &ProjectConfig, worktree: &Path, fetched: bool, expected_head: Option<&str>, gh: &dyn Fn(&Path, &str) -> std::result::Result<String, String>) -> Option<String> {
+    let fetch_ok = fetched || git(worktree, &["fetch", "--all", "--prune", "--quiet"], Duration::from_secs(120)).is_ok();
+    match merge_proof(worktree, &cfg.repo, &worktree::main_dir(cfg), &cfg.worktree, fetch_ok, expected_head, false, gh) {
+        Merged::Yes(how) => Some(how.to_string()),
+        _ => None,
     }
 }
 
@@ -357,14 +383,26 @@ pub fn evaluate(it: &Item, p: &Policy, d: &Deps) -> Verdict {
     }
     let facts = worktree::collect_facts(&it.worktree, FactCtx { is_main: false, claim: it.claim.clone(), running: it.running.clone(), force: false, skip_procs: false });
     let fetch_ok = matches!(facts.fetch, worktree::Fact::Known(()));
-    let reasons = worktree::guards(&facts);
+    let mut reasons = worktree::guards(&facts);
+    // The merge evidence is computed once. It may also account for commits that look unpushed
+    // because the remote branch was deleted after a squash or rebase merge (review B8); nothing
+    // else may, and unknown (`Unknown`) unpushed facts never are accounted for.
+    let mut merged = None;
+    let unpushed_known = matches!(&facts.unpushed, worktree::Fact::Known(v) if !v.is_empty());
+    if age >= p.merged_after && (reasons.is_empty() || (unpushed_known && reasons.iter().all(|r| r.code == "unpushed"))) {
+        let m = merged_how(it, fetch_ok, d);
+        if matches!(m, Merged::Yes(_)) {
+            reasons.retain(|r| r.code != "unpushed");
+        }
+        merged = Some(m);
+    }
     if !reasons.is_empty() {
         let list: Vec<String> = reasons.iter().map(|r| format!("[{}] {}", r.code, r.message)).collect();
         return skip(list.join("; "), false);
     }
     let mut gh_down = None;
-    if age >= p.merged_after {
-        match merged_how(it, fetch_ok, d) {
+    if let Some(m) = merged {
+        match m {
             Merged::Yes(how) => return Verdict::Eligible(format!("merged ({how}), idle {}", human_secs(age))),
             Merged::GhUnavailable(e) => gh_down = Some(e),
             Merged::No => {}
@@ -604,8 +642,9 @@ mod tests {
         let log = RefCell::new(Vec::new());
         let audit = |op: &str, run: &str, _x: Value| log.borrow_mut().push((op.to_string(), run.to_string()));
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
+        let proof = |wt: &Path, fetched: bool, head: Option<&str>| rm_proof(&f.cfg, wt, fetched, head, gh);
         let remove = |it: &Item| -> Result<()> {
-            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost, archive_cap: None }).map(|_| ())
+            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost, archive_cap: None, merge_proof: Some(&proof) }).map(|_| ())
         };
         let save = |_: &AutoState| -> Result<()> { Ok(()) };
         let d = Deps { now, day: day.into(), gh, audit: &audit, remove: &remove, save: &save, dry_run: dry };
@@ -1193,6 +1232,7 @@ mod tests {
             procs: vec![],
             web_port: None,
             idle: Duration::from_secs(1),
+            aliases: vec![],
         };
         let rec = RunRecord { spec, status: RunStatus::Crashed, pinned: true, procs: vec![], note: None, stopped_at: Some(7), env_hash: None, last_started_at: Some(3), last_request_at: None };
         let mut runs = BTreeMap::new();
@@ -1202,5 +1242,90 @@ mod tests {
         assert_eq!(items[0].events, Events { started: Some(3), stopped: Some(7), request: None });
         assert!(items[0].pinned && items[0].running.is_none());
         assert_eq!(items[0].claim.as_deref(), Some("me"));
+    }
+
+    /// A real squash merge that also changed the file (so no offline proof applies), then GitHub
+    /// deleted the remote branch.
+    fn squash_with_edit_and_delete_remote(f: &Fx, o: &NewOutcome) {
+        let edit = |d: &Path| {
+            fs::write(d.join("a.txt"), "x\nreview edit\n").unwrap();
+            g(d, &["add", "."]);
+            g(d, &["commit", "-q", "-m", "feat/b8 (#7)"]);
+        };
+        land_on_origin_main(f, &[&edit]);
+        g(&f.origin, &["update-ref", "-d", &format!("refs/heads/{}", o.branch)]);
+    }
+
+    #[test]
+    fn b8_a_squash_merged_branch_whose_remote_branch_was_deleted_is_removable_only_with_a_validated_proof() {
+        let f = fx("b8");
+        let o = new_wt(&f, "feat/b8");
+        let sha = push_commit(&o, "a.txt");
+        squash_with_edit_and_delete_remote(&f, &o);
+        let it = item(&f, &o, Some(2 * DAY));
+        let p = policy();
+        let mut st = AutoState::default();
+        // Without proof the commit is unpushed: kept, and the reason says so.
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &p, &mut st, T0, "d", &no_gh, false);
+        assert!(st.candidates.is_empty() && dec[0].reason.contains("[unpushed]"), "{dec:?}");
+        // A merged PR for another head is not proof.
+        let stale = |_: &Path, _: &str| Ok(merged_json("deadbeef"));
+        run(&f, std::slice::from_ref(&it), &p, &mut st, T0, "d", &stale, false);
+        assert!(st.candidates.is_empty());
+        // A merged PR for exactly this head is.
+        let good = |_: &Path, _: &str| Ok(merged_json(&sha));
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &p, &mut st, T0, "d", &good, false);
+        assert_eq!(dec[0].action, "candidate-added", "{dec:?}");
+        assert!(dec[0].reason.contains("merged (pull request)"), "{dec:?}");
+        // The head moves after the evaluation: the same PR no longer covers the tip, and the final
+        // removal (which re-checks the proof) refuses instead of deleting the new commit.
+        fs::write(o.path.join("b.txt"), "later\n").unwrap();
+        g(&o.path, &["add", "b.txt"]);
+        g(&o.path, &["commit", "-q", "-m", "after the merge"]);
+        assert!(rm_proof(&f.cfg, &o.path, false, Some(&sha), &good).is_none());
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &p, &mut st, T0 + p.grace, "d", &good, false);
+        assert!(o.path.is_dir() && dec.iter().all(|d| d.action != "removed"), "{dec:?}");
+        // Back at the proven tip, removal goes through and keeps the branch.
+        g(&o.path, &["reset", "-q", "--hard", &sha]);
+        let mut st2 = AutoState::default();
+        run(&f, std::slice::from_ref(&it), &p, &mut st2, T0, "d", &good, false);
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &p, &mut st2, T0 + p.grace, "d", &good, false);
+        assert_eq!(dec[0].action, "removed", "{dec:?}");
+        assert!(!o.path.exists());
+        assert!(!g(&f.repo, &["rev-parse", "--verify", "refs/heads/feat/b8"]).is_empty());
+    }
+
+    #[test]
+    fn b8_unpushed_protection_is_not_bypassed_for_unproven_work() {
+        // a branch with a commit nobody merged: gh says "no merged PR", the remote branch is gone
+        let f = fx("b8neg");
+        let o = new_wt(&f, "feat/neg");
+        push_commit(&o, "a.txt");
+        g(&f.origin, &["update-ref", "-d", &format!("refs/heads/{}", o.branch)]);
+        let it = item(&f, &o, Some(30 * DAY));
+        let mut st = AutoState::default();
+        let none = |_: &Path, _: &str| Ok("[]".to_string());
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &none, false);
+        assert!(st.candidates.is_empty() && dec[0].reason.contains("[unpushed]"), "{dec:?}");
+        // the rm path with no proof refuses too
+        let declared: Vec<String> = vec![];
+        let r = worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost, archive_cap: None, merge_proof: None });
+        assert!(r.is_err() && o.path.is_dir());
+    }
+
+    #[test]
+    fn b22_a_dry_run_does_not_write_git_config_but_an_applying_sweep_does() {
+        let f = fx("b22");
+        let o = new_wt(&f, "feat/b22");
+        let sha = push_commit(&o, "a.txt");
+        merge_into_origin_main(&f, &sha);
+        let it = item(&f, &o, Some(2 * DAY));
+        let key = "branch.feat/b22.setu-pushed";
+        let mut st = AutoState::default();
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, true);
+        assert_eq!(dec[0].action, "candidate-added", "{dec:?}");
+        assert!(git_cfg(&f.repo, key).is_none(), "a dry run wrote git config");
+        run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert_eq!(git_cfg(&f.repo, key).as_deref(), Some("true"));
     }
 }

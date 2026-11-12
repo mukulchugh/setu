@@ -60,4 +60,4 @@ Mode: **Operate**. World: **native macOS 26 (Tahoe), Liquid Glass**. This is pin
 - Sheets have at most one line of helper text.
 
 ## Naming (owner, 2026-11-11)
-The UI sections are called **Runs, Environments, Disk, Config**. The CLI commands keep their names (`setu-rs setup`, `setu-rs doctor`).
+The UI sections are called **Runs, Environments, Disk, Config**. The CLI commands keep their names (`setu setup`, `setu doctor`).

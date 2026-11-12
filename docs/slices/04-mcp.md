@@ -3,7 +3,7 @@
 Research: `02-env-research.md`, MCP section.
 
 ## What you get
-`setu-rs mcp` is a stdio MCP server, a thin shim over the daemon socket. Any MCP client connects to it, for example `claude mcp add --transport stdio setu -- setu-rs mcp`. It has no port, no token and no network listener: the 0600 socket is the only access control.
+`setu mcp` is a stdio MCP server, a thin shim over the daemon socket. Any MCP client connects to it, for example `claude mcp add --transport stdio setu -- setu mcp`. It has no port, no token and no network listener: the 0600 socket is the only access control.
 
 **Tools**
 
@@ -14,7 +14,7 @@ Research: `02-env-research.md`, MCP section.
 | Disk | `disk_report`, `disk_clean {apply?}` |
 
 How these tools treat secrets:
-- **`env_set` for a secret** never needs the value from the agent. Without a value it returns `pending_user_input` and tells the agent to ask the user to run `setu-rs env set NAME --secret`, which prompts without echo. The app will show a sheet later. If the agent passes a value anyway, it is stored and the reply carries no value.
+- **`env_set` for a secret** never needs the value from the agent. Without a value it returns `pending_user_input` and tells the agent to ask the user to run `setu env set NAME --secret`, which prompts without echo. The app will show a sheet later. If the agent passes a value anyway, it is stored and the reply carries no value.
 - **There is no reveal tool.** The shim also refuses `env.reveal` at the socket boundary: requests are tagged with the actor `mcp`, and the daemon refuses reveal for that actor.
 - **`run_logs` redacts every known secret value** before returning lines.
 - **Every write is audited** with actor `mcp` and the client name from the MCP initialize handshake.
@@ -33,7 +33,7 @@ How these tools treat secrets:
 - Connect a real client with `claude mcp add` in a scratch session if possible, and list runs.
 
 ## Verification results (2026-11-11)
-- **Server.** `setu-rs mcp` is a hand-rolled stdio JSON-RPC server: initialize, ping, tools/list and tools/call. rmcp would have pulled in about 92 crates. The release binary grew by 49.7 KB, to 1.42 MB.
+- **Server.** `setu mcp` is a hand-rolled stdio JSON-RPC server: initialize, ping, tools/list and tools/call. rmcp would have pulled in about 92 crates. The release binary grew by 49.7 KB, to 1.42 MB.
 - **Tools.** 13 tools. None can reveal a value.
 - **End to end** (`crates/setu/e2e/mcp-e2e.sh`), re-run by the coordinator:
   - 19 MCP responses were checked, and the sandbox secret never appears.

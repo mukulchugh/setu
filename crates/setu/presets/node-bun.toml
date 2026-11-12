@@ -8,6 +8,8 @@ any_of = ["bun.lock", "bun.lockb"]
 name = "node_modules"
 kind = "deps"
 paths = ["node_modules", "*/node_modules", "*/*/node_modules"]
+install = "bun install --frozen-lockfile"
+lockfiles = ["bun.lock", "bun.lockb"]
 
 [[disk.store]]
 name = "bun-cache"

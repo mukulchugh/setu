@@ -16,6 +16,8 @@ pub struct ProjectConfig {
     pub repo: PathBuf,
     /// Run hosts are `<run>.<domain>`; the `main` worktree is `<project>.<domain>`.
     pub domain: String,
+    /// Extra hosts (under `domain`) that route to the `main` run, e.g. a v1 URL kept after a project rename.
+    pub aliases: Vec<String>,
     pub idle: Duration,
     /// Max runs up at once across this project (default 3).
     pub max_running: usize,
@@ -35,6 +37,9 @@ pub struct ProjectConfig {
     pub worktree: WorktreeCfg,
     /// `[[setup.step]]`, run in order in a new worktree.
     pub setup_steps: Vec<SetupStep>,
+    /// Reinstall missing dependencies (a deps item with an `install` command) before a start.
+    /// `auto_install = false` turns it off; an explicit `[setup]` section also wins over it.
+    pub auto_install: bool,
 }
 
 /// `[worktree]` in a project config (slice 7).
@@ -76,6 +81,18 @@ pub struct DiskItem {
     pub paths: Vec<String>,
     /// Auto-clean this long after the run's recorded stop; None = never auto-clean.
     pub clean_after: Option<Duration>,
+    /// Deps items only: how to bring the item back when its path is missing.
+    #[serde(default)]
+    pub install: Option<Install>,
+}
+
+/// A frozen install command for a deps item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Install {
+    /// Shell command run in the worktree root.
+    pub run: String,
+    /// The install only runs when one of these exists in the worktree root (empty: no requirement).
+    pub lockfiles: Vec<String>,
 }
 
 /// A shared store outside worktrees (e.g. a package manager cache). Watched, never cleaned.
@@ -141,6 +158,9 @@ pub struct RunSpec {
     /// Port of the proc that receives proxied traffic.
     pub web_port: Option<u16>,
     pub idle: Duration,
+    /// Extra hosts that route to this run (project `aliases`, main run only).
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +185,12 @@ pub struct ProcRecord {
     /// proc was alive: (pid, start_time). Stop signals them only if the start time still matches.
     #[serde(default)]
     pub escaped: Vec<(i32, u64)>,
+    /// Members of the proc's group seen under continuous supervision (while the leader lived,
+    /// or at the instant it exited): (pid, start_time). A group whose leader is gone is the
+    /// proc's own only while one of these exact incarnations still lives in it, because a
+    /// process group id is never reused while any member exists (review B3).
+    #[serde(default)]
+    pub members: Vec<(i32, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +201,10 @@ pub enum RunStatus {
     Running,
     Stopping,
     Crashed,
+    /// A new worktree whose setup steps are still running; nothing may start it yet.
+    Preparing,
+    /// Setup failed or was interrupted; the run cannot start until `setu retry-setup` succeeds.
+    SetupFailed,
 }
 
 /// Persisted per run in state.json.
@@ -208,6 +238,11 @@ pub enum Lookup {
     Starting { run: RunId },
     /// Registered but stopped/crashed: the proxy may ask for an on-demand start.
     Down { run: RunId },
+    /// Setup is still running: the proxy shows a "preparing" page. `installing` tells a start that
+    /// is installing missing dependencies from a new worktree running its setup steps.
+    Preparing { run: RunId, installing: bool },
+    /// Setup failed: never started on demand; the proxy says how to retry.
+    SetupFailed { run: RunId },
     Unknown,
 }
 

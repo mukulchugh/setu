@@ -1,9 +1,9 @@
 #!/bin/bash
 # End-to-end check of auto-removal (slice 7, part 2) in a throwaway sandbox: temp bare "origin",
 # a bare project repo, fake files only. Never touches a real repo. Durations are tiny.
-# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/autoremove-e2e.sh <path-to-setu-rs-binary>
+# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/autoremove-e2e.sh <path-to-setu-binary>
 set -euo pipefail
-BIN="${1:?path to setu-rs binary}"
+BIN="${1:?path to setu binary}"
 SB=/tmp/setu-ar-e2e
 export SETU_HOME="$SB/home"
 DAEMON_PID=""
@@ -24,7 +24,7 @@ is_running() { "$BIN" ls | grep -q "$1 *running"; }
 
 rm -rf "${SB:?}"
 mkdir -p "$SB/seed" "$SETU_HOME/config/projects"
-G="git -c user.email=e@e -c user.name=e -c commit.gpgsign=false -c protocol.file.allow=always"
+G="git -c user.email=e@e -c user.name=e -c commit.gpgsign=false -c protocol.file.allow=always -c maintenance.auto=false -c gc.auto=0"
 cd "$SB/seed"
 $G init -q -b main .
 printf 'local.db\n.env.local\n' > .gitignore
@@ -40,6 +40,7 @@ $G -C app.git worktree add -q "$SB/app/main" main
 # merged_after = 0s: any recorded stop makes a merged branch old enough. grace = 2s.
 cat > "$SETU_HOME/config/config.toml" <<'TOML'
 proxy_port = 17781
+stop_runs_on_exit = true
 dns_port = 25354
 
 [auto_remove]

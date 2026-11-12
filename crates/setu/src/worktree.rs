@@ -126,7 +126,10 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
     for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"] {
         c.env_remove(k);
     }
-    c.env("GIT_TERMINAL_PROMPT", "0").env("GIT_OPTIONAL_LOCKS", "0").arg("-C").arg(dir).args(args);
+    // Setu's own git calls never start background maintenance: `git fetch`/`commit` otherwise leave
+    // a detached `git maintenance run --auto --detach` whose cwd is the worktree, which the
+    // "processes" guard then counts as a live process in it (the suite's flaky failure).
+    c.env("GIT_TERMINAL_PROMPT", "0").env("GIT_OPTIONAL_LOCKS", "0").args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"]).arg("-C").arg(dir).args(args);
     c
 }
 
@@ -446,10 +449,10 @@ pub fn create(
     }
     let key = format!("{}/{run}", cfg.project);
     if pending_removal(ops, &key) {
-        bail!("a removal of {key} is pending; retry `setu-rs rm {key}` first");
+        bail!("a removal of {key} is pending; retry `setu rm {key}` first");
     }
     if existing_runs.contains(&key) {
-        bail!("run {key} already exists; use `setu-rs up` for it");
+        bail!("run {key} already exists; use `setu up` for it");
     }
     if std::fs::symlink_metadata(&path).is_ok() {
         bail!("{} already exists", path.display());
@@ -457,7 +460,7 @@ pub fn create(
     git(repo, &["fetch", "--all", "--prune", "--quiet"], GIT_SLOW).map_err(|e| anyhow!("fetch failed, refusing to branch from a stale base: {e}"))?;
     for (p, b) in worktree_entries(repo)? {
         if b.as_deref() == Some(branch) {
-            bail!("branch {branch} is already checked out at {}; use `setu-rs up` there", p.display());
+            bail!("branch {branch} is already checked out at {}; use `setu up` there", p.display());
         }
         if naming::run_name(&pdir, &p) == run {
             bail!("run name {run} is already used by {}", p.display());
@@ -470,7 +473,7 @@ pub fn create(
         bail!("only {} free on the volume; creating a worktree needs at least {} (set [worktree] min_free to change)", disk::human_bytes(free), disk::human_bytes(floor));
     }
     if git_probe(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])? {
-        bail!("branch {branch} already exists; `setu-rs restore` brings back a removed worktree, or pick another name");
+        bail!("branch {branch} already exists; `setu restore` brings back a removed worktree, or pick another name");
     }
     let remote_branch = format!("refs/remotes/origin/{branch}");
     let tracks_remote = from.is_none() && cfg.worktree.base.is_none() && git_probe(repo, &["show-ref", "--verify", "--quiet", &remote_branch])?;
@@ -859,6 +862,24 @@ pub struct RmCtx<'a> {
     pub host: &'a dyn RmHost,
     /// Refuse to archive more than this many bytes of ignored data; `None` means `ARCHIVE_MAX_BYTES`.
     pub archive_cap: Option<u64>,
+    /// Validated proof that the branch tip is integrated into a freshly fetched base (a merged
+    /// pull request for exactly this head, or an offline merge-tree/cherry match). Arguments:
+    /// the worktree, whether a fetch just ran, and the head the removal was planned for. The
+    /// "unpushed" guard accepts exactly this proof and nothing else, and it is evaluated again
+    /// at every guard check, the last one right before deletion (review B8).
+    pub merge_proof: Option<&'a MergeProofFn<'a>>,
+}
+
+pub type MergeProofFn<'a> = dyn Fn(&Path, bool, Option<&str>) -> Option<String> + 'a;
+
+/// `guards` after letting a validated merge proof account for otherwise unpushed commits.
+fn guards_with_proof(ctx: &RmCtx, mut g: GuardInput, fetched: bool, expected_head: Option<&str>) -> Vec<Reason> {
+    if let (Fact::Known(v), Some(proof)) = (&g.unpushed, ctx.merge_proof) {
+        if !v.is_empty() && !g.force && proof(ctx.worktree, fetched, expected_head).is_some() {
+            g.unpushed = Fact::Known(vec![]);
+        }
+    }
+    guards(&g)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -919,7 +940,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 bail!("{} does not exist; nothing to remove", ctx.worktree.display());
             }
             // Preflight (invariant 10): nothing is persisted or signalled if the tree is not safe.
-            let mut reasons = guards(&collect_facts(ctx.worktree, facts_ctx(ctx, true)));
+            let mut reasons = guards_with_proof(ctx, collect_facts(ctx.worktree, facts_ctx(ctx, true)), true, None);
             reasons.extend(submodule_reasons(ctx.worktree));
             if !reasons.is_empty() {
                 return Err(Refused(reasons).into());
@@ -1029,7 +1050,7 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
         Step::Guards => {
             // A vanished checkout has nothing left to protect; teardown still completes.
             if ctx.worktree.is_dir() {
-                let reasons = guards(&collect_facts(ctx.worktree, facts_ctx(ctx, false)));
+                let reasons = guards_with_proof(ctx, collect_facts(ctx.worktree, facts_ctx(ctx, false)), true, rec.head.as_deref());
                 if !reasons.is_empty() {
                     return Err(Refused(reasons).into());
                 }
@@ -1065,7 +1086,7 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 if rec.branch.is_some() && now_branch != rec.branch {
                     bail!("{} is on {:?} but the removal was planned for {:?}; refusing to delete a different checkout", wt.display(), now_branch, rec.branch);
                 }
-                let mut reasons = guards(&collect_facts_opt(wt, facts_ctx(ctx, false), false));
+                let mut reasons = guards_with_proof(ctx, collect_facts_opt(wt, facts_ctx(ctx, false), false), false, rec.head.as_deref());
                 reasons.extend(submodule_reasons(wt));
                 if !reasons.is_empty() {
                     return Err(Refused(reasons).into());
@@ -1306,7 +1327,7 @@ pub fn restore(cfg: &ProjectConfig, run: &str, ops: &Db, archive_root: &Path) ->
     let key = format!("{}/{run}", cfg.project);
     let rec = load_op(ops, &key)?.ok_or_else(|| anyhow!("no removal record for {key}; nothing to restore"))?;
     if rec.step != Step::Done {
-        bail!("the removal of {key} is not finished (at step {:?}); retry `setu-rs rm {key}` first", rec.step);
+        bail!("the removal of {key} is not finished (at step {:?}); retry `setu rm {key}` first", rec.step);
     }
     let path = rec.worktree.clone();
     if std::fs::symlink_metadata(&path).is_ok() {
@@ -1413,7 +1434,7 @@ pub(crate) mod tests {
     pub(crate) fn g(dir: &Path, args: &[&str]) -> String {
         let o = Command::new("git")
             .current_dir(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always", "-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .output()
             .unwrap();
@@ -1462,18 +1483,20 @@ pub(crate) mod tests {
             repo: repo.clone(),
             domain: "app.local".into(),
             idle: Duration::from_secs(60),
+            aliases: vec![],
             max_running: 3,
             ports: vec![],
             env: Default::default(),
             procs: Default::default(),
             presets: vec![],
             disk_items: vec![
-                DiskItem { name: "deps".into(), kind: DiskKind::Deps, paths: vec!["node_modules".into()], clean_after: None },
-                DiskItem { name: "next".into(), kind: DiskKind::Cache, paths: vec![".next".into(), "scratch/.next".into()], clean_after: None },
+                DiskItem { name: "deps".into(), kind: DiskKind::Deps, paths: vec!["node_modules".into()], clean_after: None, install: None },
+                DiskItem { name: "next".into(), kind: DiskKind::Cache, paths: vec![".next".into(), "scratch/.next".into()], clean_after: None, install: None },
             ],
             stores: vec![],
             worktree: WorktreeCfg { min_free: Some(0), ..Default::default() },
             setup_steps: vec![],
+            auto_install: true,
         };
         Fx { origin: root.join("origin.git"), ops: Db::open(&root.join("ops/setu.db")).unwrap(), logs: root.join("logs"), archives: root.join("archives"), root, repo, pdir, cfg }
     }
@@ -1530,7 +1553,7 @@ pub(crate) mod tests {
 
     fn do_rm(f: &Fx, run: &str, wt: &Path, force: bool, host: &Host) -> Result<RmOutcome> {
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
-        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: None })
+        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: None, merge_proof: None })
     }
 
     fn input() -> GuardInput {
@@ -2089,7 +2112,7 @@ pub(crate) mod tests {
 
     fn do_rm_cap(f: &Fx, run: &str, wt: &Path, force: bool, host: &Host, cap: Option<u64>) -> Result<RmOutcome> {
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
-        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: cap })
+        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: cap, merge_proof: None })
     }
 
     #[test]

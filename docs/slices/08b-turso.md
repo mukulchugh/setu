@@ -53,7 +53,7 @@ Background: 08-storage-ranking.md (why, risks), 08-sqlite.md (behaviour that mus
 ### Consequences of the exclusive file lock
 - Only the daemon opens the DB today (CLI and app go through the socket; audit writes originate in the daemon), so no product code changes. It also makes "daemon is the only writer" enforced by the engine.
 - The one e2e assertion that ran `sqlite3` against the live DB (worktree-e2e.sh, "a refused rm must persist nothing") cannot read while the daemon runs; it now reads a point-in-time copy of db + wal with `sqlite3` (no new socket command; protocol unchanged).
-- `setu-rs ls --offline` (future) must not open the file while a daemon runs.
+- `setu ls --offline` (future) must not open the file while a daemon runs.
 
 ## Async design (deviation from the brief, on purpose)
 The brief said to make db calls async. They are async at the Turso boundary but the Setu-facing seam stayed closure-based and sync, driven on blocking threads; the daemon's runtime is never blocked, which the ticker test proves (`a_ticker_keeps_running_while_a_transaction_is_open`). `with_async`/`tx_async` exist for callers on the runtime (the daemon's final checkpoint uses `with_async`; `tx_async` is `#[allow(dead_code)]` because every existing async call site already reaches the DB through `spawn_blocking`).

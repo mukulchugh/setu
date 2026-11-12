@@ -120,6 +120,7 @@ mod tests {
             repo: PathBuf::new(),
             domain: "quivly.local".into(),
             idle: Duration::from_secs(1),
+            aliases: vec![],
             max_running: 3,
             ports: vec![],
             env: BTreeMap::new(),
@@ -128,6 +129,7 @@ mod tests {
             disk_items: vec![],
             worktree: Default::default(),
             setup_steps: vec![],
+            auto_install: true,
             stores: vec![],
         }
     }

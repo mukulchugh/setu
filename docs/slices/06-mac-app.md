@@ -17,10 +17,10 @@ Research:
     - Secrets are entered in an NSAlert sheet with an NSSecureTextField.
     - An "Effective" toggle shows the merged env for a selected run.
   - **Disk:** a "Refresh" button runs `disk.report` (it is expensive, so it never runs automatically). The view lists items per worktree with their real size, whether each is cleanable, and why, plus a "Clean now" button that applies.
-  - **Settings:** the setup status, which runs `setu-rs doctor` and shows the result, and a version line.
+  - **Settings:** the setup status, which runs `setu doctor` and shows the result, and a version line.
 - **Low memory.** The window is released on close, so its GPU surfaces go. Polling is idle-aware: `ls` every 2 s while the popover or window is visible, every 10 s otherwise. Logs and env are fetched only while their view is visible.
 - **Packaging.** `scripts/bundle.sh` builds `Setu.app`:
-  - `Contents/MacOS/setu-mac` and `Contents/Resources/bin/setu-rs`;
+  - `Contents/MacOS/setu-mac` and `Contents/Resources/bin/setu`;
   - `LSUIElement=true`;
   - ad-hoc signed for local use. Developer ID signing and notarization come at publish time.
 
@@ -45,9 +45,9 @@ Research:
 3. **Driven live against a sandbox daemon** (`SETU_HOME` sandbox with a demo project), using System Events accessibility queries. No screenshots. Checks:
    - the status item exists;
    - the popover lists the run;
-   - Start and Stop change the daemon state (checked with `setu-rs ls`);
+   - Start and Stop change the daemon state (checked with `setu ls`);
    - the Env view lists names with masked secrets;
-   - adding a plain var through the UI shows up in `setu-rs env ls`.
+   - adding a plain var through the UI shows up in `setu env ls`.
 4. **Memory**, measured with `footprint`, against the spike's numbers:
    - menu bar only, idle 60 s;
    - window open on Runs with logs;

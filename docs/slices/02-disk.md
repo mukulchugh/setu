@@ -6,12 +6,12 @@ Research behind this slice:
 - `MEASUREMENTS.md` in the handoff folder
 
 ## What you get
-- **`setu-rs disk`** shows, for every worktree of every configured project:
+- **`setu disk`** shows, for every worktree of every configured project:
   - what each declared item really costs on disk: logical size, plus clone-aware "frees if deleted" bytes;
   - the run's status and how long ago it stopped;
   - the volume's free space;
   - a health line for each shared package store. A cold or emptied store is the expensive case: 2.7 GiB to re-download for quivly-app.
-- **`setu-rs disk clean`** is a dry run by default. With `--apply` it deletes only declared, regenerable, git-ignored caches and outputs, in stopped runs, after their age policy has passed. Every deletion is written to an audit log.
+- **`setu disk clean`** is a dry run by default. With `--apply` it deletes only declared, regenerable, git-ignored caches and outputs, in stopped runs, after their age policy has passed. Every deletion is written to an audit log.
 - **The daemon cleans automatically** on the same rules, hourly, for runs it manages. It only ever deletes what `disk clean` would list.
 - **Nothing is stack-specific in code.** Ecosystem knowledge lives in preset TOML files, with a `[detect]` section matching marker files. Presets only fill defaults, and the project config can override or disable any of them.
 
@@ -65,7 +65,7 @@ Presets are additive, and a project can stack several of them.
 ## Measuring
 - **Private size:** a Rust walker calls `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` per file, with no symlink following, no crossing of devices, and skipping nested `.git`.
 - **Logical size:** the same walker adds up `st_size`.
-- **Caching:** results are cached per item by directory mtime. Walks run on the blocking pool, and `setu-rs disk` streams rows as they finish.
+- **Caching:** results are cached per item by directory mtime. Walks run on the blocking pool, and `setu disk` streams rows as they finish.
 - **Ground truth for savings:** the volume's free space before and after a clean.
 
 ## Code
@@ -88,7 +88,7 @@ Presets are additive, and a project can stack several of them.
      - a running proc with its cwd inside;
      - a missing stop time (the v1 D1 case);
    - the walker on clones: `cp -c` a dir, check private size is about 0.
-2. **Read-only on this machine:** `setu-rs disk` across all quivly-app worktrees. Check it agrees with the research numbers: about 12.7 GiB of `.next` across 3 trees, and `node_modules` private about 0.
+2. **Read-only on this machine:** `setu disk` across all quivly-app worktrees. Check it agrees with the research numbers: about 12.7 GiB of `.next` across 3 trees, and `node_modules` private about 0.
 3. **Apply on one stopped Setu-managed run** (`fix/harness-phase0-unblock`, whose `.next` Setu created in slice 1). Run `disk clean --apply` and report the free-space change against the dry-run estimate. Then start the run again and confirm it recompiles and serves.
 
 ## Verification results (2026-11-11)
@@ -99,7 +99,7 @@ Presets are additive, and a project can stack several of them.
 - the clone-aware walker on real APFS clones;
 - `cwd` lookup by pid.
 
-**Read-only report on this machine:** `setu-rs disk` measured all 101 quivly-app worktrees in about 12.5 s, deps left unmeasured by default.
+**Read-only report on this machine:** `setu disk` measured all 101 quivly-app worktrees in about 12.5 s, deps left unmeasured by default.
 - It found 14.0 GiB of private data in declared items.
 - `unified-harness-build` alone holds a 7.6 GiB `.next/dev`, of which 5.9 GiB is cache. This matches the research.
 - Nothing was cleanable. Live v1 dev servers and unmanaged worktrees are refused, and runs stopped before `stopped_at` existed are kept because their age is unknown.

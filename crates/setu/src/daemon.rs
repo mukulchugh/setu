@@ -5,14 +5,16 @@ use crate::autoremove;
 use crate::globalcfg;
 use crate::claims;
 use crate::config;
+use crate::deps;
 use crate::worktree;
-use crate::model::{Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes};
+use crate::model::{self, Lookup, ProjectConfig, RunId, RunRecord, RunSpec, RunStatus, Routes};
 use crate::disk;
 use crate::env;
 use crate::disk_measure;
 use crate::naming;
 use crate::paths;
 use crate::ports;
+use crate::procinfo;
 use crate::db::{self, Db};
 use crate::state::{self, State};
 use crate::supervisor::{self, ExitEvent, ExitTx};
@@ -31,8 +33,6 @@ const LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_LOG_LINES: usize = 500;
 /// Only this much of a log file's end is read for `logs`.
 const LOG_TAIL_BYTES: u64 = 512 * 1024;
-/// Values only *guessed* to be secret (by name) and shorter than this are not redacted (they would mangle ordinary text).
-const MIN_REDACT_LEN: usize = 6;
 
 pub struct Daemon {
     inner: Mutex<Inner>,
@@ -42,10 +42,12 @@ pub struct Daemon {
     written: Arc<Mutex<u64>>,
     pub activity: Arc<ActivityTracker>,
     exits: ExitTx,
-    /// One auto-remove evaluation at a time (hourly tick vs `setu-rs autoremove`).
+    /// One auto-remove evaluation at a time (hourly tick vs `setu autoremove`).
     ar_lock: Mutex<()>,
     /// One start or stop of a run at a time (review #7).
     life: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Dependency installs running at once, daemon-wide (a burst of on-demand starts must not fork 20 installs).
+    install_slots: Arc<tokio::sync::Semaphore>,
     /// Test hook: make `persist_durable` fail.
     #[cfg(test)]
     fail_persist: std::sync::atomic::AtomicBool,
@@ -62,6 +64,10 @@ struct Inner {
     version: u64,
     /// Bumped by every stop of a run; a start that sees it change was cancelled.
     gens: HashMap<String, u64>,
+    /// Runs whose start is installing missing dependencies right now (not persisted).
+    installing: std::collections::HashSet<String>,
+    /// (mtime ns, length) of each project's config file when `configs` last took it from disk.
+    cfg_stamps: HashMap<String, (u128, u64)>,
 }
 
 /// After a stop attempt: the records whose processes are still alive when the stop failed.
@@ -80,6 +86,12 @@ fn key(id: &RunId) -> String {
 impl Inner {
     fn rebuild_hosts(&mut self) {
         self.hosts = self.state.runs.iter().map(|(k, r)| (r.spec.host.clone(), k.clone())).collect();
+        // Aliases never displace a run's own host.
+        for (k, r) in &self.state.runs {
+            for a in &r.spec.aliases {
+                self.hosts.entry(a.clone()).or_insert_with(|| k.clone());
+            }
+        }
     }
     fn config(&self, project: &str) -> Result<ProjectConfig> {
         self.configs
@@ -103,7 +115,7 @@ impl Inner {
         let hits: Vec<&String> = self.state.runs.iter().filter(|(_, r)| r.spec.id.run == wanted).map(|(k, _)| k).collect();
         match hits.as_slice() {
             [one] => Ok((*one).clone()),
-            [] => bail!("no run named {wanted}; see `setu-rs ls`"),
+            [] => bail!("no run named {wanted}; see `setu ls`"),
             _ => bail!("{wanted} matches several projects; use project/run"),
         }
     }
@@ -161,6 +173,9 @@ fn build_spec_with(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut
     Ok(spec)
 }
 
+/// Most dependency installs that run at the same time.
+const MAX_CONCURRENT_INSTALLS: usize = 2;
+
 impl Daemon {
     pub fn new(exits: ExitTx) -> Result<Arc<Self>> {
         let configs = config::load_all()?;
@@ -170,7 +185,7 @@ impl Daemon {
     }
 
     fn with_parts(configs: Vec<ProjectConfig>, state: State, db: Arc<Db>, exits: ExitTx) -> Arc<Self> {
-        let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0, gens: HashMap::new() };
+        let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0, gens: HashMap::new(), installing: Default::default(), cfg_stamps: HashMap::new() };
         inner.rebuild_hosts();
         Arc::new(Self {
             inner: Mutex::new(inner),
@@ -180,11 +195,125 @@ impl Daemon {
             exits,
             ar_lock: Mutex::new(()),
             life: Mutex::new(HashMap::new()),
+            install_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
             #[cfg(test)]
             fail_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             clean_hook: Mutex::new(None),
         })
+    }
+
+    /// Journal config `[env]` secret values that an edit changed or removed, so logs written while
+    /// they were current stay redactable (review B5). Fails the refresh if it cannot be recorded.
+    fn journal_config_changes(&self, fresh: &[ProjectConfig]) -> Result<()> {
+        let old: Vec<ProjectConfig> = self.lock().configs.clone();
+        for o in &old {
+            let new = fresh.iter().find(|c| c.project == o.project);
+            for (name, value) in o.env.iter().filter(|(n, v)| env::looks_secret(n, v)) {
+                if new.is_none_or(|c| c.env.get(name) != Some(value)) {
+                    env::remember_superseded(name, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Blocking (reads the config file; never call under the state lock). The project's config as
+    /// it is on disk now, so Restart, effective env and stale-env reporting never use the copy
+    /// cached at registration (review B9). An invalid edit is an error, not a silent fallback to
+    /// the old copy. Unchanged files (same mtime and length) reuse the cached parse.
+    fn fresh_config(&self, project: &str) -> Result<ProjectConfig> {
+        let path = paths::projects_dir().join(format!("{project}.toml"));
+        let stamp = std::fs::metadata(&path).ok().map(|m| {
+            let ns = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+            (ns, m.len())
+        });
+        {
+            let inner = self.lock();
+            if let (Some(now), Some(then)) = (stamp, inner.cfg_stamps.get(project)) {
+                if now == *then {
+                    if let Ok(c) = inner.config(project) {
+                        return Ok(c);
+                    }
+                }
+            }
+        }
+        let direct = if stamp.is_some() { Some(config::load_project(&path)?) } else { None };
+        let cfg = match direct.filter(|c| c.project == project) {
+            Some(c) => c,
+            None => match config::load_all()?.into_iter().find(|c| c.project == project) {
+                Some(c) => c,
+                // No file on disk: keep what the daemon already has.
+                None => return self.lock().config(project),
+            },
+        };
+        let mut all = self.lock().configs.clone();
+        match all.iter_mut().find(|c| c.project == project) {
+            Some(slot) => *slot = cfg.clone(),
+            None => all.push(cfg.clone()),
+        }
+        self.journal_config_changes(&all)?;
+        let mut inner = self.lock();
+        inner.configs = all;
+        if let Some(st) = stamp {
+            inner.cfg_stamps.insert(project.to_string(), st);
+        }
+        domains_refresh(&inner.configs);
+        Ok(cfg)
+    }
+
+    /// Mark a run whose web port is held by its own worktree's dev server (not started by Setu)
+    /// as Running. Only a Stopped or Crashed run with no recorded processes is eligible, and the
+    /// state is checked again when the change is applied. Returns whether it was applied.
+    #[cfg(test)]
+    fn mark_external(&self, k: &str, pid: i32, start_time: u64, port: u16) -> bool {
+        self.mark_external_found(k, &procinfo::V1Found { listener: Some((pid, start_time)), ..Default::default() }, port)
+    }
+
+    /// `mark_external` for what a v1 run left behind: the listener's whole group (leader record,
+    /// listener as evidence) when it was proven, else the bare listener, plus one record per sidecar group.
+    fn mark_external_found(&self, k: &str, f: &procinfo::V1Found, port: u16) -> bool {
+        let Some((lpid, lst)) = f.listener else { return false };
+        let mut applied = false;
+        self.set(k, |r| {
+            if matches!(r.status, RunStatus::Stopped | RunStatus::Crashed) && r.procs.is_empty() && r.spec.web_port == Some(port) {
+                let rec = |name: &str, pid: i32, start_time: u64, members: Vec<(i32, u64)>| crate::model::ProcRecord { name: name.into(), pid, start_time, escaped: vec![], members };
+                r.status = RunStatus::Running;
+                r.procs = vec![match f.leader {
+                    Some((g, gst)) => rec(supervisor::EXTERNAL_PROC, g, gst, vec![(lpid, lst)]),
+                    None => rec(supervisor::EXTERNAL_PROC, lpid, lst, vec![]),
+                }];
+                r.procs.extend(f.sidecars.iter().map(|&(p, st)| rec(supervisor::EXTERNAL_SIDECAR, p, st, vec![])));
+                let side = if f.sidecars.is_empty() { String::new() } else { format!(" and {} sidecar group(s)", f.sidecars.len()) };
+                r.note = Some(format!("already running outside Setu (pid {lpid} on port {port}, started from this worktree{side}); Down or Restart stops it, and a restart makes Setu its owner"));
+                applied = true;
+            }
+        });
+        applied
+    }
+
+    /// Blocking: look for external listeners for every eligible run (one scan of the process table).
+    fn detect_external_all(&self) -> Vec<String> {
+        let eligible: Vec<(String, std::path::PathBuf, u16)> = self
+            .lock()
+            .state
+            .runs
+            .iter()
+            .filter(|(_, r)| matches!(r.status, RunStatus::Stopped | RunStatus::Crashed) && r.procs.is_empty())
+            .filter_map(|(k, r)| Some((k.clone(), r.spec.worktree.clone(), r.spec.web_port?)))
+            .collect();
+        if eligible.is_empty() {
+            return Vec::new();
+        }
+        let wanted: Vec<(std::path::PathBuf, u16)> = eligible.iter().map(|(_, w, p)| (w.clone(), *p)).collect();
+        let found = procinfo::v1_groups(&wanted, None);
+        let mut out = Vec::new();
+        for ((k, _, port), hit) in eligible.into_iter().zip(found) {
+            if self.mark_external_found(&k, &hit, port) {
+                out.push(k);
+            }
+        }
+        out
     }
 
     fn life_lock(&self, k: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -204,6 +333,38 @@ impl Daemon {
         let runs: Vec<(String, RunRecord)> = self.lock().state.runs.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
         for (k, rec) in runs {
             if rec.procs.is_empty() {
+                // A transitional state with nothing to supervise can never finish on its own: the
+                // daemon died before the first process was recorded (or after the last one left).
+                // Turn it into an explicit Stopped state the user can act on (review B11).
+                if matches!(rec.status, RunStatus::Starting | RunStatus::Stopping | RunStatus::Running | RunStatus::Preparing) {
+                    let was = rec.status;
+                    self.set(&k, |r| {
+                        // Setup died with the daemon: the checkout may be half installed, so it is not startable.
+                        r.status = if was == RunStatus::Preparing { RunStatus::SetupFailed } else { RunStatus::Stopped };
+                        r.stopped_at = Some(crate::disk::now_secs());
+                        r.note = Some(match was {
+                            RunStatus::Preparing => "the daemon restarted while setup was running; run `setu retry-setup` to finish it".to_string(),
+                            RunStatus::Starting => "the daemon restarted while this run was starting, before any process was recorded; start it again".to_string(),
+                            RunStatus::Stopping => "the daemon restarted while this run was stopping; no processes are recorded, so it is stopped".to_string(),
+                            _ => "the daemon restarted and this run had no recorded processes; start it again".to_string(),
+                        });
+                    });
+                }
+                continue;
+            }
+            // A server Setu adopted but did not start (a v1 dev server) is kept as external while any
+            // part of it lives; it is never signalled here. The watchdog re-proves and stops it on request.
+            if rec.status == RunStatus::Running && rec.procs.iter().all(supervisor::is_external) {
+                if rec.procs.iter().any(supervisor::external_alive) {
+                    self.activity.touch(&rec.spec.id);
+                } else {
+                    self.set(&k, |r| {
+                        r.status = RunStatus::Stopped;
+                        r.procs.clear();
+                        r.stopped_at = Some(crate::disk::now_secs());
+                        r.note = Some("the external server exited while the daemon was down".into());
+                    });
+                }
                 continue;
             }
             let all_alive = rec.procs.iter().all(supervisor::owned_and_alive);
@@ -221,9 +382,16 @@ impl Daemon {
                     r.stopped_at = Some(crate::disk::now_secs());
                     r.note = Some("stopped after a daemon restart".into());
                 } else {
-                    r.note = Some("some processes survived the stop after a daemon restart; stop the run again".into());
+                    r.note = Some(match &res {
+                        Err(e) => format!("after a daemon restart some processes could not be stopped or proven to be this run's: {e:#}"),
+                        Ok(()) => "some processes survived the stop after a daemon restart; stop the run again".to_string(),
+                    });
                 }
             });
+        }
+        // Reconciled states are on disk before the daemon serves its first request.
+        if let Err(e) = self.persist_durable().await {
+            eprintln!("setu: saving reconciled run states failed: {e:#}");
         }
     }
 
@@ -276,22 +444,53 @@ impl Daemon {
     /// Register (or refresh) the run record for a worktree and return its key and spec.
     /// Shared by `up`, `worktree.new`, `worktree.adopt` and `worktree.restore`.
     fn register(&self, cfg: &ProjectConfig, worktree: &Path, run: &str) -> Result<(String, RunSpec)> {
+        self.register_seeded(cfg, worktree, run, None, RunStatus::Stopped).map(|(k, s, _)| (k, s))
+    }
+
+    /// `register`, optionally pre-leasing `seed` as the run's `web` port (import of a v1 port).
+    /// The third value says whether the seed was used. A seed is refused when the run already
+    /// has a lease, the port is outside 1024..=65535, reserved, leased to another run, or busy.
+    fn register_seeded(&self, cfg: &ProjectConfig, worktree: &Path, run: &str, seed: Option<u16>, initial: RunStatus) -> Result<(String, RunSpec, Option<bool>)> {
+        // Probing the port is slow-ish; do it before the state lock.
+        // A busy port still counts as free for a seed when it is this worktree's own dev server.
+        let seed_free = seed.map(|p| ports::port_free(p) || procinfo::external_listener(worktree, p).is_some());
         // Disk and git work happens before the state lock is taken (review #18).
         let fresh = config::load_all().ok();
+        if let Some(f) = &fresh {
+            self.journal_config_changes(f)?;
+        }
         let id = RunId { project: cfg.project.clone(), run: run.to_string() };
         let layers = read_layers(&cfg.project, &id)?;
         let mut inner = self.lock();
         if let Some(fresh) = fresh {
             domains_refresh(&fresh);
+            inner.cfg_stamps.clear();
             inner.configs = fresh;
         }
         let mut leases = inner.state.leases.clone();
+        let k0 = key(&id);
+        let mut seeded = None;
+        if let Some(p) = seed {
+            let wants_web = cfg.ports.iter().any(|n| n == "web");
+            let sane = (1024..=65535).contains(&p) && ![80, 7777, 15353].contains(&p);
+            let taken = leases.iter().any(|(rk, m)| *rk != k0 && m.values().any(|x| *x == p));
+            if !wants_web || leases.contains_key(&k0) {
+                seeded = Some(leases.get(&k0).and_then(|m| m.get("web")) == Some(&p));
+            } else if sane && !taken && seed_free == Some(true) {
+                leases.insert(k0.clone(), BTreeMap::from([("web".to_string(), p)]));
+                seeded = Some(true);
+            } else {
+                seeded = Some(false);
+            }
+        }
         let spec = build_spec_with(cfg, worktree, run, &mut leases, &layers)?;
         inner.state.leases = leases;
         let k = key(&spec.id);
-        if let Some(other) = inner.hosts.get(&spec.host) {
-            if other != &k {
-                bail!("host {} already belongs to run {other}", spec.host);
+        for host in std::iter::once(&spec.host).chain(spec.aliases.iter()) {
+            if let Some(other) = inner.hosts.get(host) {
+                if other != &k {
+                    bail!("host {host} already belongs to run {other}");
+                }
             }
         }
         if let Some(existing) = inner.state.runs.get(&k) {
@@ -301,7 +500,7 @@ impl Daemon {
         }
         let rec = inner.state.runs.entry(k.clone()).or_insert_with(|| RunRecord {
             spec: spec.clone(),
-            status: RunStatus::Stopped,
+            status: initial,
             pinned: false,
             procs: vec![],
             note: None,
@@ -314,7 +513,31 @@ impl Daemon {
         inner.rebuild_hosts();
         drop(inner);
         self.persist();
-        Ok((k, spec))
+        Ok((k, spec, seeded))
+    }
+
+    /// `setu import-v1`: register one existing worktree (no install, no start), keeping its v1
+    /// port when `port` is free and sane. Idempotent.
+    pub async fn import_adopt(self: &Arc<Self>, actor: &str, project: &str, path: &Path, port: Option<u16>) -> Result<Value> {
+        let (p, name) = (path.to_path_buf(), project.to_string());
+        let me = Arc::clone(self);
+        let (k, spec, seeded) = tokio::task::spawn_blocking(move || -> Result<(String, RunSpec, Option<bool>)> {
+            let configs = config::load_all()?;
+            let cfg = configs.iter().find(|c| c.project == name).ok_or_else(|| anyhow!("no project config named {name}"))?;
+            let (wt, run) = worktree::adopt_check(cfg, &p)?;
+            me.register_seeded(cfg, &wt, &run, port, RunStatus::Stopped)
+        })
+        .await??;
+        // A v1 dev server that is still up on the kept port becomes a running (external) run right away.
+        if let (Some(port), true) = (spec.web_port, seeded == Some(true)) {
+            let (me, k2, wt) = (Arc::clone(self), k.clone(), spec.worktree.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                me.mark_external_found(&k2, &procinfo::v1_group(&wt, port, None), port);
+            })
+            .await;
+        }
+        worktree::audit(actor, None, "adopt", &k, json!({ "path": spec.worktree, "import_v1": true }));
+        Ok(json!({ "run": k, "url": spec.url, "port": spec.ports.get("web"), "port_kept": seeded.unwrap_or(false), "worktree": spec.worktree }))
     }
 
     /// Register the run for a worktree path (if new) and start it.
@@ -342,25 +565,59 @@ impl Daemon {
     pub async fn start(self: &Arc<Self>, k: &str) -> Result<()> {
         let (db, key) = (self.db.clone(), k.to_string());
         if tokio::task::spawn_blocking(move || worktree::pending_removal(&db, &key)).await? {
-            bail!("a removal of {k} is pending; retry `setu-rs rm {k}` to finish it");
+            bail!("a removal of {k} is pending; retry `setu rm {k}` to finish it");
         }
         let life = self.life_lock(k);
         let _life = life.lock().await;
-        let id = self.lock().state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.spec.id.clone();
+        // The run's own dev server may already be listening on its port (a v1 server, or one
+        // started by hand): adopt it instead of starting a second one (and instead of failing on the busy port).
+        let probe = self.lock().state.runs.get(k).filter(|r| matches!(r.status, RunStatus::Stopped | RunStatus::Crashed) && r.procs.is_empty()).and_then(|r| Some((r.spec.worktree.clone(), r.spec.web_port?)));
+        if let Some((wt, port)) = probe {
+            let f = tokio::task::spawn_blocking(move || procinfo::v1_group(&wt, port, None)).await?;
+            if self.mark_external_found(k, &f, port) {
+                return Ok(());
+            }
+        }
+        let (id, wt_path) = {
+            let inner = self.lock();
+            let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            (r.spec.id.clone(), r.spec.worktree.clone())
+        };
         // The layer files are read off the runtime thread and outside the state lock (review #18).
-        let layers = tokio::task::spawn_blocking(move || read_layers(&id.project.clone(), &id)).await??;
-        let (spec, gen) = {
+        // The project config is re-read too, so a restart picks up edits made since registration (review B9).
+        let me = Arc::clone(self);
+        let (layers, fresh_cfg, need) = tokio::task::spawn_blocking(move || -> Result<(Layers, ProjectConfig, deps::Need)> {
+            let cfg = me.fresh_config(&id.project)?;
+            // Missing dependencies (cheap directory check) are restored before the procs start.
+            let need = deps::plan(&cfg, &wt_path);
+            Ok((read_layers(&id.project, &id)?, cfg, need))
+        })
+        .await??;
+        let (spec, gen, install) = {
             let mut inner = self.lock();
             let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
             match rec.status {
                 RunStatus::Running | RunStatus::Starting => return Ok(()),
                 RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
+                RunStatus::Preparing => bail!("{k} is still being prepared (setup is running); it can start once setup succeeds"),
+                RunStatus::SetupFailed => bail!("setup failed for {k}{}; fix the cause, then run `setu retry-setup {k}`", rec.note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()),
                 _ => {}
             }
             if let Some(p) = rec.procs.iter().find(|p| supervisor::unresolved(p)) {
-                bail!("{k} still has a process from an earlier run that could not be stopped (pid {}); run `setu-rs down {k}` again, or end it by hand", p.pid);
+                bail!("{k} still has a process from an earlier run that could not be stopped (pid {}); run `setu down {k}` again, or end it by hand", p.pid);
             }
-            let cfg = inner.config(&rec.spec.id.project)?;
+            if let deps::Need::Blocked(why) = &need {
+                let note = format!("setup failed: {why}");
+                if let Some(r) = inner.state.runs.get_mut(k) {
+                    r.status = RunStatus::SetupFailed;
+                    r.note = Some(note.clone());
+                }
+                inner.rebuild_hosts();
+                drop(inner);
+                self.persist();
+                bail!("{k}: {note}");
+            }
+            let cfg = fresh_cfg;
             if inner.up_count(&cfg.project) >= cfg.max_running {
                 bail!("{} already has {} runs up (max_running); stop one first", cfg.project, cfg.max_running);
             }
@@ -371,7 +628,8 @@ impl Daemon {
             if let Some(r) = inner.state.runs.get_mut(k) {
                 r.spec = spec.clone();
                 r.env_hash = Some(env::env_hash(&spec.env));
-                r.status = RunStatus::Starting;
+                // Missing dependencies: the proxy shows the Preparing page until the install is done.
+                r.status = if matches!(need, deps::Need::Install(_)) { RunStatus::Preparing } else { RunStatus::Starting };
                 r.last_started_at = Some(crate::disk::now_secs());
                 r.note = None;
                 r.procs.clear();
@@ -379,8 +637,46 @@ impl Daemon {
             inner.rebuild_hosts();
             drop(inner);
             self.persist();
-            (spec, gen)
+            let install = match need {
+                deps::Need::Install(steps) => Some(steps),
+                _ => None,
+            };
+            (spec, gen, install)
         };
+        if let Some(steps) = install {
+            if let Err(e) = self.run_auto_install(k, &spec, steps).await {
+                let note = format!("setup failed: {e:#}");
+                self.set(k, |r| {
+                    r.status = RunStatus::SetupFailed;
+                    r.note = Some(note);
+                });
+                return Err(e.context(format!("installing dependencies for {k} failed; fix the cause, then run `setu retry-setup {k}`")));
+            }
+            let admitted = {
+                let mut inner = self.lock();
+                let (max, others) = match inner.config(&spec.id.project) {
+                    Ok(c) => (c.max_running, inner.up_count(&spec.id.project)),
+                    Err(_) => (usize::MAX, 0),
+                };
+                match inner.state.runs.get_mut(k) {
+                    Some(r) if r.status == RunStatus::Preparing && others < max => {
+                        r.status = RunStatus::Starting;
+                        r.last_started_at = Some(crate::disk::now_secs());
+                        true
+                    }
+                    Some(r) if r.status == RunStatus::Preparing => {
+                        r.status = RunStatus::Stopped;
+                        r.note = Some(format!("dependencies were installed, but {} already has {max} runs up (max_running); start it again once one is stopped", spec.id.project));
+                        false
+                    }
+                    _ => false,
+                }
+            };
+            self.persist();
+            if !admitted {
+                bail!("{k} was not started after its install: it was stopped or {} is at max_running", spec.id.project);
+            }
+        }
         for port in spec.ports.values() {
             if !ports::port_free(*port) {
                 self.set(k, |r| {
@@ -454,7 +750,7 @@ impl Daemon {
                     if ready {
                         r.status = RunStatus::Running;
                     } else {
-                        r.note = Some("web port never opened; see `setu-rs logs`".into());
+                        r.note = Some("web port never opened; see `setu logs`".into());
                     }
                 }
             });
@@ -463,6 +759,47 @@ impl Daemon {
             }
         });
         Ok(())
+    }
+
+    /// Run the auto-install steps for `spec`'s worktree: at most `MAX_CONCURRENT_INSTALLS` at once
+    /// daemon-wide (callers wait for a slot while their run shows as preparing). The output goes to
+    /// the run's setup log; an error carries a redacted tail of it.
+    async fn run_auto_install(self: &Arc<Self>, k: &str, spec: &RunSpec, steps: Vec<model::SetupStep>) -> Result<()> {
+        // The proxy's Preparing page says "installing dependencies" while this runs.
+        struct Installing(Arc<Daemon>, String);
+        impl Drop for Installing {
+            fn drop(&mut self) {
+                self.0.lock().installing.remove(&self.1);
+            }
+        }
+        self.lock().installing.insert(k.to_string());
+        let _installing = Installing(Arc::clone(self), k.to_string());
+        let _slot = self.install_slots.clone().acquire_owned().await.map_err(|_| anyhow!("the install queue is closed"))?;
+        let (wt, env) = (spec.worktree.clone(), spec.env.clone());
+        let log = paths::logs_dir().join(&spec.id.project).join(&spec.id.run).join("setup.log");
+        let l2 = log.clone();
+        let res = tokio::task::spawn_blocking(move || worktree::run_steps(&steps, &wt, &env, &l2)).await?;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let me = Arc::clone(self);
+                let key = k.to_string();
+                let tail = tokio::task::spawn_blocking(move || -> Option<String> {
+                    let lines = tail_lines(&log, 8).ok()?;
+                    // Redaction failing means the tail is withheld, never shown raw.
+                    let secrets = me.redaction_set(&key).ok()?;
+                    let text = redact(&lines.join("\n"), &secrets);
+                    Some(text.chars().take(1500).collect())
+                })
+                .await
+                .ok()
+                .flatten();
+                match tail {
+                    Some(t) if !t.trim().is_empty() => Err(anyhow!("{e:#}\n--- setup log tail ---\n{t}")),
+                    _ => Err(e),
+                }
+            }
+        }
     }
 
     /// A stop arrived while start was spawning: stop what this start created and give way.
@@ -481,8 +818,10 @@ impl Daemon {
     pub async fn stop(self: &Arc<Self>, k: &str, end: RunStatus) -> Result<()> {
         {
             let mut inner = self.lock();
-            if !inner.state.runs.contains_key(k) {
-                bail!("unknown run {k}");
+            let Some(r) = inner.state.runs.get(k) else { bail!("unknown run {k}") };
+            // Nothing runs while preparing or after a failed setup, and Stopped would unlock starting.
+            if matches!(r.status, RunStatus::Preparing | RunStatus::SetupFailed) {
+                return Ok(());
             }
             // Tells an in-flight start to give way, then wait for it to finish.
             *inner.gens.entry(k.to_string()).or_default() += 1;
@@ -501,14 +840,36 @@ impl Daemon {
             self.persist();
             procs
         };
-        let result = supervisor::stop_procs(&procs, STOP_GRACE).await;
+        // A server Setu adopted but did not start is stopped only after its claim is proven again.
+        let (ext, procs): (Vec<_>, Vec<_>) = procs.into_iter().partition(supervisor::is_external);
+        let (ext_wt, ext_port) = self.lock().state.runs.get(k).map(|r| (r.spec.worktree.clone(), r.spec.web_port)).unwrap_or_default();
+        let mut result = supervisor::stop_procs(&procs, STOP_GRACE).await;
+        let mut ext_left: Vec<crate::model::ProcRecord> = Vec::new();
+        let mut ext_note: Option<String> = None;
+        for e in &ext {
+            let Some(port) = ext_port else { continue };
+            match supervisor::stop_external(e, &ext_wt, port, STOP_GRACE).await {
+                Ok(true) => {}
+                Ok(false) => ext_note = Some(format!("{} (pid {}, port {port}) no longer matches this worktree, so it was not signalled", e.name, e.pid)),
+                Err(er) => {
+                    ext_left.push(e.clone());
+                    if result.is_ok() {
+                        result = Err(er);
+                    }
+                }
+            }
+        }
         let id = self.lock().state.runs.get(k).map(|r| r.spec.id.clone());
         // The tracker is forgotten below; keep its last request time (auto-removal's idle age).
         let last_req = id.as_ref().and_then(|id| self.activity.last_request_unix(id));
         // A failed stop keeps ownership of whatever is still alive and does not claim "stopped" (review #9).
-        let left = retained_after_stop(&procs, result.is_err(), &supervisor::unresolved);
+        let mut left = retained_after_stop(&procs, result.is_err(), &supervisor::unresolved);
+        left.extend(ext_left);
         self.set(k, |r| {
             r.procs = left.clone();
+            if let Some(n) = &ext_note {
+                r.note = Some(n.clone());
+            }
             if left.is_empty() {
                 r.status = end;
                 r.stopped_at = Some(crate::disk::now_secs());
@@ -543,6 +904,12 @@ impl Daemon {
         if !matches!(status, RunStatus::Running | RunStatus::Starting) {
             return;
         }
+        // The leader just died under our eyes: the group is provably ours right now, so record who is in it.
+        self.set(&k, |r| {
+            if let Some(p) = r.procs.iter_mut().find(|p| p.pid == ev.pid) {
+                supervisor::record_members_at_exit(p);
+            }
+        });
         let note = format!("{} exited ({})", ev.proc, ev.code.map(|c| format!("code {c}")).unwrap_or_else(|| "signal".into()));
         if web.as_deref() == Some(ev.proc.as_str()) {
             let _ = self.stop(&k, RunStatus::Crashed).await;
@@ -578,15 +945,78 @@ impl Daemon {
         }
     }
 
+    /// Blocking. The unix second before which no log file and no live process can still hold a
+    /// value that was superseded then: the oldest of every log's data floor (rotation retires the
+    /// bytes) and the start of every run that still has processes.
+    fn history_horizon(&self) -> u64 {
+        fn walk(dir: &Path, h: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => walk(&p, h),
+                    Ok(t) if t.is_file() => *h = (*h).min(supervisor::log_data_floor(&p)),
+                    _ => {}
+                }
+            }
+        }
+        let mut h = crate::db::now_secs();
+        for r in self.lock().state.runs.values() {
+            if !r.procs.is_empty() || matches!(r.status, RunStatus::Starting | RunStatus::Running | RunStatus::Stopping) {
+                h = h.min(r.last_started_at.unwrap_or(0));
+            }
+        }
+        walk(&paths::logs_dir(), &mut h);
+        h
+    }
+
+    /// Retire redaction-history values that no existing log or live process can still hold.
+    pub async fn prune_redaction_history(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || env::prune_history(me.history_horizon())).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("setu: pruning the redaction history failed: {e:#}"),
+            Err(e) => eprintln!("setu: pruning the redaction history failed: {e}"),
+        }
+    }
+
     /// Every SWEEP_EVERY: idle stop, crash detection for adopted procs, log rotation.
     pub async fn sweep(self: &Arc<Self>) {
         self.record_request_times();
+        // Runs whose own dev server is already up outside Setu show as running (external).
+        let me = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || me.detect_external_all()).await;
         let runs: Vec<(String, RunRecord)> = self.lock().state.runs.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
         for (k, r) in runs {
             for p in &r.spec.procs {
                 let _ = supervisor::rotate_log(&p.log_path, LOG_MAX_BYTES);
             }
             if r.status != RunStatus::Running {
+                continue;
+            }
+            // An external server is never crash-stopped or idle-stopped by Setu; if it exits the run is simply stopped.
+            if r.procs.iter().any(supervisor::is_external) {
+                // The run lives while the listener's group (or bare listener) lives.
+                let listener_alive = r.procs.iter().any(|p| p.name == supervisor::EXTERNAL_PROC && supervisor::external_alive(p));
+                if !listener_alive {
+                    // Remaining v1 sidecar groups are stopped with the same re-proof as Down.
+                    let mut stuck = false;
+                    for p in r.procs.iter().filter(|p| p.name == supervisor::EXTERNAL_SIDECAR) {
+                        if supervisor::stop_external(p, &r.spec.worktree, r.spec.web_port.unwrap_or(0), STOP_GRACE).await.is_err() {
+                            stuck = true;
+                        }
+                    }
+                    if !stuck {
+                        self.set(&k, |x| {
+                            if x.status == RunStatus::Running && x.procs.iter().all(supervisor::is_external) {
+                                x.status = RunStatus::Stopped;
+                                x.procs.clear();
+                                x.stopped_at = Some(crate::disk::now_secs());
+                                x.note = Some("the server that was running outside Setu exited".into());
+                            }
+                        });
+                    }
+                }
                 continue;
             }
             // Track children that left their group, so stop can still reach them.
@@ -636,6 +1066,10 @@ impl Daemon {
     pub fn list(&self) -> Value {
         let gcfg = globalcfg::GlobalConfig::load().ok();
         let auto = autoremove::load_state(&self.db).ok();
+        // Configs are read from disk first (never under the state lock): staleness is judged
+        // against what a start would use now, and an invalid edit is reported, not hidden (review B9).
+        let projects: std::collections::BTreeSet<String> = self.lock().state.runs.values().map(|r| r.spec.id.project.clone()).collect();
+        let fresh: BTreeMap<String, Result<ProjectConfig, String>> = projects.into_iter().map(|p| (p.clone(), self.fresh_config(&p).map_err(|e| format!("{e:#}")))).collect();
         let inner = self.lock();
         let mut leases = inner.state.leases.clone();
         Value::Array(
@@ -645,14 +1079,22 @@ impl Daemon {
                 .iter()
                 .map(|(k, r)| {
                     // A running run whose env would differ if started now needs a restart.
-                    let stale = matches!(r.status, RunStatus::Running | RunStatus::Starting)
-                        && r.env_hash.is_some()
-                        && inner
-                            .config(&r.spec.id.project)
-                            .and_then(|cfg| build_spec(&cfg, &r.spec.worktree, &r.spec.id.run, &mut leases))
-                            .is_ok_and(|spec| Some(env::env_hash(&spec.env)) != r.env_hash);
+                    let live = matches!(r.status, RunStatus::Running | RunStatus::Starting) && r.env_hash.is_some();
+                    let (stale, config_error) = if !live {
+                        (false, None)
+                    } else {
+                        match fresh.get(&r.spec.id.project) {
+                            Some(Ok(cfg)) => match build_spec(cfg, &r.spec.worktree, &r.spec.id.run, &mut leases) {
+                                Ok(spec) => (Some(env::env_hash(&spec.env)) != r.env_hash, None),
+                                Err(e) => (true, Some(format!("{e:#}"))),
+                            },
+                            Some(Err(e)) => (true, Some(e.clone())),
+                            None => (false, None),
+                        }
+                    };
                     let mut v = run_json(&self.db, k, r);
                     v["stale_env"] = json!(stale);
+                    v["config_error"] = json!(config_error);
                     v["removal"] = match (&gcfg, &auto) {
                         (Some(g), Some(a)) => autoremove::removal_json(a, k, &g.auto_remove, r.pinned),
                         _ => Value::Null,
@@ -713,11 +1155,8 @@ impl Daemon {
     /// Every name a run receives, with the layer it comes from. Secrets masked.
     pub fn env_effective(&self, wanted: &str) -> Result<Value> {
         let k = self.resolve(wanted)?;
-        let (cfg, rec) = {
-            let inner = self.lock();
-            let rec = inner.state.runs.get(&k).cloned().ok_or_else(|| anyhow!("unknown run {k}"))?;
-            (inner.config(&rec.spec.id.project)?, rec)
-        };
+        let rec = self.lock().state.runs.get(&k).cloned().ok_or_else(|| anyhow!("unknown run {k}"))?;
+        let cfg = self.fresh_config(&rec.spec.id.project)?;
         let mut leases = self.lock().state.leases.clone();
         let spec = build_spec(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases)?;
         let layers: Vec<(&str, BTreeMap<String, String>, std::collections::BTreeSet<String>)> = {
@@ -754,7 +1193,7 @@ impl Daemon {
                     sources.push("computed");
                 }
                 let source = sources.last().copied().unwrap_or("computed");
-                let secret = layers.iter().any(|(_, _, s)| s.contains(name)) || env::is_secret_name(name);
+                let secret = layers.iter().any(|(_, _, s)| s.contains(name)) || env::looks_secret(name, value);
                 let preview = if secret { env::mask(value) } else { Some(value.clone()) };
                 json!({ "name": name, "source": source, "overrides": &sources[..sources.len().saturating_sub(1)], "secret": secret, "preview": preview })
             })
@@ -791,7 +1230,7 @@ impl Daemon {
     /// The only call that returns a value. Never allowed for MCP; always audited.
     pub fn env_reveal(&self, actor: &str, scope: &env::Scope, name: &str) -> Result<Value> {
         if actor == "mcp" {
-            bail!("reveal is not available to agents; ask the user to run `setu-rs env reveal` themselves");
+            bail!("reveal is not available to agents; ask the user to run `setu env reveal` themselves");
         }
         let value = env::get_value(scope, name)?.ok_or_else(|| anyhow!("{name} is not set in this layer"))?;
         env::audit(actor, "reveal", scope, Some(name), None);
@@ -859,17 +1298,20 @@ impl Daemon {
             flagged.insert(v.name.clone());
             out.push((v.name.clone(), v.value.clone()));
         }
-        for scope in [env::Scope::Global] {
-            for v in env::read_layer(&scope).context("the global env layer could not be read, so logs cannot be redacted safely")?.into_iter().filter(|v| v.secret) {
-                flagged.insert(v.name.clone());
-                out.push((v.name, v.value));
-            }
+        for v in env::read_layer(&env::Scope::Global).context("the global env layer could not be read, so logs cannot be redacted safely")?.into_iter().filter(|v| v.secret) {
+            flagged.insert(v.name.clone());
+            out.push((v.name, v.value));
         }
+        // The same classification the effective view uses: flagged in a layer, or a secret-looking
+        // name with a credential-length value. An explicitly flagged secret too short to redact is
+        // an error, never silently left in the log (review B5).
         for (name, value) in &spec.env {
-            // Name-based guesses keep the length floor (they would otherwise mangle ordinary text).
-            if flagged.contains(name) || (env::is_secret_name(name) && value.len() >= MIN_REDACT_LEN) {
+            if flagged.contains(name) || env::looks_secret(name, value) {
                 out.push((name.clone(), value.clone()));
             }
+        }
+        for (name, value) in &out {
+            env::check_redactable(name, value)?;
         }
         out.extend(env::redaction_history().context("the redaction history could not be read, so logs cannot be redacted safely")?);
         Ok(out)
@@ -964,7 +1406,7 @@ impl Daemon {
         if let Some(h) = claims::live_holder(&self.db, k, claims::now()) {
             if holder != Some(h.as_str()) {
                 bail!(
-                    "{k} has a live writer claim held by {h}; only {h} can do this. Ask it to release, or run `setu-rs release {k}` yourself"
+                    "{k} has a live writer claim held by {h}; only {h} can do this. Ask it to release, or run `setu release {k}` yourself"
                 );
             }
         }
@@ -981,10 +1423,15 @@ impl Daemon {
         let existing: std::collections::BTreeSet<String> = self.lock().state.runs.keys().cloned().collect();
         let me = Arc::clone(self);
         let (b, f) = (branch.to_string(), from.map(String::from));
+        let registered: Arc<Mutex<Option<String>>> = Arc::default();
+        let reg = registered.clone();
         let out = tokio::task::spawn_blocking(move || {
             worktree::create(&cfg, &b, f.as_deref(), &existing, &me.db, &paths::logs_dir(), |path, run| {
                 let wt = path.canonicalize()?;
-                let (_, spec) = me.register(&cfg, &wt, run)?;
+                // Registered as Preparing: no manual or on-demand start until setup succeeds (review B10).
+                let initial = if cfg.setup_steps.is_empty() { RunStatus::Stopped } else { RunStatus::Preparing };
+                let (k, spec, _) = me.register_seeded(&cfg, &wt, run, None, initial)?;
+                *reg.lock().unwrap_or_else(|e| e.into_inner()) = Some(k);
                 Ok(spec.env)
             })
         })
@@ -992,11 +1439,26 @@ impl Daemon {
         let out = match out {
             Ok(o) => o,
             Err(e) => {
+                // A run that was registered but never finished setup stays registered, as setup-failed.
+                let preparing = registered.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(pk) = preparing {
+                    let note = format!("setup failed: {e:#}");
+                    self.set(&pk, |r| {
+                        r.status = RunStatus::SetupFailed;
+                        r.note = Some(note);
+                    });
+                }
                 worktree::audit(actor, client, "new-failed", &format!("{project}/{branch}"), json!({ "error": format!("{e:#}") }));
                 return Err(e);
             }
         };
         let k = format!("{project}/{}", out.run);
+        self.set(&k, |r| {
+            if r.status == RunStatus::Preparing {
+                r.status = RunStatus::Stopped;
+                r.note = None;
+            }
+        });
         worktree::audit(actor, client, "new", &k, json!({ "branch": out.branch, "base": out.base, "path": out.path }));
         if start {
             self.start(&k).await?;
@@ -1004,6 +1466,70 @@ impl Daemon {
         let mut v = self.describe_async(&k).await?;
         v["worktree_new"] = serde_json::to_value(&out)?;
         Ok(v)
+    }
+
+    /// `setu retry-setup`: re-run the setup steps of a run whose setup failed or was interrupted.
+    /// The run stays un-startable until they succeed (review B10).
+    pub async fn worktree_retry_setup(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str) -> Result<Value> {
+        let k = self.resolve(wanted)?;
+        let (project, run, wt) = {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get_mut(&k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            match r.status {
+                RunStatus::SetupFailed => {}
+                RunStatus::Preparing => bail!("setup of {k} is already running"),
+                _ => bail!("{k} did not fail setup (it is {:?}); retry-setup only applies to a setup-failed run", r.status),
+            }
+            r.status = RunStatus::Preparing;
+            r.note = None;
+            (r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone())
+        };
+        self.persist();
+        let me = Arc::clone(self);
+        let (p2, r2, w2) = (project.clone(), run.clone(), wt.clone());
+        let prep = tokio::task::spawn_blocking(move || -> Result<(ProjectConfig, RunSpec, deps::Need)> {
+            let cfg = me.fresh_config(&p2)?;
+            let mut leases = me.lock().state.leases.clone();
+            let spec = build_spec(&cfg, &w2, &r2, &mut leases)?;
+            let need = deps::plan(&cfg, &w2);
+            Ok((cfg, spec, need))
+        })
+        .await?;
+        let res: Result<usize> = match prep {
+            Err(e) => Err(e),
+            Ok((cfg, spec, need)) => match need {
+                deps::Need::Blocked(why) => Err(anyhow!("{why}")),
+                deps::Need::Install(steps) => {
+                    let n = steps.len();
+                    self.run_auto_install(&k, &spec, steps).await.map(|_| n)
+                }
+                deps::Need::Nothing => {
+                    let log = paths::logs_dir().join(&spec.id.project).join(&spec.id.run).join("setup.log");
+                    let (steps, w) = (cfg.setup_steps.clone(), spec.worktree.clone());
+                    let env = spec.env.clone();
+                    tokio::task::spawn_blocking(move || worktree::run_steps(&steps, &w, &env, &log).map(|r| r.len())).await?
+                }
+            },
+        };
+        match res {
+            Ok(steps) => {
+                self.set(&k, |r| {
+                    r.status = RunStatus::Stopped;
+                    r.note = None;
+                });
+                worktree::audit(actor, client, "setup-retried", &k, json!({ "steps": steps }));
+                self.describe_async(&k).await
+            }
+            Err(e) => {
+                let note = format!("setup failed: {e:#}");
+                self.set(&k, |r| {
+                    r.status = RunStatus::SetupFailed;
+                    r.note = Some(note);
+                });
+                worktree::audit(actor, client, "setup-retry-failed", &k, json!({ "error": format!("{e:#}") }));
+                Err(e)
+            }
+        }
     }
 
     pub async fn worktree_adopt(self: &Arc<Self>, actor: &str, client: Option<&str>, path: &Path) -> Result<Value> {
@@ -1020,6 +1546,36 @@ impl Daemon {
         let (k, _) = tokio::task::spawn_blocking(move || me.register(&c2, &w2, &r2)).await??;
         worktree::audit(actor, client, "adopt", &k, json!({ "path": wt }));
         self.describe_async(&k).await
+    }
+
+    /// `setu forget`: unregister a run and release its lease. The worktree's files are never touched.
+    /// Refused while the run is up (or mid-setup/stop), has recorded processes, or has a live claim.
+    pub async fn worktree_forget(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str) -> Result<Value> {
+        let k = self.resolve(wanted)?;
+        let life = self.life_lock(&k);
+        let _life = life.lock().await;
+        let (id, wt) = {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get(&k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            if matches!(r.status, RunStatus::Running | RunStatus::Starting | RunStatus::Stopping | RunStatus::Preparing) {
+                bail!("{k} is {}; stop it first (`setu down {k}`), then forget it", format!("{:?}", r.status).to_lowercase());
+            }
+            if !r.procs.is_empty() {
+                bail!("{k} still has recorded processes; run `setu down {k}` first");
+            }
+            if let Some(h) = claims::live_holder(&self.db, &k, claims::now()) {
+                bail!("{k} has a live writer claim held by {h}; release it first (`setu release {k}`)");
+            }
+            let removed = inner.state.runs.remove(&k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            inner.state.leases.remove(&k);
+            inner.gens.remove(&k);
+            inner.rebuild_hosts();
+            (removed.spec.id, removed.spec.worktree)
+        };
+        self.activity.forget(&id);
+        self.persist_durable().await?;
+        worktree::audit(actor, client, "forget", &k, json!({ "path": wt }));
+        Ok(json!({ "run": k, "forgotten": true, "worktree": wt }))
     }
 
     pub async fn worktree_rm(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str, force: bool) -> Result<Value> {
@@ -1047,7 +1603,10 @@ impl Daemon {
         let host = DaemonHost { d: Arc::clone(self), key: key.clone(), rt: tokio::runtime::Handle::current() };
         let archive_root = paths::archive_dir();
         let result = tokio::task::spawn_blocking(move || {
-            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, db: &db, force, host: &host, archive_cap: None })
+            // Squash- and rebase-merged branches look unpushed once the remote branch is deleted;
+            // a validated merge proof (re-checked at each guard) is the only way past that guard (review B8).
+            let proof = |wt: &Path, fetched: bool, head: Option<&str>| autoremove::rm_proof(&cfg, wt, fetched, head, &autoremove::real_gh);
+            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, db: &db, force, host: &host, archive_cap: None, merge_proof: Some(&proof) })
         })
         .await?;
         match result {
@@ -1113,7 +1672,7 @@ impl Daemon {
     pub async fn autoremove(self: &Arc<Self>, dry_run: bool) -> Result<Value> {
         let gcfg = globalcfg::GlobalConfig::load()?;
         if !gcfg.auto_remove.enabled && !dry_run {
-            bail!("auto_remove is off. Set `enabled = true` under [auto_remove] in {}, or preview with `setu-rs autoremove --dry-run`", globalcfg::config_path().display());
+            bail!("auto_remove is off. Set `enabled = true` under [auto_remove] in {}, or preview with `setu autoremove --dry-run`", globalcfg::config_path().display());
         }
         let policy = autoremove::check_cfg(&gcfg.auto_remove)?;
         self.record_request_times();
@@ -1212,6 +1771,11 @@ impl Daemon {
         Ok(Value::Array(cfgs.into_iter().map(|c| json!({ "project": c.project, "base": c.worktree.base })).collect()))
     }
 
+    /// A run whose processes are all servers Setu took over rather than started.
+    pub fn is_external_run(&self, k: &str) -> bool {
+        self.lock().state.runs.get(k).is_some_and(|r| !r.procs.is_empty() && r.procs.iter().all(supervisor::is_external))
+    }
+
     pub fn running_keys(&self) -> Vec<String> {
         self.lock()
             .state
@@ -1300,6 +1864,8 @@ fn run_json(db: &Db, k: &str, r: &RunRecord) -> Value {
     json!({
         "run": k,
         "url": r.spec.url,
+        "aliases": r.spec.aliases,
+        "external": r.procs.iter().any(supervisor::is_external),
         "status": r.status,
         "pinned": r.pinned,
         "ram_bytes": ram,
@@ -1320,6 +1886,8 @@ impl Routes for Daemon {
         match (r.status, r.spec.web_port) {
             (RunStatus::Running, Some(port)) => Lookup::Up { run, port },
             (RunStatus::Starting, _) | (RunStatus::Stopping, _) => Lookup::Starting { run },
+            (RunStatus::Preparing, _) => Lookup::Preparing { installing: inner.installing.contains(k.as_str()), run },
+            (RunStatus::SetupFailed, _) => Lookup::SetupFailed { run },
             _ => Lookup::Down { run },
         }
     }
@@ -1331,11 +1899,16 @@ impl Routes for Daemon {
         {
             let inner = self.lock();
             let r = inner.state.runs.get(&k).ok_or("unknown run")?;
+            match r.status {
+                RunStatus::Preparing => return Err(format!("{k} is still being prepared (setup is running)")),
+                RunStatus::SetupFailed => return Err(format!("setup failed for {k}; run `setu retry-setup {k}`")),
+                _ => {}
+            }
             if !matches!(r.status, RunStatus::Running | RunStatus::Starting) {
                 let cfg = inner.config(&run.project).map_err(|e| e.to_string())?;
                 if inner.up_count(&run.project) >= cfg.max_running {
                     return Err(format!(
-                        "{} already has {} runs up. Stop one with `setu-rs down <run>` first.",
+                        "{} already has {} runs up. Stop one with `setu down <run>` first.",
                         run.project, cfg.max_running
                     ));
                 }
@@ -1371,7 +1944,7 @@ impl worktree::RmHost for DaemonHost {
     fn running(&self) -> Option<String> {
         let inner = self.d.lock();
         match inner.state.runs.get(&self.key).map(|r| r.status) {
-            Some(st @ (RunStatus::Running | RunStatus::Starting | RunStatus::Stopping)) => Some(format!("{st:?}").to_lowercase()),
+            Some(st @ (RunStatus::Running | RunStatus::Starting | RunStatus::Stopping | RunStatus::Preparing)) => Some(format!("{st:?}").to_lowercase()),
             _ => None,
         }
     }
@@ -1423,7 +1996,7 @@ fn dns_domains() -> Arc<std::sync::RwLock<Vec<String>>> {
 }
 
 fn domains_refresh(configs: &[ProjectConfig]) {
-    let list: Vec<String> = configs.iter().map(|c| c.domain.to_lowercase()).filter(|d| !d.ends_with("localhost")).collect();
+    let list: Vec<String> = configs.iter().map(|c| c.domain.to_lowercase()).filter(|d| !d.ends_with("localhost")).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     if let Ok(mut w) = dns_domains().write() {
         *w = list;
     }
@@ -1437,22 +2010,67 @@ fn single_instance_lock() -> Result<std::fs::File> {
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("daemon.lock"))?;
     // SAFETY: flock on a valid fd we own.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another setu-rs daemon is already running");
+        bail!("another setu daemon is already running");
     }
     Ok(f)
+}
+
+/// Who listens on a TCP port, for the log line and doctor: "caddy (pid 123)". Best effort.
+pub fn port_holder(port: u16) -> Option<String> {
+    let out = std::process::Command::new("lsof").args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut pid, mut name) = (None, None);
+    for l in text.lines() {
+        if let Some(p) = l.strip_prefix('p') {
+            pid.get_or_insert(p.to_string());
+        } else if let Some(c) = l.strip_prefix('c') {
+            name.get_or_insert(c.to_string());
+        }
+    }
+    Some(match (name, pid) {
+        (Some(n), Some(p)) => format!("{n} (pid {p})"),
+        (None, Some(p)) => format!("pid {p}"),
+        _ => return None,
+    })
+}
+
+/// Bind the proxy. Config `proxy_port` wins and must succeed. Otherwise try the wildcard :80
+/// (IPv4 and IPv6 sockets, so both work as with v1's Caddy; loopback-only peers
+/// are enforced by the proxy) and fall back to loopback :7777 on both 127.0.0.1 and ::1.
+async fn bind_proxy() -> Result<(Vec<tokio::net::TcpListener>, &'static str, u16, globalcfg::ProxyBinding)> {
+    if let Some(p) = globalcfg::GlobalConfig::load().ok().and_then(|c| c.proxy_port) {
+        let (ls, ip) = if p < 1024 {
+            (crate::proxy::bind_wildcard(p).with_context(|| format!("binding the proxy on port {p}"))?, "*")
+        } else {
+            (crate::proxy::bind_loopback(p).with_context(|| format!("binding the proxy on 127.0.0.1:{p}"))?, "127.0.0.1")
+        };
+        return Ok((ls, ip, p, globalcfg::ProxyBinding { port: p, fallback_reason: None }));
+    }
+    let want = globalcfg::DEFAULT_PROXY_PORT;
+    match crate::proxy::bind_wildcard(want) {
+        Ok(ls) => Ok((ls, "*", want, globalcfg::ProxyBinding { port: want, fallback_reason: None })),
+        Err(e) => {
+            let why = match port_holder(want) {
+                Some(h) => format!("port {want} is held by {h}"),
+                None => format!("port {want} is not available ({e})"),
+            };
+            let fb = globalcfg::FALLBACK_PROXY_PORT;
+            eprintln!("setu daemon: {why}; serving the proxy on 127.0.0.1:{fb} instead. Free port {want} and restart the daemon to use it.");
+            let ls = crate::proxy::bind_loopback(fb).with_context(|| format!("{why}, and the fallback 127.0.0.1:{fb} failed"))?;
+            Ok((ls, "127.0.0.1", fb, globalcfg::ProxyBinding { port: fb, fallback_reason: Some(why) }))
+        }
+    }
 }
 
 /// Run the daemon until SIGINT/SIGTERM. Stops every run it started on the way out.
 pub async fn run() -> Result<()> {
     // One daemon only: hold an exclusive lock for our lifetime, before touching state.
     let _lock = single_instance_lock()?;
-    let proxy_port = crate::globalcfg::proxy_port();
-    // Port 80 can only be bound unprivileged on the wildcard address; the proxy still
-    // drops every non-loopback peer. Any other port binds loopback only.
-    let bind_ip = if proxy_port < 1024 { "0.0.0.0" } else { "127.0.0.1" };
-    let listener = tokio::net::TcpListener::bind((bind_ip, proxy_port))
-        .await
-        .with_context(|| format!("binding the proxy on {bind_ip}:{proxy_port}"))?;
+    let (listeners, bind_ip, proxy_port, binding) = bind_proxy().await?;
+    globalcfg::set_effective_proxy_port(proxy_port);
+    if let Ok(text) = serde_json::to_string(&binding) {
+        let _ = std::fs::write(globalcfg::proxy_binding_path(), text);
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExitEvent>();
     let daemon = tokio::task::spawn_blocking(move || Daemon::new(tx)).await??;
     let _ = SELF.set(Arc::clone(&daemon));
@@ -1460,7 +2078,7 @@ pub async fn run() -> Result<()> {
     let routes: Arc<dyn Routes> = daemon.clone();
     let activity = daemon.activity.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::proxy::serve(listener, routes, activity).await {
+        if let Err(e) = crate::proxy::serve_all(listeners, routes, activity).await {
             eprintln!("setu: proxy stopped: {e:#}");
         }
     });
@@ -1485,7 +2103,7 @@ pub async fn run() -> Result<()> {
             eprintln!("setu: DNS on 127.0.0.1:{dns_port} unavailable: {e:#}");
         }
     });
-    eprintln!("setu-rs daemon: proxy on http://{bind_ip}:{proxy_port}, socket {}", paths::socket_path().display());
+    eprintln!("setu daemon: proxy on http://{bind_ip}:{proxy_port}, socket {}", paths::socket_path().display());
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -1497,6 +2115,7 @@ pub async fn run() -> Result<()> {
         tokio::select! {
             _ = tick.tick() => daemon.sweep().await,
             _ = disk_tick.tick() => {
+                daemon.prune_redaction_history().await;
                 match daemon.disk_clean(true, false).await {
                     Ok(v) if v["items"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("setu: auto disk clean: {v}"),
                     Err(e) => eprintln!("setu: auto disk clean failed: {e:#}"),
@@ -1519,14 +2138,22 @@ pub async fn run() -> Result<()> {
             _ = term.recv() => break,
         }
     }
-    eprintln!("setu-rs daemon: stopping runs");
-    for k in daemon.running_keys() {
-        let _ = daemon.stop(&k, RunStatus::Stopped).await;
+    if globalcfg::GlobalConfig::load().is_ok_and(|c| c.stop_runs_on_exit) {
+        eprintln!("setu daemon: stopping Setu-started runs (stop_runs_on_exit)");
+        for k in daemon.running_keys() {
+            if daemon.is_external_run(&k) {
+                continue;
+            }
+            let _ = daemon.stop(&k, RunStatus::Stopped).await;
+        }
+    } else {
+        eprintln!("setu daemon: exiting; running dev servers stay up and are adopted by the next daemon");
     }
     // Fold the WAL into the main file so the next start opens a small, clean database.
     if let Err(e) = daemon.db.with_async(|c| c.query("PRAGMA wal_checkpoint(TRUNCATE)", (), |_| Ok(())).map(|_| ())).await {
         eprintln!("setu: final checkpoint failed: {e:#}");
     }
+    let _ = std::fs::remove_file(globalcfg::proxy_binding_path());
     let _ = std::fs::remove_file(paths::socket_path());
     Ok(())
 }
@@ -1539,6 +2166,18 @@ mod tests {
 
     fn pgrep(pattern: &str) -> bool {
         std::process::Command::new("pgrep").args(["-f", pattern]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
+    }
+
+    /// Is a process matching `pattern` still alive after giving it up to 5 seconds to go away?
+    /// A fixed short sleep is a flake under load.
+    async fn still_running(pattern: &str) -> bool {
+        for _ in 0..100 {
+            if !pgrep(pattern) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
     }
 
     fn pkill(pattern: &str) {
@@ -1600,8 +2239,7 @@ mod tests {
         assert!(recorded(&f) >= 1, "start never got going");
         d.stop(&k, RunStatus::Stopped).await.unwrap();
         let _ = starter.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let leaked = pgrep("sleep 300701");
+        let leaked = still_running("sleep 300701").await;
         pkill("sleep 300701");
         assert!(!leaked, "processes spawned by a cancelled start are still running");
         assert_eq!(recorded(&f), 0);
@@ -1611,15 +2249,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_sidecar_leader_exit_keeps_its_surviving_group_owned() {
         // review #8
-        let mut f = fixture(&[("w".to_string(), "sleep 300702 & exit 0".to_string())], "");
+        // The leader lives a second, so under load neither the start-time read nor the child's
+        // fork/exec races its exit (the other flaky failure of the suite).
+        let mut f = fixture(&[("w".to_string(), "sleep 300702 & sleep 1; exit 0".to_string())], "");
         f.d.start(&f.k).await.unwrap();
         let ev = tokio::time::timeout(Duration::from_secs(5), f.rx.recv()).await.unwrap().unwrap();
         f.d.on_exit(ev).await;
         assert!(pgrep("sleep 300702"), "the backgrounded child should still run");
         assert_eq!(recorded(&f), 1, "the record stays while its group survives");
         f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let left = pgrep("sleep 300702");
+        let left = still_running("sleep 300702").await;
         pkill("sleep 300702");
         assert!(!left, "stop must reach the surviving group");
         assert_eq!(recorded(&f), 0);
@@ -1628,7 +2267,7 @@ mod tests {
     #[test]
     fn a_failed_stop_keeps_what_is_still_alive() {
         // review #9
-        let rec = |pid| crate::model::ProcRecord { name: "w".into(), pid, start_time: 1, escaped: vec![] };
+        let rec = |pid| crate::model::ProcRecord { name: "w".into(), pid, start_time: 1, escaped: vec![], members: vec![] };
         let procs = [rec(10), rec(11)];
         assert!(retained_after_stop(&procs, false, &|_| true).is_empty(), "a successful stop leaves nothing");
         let left = retained_after_stop(&procs, true, &|p| p.pid == 11);
@@ -1646,7 +2285,7 @@ mod tests {
         let pid = stranger.id() as i32;
         // reap it as soon as it dies, so it does not linger as a zombie
         let reaper = std::thread::spawn(move || stranger.wait());
-        let rec = crate::model::ProcRecord { name: "w".into(), pid, start_time: crate::procinfo::start_time(pid).unwrap(), escaped: vec![] };
+        let rec = crate::model::ProcRecord { name: "w".into(), pid, start_time: crate::procinfo::start_time(pid).unwrap(), escaped: vec![], members: vec![] };
         f.d.set(&f.k, |r| {
             r.status = RunStatus::Crashed;
             r.procs = vec![rec.clone()];
@@ -1667,8 +2306,7 @@ mod tests {
         f.d.fail_persist.store(true, std::sync::atomic::Ordering::SeqCst);
         let e = f.d.start(&f.k).await.unwrap_err();
         assert!(format!("{e:#}").contains("could not save"), "{e:#}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let leaked = pgrep("sleep 300704");
+        let leaked = still_running("sleep 300704").await;
         pkill("sleep 300704");
         assert!(!leaked, "a process whose ownership could not be saved must be stopped");
         assert_eq!(status(&f), RunStatus::Crashed);
@@ -1732,7 +2370,7 @@ mod tests {
         std::fs::create_dir_all(o.path.join(".next")).unwrap();
         std::fs::write(o.path.join(".next/blob"), vec![1u8; 2048]).unwrap();
         let mut cfg = f.cfg.clone();
-        cfg.disk_items = vec![DiskItem { name: "next".into(), kind: DiskKind::Cache, paths: vec![".next".into()], clean_after: Some(Duration::from_secs(1)) }];
+        cfg.disk_items = vec![DiskItem { name: "next".into(), kind: DiskKind::Cache, paths: vec![".next".into()], clean_after: Some(Duration::from_secs(1)), install: None }];
         let spec = RunSpec {
             id: RunId { project: "app".into(), run: "feat-dc".into() },
             worktree: o.path.clone(),
@@ -1743,6 +2381,7 @@ mod tests {
             procs: vec![],
             web_port: None,
             idle: Duration::from_secs(60),
+            aliases: vec![],
         };
         let mut st = State::default();
         st.runs.insert(
@@ -1765,5 +2404,828 @@ mod tests {
         *d.clean_hook.lock().unwrap() = None;
         d.disk_clean(true, false).await.unwrap();
         assert!(!o.path.join(".next").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b5_short_config_secret_is_redacted_like_the_effective_view_classifies_it() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300711".to_string())], "[env]\nAPI_TOKEN = \"12345\"\n");
+        let log_dir = paths::logs_dir().join("tp/r");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("w.log"), "token=12345\nport 8080 is fine\n").unwrap();
+        let eff = f.d.env_effective("r").unwrap();
+        let tok = eff["vars"].as_array().unwrap().iter().find(|v| v["name"] == "API_TOKEN").unwrap();
+        assert_eq!(tok["secret"], true);
+        let out = f.d.logs(&f.k, None, 50).unwrap();
+        let text = out["text"].as_str().unwrap();
+        assert!(!text.contains("12345") || text.contains("port 8080"), "{text}");
+        assert!(text.contains("token=[redacted:API_TOKEN]"), "{text}");
+        assert!(text.contains("port 8080 is fine"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b5_history_is_not_capped_by_count_while_a_log_can_still_hold_the_value() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300712".to_string())], "");
+        let log_dir = paths::logs_dir().join("tp/r");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("w.log"), "old=OLDEST-ROTATED-SECRET\n").unwrap();
+        let sc = env::Scope::Project("tp".into());
+        for i in 0..502 {
+            env::write_var(&sc, "DB_PASSWORD", &format!("rotated-{i:04}-value"), None).unwrap();
+        }
+        env::write_var(&sc, "OTHER_SECRET", "OLDEST-ROTATED-SECRET", None).unwrap();
+        env::write_var(&sc, "OTHER_SECRET", "something-else-now", None).unwrap();
+        assert!(env::redaction_history().unwrap().len() >= 502);
+        let text = f.d.logs(&f.k, None, 50).unwrap()["text"].as_str().unwrap().to_string();
+        assert!(!text.contains("OLDEST-ROTATED-SECRET"), "{text}");
+        // once no log or process can hold them, rotation retires them
+        std::fs::remove_dir_all(&log_dir).unwrap();
+        let h = f.d.history_horizon();
+        assert!(h > 0);
+        env::prune_history(h + 1).unwrap();
+        assert!(env::redaction_history().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b5_damaged_history_fails_log_delivery() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300713".to_string())], "");
+        let log_dir = paths::logs_dir().join("tp/r");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("w.log"), "hello\n").unwrap();
+        env::write_var(&env::Scope::Project("tp".into()), "DB_PASSWORD", "rotated-one-value", None).unwrap();
+        env::write_var(&env::Scope::Project("tp".into()), "DB_PASSWORD", "rotated-two-value", None).unwrap();
+        let hp = paths::env_dir().join(".redact-history.jsonl");
+        let mut text = std::fs::read_to_string(&hp).unwrap();
+        text.push_str("{this line is damaged CANARY-HISTORY\n");
+        std::fs::write(&hp, text).unwrap();
+        let e = format!("{:#}", f.d.logs(&f.k, None, 50).unwrap_err());
+        assert!(e.contains("damaged") && !e.contains("CANARY"), "{e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b5_an_edited_config_secret_is_journaled_for_redaction() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300714".to_string())], "[env]\nAPI_TOKEN = \"first-config-token\"\n");
+        let p = paths::projects_dir().join("tp.toml");
+        let t = std::fs::read_to_string(&p).unwrap().replace("first-config-token", "second-config-token");
+        std::fs::write(&p, t).unwrap();
+        f.d.env_effective("r").unwrap();
+        assert!(env::redaction_history().unwrap().iter().any(|(n, v)| n == "API_TOKEN" && v == "first-config-token"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b9_restart_effective_and_stale_env_use_the_config_on_disk() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300715".to_string())], "[env]\nA = \"old\"\n");
+        let p = paths::projects_dir().join("tp.toml");
+        let edit = |from: &str, to: &str| {
+            let t = std::fs::read_to_string(&p).unwrap().replace(from, to);
+            std::fs::write(&p, t).unwrap();
+        };
+        let val = |f: &Fx| -> String {
+            let eff = f.d.env_effective("r").unwrap();
+            eff["vars"].as_array().unwrap().iter().find(|v| v["name"] == "A").unwrap()["preview"].as_str().unwrap().to_string()
+        };
+        assert_eq!(val(&f), "old");
+        edit("\"old\"", "\"newer\"");
+        assert_eq!(val(&f), "newer", "effective must read the edited config");
+        f.d.start(&f.k).await.unwrap();
+        assert_eq!(f.d.lock().state.runs[&f.k].spec.env["A"], "newer");
+        let stale = |f: &Fx| f.d.list()[0].clone();
+        assert_eq!(stale(&f)["stale_env"], false);
+        edit("\"newer\"", "\"newest\"");
+        assert_eq!(stale(&f)["stale_env"], true, "a config edit needs a restart");
+        // restart picks it up
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        f.d.start(&f.k).await.unwrap();
+        assert_eq!(f.d.lock().state.runs[&f.k].spec.env["A"], "newest");
+        // an invalid edit is an error everywhere, never a silent fallback
+        edit("domain = \"tp.local\"", "domain = \"tp local\"");
+        assert!(f.d.env_effective("r").is_err());
+        let row = stale(&f);
+        assert_eq!(row["stale_env"], true);
+        assert!(row["config_error"].as_str().is_some_and(|e| e.contains("domain")), "{row}");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        assert!(f.d.start(&f.k).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b11_adoption_turns_an_empty_transitional_record_into_a_persisted_stopped_state() {
+        for status in [RunStatus::Starting, RunStatus::Stopping, RunStatus::Running] {
+            let f = fixture(&[("w".to_string(), "exec sleep 300716".to_string())], "");
+            f.d.set(&f.k, |r| {
+                r.status = status;
+                r.procs.clear();
+            });
+            f.d.adopt().await;
+            assert_eq!(super::tests::status(&f), RunStatus::Stopped, "{status:?}");
+            assert!(f.d.lock().state.runs[&f.k].note.as_deref().is_some_and(|n| n.contains("daemon restarted")));
+            let disk = crate::state::load(&f.d.db).unwrap();
+            assert_eq!(disk.runs[&f.k].status, RunStatus::Stopped, "reconciliation must be on disk when adopt returns");
+            // and a start now works instead of reporting the stale Starting
+            f.d.start(&f.k).await.unwrap();
+            f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forget_unregisters_a_stopped_run_keeps_its_files_and_is_refused_while_running_or_claimed() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300790".to_string())], "");
+        std::fs::write(f.wt.join("keep.txt"), "mine").unwrap();
+        // running: refused
+        f.d.start(&f.k).await.unwrap();
+        let e = f.d.worktree_forget("cli", None, &f.k).await.unwrap_err();
+        assert!(format!("{e:#}").contains("stop it first"), "{e:#}");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        // claimed: refused
+        f.d.claim("cli", None, &f.k, "alice", None).unwrap();
+        let e = f.d.worktree_forget("cli", None, &f.k).await.unwrap_err();
+        assert!(format!("{e:#}").contains("live writer claim"), "{e:#}");
+        assert!(f.d.lock().state.runs.contains_key(&f.k), "a refused forget changes nothing");
+        f.d.release("cli", None, &f.k, None).unwrap();
+        // stopped and unclaimed: forgotten, files untouched, lease released, event written
+        let host = f.d.lock().state.runs[&f.k].spec.host.clone();
+        f.d.worktree_forget("cli", None, &f.k).await.unwrap();
+        assert!(!f.d.lock().state.runs.contains_key(&f.k));
+        assert!(!f.d.lock().state.leases.contains_key(&f.k));
+        assert!(matches!(f.d.lookup(&host), Lookup::Unknown));
+        assert_eq!(std::fs::read_to_string(f.wt.join("keep.txt")).unwrap(), "mine");
+        let disk = crate::state::load(&f.d.db).unwrap();
+        assert!(!disk.runs.contains_key(&f.k) && !disk.leases.contains_key(&f.k));
+        let ev = f.d.events(Some("worktree"), Some(&f.k), None, 50).unwrap();
+        assert!(ev.to_string().contains("forget"), "{ev}");
+        assert!(f.d.worktree_forget("cli", None, &f.k).await.is_err(), "unknown after forgetting");
+    }
+
+    // ---- auto-install of missing dependencies ----
+
+    /// Puts a fake `bun` first on PATH for the test and restores PATH afterwards.
+    struct FakeBun {
+        old: Option<std::ffi::OsString>,
+        log: PathBuf,
+    }
+    impl Drop for FakeBun {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(o) => std::env::set_var("PATH", o),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+    /// `body` is the shell body of the shim; `$LOG` is its argv log. Every call appends its argv to the log.
+    fn fake_bun(dir: &Path, body: &str) -> FakeBun {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("shim-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("bun-argv.log");
+        let script = format!("#!/bin/sh\nLOG='{}'\necho \"$@\" >> \"$LOG\"\n{body}\n", log.display());
+        std::fs::write(bin.join("bun"), script).unwrap();
+        std::fs::set_permissions(bin.join("bun"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH");
+        let mut p = std::ffi::OsString::from(bin.as_os_str());
+        p.push(":");
+        p.push(old.clone().unwrap_or_default());
+        std::env::set_var("PATH", p);
+        FakeBun { old, log }
+    }
+
+    /// The daemon behind the real proxy, with on-demand start wired like `request_start` (which needs the global daemon).
+    struct Demand(Arc<Daemon>);
+    impl Routes for Demand {
+        fn lookup(&self, host: &str) -> Lookup {
+            Routes::lookup(&*self.0, host)
+        }
+        fn request_start(&self, run: &RunId) -> std::result::Result<(), String> {
+            let (d, k) = (self.0.clone(), key(run));
+            tokio::spawn(async move {
+                let _ = d.start(&k).await;
+            });
+            Ok(())
+        }
+    }
+
+    async fn demand_proxy(d: &Arc<Daemon>) -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(crate::proxy::serve(l, Arc::new(Demand(d.clone())), d.activity.clone()));
+        port
+    }
+
+    async fn html_get(port: u16, host: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nAccept: text/html\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn bun_worktree(wt: &Path, lock: bool) {
+        std::fs::create_dir_all(wt).unwrap();
+        std::fs::write(wt.join("package.json"), "{}").unwrap();
+        if lock {
+            std::fs::write(wt.join("bun.lock"), "").unwrap();
+        }
+    }
+
+    const BUN_EXTRA: &str = "preset = \"node-bun\"\nmax_running = 10\n";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_with_missing_node_modules_installs_once_serves_the_preparing_page_then_runs() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300801".to_string())], BUN_EXTRA);
+        bun_worktree(&f.wt, true);
+        let bun = fake_bun(&f._sb.dir, "sleep 1\nmkdir -p node_modules/dep");
+        let host = f.d.lock().state.runs[&f.k].spec.host.clone();
+        let port = demand_proxy(&f.d).await;
+        // the first hit starts the run on demand; keep hitting while it installs
+        let mut pages = Vec::new();
+        for _ in 0..400 {
+            pages.push(html_get(port, &host).await);
+            if status(&f) == RunStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status(&f), RunStatus::Running, "note: {:?}", f.d.lock().state.runs[&f.k].note);
+        assert!(pages.iter().any(|p| p.starts_with("HTTP/1.1 503") && p.contains("Installing dependencies for tp/r")), "the installing page was served in between");
+        assert!(f.wt.join("node_modules/dep").is_dir());
+        assert_eq!(std::fs::read_to_string(&bun.log).unwrap().trim(), "install --frozen-lockfile", "one install, frozen");
+        // deps are there now: a restart does not install again
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        f.d.start(&f.k).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&bun.log).unwrap().lines().count(), 1);
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn six_concurrent_on_demand_hits_run_at_most_two_installs_at_once() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300802".to_string())], BUN_EXTRA);
+        let cfg = config::load_all().unwrap().remove(0);
+        let mut keys = vec![f.k.clone()];
+        bun_worktree(&f.wt, true);
+        for i in 1..6 {
+            let wt = f._sb.dir.join(format!("wt/r{i}"));
+            bun_worktree(&wt, true);
+            keys.push(f.d.register(&cfg, &wt, &format!("r{i}")).unwrap().0);
+        }
+        let active = f._sb.dir.join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        let seen = f._sb.dir.join("seen");
+        let body = format!("A='{}'\ntouch \"$A/$$\"\nls \"$A\" | wc -l >> '{}'\nsleep 0.5\nmkdir -p node_modules/dep\nrm -f \"$A/$$\"", active.display(), seen.display());
+        let bun = fake_bun(&f._sb.dir, &body);
+        let port = demand_proxy(&f.d).await;
+        let hosts: Vec<String> = keys.iter().map(|k| f.d.lock().state.runs[k].spec.host.clone()).collect();
+        let hits: Vec<_> = hosts.iter().cloned().map(|h| tokio::spawn(async move { html_get(port, &h).await })).collect();
+        for h in hits {
+            h.await.unwrap();
+        }
+        for _ in 0..600 {
+            if keys.iter().all(|k| f.d.lock().state.runs[k].status == RunStatus::Running) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let statuses: Vec<_> = keys.iter().map(|k| f.d.lock().state.runs[k].status).collect();
+        assert!(statuses.iter().all(|s| *s == RunStatus::Running), "{statuses:?}");
+        assert_eq!(std::fs::read_to_string(&bun.log).unwrap().lines().count(), 6, "each worktree installed once");
+        let max = std::fs::read_to_string(&seen).unwrap().lines().filter_map(|l| l.trim().parse::<usize>().ok()).max().unwrap();
+        assert_eq!(max, 2, "never more than 2 at once, and the cap was actually used");
+        for k in &keys {
+            f.d.stop(k, RunStatus::Stopped).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_install_is_setup_failed_with_the_log_tail_and_retry_setup_finishes_it() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300803".to_string())], BUN_EXTRA);
+        bun_worktree(&f.wt, true);
+        let flag = f._sb.dir.join("fail-flag");
+        std::fs::write(&flag, "x").unwrap();
+        let bun = fake_bun(&f._sb.dir, &format!("if [ -f '{}' ]; then echo 'error: registry unreachable (boom)'; exit 1; fi\nmkdir -p node_modules/dep", flag.display()));
+        let e = f.d.start(&f.k).await.unwrap_err();
+        assert!(format!("{e:#}").contains("retry-setup"), "{e:#}");
+        let rec = f.d.lock().state.runs[&f.k].clone();
+        assert_eq!(rec.status, RunStatus::SetupFailed);
+        assert!(rec.note.as_deref().is_some_and(|n| n.contains("registry unreachable (boom)")), "log tail in the note: {:?}", rec.note);
+        assert!(rec.procs.is_empty(), "nothing started");
+        let host = rec.spec.host.clone();
+        assert!(matches!(f.d.lookup(&host), Lookup::SetupFailed { .. }));
+        assert!(f.d.worktree_retry_setup("cli", None, &f.k).await.is_err(), "still failing");
+        std::fs::remove_file(&flag).unwrap();
+        f.d.worktree_retry_setup("cli", None, &f.k).await.unwrap();
+        assert_eq!(status(&f), RunStatus::Stopped);
+        assert!(f.wt.join("node_modules/dep").is_dir());
+        f.d.start(&f.k).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&bun.log).unwrap().lines().count(), 3, "fail, fail, then one good install; the start after retry installs nothing");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_deps_without_a_lockfile_fail_clearly_and_never_install_unfrozen() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300804".to_string())], BUN_EXTRA);
+        bun_worktree(&f.wt, false);
+        let bun = fake_bun(&f._sb.dir, "mkdir -p node_modules/dep");
+        assert!(f.d.start(&f.k).await.is_err());
+        let rec = f.d.lock().state.runs[&f.k].clone();
+        assert_eq!(rec.status, RunStatus::SetupFailed);
+        assert!(rec.note.as_deref().is_some_and(|n| n.contains("no lockfile") && n.contains("bun.lock")), "{:?}", rec.note);
+        assert!(!bun.log.exists(), "no unfrozen install was attempted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_install_false_opts_out_and_starts_without_installing() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300805".to_string())], &format!("{BUN_EXTRA}auto_install = false\n"));
+        bun_worktree(&f.wt, true);
+        let bun = fake_bun(&f._sb.dir, "mkdir -p node_modules/dep");
+        f.d.start(&f.k).await.unwrap();
+        assert!(!bun.log.exists() && !f.wt.join("node_modules").exists());
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b10_a_new_run_cannot_start_until_setup_succeeds_and_setup_can_be_retried() {
+        let sb = sandbox();
+        let wf = crate::worktree::tests::fx("b10");
+        let (go, fail) = (sb.dir.join("go"), sb.dir.join("fail"));
+        let toml = format!(
+            "project = \"app\"\nrepo = '{}'\ndomain = \"app.local\"\n[worktree]\nmin_free = \"0\"\n[[setup.step]]\nname = \"slow\"\nrun = 'i=0; while [ ! -f {} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; [ ! -f {} ]'\n",
+            wf.repo.display(),
+            go.display(),
+            fail.display()
+        );
+        std::fs::create_dir_all(paths::projects_dir()).unwrap();
+        std::fs::write(paths::projects_dir().join("app.toml"), toml).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::new(tx).unwrap();
+        let creator = {
+            let d = d.clone();
+            tokio::spawn(async move { d.worktree_new("cli", None, "app", "feat/b10", None, false).await })
+        };
+        let k = "app/feat-b10".to_string();
+        for _ in 0..400 {
+            if d.lock().state.runs.contains_key(&k) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Preparing, "registered as preparing, not stopped");
+        // manual start, on-demand start and the proxy lookup all see the preparing state
+        let e = d.start(&k).await.unwrap_err();
+        assert!(e.to_string().contains("being prepared"), "{e:#}");
+        let host = d.lock().state.runs[&k].spec.host.clone();
+        assert!(matches!(d.lookup(&host), Lookup::Preparing { .. }));
+        assert!(d.request_start(&RunId { project: "app".into(), run: "feat-b10".into() }).is_err());
+        // down must not unlock it either
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Preparing);
+        // setup fails: the run stays registered, setup-failed, and cannot start
+        std::fs::write(&fail, "x").unwrap();
+        std::fs::write(&go, "x").unwrap();
+        assert!(creator.await.unwrap().is_err());
+        let rec = d.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::SetupFailed);
+        assert!(rec.note.as_deref().is_some_and(|n| n.contains("setup")), "{:?}", rec.note);
+        assert!(matches!(d.lookup(&host), Lookup::SetupFailed { .. }));
+        let e = d.start(&k).await.unwrap_err();
+        assert!(format!("{e:#}").contains("retry-setup"), "{e:#}");
+        assert!(d.worktree_retry_setup("cli", None, &k).await.is_err(), "still failing");
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::SetupFailed);
+        // fixed: retry succeeds, the run becomes startable
+        std::fs::remove_file(&fail).unwrap();
+        d.worktree_retry_setup("cli", None, &k).await.unwrap();
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Stopped);
+        d.start(&k).await.unwrap();
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        // an interrupted setup (daemon died) is reconciled to setup-failed on adoption
+        d.set(&k, |r| r.status = RunStatus::Preparing);
+        d.adopt().await;
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::SetupFailed);
+        assert_eq!(crate::state::load(&d.db).unwrap().runs[&k].status, RunStatus::SetupFailed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aliases_route_to_the_main_run_and_are_collision_checked() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300717".to_string())], "aliases = [\"Old.Name.tp.local\"]\n");
+        // the fixture's run is `r`, not `main`: aliases belong to main only
+        assert!(f.d.lock().state.runs[&f.k].spec.aliases.is_empty());
+        assert!(matches!(f.d.lookup("old.name.tp.local"), Lookup::Unknown));
+        let cfg = config::load_all().unwrap().remove(0);
+        assert_eq!(cfg.aliases, vec!["old.name.tp.local".to_string()], "lowercased");
+        let (km, spec) = f.d.register(&cfg, &f._sb.dir.join("wt/main"), "main").unwrap();
+        assert_eq!(spec.aliases, vec!["old.name.tp.local".to_string()]);
+        assert!(matches!(f.d.lookup("old.name.tp.local"), Lookup::Down { run } if run.run == "main"));
+        assert!(matches!(f.d.lookup("tp.tp.local"), Lookup::Down { .. }), "the primary host still works");
+        // another run may not claim the same alias
+        let mut other = cfg.clone();
+        other.project = "tq".into();
+        other.aliases = vec!["old.name.tp.local".into()];
+        let e = f.d.register(&other, &f._sb.dir.join("wt/main2"), "main").unwrap_err();
+        assert!(e.to_string().contains("already belongs to run"), "{e:#}");
+        let _ = km;
+    }
+
+    /// A daemon with one run `tp/r` whose web proc is declared (not started) and a leased web port.
+    fn web_fixture() -> (Sandbox, Arc<Daemon>, String, u16, std::path::PathBuf) {
+        let sb = sandbox();
+        let toml = "project = \"tp\"\nrepo = \"/nonexistent/tp.git\"\ndomain = \"tp.local\"\n[ports.web]\n[procs.w]\nrun = 'exec sleep 300722'\nport = \"web\"\n";
+        std::fs::create_dir_all(paths::projects_dir()).unwrap();
+        std::fs::write(paths::projects_dir().join("tp.toml"), toml).unwrap();
+        let wt = std::fs::canonicalize(&sb.dir).unwrap().join("wt/r");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::new(tx).unwrap();
+        let cfg = config::load_all().unwrap().remove(0);
+        let (k, spec) = d.register(&cfg, &wt, "r").unwrap();
+        let port = spec.ports["web"];
+        (sb, d, k, port, wt)
+    }
+
+    fn serve_in(dir: &Path, port: u16) -> std::process::Child {
+        std::fs::create_dir_all(dir).unwrap();
+        let child = std::process::Command::new("python3")
+            .args(["-m", "http.server", &port.to_string(), "--bind", "127.0.0.1"])
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_a_server_from_the_runs_own_worktree_on_its_port_is_adopted_routed_and_stoppable() {
+        let (_sb, d, k, port, wt) = web_fixture();
+        let mut child = serve_in(&wt, port);
+        let pid = child.id() as i32;
+        // the sweep notices it (no request needed)
+        let me = d.clone();
+        assert_eq!(tokio::task::spawn_blocking(move || me.detect_external_all()).await.unwrap(), vec![k.clone()]);
+        let rec = d.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::Running);
+        assert!(supervisor::is_external(&rec.procs[0]) && rec.procs[0].pid == pid);
+        let host = rec.spec.host.clone();
+        assert!(matches!(d.lookup(&host), Lookup::Up { port: p, .. } if p == port), "the proxy routes to the external server");
+        assert_eq!(d.list()[0]["external"], true);
+        assert_eq!(d.list()[0]["status"], "running");
+        // a start does not launch a second server
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if child.try_wait().unwrap().is_some() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !gone {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(gone, "Down must stop the external server after re-proving it");
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_start_adopts_instead_of_starting_a_second_server_and_restart_makes_setu_the_owner() {
+        let (_sb, d, k, port, wt) = web_fixture();
+        let mut child = serve_in(&wt, port);
+        d.start(&k).await.unwrap();
+        let rec = d.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::Running);
+        assert!(rec.procs.len() == 1 && supervisor::is_external(&rec.procs[0]), "no second server was spawned");
+        // restart: the external server is stopped, then Setu starts (and owns) its own
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        for _ in 0..100 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        d.start(&k).await.unwrap();
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(rec.procs.iter().all(|p| !supervisor::is_external(p)) && !rec.procs.is_empty(), "Setu owns the new process");
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_a_listener_outside_the_worktree_is_busy_and_never_signalled() {
+        let (sb, d, k, port, _wt) = web_fixture();
+        let mut stranger = serve_in(&std::fs::canonicalize(&sb.dir).unwrap().join("elsewhere"), port);
+        let me = d.clone();
+        assert!(tokio::task::spawn_blocking(move || me.detect_external_all()).await.unwrap().is_empty());
+        let e = d.start(&k).await.unwrap_err();
+        assert!(e.to_string().contains("in use by another process"), "{e:#}");
+        assert!(d.lock().state.runs[&k].procs.is_empty());
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(stranger.try_wait().unwrap().is_none(), "an unrelated listener must never be signalled");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_down_re_proves_the_claim_and_leaves_a_process_that_no_longer_matches_alone() {
+        let (_sb, d, k, port, _wt) = web_fixture();
+        // a process that does not listen on the port (the original server is gone, the pid was reused)
+        let mut other = std::process::Command::new("sleep").arg("300723").spawn().unwrap();
+        let st = procinfo::start_time(other.id() as i32).unwrap();
+        assert!(d.mark_external(&k, other.id() as i32, st, port));
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(other.try_wait().unwrap().is_none(), "not signalled: it does not listen on the port from this worktree");
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(rec.procs.is_empty() && rec.note.as_deref().is_some_and(|n| n.contains("not signalled")), "{:?}", rec.note);
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    // ---- v1 process groups: the listener's whole group and its sidecar groups ----
+
+    const GROUP_FIXTURE: &str = r#"
+import os, sys, subprocess, time
+d, port, pf, role, other = sys.argv[1:6]
+if os.fork() != 0:
+    sys.exit(0)
+os.setsid()
+os.chdir(d)
+dn = os.open(os.devnull, os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(dn, fd)
+def publish():
+    open(pf + ".tmp", "w").write(str(os.getpid()))
+    os.rename(pf + ".tmp", pf)
+if role == "shell":
+    publish()
+    os.execvp("sh", ["sh", "-c", "sleep 300; true"])
+if port != "0":
+    subprocess.Popen(["sh", "-c", "python3 -m http.server %s --bind 127.0.0.1; true" % port])
+else:
+    subprocess.Popen(["sleep", "300"])
+publish()
+while True:
+    time.sleep(0.1)
+    if os.path.exists(pf + ".move"):
+        os.chdir(other)
+"#;
+
+    /// A recorded v1 group leader. Dropping it kills that group (the test's own process, by recorded pid).
+    struct V1Grp {
+        leader: i32,
+        start: u64,
+        flag: std::path::PathBuf,
+    }
+    impl Drop for V1Grp {
+        fn drop(&mut self) {
+            if procinfo::start_time(self.leader) == Some(self.start) {
+                // SAFETY: killpg of the group whose leader this test spawned and just re-proved.
+                unsafe { libc::killpg(self.leader, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// An orphaned (ppid 1) session leader with cwd `cwd`: the leader double-forks and its parent exits.
+    /// `port` Some: its child chain ends in an HTTP listener on that port.
+    fn v1_group(sandbox_dir: &Path, cwd: &Path, port: Option<u16>, role: &str, tag: &str, orphan: bool) -> V1Grp {
+        let pf = sandbox_dir.join(format!("{tag}.pid"));
+        let other = sandbox_dir.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let mut cmd = std::process::Command::new("python3");
+        cmd.args(["-c", GROUP_FIXTURE]).arg(cwd).arg(port.unwrap_or(0).to_string()).arg(&pf).arg(role).arg(&other);
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        if orphan {
+            assert!(cmd.status().unwrap().success());
+        } else {
+            // not orphaned: this test process stays the parent of a plain session leader
+            use std::os::unix::process::CommandExt;
+            let script = "import os,sys,time\nos.chdir(sys.argv[1])\nopen(sys.argv[2],'w').write(str(os.getpid()))\ntime.sleep(300)";
+            let mut c = std::process::Command::new("python3");
+            c.args(["-c", script]).arg(cwd).arg(&pf).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            // SAFETY: setsid in the forked child before exec.
+            unsafe { c.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+            std::mem::forget(c.spawn().unwrap());
+        }
+        let mut leader = 0;
+        for _ in 0..200 {
+            if let Ok(t) = std::fs::read_to_string(&pf) {
+                if let Ok(n) = t.trim().parse::<i32>() {
+                    leader = n;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(leader > 1, "fixture {tag} did not start");
+        if let Some(p) = port {
+            for _ in 0..200 {
+                if std::net::TcpStream::connect(("127.0.0.1", p)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let start = procinfo::start_time(leader).unwrap();
+        V1Grp { leader, start, flag: pf.with_extension("pid.move") }
+    }
+
+    async fn all_gone(g: &V1Grp, members: &[i32]) -> bool {
+        for _ in 0..150 {
+            if procinfo::group_pids(g.leader).is_empty() && members.iter().all(|p| !procinfo::alive(*p)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    async fn detect(d: &Arc<Daemon>) -> Vec<String> {
+        let me = d.clone();
+        tokio::task::spawn_blocking(move || me.detect_external_all()).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_detection_records_the_listener_group_and_the_sidecar_group_and_down_stops_every_process() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        let app_members = procinfo::group_pids(app.leader);
+        let side_members = procinfo::group_pids(side.leader);
+        assert!(app_members.len() >= 3 && side_members.len() >= 2, "fixture trees: {app_members:?} {side_members:?}");
+        assert_eq!(procinfo::ident(app.leader).unwrap().ppid, 1, "orphaned to launchd");
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        let rec = d.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::Running);
+        assert_eq!(rec.procs.len(), 2, "{:?}", rec.procs);
+        assert!(rec.procs[0].name == supervisor::EXTERNAL_PROC && rec.procs[0].pid == app.leader && rec.procs[0].start_time == app.start);
+        assert!(rec.procs[0].members.len() == 1 && procinfo::listening_ports(rec.procs[0].members[0].0).contains(&port), "listener is the evidence");
+        assert!(rec.procs[1].name == supervisor::EXTERNAL_SIDECAR && rec.procs[1].pid == side.leader);
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(all_gone(&app, &app_members).await, "listener group must be gone");
+        assert!(all_gone(&side, &side_members).await, "sidecar group must be gone");
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_runs_are_readopted_routed_and_never_signalled_after_a_daemon_restart() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        let (am, sm) = (procinfo::group_pids(app.leader), procinfo::group_pids(side.leader));
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        d.persist_durable().await.unwrap();
+        let before = d.lock().state.runs[&k].procs.clone();
+        let host = d.lock().state.runs[&k].spec.host.clone();
+        // a fresh daemon over the same state database, as after a restart
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d2 = Daemon::new(tx).unwrap();
+        d2.adopt().await;
+        let rec = d2.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::Running, "not crashed or stopped: {:?}", rec.note);
+        assert_eq!(rec.procs, before, "the external records are kept as they were");
+        assert!(rec.procs.iter().all(supervisor::is_external));
+        assert!(matches!(d2.lookup(&host), Lookup::Up { port: p, .. } if p == port), "still routed");
+        assert_eq!(d2.list()[0]["external"], true);
+        assert!(!am.iter().chain(sm.iter()).any(|p| !procinfo::alive(*p)), "nothing was signalled");
+        assert_eq!(crate::state::load(&d2.db).unwrap().runs[&k].status, RunStatus::Running);
+        // and Setu still stops it on request, after re-proving the claim
+        d2.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(all_gone(&app, &am).await && all_gone(&side, &sm).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_run_whose_group_leader_exited_is_still_readopted_after_a_daemon_restart() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let am = procinfo::group_pids(app.leader);
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        d.persist_durable().await.unwrap();
+        let listener = d.lock().state.runs[&k].procs[0].members[0].0;
+        // the leader (the v1 launcher) is gone; the listener it started lives on
+        // SAFETY: SIGKILL to the leader this test spawned and re-proved by its start time.
+        unsafe { libc::kill(app.leader, libc::SIGKILL) };
+        for _ in 0..100 {
+            if !procinfo::alive(app.leader) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d2 = Daemon::new(tx).unwrap();
+        d2.adopt().await;
+        let rec = d2.lock().state.runs[&k].clone();
+        assert_eq!(rec.status, RunStatus::Running, "{:?}", rec.note);
+        assert!(rec.procs.iter().all(supervisor::is_external));
+        assert!(procinfo::alive(listener), "the listener was not signalled");
+        // SAFETY: cleanup of the listener this test spawned.
+        unsafe { libc::killpg(app.leader, libc::SIGKILL) };
+        for p in am {
+            unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_restart_stops_both_groups_and_setu_then_owns_its_own() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        let (am, sm) = (procinfo::group_pids(app.leader), procinfo::group_pids(side.leader));
+        d.start(&k).await.unwrap();
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(rec.procs.len() == 2 && rec.procs.iter().all(supervisor::is_external), "adopted, no second server");
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(all_gone(&app, &am).await && all_gone(&side, &sm).await);
+        d.start(&k).await.unwrap();
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(!rec.procs.is_empty() && rec.procs.iter().all(|p| !supervisor::is_external(p)), "Setu owns the new process");
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_a_group_leader_whose_parent_is_not_1_is_never_recorded_or_signalled() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let mine = v1_group(&sb.dir, &wt, None, "sidecar", "mine", false);
+        assert_eq!(procinfo::ident(mine.leader).unwrap().ppid, std::process::id() as i32);
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(rec.procs.iter().all(|p| p.pid != mine.leader), "{:?}", rec.procs);
+        // the record is simply absent, so Down leaves that group alone
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(procinfo::alive(mine.leader) && procinfo::start_time(mine.leader) == Some(mine.start));
+        drop(app);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_a_shell_is_never_signalled() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let _app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let sh = v1_group(&sb.dir, &wt, None, "shell", "sh", true);
+        assert!(procinfo::exe_name(sh.leader).is_some_and(|n| procinfo::is_shell_name(&n)), "{:?}", procinfo::exe_name(sh.leader));
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        assert!(d.lock().state.runs[&k].procs.iter().all(|p| p.pid != sh.leader), "a shell is not a sidecar");
+        // a forged record for the shell is refused at stop time too
+        let forged = crate::model::ProcRecord { name: supervisor::EXTERNAL_SIDECAR.into(), pid: sh.leader, start_time: sh.start, escaped: vec![], members: vec![] };
+        assert!(!supervisor::stop_external(&forged, &wt, port, Duration::from_millis(200)).await.unwrap());
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(procinfo::alive(sh.leader));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_a_leader_whose_cwd_moved_out_of_the_worktree_is_never_signalled() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let _app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        assert!(d.lock().state.runs[&k].procs.iter().any(|p| p.pid == side.leader));
+        std::fs::write(&side.flag, "").unwrap();
+        let mut moved = false;
+        for _ in 0..100 {
+            if procinfo::cwd(side.leader).is_some_and(|c| !c.starts_with(&wt)) {
+                moved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(moved, "fixture leader changed directory");
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(procinfo::alive(side.leader) && !procinfo::group_pids(side.leader).is_empty(), "moved leader's group untouched");
+        let note = d.lock().state.runs[&k].note.clone().unwrap_or_default();
+        assert!(note.contains("not signalled"), "{note}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_a_recycled_leader_with_a_different_start_time_is_never_signalled() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let _app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        d.set(&k, |r| {
+            for p in r.procs.iter_mut().filter(|p| p.pid == side.leader) {
+                p.start_time += 1;
+            }
+        });
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        assert!(procinfo::alive(side.leader) && procinfo::start_time(side.leader) == Some(side.start));
+        assert!(!procinfo::group_pids(side.leader).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_v1_sweep_stops_leftover_sidecars_once_the_listener_group_is_gone() {
+        let (sb, d, k, port, wt) = web_fixture();
+        let app = v1_group(&sb.dir, &wt, Some(port), "listener", "app", true);
+        let side = v1_group(&sb.dir, &wt, None, "sidecar", "side", true);
+        let (am, sm) = (procinfo::group_pids(app.leader), procinfo::group_pids(side.leader));
+        assert_eq!(detect(&d).await, vec![k.clone()]);
+        d.sweep().await;
+        assert_eq!(d.lock().state.runs[&k].status, RunStatus::Running, "the listener group lives, so the run stays running");
+        // SAFETY: the test's own fixture group, leader proved by start time.
+        unsafe { libc::killpg(app.leader, libc::SIGKILL) };
+        assert!(all_gone(&app, &am).await);
+        d.sweep().await;
+        assert!(all_gone(&side, &sm).await, "leftover sidecar group stopped");
+        let rec = d.lock().state.runs[&k].clone();
+        assert!(rec.status == RunStatus::Stopped && rec.procs.is_empty(), "{:?} {:?}", rec.status, rec.procs);
     }
 }

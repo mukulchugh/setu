@@ -1,4 +1,4 @@
-//! `setu-rs <command>`. Everything except `daemon` and `logs` talks to the daemon socket.
+//! `setu <command>`. Everything except `daemon` and `logs` talks to the daemon socket.
 
 use crate::api;
 use crate::paths;
@@ -6,40 +6,49 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
-setu-rs: run every worktree's app and workers at its own local URL
+setu: run every worktree's app and workers at its own local URL
 
-  setu-rs setup [--dry-run] [--yes] [--undo]
+  setu setup [--dry-run] [--yes] [--undo]
                                      one-time setup: login PATH, start at login, custom domains
-  setu-rs doctor [--json]            check every layer and print the exact fix
-  setu-rs daemon                     run the daemon in the foreground
-  setu-rs up [path]                  start the run for a worktree (default: current dir)
-  setu-rs down [run]                 stop a run (default: the current worktree's)
-  setu-rs ls [--json]                list runs with URL, status and RAM
-  setu-rs logs [run] [proc] [-f]     show or follow logs
-  setu-rs pin|unpin [run]            keep a run up, or let idle stop it again
-  setu-rs disk [--deps] [--json]     what each worktree's declared items really cost
-  setu-rs disk clean [--apply] [--include-unmanaged]
+  setu doctor [--json]            check every layer and print the exact fix
+  setu daemon                     run the daemon in the foreground
+  setu up [path]                  start the run for a worktree (default: current dir)
+  setu down [run]                 stop a run (default: the current worktree's)
+  setu ls [--json]                list runs with URL, status and RAM
+  setu logs [run] [proc] [-f]     show or follow logs
+  setu pin|unpin [run]            keep a run up, or let idle stop it again
+  setu disk [--deps] [--json]     what each worktree's declared items really cost
+  setu disk clean [--apply] [--include-unmanaged]
                                      delete regenerable items of stopped runs past policy
-  setu-rs env ls <scope> [target]    scope: global | project <name> | worktree <run>
-  setu-rs env effective [run]        every var a run gets, and which layer it comes from
-  setu-rs env set <scope> [target] NAME=value [--secret|--plain]
-  setu-rs env set <scope> [target] NAME --secret      type the value hidden
-  setu-rs env unset <scope> [target] NAME
-  setu-rs env import <scope> [target] <file> [--preview] [--overwrite]
-  setu-rs env reveal <scope> [target] NAME          prints one value (audited)
-  setu-rs new <project> <branch> [--from <base>] [--start]
+  setu env ls <scope> [target]    scope: global | project <name> | worktree <run>
+  setu env effective [run]        every var a run gets, and which layer it comes from
+  setu env set <scope> [target] NAME=value [--secret|--plain]
+  setu env set <scope> [target] NAME --secret      type the value hidden
+  setu env unset <scope> [target] NAME
+  setu env import <scope> [target] <file> [--preview] [--overwrite]
+  setu env reveal <scope> [target] NAME          prints one value (audited)
+  setu new <project> <branch> [--from <base>] [--start]
                                      create a worktree (fetch, link/copy files, setup steps)
-  setu-rs adopt <path>               register an existing worktree (changes nothing in it)
-  setu-rs rm <run> [--force]         stop, check guards, archive ignored data, remove (branch kept)
-  setu-rs restore <run>              bring a removed worktree back, with its archived files
-  setu-rs claim <run> [--as name] [--pid N]
+  setu adopt <path>               register an existing worktree (changes nothing in it)
+  setu path <project> [run|branch]   print a worktree's path (for the shell's `setu cd`)
+  setu import-v1 [--apply]           adopt the old Setu's projects, worktrees and ports (dry run by default)
+  setu rm <run> [--force]         stop, check guards, archive ignored data, remove (branch kept)
+  setu retry-setup <run>          re-run the setup steps of a new worktree whose setup failed
+  setu forget <run>               unregister a stopped run and release its lease; its files are not touched
+  setu restore <run>              bring a removed worktree back, with its archived files
+  setu claim <run> [--as name] [--pid N]
                                      mark a worktree as being edited by you (default pid: the parent shell)
-  setu-rs release <run> [--as name]  drop a claim (without --as: whatever claim is there)
-  setu-rs claims                     who holds which worktree
-  setu-rs autoremove [--dry-run]     evaluate auto-removal now (needs [auto_remove] enabled) and print every decision
-  setu-rs history [run] [--kind env|worktree|disk|autoremove] [--limit N] [--json]
+  setu release <run> [--as name]  drop a claim (without --as: whatever claim is there)
+  setu claims                     who holds which worktree
+  setu autoremove [--dry-run]     evaluate auto-removal now (needs [auto_remove] enabled) and print every decision
+  setu history [run] [--kind env|worktree|disk|autoremove] [--limit N] [--json]
                                      recent audit events, newest first (names only, never values)
-  setu-rs mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
+  setu restart [run]              stop a run and start it again (also takes over a running external one)
+  setu migrate [plan|run --yes|rollback]
+                                     move from the old JS Setu (v1): plan is read-only, run needs --yes
+  setu x trigger-dev [--max-concurrent-runs N] [--env-file PATH]
+                                     Trigger.dev dev worker with the CLI version this worktree pins
+  setu mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
 pub fn main() -> i32 {
@@ -47,14 +56,14 @@ pub fn main() -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("setu-rs: {e}");
+            eprintln!("setu: {e}");
             return 1;
         }
     };
     match rt.block_on(dispatch(args)) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("setu-rs: {e:#}");
+            eprintln!("setu: {e:#}");
             1
         }
     }
@@ -122,6 +131,8 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         }
         Some("daemon") => crate::daemon::run().await,
         Some("mcp") => crate::mcp::run().await,
+        Some("x") => crate::trigger::x_main(&args[1..]),
+        Some("migrate") => crate::migrate::main(&args[1..]),
         Some("up") => {
             let path = match args.get(1) {
                 Some(p) => std::path::Path::new(p).canonicalize()?.display().to_string(),
@@ -129,7 +140,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             };
             let run = api::call(json!({ "cmd": "up", "path": path })).await?;
             println!("{} starting at {}", run["run"].as_str().unwrap_or("?"), run["url"].as_str().unwrap_or("?"));
-            println!("  `setu-rs ls` shows when it is up; `setu-rs logs -f` follows its output");
+            println!("  `setu ls` shows when it is up; `setu logs -f` follows its output");
             Ok(())
         }
         Some("down") => {
@@ -140,6 +151,16 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             }
             let run = api::call(with_cmd("down", req)).await?;
             println!("{} stopped", run["run"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Some("restart") => {
+            let (rest, holder) = extract_as(&args[1..])?;
+            let mut req = target(rest.first())?;
+            if let Some(h) = holder {
+                req["holder"] = json!(h);
+            }
+            let run = api::call(with_cmd("restart", req)).await?;
+            println!("{} restarted ({}) at {}", run["run"].as_str().unwrap_or("?"), run["status"].as_str().unwrap_or("?"), run["url"].as_str().unwrap_or("?"));
             Ok(())
         }
         Some(c @ ("pin" | "unpin")) => {
@@ -155,7 +176,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             }
             let list = runs.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
-                println!("no runs yet. In a worktree, run `setu-rs up`.");
+                println!("no runs yet. In a worktree, run `setu up`.");
             }
             for r in list {
                 let mb = r["ram_bytes"].as_u64().unwrap_or(0) / (1024 * 1024);
@@ -172,10 +193,10 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                     println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
                 }
                 if let (Some(after), Some(why)) = (r["removal"]["removes_after"].as_u64(), r["removal"]["reason"].as_str()) {
-                    println!("    {}; `setu-rs pin {}` to keep", removal_note(after, crate::disk::now_secs(), why), r["run"].as_str().unwrap_or("<run>"));
+                    println!("    {}; `setu pin {}` to keep", removal_note(after, crate::disk::now_secs(), why), r["run"].as_str().unwrap_or("<run>"));
                 }
                 if r["stale_env"].as_bool() == Some(true) {
-                    println!("    env changed since this run started; `setu-rs down` then `setu-rs up` to apply");
+                    println!("    env changed since this run started; `setu down` then `setu up` to apply");
                 }
             }
             Ok(())
@@ -186,7 +207,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             let pos: Vec<&String> = rest.iter().filter(|a| *a != "--start").collect();
             let (project, branch) = match pos.as_slice() {
                 [p, b] => (p.to_string(), b.to_string()),
-                _ => bail!("usage: setu-rs new <project> <branch> [--from <base>] [--start]"),
+                _ => bail!("usage: setu new <project> <branch> [--from <base>] [--start]"),
             };
             let mut req = json!({ "project": project, "branch": branch, "start": start });
             if let Some(f) = from {
@@ -201,7 +222,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             for st in n["setup"].as_array().cloned().unwrap_or_default() {
                 println!("  setup {}: {}", st["name"].as_str().unwrap_or("?"), if st["ok"].as_bool() == Some(true) { "ok" } else { "failed" });
             }
-            println!("  {}", if start { "starting; `setu-rs ls` shows when it is up" } else { "start it with `setu-rs up` in that directory" });
+            println!("  {}", if start { "starting; `setu ls` shows when it is up" } else { "start it with `setu up` in that directory" });
             Ok(())
         }
         Some("history") => {
@@ -212,7 +233,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                     "--kind" => kind = Some(it.next().ok_or_else(|| anyhow!("--kind needs a value"))?.clone()),
                     "--limit" => limit = Some(it.next().and_then(|n| n.parse::<u64>().ok()).ok_or_else(|| anyhow!("--limit needs a number"))?),
                     "--json" => json_out = true,
-                    f if f.starts_with("--") => bail!("unknown flag {f}; usage: setu-rs history [run] [--kind K] [--limit N] [--json]"),
+                    f if f.starts_with("--") => bail!("unknown flag {f}; usage: setu history [run] [--kind K] [--limit N] [--json]"),
                     r => run = Some(r.to_string()),
                 }
             }
@@ -257,15 +278,21 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("adopt") => {
-            let p = args.get(1).ok_or_else(|| anyhow!("usage: setu-rs adopt <path>"))?;
+            let p = args.get(1).ok_or_else(|| anyhow!("usage: setu adopt <path>"))?;
             let path = std::path::Path::new(p).canonicalize()?.display().to_string();
             let out = api::call(json!({ "cmd": "worktree.adopt", "path": path })).await?;
             println!("{} registered ({}); nothing in the worktree was changed", out["run"].as_str().unwrap_or("?"), out["worktree"].as_str().unwrap_or("?"));
             Ok(())
         }
+        Some("path") => {
+            let project = args.get(1).ok_or_else(|| anyhow!("usage: setu path <project> [run|branch]"))?;
+            println!("{}", crate::cutover::path_for(project, args.get(2).map(String::as_str))?.display());
+            Ok(())
+        }
+        Some("import-v1") => import_v1(&args[1..]).await,
         Some("rm") => {
             let force = args.iter().any(|a| a == "--force");
-            let run = args.iter().skip(1).find(|a| !a.starts_with("--")).ok_or_else(|| anyhow!("usage: setu-rs rm <run> [--force]"))?;
+            let run = args.iter().skip(1).find(|a| !a.starts_with("--")).ok_or_else(|| anyhow!("usage: setu rm <run> [--force]"))?;
             let out = api::call(json!({ "cmd": "worktree.rm", "run": run, "force": force })).await?;
             if out["already"].as_bool() == Some(true) {
                 println!("{} was already removed", out["run"].as_str().unwrap_or("?"));
@@ -273,12 +300,24 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                 println!("{} removed; branch {} kept", out["run"].as_str().unwrap_or("?"), out["branch"].as_str().unwrap_or("(detached)"));
             }
             if let Some(a) = out["archive"].as_str() {
-                println!("  {} ignored file(s) archived to {a}; `setu-rs restore {}` brings them back", out["archived_files"].as_u64().unwrap_or(0), out["run"].as_str().unwrap_or(""));
+                println!("  {} ignored file(s) archived to {a}; `setu restore {}` brings them back", out["archived_files"].as_u64().unwrap_or(0), out["run"].as_str().unwrap_or(""));
             }
             Ok(())
         }
+        Some("retry-setup") => {
+            let run = args.get(1).ok_or_else(|| anyhow!("usage: setu retry-setup <run>"))?;
+            let out = api::call(json!({ "cmd": "worktree.retry-setup", "run": run })).await?;
+            println!("setup finished for {}; it can start now (`setu start {}`)", out["run"].as_str().unwrap_or("?"), out["run"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Some("forget") => {
+            let run = args.get(1).ok_or_else(|| anyhow!("usage: setu forget <run>"))?;
+            let out = api::call(json!({ "cmd": "worktree.forget", "run": run })).await?;
+            println!("{} forgotten; its files at {} were not touched", out["run"].as_str().unwrap_or("?"), out["worktree"].as_str().unwrap_or("?"));
+            Ok(())
+        }
         Some("restore") => {
-            let run = args.get(1).ok_or_else(|| anyhow!("usage: setu-rs restore <run>"))?;
+            let run = args.get(1).ok_or_else(|| anyhow!("usage: setu restore <run>"))?;
             let out = api::call(json!({ "cmd": "worktree.restore", "run": run })).await?;
             let r = &out["restore"];
             println!("{} restored at {}", out["run"].as_str().unwrap_or("?"), r["path"].as_str().unwrap_or("?"));
@@ -288,13 +327,13 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             for w in r["warnings"].as_array().cloned().unwrap_or_default() {
                 println!("  note: {}", w.as_str().unwrap_or(""));
             }
-            println!("  dependencies are not reinstalled; run the project's install, then `setu-rs up`");
+            println!("  dependencies are not reinstalled; run the project's install, then `setu up`");
             Ok(())
         }
         Some("claim") => {
             let (rest, holder) = extract_as(&args[1..])?;
             let (rest, pid) = extract_opt(&rest, "--pid")?;
-            let run = rest.first().ok_or_else(|| anyhow!("usage: setu-rs claim <run> [--as name] [--pid N]"))?;
+            let run = rest.first().ok_or_else(|| anyhow!("usage: setu claim <run> [--as name] [--pid N]"))?;
             let holder = holder.unwrap_or_else(default_holder);
             // The CLI exits at once, so default to the shell that ran it.
             let pid: i64 = match pid {
@@ -308,7 +347,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         }
         Some("release") => {
             let (rest, holder) = extract_as(&args[1..])?;
-            let run = rest.first().ok_or_else(|| anyhow!("usage: setu-rs release <run> [--as name]"))?;
+            let run = rest.first().ok_or_else(|| anyhow!("usage: setu release <run> [--as name]"))?;
             let mut req = json!({ "run": run });
             if let Some(h) = holder {
                 req["holder"] = json!(h);
@@ -344,7 +383,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         Some("setup") => setup_cmd(&args[1..]).await,
         Some("doctor") => doctor_cmd(&args[1..]).await,
         Some("--version" | "version") => {
-            println!("setu-rs {}", env!("CARGO_PKG_VERSION"));
+            println!("setu {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("env") => env(&args[1..]).await,
@@ -534,7 +573,7 @@ async fn disk(args: &[String]) -> Result<()> {
         if apply {
             println!("volume free space changed by {}", human_bytes(out["freed_bytes"].as_i64().unwrap_or(0).max(0) as u64));
         } else {
-            println!("about {} would be freed. Run `setu-rs disk clean --apply` to do it.", human_bytes(est));
+            println!("about {} would be freed. Run `setu disk clean --apply` to do it.", human_bytes(est));
         }
         return Ok(());
     }
@@ -604,14 +643,16 @@ async fn setup_cmd(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut gcfg = GlobalConfig::load()?;
-    let domains: Vec<String> = crate::config::load_all()?.into_iter().map(|c| c.domain).collect();
+    let mut domains: Vec<String> = crate::config::load_all()?.into_iter().map(|c| c.domain).collect();
+    domains.sort();
+    domains.dedup();
     let binary = setup::stable_binary_path();
     let steps = setup::plan(&gcfg, &domains, &binary, &sys);
     if steps.is_empty() {
-        println!("everything is already set up. `setu-rs doctor` checks it.");
+        println!("everything is already set up. `setu doctor` checks it.");
         return Ok(());
     }
-    println!("setu-rs setup will:");
+    println!("setu setup will:");
     for s in &steps {
         println!("  {} {}", if s.sudo { "[sudo]" } else { "      " }, s.description);
     }
@@ -630,7 +671,7 @@ async fn setup_cmd(args: &[String]) -> Result<()> {
         }
     }
     let record = setup::apply(&steps, &mut gcfg, &binary, &layout, &sys)?;
-    println!("done. Recorded in {}. Undo with `setu-rs setup --undo`.", setup::record_path().display());
+    println!("done. Recorded in {}. Undo with `setu setup --undo`.", setup::record_path().display());
     if let Some(p) = record.plist {
         println!("daemon starts at login from {p}");
     }
@@ -651,8 +692,10 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
         .run("launchctl", &["print", &format!("gui/{}/{LABEL}", sys.uid())])
         .map(|(code, _)| code == 0)
         .unwrap_or(false);
+    let proxy_binding = crate::globalcfg::read_proxy_binding();
+    let proxy_port = proxy_binding.as_ref().map(|b| b.port).or(gcfg.proxy_port).unwrap_or(crate::globalcfg::DEFAULT_PROXY_PORT);
     let proxy_listening = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], gcfg.proxy_port)),
+        &std::net::SocketAddr::from(([127, 0, 0, 1], proxy_port)),
         std::time::Duration::from_millis(300),
     )
     .is_ok();
@@ -664,6 +707,8 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
             gcfg,
             projects: crate::config::load_all()?,
             proxy_listening,
+            proxy_binding,
+            proxy_port,
         },
         &sys,
     );
@@ -682,6 +727,95 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
     }
     if failed > 0 {
         bail!("doctor found {failed} problem(s)");
+    }
+    Ok(())
+}
+
+/// `import-v1`: dry run unless `--apply`. Writes only project configs (new files), the ledger,
+/// and, through the daemon, the run registrations and port leases.
+async fn import_v1(args: &[String]) -> Result<()> {
+    use crate::cutover::{self, Registered};
+    let mut apply = false;
+    for a in args {
+        match a.as_str() {
+            "--apply" => apply = true,
+            other => bail!("unknown flag {other}; usage: setu import-v1 [--apply]"),
+        }
+    }
+    let v1 = cutover::read_v1()?;
+    // Ask the daemon what is already registered, if one is running (no waiting for one to start).
+    let daemon_up = tokio::net::UnixStream::connect(paths::socket_path()).await.is_ok();
+    let mut registered: Registered = Registered::new();
+    if daemon_up {
+        for r in api::call(json!({ "cmd": "ls" })).await?.as_array().cloned().unwrap_or_default() {
+            if let Some(k) = r["run"].as_str() {
+                registered.insert(k.to_string(), r["ports"]["web"].as_u64().map(|p| p as u16));
+            }
+        }
+    }
+    let plan = cutover::plan(&v1, &registered, &crate::ports::port_free)?;
+    for n in &plan.notes {
+        println!("note: {n}");
+    }
+    if !apply {
+        println!("{}", cutover::table(&plan.rows));
+        for c in &plan.configs {
+            println!("would write {} ({})", c.path.display(), c.state.label());
+        }
+        println!("{}", cutover::summarize(&plan.rows));
+        println!("dry run: nothing was changed. Re-run with --apply to do it.");
+        return Ok(());
+    }
+    if !daemon_up {
+        bail!("the daemon is not running; start it (`setu setup` or `setu daemon`) before `setu import-v1 --apply`");
+    }
+    cutover::ledger_append(json!({ "action": "import-v1-start", "rows": plan.rows.len() }))?;
+    for c in &plan.configs {
+        std::fs::create_dir_all(&paths::projects_dir())?;
+        // create_new: never overwrite a config that appeared since the plan.
+        use std::io::Write;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&c.path) {
+            Ok(mut f) => {
+                f.write_all(c.text.as_bytes())?;
+                cutover::ledger_append(json!({ "action": "config-generated", "project": c.project, "path": c.path, "state": c.state.label() }))?;
+                println!("wrote {} ({})", c.path.display(), c.state.label());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut rows = plan.rows;
+    let (mut failed, mut adopted) = (0, 0);
+    for r in rows.iter_mut() {
+        if r.skipped() || r.registered {
+            continue;
+        }
+        match api::call(json!({ "cmd": "import.adopt", "project": r.project, "path": r.worktree, "port": r.seed() })).await {
+            Ok(out) => {
+                let port = out["port"].as_u64().map(|p| p as u16);
+                r.port = match (out["port_kept"].as_bool(), port) {
+                    (Some(true), Some(p)) => cutover::PortPlan::Kept(p),
+                    (_, Some(p)) => cutover::PortPlan::Leased(p),
+                    _ => cutover::PortPlan::None,
+                };
+                r.registered = true;
+                adopted += 1;
+                cutover::ledger_append(json!({ "action": "adopted", "project": r.project, "run": r.run, "path": r.worktree, "port": port, "port_kept": out["port_kept"], "url": out["url"] }))?;
+            }
+            Err(e) => {
+                failed += 1;
+                cutover::ledger_append(json!({ "action": "adopt-failed", "project": r.project, "run": r.run, "path": r.worktree, "error": format!("{e:#}") }))?;
+                eprintln!("failed: {}/{}: {e:#}", r.project, r.run);
+            }
+        }
+    }
+    println!("{}", cutover::table(&rows));
+    println!("{}", cutover::summarize(&rows));
+    println!("adopted {adopted} worktree(s) in this run");
+    cutover::ledger_append(json!({ "action": "import-v1-done", "failed": failed }))?;
+    println!("ledger: {}", cutover::ledger_path().display());
+    if failed > 0 {
+        bail!("{failed} worktree(s) failed; fix them and re-run (done items are skipped)");
     }
     Ok(())
 }

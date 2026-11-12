@@ -365,7 +365,7 @@ struct CleanedItem: Decodable, Sendable {
     var error: String?
 }
 
-/// One `setu-rs doctor --json` row.
+/// One `setu doctor --json` row.
 struct Check: Sendable, Identifiable, Hashable {
     var name: String
     var ok: Bool

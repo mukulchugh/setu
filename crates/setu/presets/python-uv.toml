@@ -8,6 +8,8 @@ any_of = ["uv.lock"]
 name = "venv"
 kind = "deps"
 paths = [".venv", "*/.venv"]
+install = "uv sync --frozen"
+lockfiles = ["uv.lock"]
 
 [[disk.item]]
 name = "python-tool-caches"

@@ -17,11 +17,11 @@ Research: `02-env-research.md`.
   - previews show at most the first 3 and last 4 characters, and nothing for values under 12 characters;
   - `reveal` exists on the CLI (and later the app), is never offered to MCP, and writes an audit line.
 - **Import from an existing `.env` file**, parsed inside the daemon so values never pass through an agent:
-  - `setu-rs env import <file> <scope> [target]`
+  - `setu env import <file> <scope> [target]`
   - `--preview` first shows names and collisions only;
   - the source file and the `.env.local` symlink are untouched, because Next reads its own file and Setu's injected env already wins.
 - **Effective view per run:** every name with its source (global, project, worktree or computed) and a masked preview. It shows which layer overrides which.
-- **`stale_env` on each run:** the env is hashed at start, so `setu-rs ls` can say "restart to apply env changes".
+- **`stale_env` on each run:** the env is hashed at start, so `setu ls` can say "restart to apply env changes".
 - **Audit log:** every set, unset, import and reveal goes to `~/Library/Logs/Setu/env-audit.jsonl` (0600), recording time, actor, operation, scope, target and name. Never a value.
 
 ## Not in this slice

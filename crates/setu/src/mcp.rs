@@ -1,4 +1,4 @@
-//! `setu-rs mcp`: a stdio MCP server (JSON-RPC 2.0, one message per line) that forwards to the
+//! `setu mcp`: a stdio MCP server (JSON-RPC 2.0, one message per line) that forwards to the
 //! daemon socket. No port, no token: the 0600 socket is the access control. stdout carries the
 //! protocol only; diagnostics go to stderr. Every socket request is tagged `"actor":"mcp"`, which
 //! the daemon uses to refuse `env.reveal`, and there is deliberately no reveal tool here.
@@ -282,7 +282,7 @@ async fn call_tool(name: &str, args: &Value, client: Option<&str>) -> Result<Val
                 let target = str_arg(args, "target").map(|t| format!(" {t}")).unwrap_or_default();
                 return Ok(json!({
                     "status": "pending_user_input",
-                    "next": format!("Ask the user to run: setu-rs env set {}{} {} --secret", need(args, "scope")?, target, need(args, "name")?)
+                    "next": format!("Ask the user to run: setu env set {}{} {} --secret", need(args, "scope")?, target, need(args, "name")?)
                 }));
             };
             req["value"] = json!(value);
@@ -358,6 +358,6 @@ mod tests {
     async fn secret_env_set_without_value_never_reaches_the_daemon() {
         let r = call_tool("env_set", &json!({ "scope": "project", "target": "app", "name": "API_TOKEN" }), None).await.unwrap();
         assert_eq!(r["status"], "pending_user_input");
-        assert_eq!(r["next"], "Ask the user to run: setu-rs env set project app API_TOKEN --secret");
+        assert_eq!(r["next"], "Ask the user to run: setu env set project app API_TOKEN --secret");
     }
 }

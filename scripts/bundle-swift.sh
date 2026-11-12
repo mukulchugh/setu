@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the SwiftUI Setu.app: release Swift package + release `setu-rs`, assemble the bundle,
+# Build the SwiftUI Setu.app: release Swift package + release `setu`, assemble the bundle,
 # ad-hoc sign inside-out and verify. Output: <repo>/target-swift/Setu.app
 set -euo pipefail
 
@@ -14,12 +14,12 @@ SWIFT_BIN="$(swift build -c release --show-bin-path)/SetuApp"
 
 cd "$ROOT"
 cargo build --release -p setu
-RS_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/setu-rs"
+RS_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/setu"
 
 rm -rf "${APP:?}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/SetuApp"
-cp "$RS_BIN" "$APP/Contents/Resources/bin/setu-rs"
+cp "$RS_BIN" "$APP/Contents/Resources/bin/setu"
 # App icon from the brand kit (brand/icon/Setu.iconset, made from brand/icon/setu-icon-1024.png).
 ICONSET="$ROOT/brand/icon/Setu.iconset"
 if [ -d "$ICONSET" ]; then
@@ -47,7 +47,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # Inside-out: inner binaries first, then the bundle.
-codesign --force --sign - "$APP/Contents/Resources/bin/setu-rs"
+codesign --force --sign - "$APP/Contents/Resources/bin/setu"
 codesign --force --sign - "$APP/Contents/MacOS/SetuApp"
 codesign --force --sign - "$APP"
 codesign -v --strict "$APP"

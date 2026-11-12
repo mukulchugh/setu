@@ -60,7 +60,7 @@ Mode: **Operate**. World: **native macOS 26 (Tahoe), Liquid Glass**. This is pin
 - Sheets have at most one line of helper text.
 
 ## Naming (owner, 2026-11-11)
-The UI sections are called **Runs, Environments, Disk, Config**. The CLI commands keep their names (`setu-rs setup`, `setu-rs doctor`).
+The UI sections are called **Runs, Environments, Disk, Config**. The CLI commands keep their names (`setu setup`, `setu doctor`).
 
 ## Decisions (owner, 2026-11-12)
-- Force Remove stays CLI-only (`setu-rs rm --force`, which backs up dirty work to `refs/setu-backup/<branch>`). The app never discards uncommitted work in one click.
+- Force Remove stays CLI-only (`setu rm --force`, which backs up dirty work to `refs/setu-backup/<branch>`). The app never discards uncommitted work in one click.

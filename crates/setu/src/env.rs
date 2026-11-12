@@ -6,7 +6,7 @@
 use crate::config::load_env_layer;
 use crate::model::RunId;
 use crate::paths;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -92,6 +92,28 @@ pub fn mask(value: &str) -> Option<String> {
     Some(format!("{head}…{tail}"))
 }
 
+/// Secret values shorter than this cannot be redacted from logs without mangling ordinary text
+/// ("1" would rewrite every digit), so they are refused instead of being left unredacted.
+pub const MIN_SECRET_LEN: usize = 3;
+
+/// Refuse a value that would be classified secret but is too short to redact. Empty is fine
+/// (there is nothing to leak).
+pub fn check_redactable(name: &str, value: &str) -> Result<()> {
+    let n = value.chars().count();
+    if n > 0 && n < MIN_SECRET_LEN {
+        bail!(
+            "{name} is treated as a secret but its value is only {n} character(s); values shorter than {MIN_SECRET_LEN} cannot be redacted from logs without mangling ordinary text, so Setu refuses them. Use a longer value, or a name that does not look like a secret"
+        );
+    }
+    Ok(())
+}
+
+/// Name-based guess: a secret-looking name with a value long enough to be a credential. A 1–2
+/// character value under such a name (`MAX_TOKENS=50`) is ordinary config, not a secret.
+pub fn looks_secret(name: &str, value: &str) -> bool {
+    is_secret_name(name) && value.chars().count() >= MIN_SECRET_LEN
+}
+
 pub struct Var {
     pub name: String,
     pub value: String,
@@ -104,10 +126,25 @@ fn valid_name(name: &str) -> bool {
         && c.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn load_pair(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+/// Every env mutation (set, unset, import) is a read-modify-write of one or two files, and the
+/// daemon is the only writer (CLI, app and MCP all go through its socket), so one in-process lock
+/// serializes them. It also covers the shared redaction-history file, which scope-level locks
+/// could not (review B1). Readers take it too so they see a coherent plain+secrets pair.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load_pair_unlocked(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
     scope.validate()?;
     let (p, s) = scope.paths();
     Ok((load_env_layer(&p)?, load_env_layer(&s)?))
+}
+
+fn load_pair(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    let _g = lock();
+    load_pair_unlocked(scope)
 }
 
 /// Plain file, then secrets file; secrets win on a clash and are marked secret.
@@ -201,12 +238,18 @@ fn write_map(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
 /// Apply many (name, value, explicit secret flag) updates with one read and at most two writes.
 /// Returns the secret flag used for each, in order.
 fn apply(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Vec<bool>> {
+    let _g = lock();
+    apply_locked(scope, updates)
+}
+
+/// `apply` for callers that already hold the env lock.
+fn apply_locked(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Vec<bool>> {
     for (n, _, _) in updates {
         if !valid_name(n) {
             bail!("invalid env name {n:?}: use letters, digits and underscore, not starting with a digit");
         }
     }
-    let (mut plain, mut secrets) = load_pair(scope)?;
+    let (mut plain, mut secrets) = load_pair_unlocked(scope)?;
     let (plain0, secrets0) = (plain.clone(), secrets.clone());
     let mut flags = Vec::with_capacity(updates.len());
     for (name, value, explicit) in updates {
@@ -217,7 +260,11 @@ fn apply(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Ve
         } else {
             None
         };
-        let secret = explicit.or(existing).unwrap_or_else(|| is_secret_name(name));
+        let secret = explicit.or(existing).unwrap_or_else(|| looks_secret(name, value));
+        // Same classification the effective view and log redaction use: refuse, don't leak (B5).
+        if secret {
+            check_redactable(name, value)?;
+        }
         let (dst, other) = if secret { (&mut secrets, &mut plain) } else { (&mut plain, &mut secrets) };
         other.remove(name);
         dst.insert(name.clone(), value.clone());
@@ -274,38 +321,88 @@ fn history_path() -> PathBuf {
     paths::env_dir().join(".redact-history.jsonl")
 }
 
-const HISTORY_KEEP: usize = 500;
-
-/// Keep a superseded or removed secret value (0600, outside the database) so log redaction still
-/// covers output written while it was current. Failing to record it fails the change.
-fn remember_secret(name: &str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    ensure_dir(&paths::env_dir())?;
-    let path = history_path();
-    let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(String::from).collect();
-    let line = serde_json::json!({ "name": name, "value": value }).to_string();
-    if lines.contains(&line) {
-        return Ok(());
-    }
-    lines.push(line);
-    let skip = lines.len().saturating_sub(HISTORY_KEEP);
-    atomic_write(&path, &(lines[skip..].join("\n") + "\n")).context("recording the previous secret value for log redaction")
+/// One journaled secret: the value, and the unix second it stopped being current.
+struct Hist {
+    name: String,
+    value: String,
+    ts: u64,
 }
 
-/// Previously stored secret values (name, value), for log redaction. An unreadable file is an error.
-pub fn redaction_history() -> Result<Vec<(String, String)>> {
+fn read_history() -> Result<Vec<Hist>> {
     let text = match std::fs::read_to_string(history_path()) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e).context("reading the redaction history"),
     };
-    Ok(text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| Some((v["name"].as_str()?.to_string(), v["value"].as_str()?.to_string())))
-        .collect())
+    let now = crate::db::now_secs();
+    let mut out = Vec::new();
+    for (i, l) in text.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        // Damaged history must stop log delivery: a silently skipped line is a silent leak.
+        // The message never quotes the line (it holds a secret).
+        let damaged = || anyhow!("the redaction history is damaged at line {} ({}); logs cannot be redacted safely until it is repaired", i + 1, history_path().display());
+        let v: serde_json::Value = serde_json::from_str(l).map_err(|_| damaged())?;
+        let (Some(name), Some(value)) = (v["name"].as_str(), v["value"].as_str()) else { return Err(damaged()) };
+        // Lines written before timestamps existed are treated as current, so they are kept.
+        out.push(Hist { name: name.to_string(), value: value.to_string(), ts: v["ts"].as_u64().unwrap_or(now) });
+    }
+    Ok(out)
+}
+
+fn write_history(entries: &[Hist]) -> Result<()> {
+    let mut text = String::new();
+    for h in entries {
+        text.push_str(&serde_json::json!({ "name": h.name, "value": h.value, "ts": h.ts }).to_string());
+        text.push('\n');
+    }
+    atomic_write(&history_path(), &text).context("recording the previous secret value for log redaction")
+}
+
+/// Keep a superseded or removed secret value (0600, outside the database) so log redaction still
+/// covers output written while it was current. Failing to record it fails the change. Entries are
+/// never dropped by count: `prune_history` retires them once no log can still hold them. The
+/// caller holds the env lock.
+fn remember_secret(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.chars().count() < MIN_SECRET_LEN {
+        return Ok(());
+    }
+    ensure_dir(&paths::env_dir())?;
+    let mut entries = read_history()?;
+    if entries.iter().any(|h| h.name == name && h.value == value) {
+        return Ok(());
+    }
+    entries.push(Hist { name: name.to_string(), value: value.to_string(), ts: crate::db::now_secs() });
+    write_history(&entries)
+}
+
+/// Journal a secret value that is leaving use outside the env API (a project config `[env]`
+/// secret that was edited or removed).
+pub fn remember_superseded(name: &str, value: &str) -> Result<()> {
+    let _g = lock();
+    remember_secret(name, value)
+}
+
+/// Retire history entries that stopped being current before `horizon` (unix seconds): the daemon
+/// computes it as the moment from which every existing log file and live process can only hold
+/// newer values, so values leave the history with the log rotation that destroyed them.
+pub fn prune_history(horizon: u64) -> Result<usize> {
+    let _g = lock();
+    let entries = read_history()?;
+    let before = entries.len();
+    let kept: Vec<Hist> = entries.into_iter().filter(|h| h.ts >= horizon).collect();
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        write_history(&kept)?;
+    }
+    Ok(dropped)
+}
+
+/// Previously stored secret values (name, value), for log redaction. An unreadable or damaged file is an error.
+pub fn redaction_history() -> Result<Vec<(String, String)>> {
+    let _g = lock();
+    Ok(read_history()?.into_iter().map(|h| (h.name, h.value)).collect())
 }
 
 /// Returns the secret flag the value was stored with. Secret = explicit flag, else the name's
@@ -316,7 +413,8 @@ pub fn write_var(scope: &Scope, name: &str, value: &str, secret: Option<bool>) -
 
 /// Returns whether the name existed.
 pub fn unset_var(scope: &Scope, name: &str) -> Result<bool> {
-    let (mut plain, mut secrets) = load_pair(scope)?;
+    let _g = lock();
+    let (mut plain, mut secrets) = load_pair_unlocked(scope)?;
     if let Some(old) = secrets.get(name) {
         remember_secret(name, old)?;
     }
@@ -426,6 +524,8 @@ pub struct ImportReport {
 }
 
 pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Result<ImportReport> {
+    // The existing-layer read and the write below are one transaction.
+    let _g = lock();
     let (parsed, problems) = parse_dotenv(text);
     // Last duplicate wins; keep first-seen order.
     let mut order: Vec<String> = Vec::new();
@@ -435,7 +535,8 @@ pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Resu
             order.push(k);
         }
     }
-    let existing: BTreeMap<String, bool> = read_layer(scope)?.into_iter().map(|v| (v.name, v.secret)).collect();
+    let (plain_now, secrets_now) = load_pair_unlocked(scope)?;
+    let existing: BTreeMap<String, bool> = plain_now.keys().map(|k| (k.clone(), false)).chain(secrets_now.keys().map(|k| (k.clone(), true))).collect();
     let mut rep = ImportReport { problems, ..Default::default() };
     let mut updates = Vec::new();
     for name in order {
@@ -447,15 +548,25 @@ pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Resu
         if prior.is_some() {
             rep.overwritten.push(name.clone());
         }
-        if prior.unwrap_or_else(|| is_secret_name(&name)) {
+        let value = vals.remove(&name).unwrap_or_default();
+        let secret = prior.unwrap_or_else(|| looks_secret(&name, &value));
+        if secret {
             rep.secrets.push(name.clone());
         }
-        let value = vals.remove(&name).unwrap_or_default();
+        if secret {
+            if let Err(e) = check_redactable(&name, &value) {
+                // A refused value is reported and left out; the rest of the import proceeds.
+                rep.problems.push(format!("{e}"));
+                rep.secrets.retain(|n| n != &name);
+                rep.overwritten.retain(|n| n != &name);
+                continue;
+            }
+        }
         rep.imported.push(name.clone());
         updates.push((name, value, None));
     }
     if !preview && !updates.is_empty() {
-        apply(scope, &updates)?;
+        apply_locked(scope, &updates)?;
     }
     Ok(rep)
 }
@@ -617,18 +728,18 @@ pub(crate) mod tests {
         let sc = Scope::Project("proj".into());
         assert!(read_layer(&sc).unwrap().is_empty());
         assert!(!write_var(&sc, "PLAIN", "v1", None).unwrap());
-        assert!(write_var(&sc, "API_TOKEN", "t1", None).unwrap());
+        assert!(write_var(&sc, "API_TOKEN", "tok1", None).unwrap());
         let (pp, sp) = sc.paths();
         assert!(std::fs::read_to_string(&pp).unwrap().contains("PLAIN"));
         assert!(!std::fs::read_to_string(&pp).unwrap().contains("API_TOKEN"));
         assert!(std::fs::read_to_string(&sp).unwrap().contains("API_TOKEN"));
         // existing flag sticks without an explicit one
-        assert!(write_var(&sc, "API_TOKEN", "t2", None).unwrap());
-        assert_eq!(get_value(&sc, "API_TOKEN").unwrap().as_deref(), Some("t2"));
+        assert!(write_var(&sc, "API_TOKEN", "tok2", None).unwrap());
+        assert_eq!(get_value(&sc, "API_TOKEN").unwrap().as_deref(), Some("tok2"));
         // move between files
-        assert!(write_var(&sc, "PLAIN", "v1", Some(true)).unwrap());
+        assert!(write_var(&sc, "PLAIN", "val1", Some(true)).unwrap());
         assert!(!std::fs::read_to_string(&pp).unwrap().contains("PLAIN"));
-        assert!(!write_var(&sc, "API_TOKEN", "t2", Some(false)).unwrap());
+        assert!(!write_var(&sc, "API_TOKEN", "tok2", Some(false)).unwrap());
         assert!(std::fs::read_to_string(&pp).unwrap().contains("API_TOKEN"));
         assert!(!std::fs::read_to_string(&sp).unwrap().contains("API_TOKEN"));
         let vars = read_layer(&sc).unwrap();
@@ -811,5 +922,129 @@ pub(crate) mod tests {
         let values: Vec<&str> = h.iter().map(|(_, v)| v.as_str()).collect();
         assert!(values.contains(&"old-secret-value") && values.contains(&"new-secret-value"), "{values:?}");
         assert_eq!(mode(&history_path()), 0o600);
+    }
+
+    #[test]
+    fn b1_concurrent_writers_keep_every_edit() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let hs: Vec<_> = (0..24)
+            .map(|i| {
+                let (sc, b) = (sc.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    write_var(&sc, &format!("VAR_{i:02}"), &format!("value-{i}"), None).unwrap();
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(read_layer(&sc).unwrap().len(), 24, "acknowledged writes were lost");
+    }
+
+    #[test]
+    fn b1_concurrent_unset_import_and_history_rotations_do_not_lose_each_other() {
+        let _s = sandbox();
+        let a = Scope::Project("pa".into());
+        let b = Scope::Project("pb".into());
+        for i in 0..12 {
+            write_var(&a, &format!("KEEP_{i:02}"), "kept-value", None).unwrap();
+        }
+        write_var(&a, "ROTATE_TOKEN", "rot-0000", None).unwrap();
+        write_var(&b, "ROTATE_TOKEN", "rot-bbbb", None).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let mut hs = Vec::new();
+        for i in 0..12 {
+            let (sc, bar) = (a.clone(), barrier.clone());
+            hs.push(std::thread::spawn(move || {
+                bar.wait();
+                assert!(unset_var(&sc, &format!("KEEP_{i:02}")).unwrap());
+            }));
+        }
+        for i in 0..6 {
+            let (sc, bar) = (a.clone(), barrier.clone());
+            hs.push(std::thread::spawn(move || {
+                bar.wait();
+                import(&sc, &format!("IMP_{i}=imported\n"), false, false).unwrap();
+            }));
+        }
+        // rotations in two scopes share one history file
+        for (sc, v) in [(a.clone(), "rot-aaaa"), (b.clone(), "rot-bbb2")] {
+            for k in 0..3 {
+                let bar = barrier.clone();
+                let sc = sc.clone();
+                hs.push(std::thread::spawn(move || {
+                    bar.wait();
+                    write_var(&sc, "ROTATE_TOKEN", &format!("{v}-{k}"), None).unwrap();
+                }));
+            }
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let names: Vec<String> = read_layer(&a).unwrap().into_iter().map(|v| v.name).collect();
+        assert!(!names.iter().any(|n| n.starts_with("KEEP_")), "{names:?}");
+        assert_eq!(names.iter().filter(|n| n.starts_with("IMP_")).count(), 6, "{names:?}");
+        // 6 writes over two scopes superseded 6 values (each scope: first value + 2 of its 3 racers)
+        let hist = redaction_history().unwrap();
+        assert!(hist.iter().any(|(_, v)| v == "rot-0000"), "{hist:?}");
+        assert!(hist.iter().any(|(_, v)| v == "rot-bbbb"), "{hist:?}");
+        assert!(hist.len() >= 6, "history lost entries: {hist:?}");
+    }
+
+    #[test]
+    fn b5_history_is_never_capped_by_count_and_prunes_by_horizon() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        for i in 0..502 {
+            write_var(&sc, "DB_PASSWORD", &format!("rotated-{i:04}"), None).unwrap();
+        }
+        let h = redaction_history().unwrap();
+        assert_eq!(h.len(), 501, "every superseded value is kept");
+        assert!(h.iter().any(|(_, v)| v == "rotated-0000"));
+        assert_eq!(prune_history(0).unwrap(), 0);
+        assert_eq!(prune_history(u64::MAX).unwrap(), 501);
+        assert!(redaction_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn b5_damaged_history_is_an_error_without_quoting_the_line() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        write_var(&sc, "DB_PASSWORD", "rotated-one", None).unwrap();
+        write_var(&sc, "DB_PASSWORD", "rotated-two", None).unwrap();
+        let mut t = std::fs::read_to_string(history_path()).unwrap();
+        t.push_str("{\"name\":\"X\"}\nnot json CANARY-SECRET\n");
+        std::fs::write(history_path(), t).unwrap();
+        let e = format!("{:#}", redaction_history().unwrap_err());
+        assert!(e.contains("damaged") && !e.contains("CANARY"), "{e}");
+        // and a new rotation refuses to proceed on top of damaged history
+        assert!(write_var(&sc, "DB_PASSWORD", "rotated-three", None).is_err());
+    }
+
+    #[test]
+    fn short_values_are_plain_unless_explicitly_marked_secret() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        // Explicitly marked secret but too short to redact: refused with a message.
+        let e = format!("{:#}", write_var(&sc, "PLAINNAME", "12", Some(true)).unwrap_err());
+        assert!(e.contains("shorter than 3") && e.contains("PLAINNAME"), "{e}");
+        // A secret-looking name with a 1–2 character value is ordinary config, stored plain.
+        write_var(&sc, "MAX_TOKENS", "50", None).unwrap();
+        write_var(&sc, "MONKEY", "12", Some(false)).unwrap();
+        write_var(&sc, "API_TOKEN", "123", None).unwrap();
+        write_var(&sc, "EMPTY_TOKEN", "", None).unwrap();
+        let layer = read_layer(&sc).unwrap();
+        let secret = |n: &str| layer.iter().find(|v| v.name == n).map(|v| v.secret);
+        assert_eq!(secret("MAX_TOKENS"), Some(false));
+        assert_eq!(secret("MONKEY"), Some(false));
+        assert_eq!(secret("API_TOKEN"), Some(true));
+        assert!(secret("PLAINNAME").is_none());
+        // Import treats short secret-looking values the same way.
+        let r = import(&sc, "A_SECRET=1\nB_SECRET=long-enough\nFINE=1\n", false, false).unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(r.secrets, vec!["B_SECRET".to_string()]);
     }
 }

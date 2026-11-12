@@ -140,6 +140,7 @@ mod tests {
             procs: vec![ResolvedProc { name: "web".into(), command: "serve --key CANARY-STATE-SECRET".into(), cwd: "/w".into(), port: Some(4001), log_path: "/l/web.log".into() }],
             web_port: Some(4001),
             idle: Duration::from_secs(60),
+            aliases: vec![],
         };
         s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None, env_hash: Some(u64::MAX), last_started_at: None, last_request_at: None });
         s.leases.insert("p/r".into(), BTreeMap::from([("web".to_string(), 4001u16)]));

@@ -89,7 +89,7 @@ fn liveness(wt: &WorktreeInfo) -> Option<String> {
     if let Some(holder) = &wt.claimed_by {
         return Some(format!("a live writer claim is held by {holder}; release it first"));
     }
-    if matches!(wt.status, Some(RunStatus::Running | RunStatus::Starting | RunStatus::Stopping)) {
+    if matches!(wt.status, Some(RunStatus::Running | RunStatus::Starting | RunStatus::Stopping | RunStatus::Preparing)) {
         return Some("the run is up".into());
     }
     let pids = procinfo::pids_with_cwd_under(&wt.worktree);
@@ -383,6 +383,7 @@ mod tests {
             repo: "/nonexistent".into(),
             domain: "p.test".into(),
             idle: Duration::from_secs(60),
+            aliases: vec![],
             max_running: 1,
             ports: vec![],
             env: Default::default(),
@@ -393,10 +394,12 @@ mod tests {
                 kind: DiskKind::Cache,
                 paths: paths.iter().map(|s| s.to_string()).collect(),
                 clean_after: after,
+                install: None,
             }],
             stores: vec![],
             worktree: Default::default(),
             setup_steps: vec![],
+            auto_install: true,
         }
     }
 

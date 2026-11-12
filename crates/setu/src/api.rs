@@ -26,7 +26,7 @@ pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
     }
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
-            bail!("another setu-rs daemon is already running ({})", path.display());
+            bail!("another setu daemon is already running ({})", path.display());
         }
         std::fs::remove_file(&path)?;
     }
@@ -156,13 +156,28 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             .await
         }
         "worktree.adopt" => d.worktree_adopt(actor(req), client(req), &PathBuf::from(s(req, "path").ok_or_else(|| anyhow!("worktree.adopt needs a path"))?)).await,
+        "import.adopt" => {
+            if actor(req) == "mcp" {
+                bail!("import-v1 is not available to agents; ask the user to run `setu import-v1`");
+            }
+            let port = req.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+            d.import_adopt(
+                actor(req),
+                s(req, "project").ok_or_else(|| anyhow!("import.adopt needs a project"))?,
+                &PathBuf::from(s(req, "path").ok_or_else(|| anyhow!("import.adopt needs a path"))?),
+                port,
+            )
+            .await
+        }
         "worktree.rm" => {
             let force = req.get("force").and_then(Value::as_bool).unwrap_or(false);
             if force && actor(req) == "mcp" {
-                bail!("force removal is not available to agents; ask the user to run `setu-rs rm --force` themselves");
+                bail!("force removal is not available to agents; ask the user to run `setu rm --force` themselves");
             }
             d.worktree_rm(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.rm needs a run"))?, force).await
         }
+        "worktree.retry-setup" => d.worktree_retry_setup(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.retry-setup needs a run"))?).await,
+        "worktree.forget" => d.worktree_forget(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.forget needs a run"))?).await,
         "worktree.restore" => d.worktree_restore(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.restore needs a run"))?).await,
         "worktree.removed" => blocking(d, |d| Ok(d.removed())).await,
         "projects" => blocking(d, |d| d.projects_list()).await,
@@ -190,7 +205,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         "autoremove" => {
             let dry = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
             if !dry && actor(req) == "mcp" {
-                bail!("agents can only preview auto-removal; ask the user to run `setu-rs autoremove`");
+                bail!("agents can only preview auto-removal; ask the user to run `setu autoremove`");
             }
             d.autoremove(dry).await
         }
@@ -251,7 +266,7 @@ pub async fn call(req: Value) -> Result<Value> {
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(_) => bail!("setu-rs daemon is not running. Start it with `setu-rs daemon`."),
+            Err(_) => bail!("setu daemon is not running. Start it with `setu daemon`."),
         }
     };
     let (read, mut write) = stream.into_split();

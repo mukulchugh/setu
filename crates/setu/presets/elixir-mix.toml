@@ -14,3 +14,5 @@ clean_after = "7d"
 name = "mix-deps"
 kind = "deps"
 paths = ["deps"]
+install = "mix deps.get"
+lockfiles = ["mix.lock"]

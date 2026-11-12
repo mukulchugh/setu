@@ -156,7 +156,7 @@ pub fn claim(db: &Db, run: &str, holder: &str, pid: Option<i32>, now: u64) -> Re
         // new writer. Same transaction as the claim row, so the two cannot interleave (review #3).
         let pending: Option<String> = tx.query_opt("SELECT step FROM removal_ops WHERE run_key = ?1", [run], |r| Ok(r.get::<String>(0)?))?;
         if pending.is_some_and(|s| s != "done") {
-            bail!("{run} is being removed; it cannot be claimed. Wait for the removal to finish (or retry `setu-rs rm {run}`), then restore it if you still need it");
+            bail!("{run} is being removed; it cannot be claimed. Wait for the removal to finish (or retry `setu rm {run}`), then restore it if you still need it");
         }
         let existing = read_tx(tx, run)?;
         let outcome = match &existing {

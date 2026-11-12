@@ -1,8 +1,8 @@
 #!/bin/bash
-# End-to-end check of `setu-rs mcp` against a throwaway sandbox. Fake secret values only.
-# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/mcp-e2e.sh <path-to-setu-rs-binary>
+# End-to-end check of `setu mcp` against a throwaway sandbox. Fake secret values only.
+# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/mcp-e2e.sh <path-to-setu-binary>
 set -euo pipefail
-BIN="${1:?path to setu-rs binary}"
+BIN="${1:?path to setu binary}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SB=/tmp/setu-mcp-e2e
 export SETU_HOME="$SB/home"
@@ -11,12 +11,12 @@ cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   sleep 1
   # runs left behind by a failed assertion
-  pkill -f "http.server .* --bind 127.0.0.1" 2>/dev/null || true
   rm -rf "${SB:?}"
 }
 trap cleanup EXIT
 rm -rf "${SB:?}"
 mkdir -p "$SB/seed" "$SETU_HOME/config/projects"
+printf 'stop_runs_on_exit = true\n' > "$SETU_HOME/config/config.toml"
 cd "$SB/seed"
 git init -q -b main . && git -c user.email=e@e -c user.name=e commit -q --allow-empty -m init
 git clone -q --bare "$SB/seed" "$SB/app.git"

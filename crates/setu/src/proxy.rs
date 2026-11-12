@@ -38,6 +38,15 @@ pub async fn serve(
     routes: Arc<dyn Routes>,
     activity: Arc<ActivityTracker>,
 ) -> anyhow::Result<()> {
+    serve_all(vec![listener], routes, activity).await
+}
+
+/// Serve every listener (for example one IPv4 and one IPv6 loopback socket) with one routing state.
+pub async fn serve_all(
+    listeners: Vec<TcpListener>,
+    routes: Arc<dyn Routes>,
+    activity: Arc<ActivityTracker>,
+) -> anyhow::Result<()> {
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(Duration::from_secs(5)));
     let client = Client::builder(TokioExecutor::new())
@@ -48,6 +57,17 @@ pub async fn serve(
         activity,
         client,
     });
+    let mut listeners = listeners;
+    let Some(last) = listeners.pop() else {
+        anyhow::bail!("the proxy has no listener");
+    };
+    for l in listeners {
+        tokio::spawn(accept_loop(l, state.clone()));
+    }
+    accept_loop(last, state).await
+}
+
+async fn accept_loop(listener: TcpListener, state: Arc<State>) -> anyhow::Result<()> {
     let local_port = listener.local_addr()?.port();
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -72,6 +92,46 @@ pub async fn serve(
                 .await;
         });
     }
+}
+
+/// Wildcard bind, as v1's Caddy did: `0.0.0.0` (required) plus `[::]` with IPV6_V6ONLY on, so
+/// `http://name.zone` works whichever address the resolver or browser picks. Two sockets, one
+/// per family, because a single dual-stack `[::]` socket on macOS binds happily next to another
+/// program's `0.0.0.0:80` (Caddy) instead of reporting the port as taken. The IPv6 socket is
+/// best effort: a host without IPv6 just serves IPv4. A taken port is reported as is, so the
+/// caller can fall back to another port.
+pub fn bind_wildcard(port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))?;
+    v4.set_nonblocking(true)?;
+    let port = v4.local_addr()?.port();
+    let mut out = vec![TcpListener::from_std(v4)?];
+    if let Ok(v6) = bind_v6_only(port) {
+        out.push(v6);
+    }
+    Ok(out)
+}
+
+fn bind_v6_only(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_only_v6(true)?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    sock.listen(1024)?;
+    sock.set_nonblocking(true)?;
+    TcpListener::from_std(sock.into())
+}
+
+/// Loopback bind on both families: `127.0.0.1` must work, `::1` is added when the host has it.
+pub fn bind_loopback(port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+    v4.set_nonblocking(true)?;
+    let mut out = vec![TcpListener::from_std(v4)?];
+    if let Ok(v6) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+        v6.set_nonblocking(true)?;
+        out.push(TcpListener::from_std(v6)?);
+    }
+    Ok(out)
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
@@ -181,6 +241,19 @@ async fn handle(
             None => pending = Some(run),
         },
         Lookup::Starting { run } => pending = Some(run),
+        Lookup::Preparing { run, installing } => {
+            // Two different waits behind the same status: a start that is installing missing
+            // dependencies (any worktree), and a newly created worktree running its setup steps.
+            let (title, msg) = if installing {
+                (format!("Installing dependencies for {run}\u{2026}"), "Installing dependencies for this worktree. This page refreshes when it is ready to start.")
+            } else {
+                (format!("Setting up {run}\u{2026}"), "Setting up the new worktree. This page refreshes when it is ready to start.")
+            };
+            return page(StatusCode::SERVICE_UNAVAILABLE, &title, msg, true);
+        }
+        Lookup::SetupFailed { run } => {
+            return page(StatusCode::SERVICE_UNAVAILABLE, &format!("Setup failed for {run}"), &format!("The new worktree's setup did not finish, so it was not started. Fix the cause (see the setup log), then run `setu retry-setup {run}`."), false);
+        }
         Lookup::Down { run } => {
             if let Err(msg) = st.routes.request_start(&run) {
                 return page(
@@ -220,10 +293,17 @@ async fn handle(
     let deadline = tokio::time::Instant::now() + START_WAIT;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(RETRY_STEP).await;
-        if let Lookup::Up { run, port } = st.routes.lookup(&host) {
-            if let Some(g) = st.activity.begin(&run) {
-                return forward(&st, req, peer, local_port, &run, port, g).await;
+        match st.routes.lookup(&host) {
+            Lookup::Up { run, port } => {
+                if let Some(g) = st.activity.begin(&run) {
+                    return forward(&st, req, peer, local_port, &run, port, g).await;
+                }
             }
+            // The start turned into a failed install: say so now instead of timing out.
+            Lookup::SetupFailed { run } => {
+                return page(StatusCode::SERVICE_UNAVAILABLE, &format!("Setup failed for {run}"), &format!("Installing dependencies did not finish, so it was not started. Fix the cause (see the setup log), then run `setu retry-setup {run}`."), false);
+            }
+            _ => {}
         }
     }
     page(
@@ -709,6 +789,76 @@ mod tests {
             "{r}"
         );
         assert_eq!(m.starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b10_a_preparing_run_shows_a_page_and_is_never_started_on_demand() {
+        let m = Mock::new();
+        m.set("n.test", Lookup::Preparing { run: rid("n"), installing: false });
+        m.set("f.test", Lookup::SetupFailed { run: rid("f") });
+        let (p, _) = proxy(&m).await;
+        for accept in ["Accept: text/html\r\n", "Accept: */*\r\n"] {
+            let r = raw(p, &get("n.test", accept)).await;
+            assert!(r.starts_with("HTTP/1.1 503") && r.contains("Setting up p/n") && r.contains("Setting up the new worktree") && !r.contains("Installing"), "{r}");
+        }
+        let r = raw(p, &get("n.test", "Accept: text/html\r\n")).await;
+        assert!(r.contains("http-equiv=\"refresh\""), "a preparing page refreshes: {r}");
+        let r = raw(p, &get("f.test", "Accept: text/html\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 503") && r.contains("retry-setup p/f") && !r.contains("http-equiv=\"refresh\""), "{r}");
+        assert_eq!(m.starts.load(Ordering::SeqCst), 0, "no on-demand start while preparing or after a failed setup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn d_the_preparing_page_says_installing_for_an_install_and_setting_up_for_a_new_worktree() {
+        let m = Mock::new();
+        m.set("i.test", Lookup::Preparing { run: rid("i"), installing: true });
+        let (p, _) = proxy(&m).await;
+        let r = raw(p, &get("i.test", "Accept: text/html\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 503") && r.contains("Installing dependencies for p/i") && !r.contains("new worktree"), "{r}");
+        assert!(r.contains("http-equiv=\"refresh\""), "{r}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn c_a_wildcard_bind_answers_over_ipv6_loopback_and_ipv4() {
+        let m = Mock::new();
+        let up = upstream(|_| text("hello-from-up")).await;
+        m.set("w.test", Lookup::Up { run: rid("w"), port: up });
+        let ls = bind_wildcard(0).expect("wildcard bind");
+        assert_eq!(ls.len(), 2, "0.0.0.0 and [::]");
+        let port = ls[0].local_addr().unwrap().port();
+        tokio::spawn(serve_all(ls, m.clone(), ActivityTracker::new()));
+        let get_over = |addr: std::net::SocketAddr| async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(get("w.test", "").as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let v6 = get_over(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))).await;
+        assert!(v6.starts_with("HTTP/1.1 200") && v6.ends_with("hello-from-up"), "over ::1: {v6}");
+        let v4 = get_over(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))).await;
+        assert!(v4.ends_with("hello-from-up"), "over 127.0.0.1: {v4}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn c_a_loopback_bind_listens_on_both_families_and_a_wildcard_bind_reports_a_taken_port() {
+        let m = Mock::new();
+        let up = upstream(|_| text("hello-from-up")).await;
+        m.set("w.test", Lookup::Up { run: rid("w"), port: up });
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let ls = bind_loopback(free).expect("loopback bind");
+        assert_eq!(ls.len(), 2, "127.0.0.1 and ::1");
+        tokio::spawn(serve_all(ls, m.clone(), ActivityTracker::new()));
+        for addr in [SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, free)), SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, free))] {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(get("w.test", "").as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.unwrap();
+            assert!(String::from_utf8_lossy(&out).ends_with("hello-from-up"), "{addr}");
+        }
+        // A port held on 0.0.0.0 (as Caddy held :80) is an error, so the daemon can fall back to :7777.
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        assert!(bind_wildcard(held.local_addr().unwrap().port()).is_err(), "must not share a taken port");
     }
 
     #[tokio::test(flavor = "current_thread")]

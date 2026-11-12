@@ -1,16 +1,15 @@
 #!/bin/bash
 # End-to-end check of slice 7 (worktrees and claims) in a throwaway sandbox: temp bare "origin",
 # a bare project repo, a fake setup step, fake files only. Never touches a real repo.
-# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/worktree-e2e.sh <path-to-setu-rs-binary>
+# Usage: CARGO_TARGET_DIR=... crates/setu/e2e/worktree-e2e.sh <path-to-setu-binary>
 set -euo pipefail
-BIN="${1:?path to setu-rs binary}"
+BIN="${1:?path to setu binary}"
 SB=/tmp/setu-wt-e2e
 export SETU_HOME="$SB/home"
 DAEMON_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   sleep 1
-  pkill -f "http.server .* --bind 127.0.0.1" 2>/dev/null || true
   rm -rf "${SB:?}"
 }
 trap cleanup EXIT
@@ -26,7 +25,7 @@ expect_fail() { # expect_fail <substring> <cmd...>
 
 rm -rf "${SB:?}"
 mkdir -p "$SB/seed" "$SETU_HOME/config/projects"
-G="git -c user.email=e@e -c user.name=e -c commit.gpgsign=false -c protocol.file.allow=always"
+G="git -c user.email=e@e -c user.name=e -c commit.gpgsign=false -c protocol.file.allow=always -c maintenance.auto=false -c gc.auto=0"
 cd "$SB/seed"
 $G init -q -b main .
 printf 'local.db\n.env.local\nsetup-*.txt\n' > .gitignore
@@ -43,6 +42,7 @@ echo 'TOKEN=fake-value' > "$SB/app/main/.env.local"
 
 cat > "$SETU_HOME/config/config.toml" <<'TOML'
 proxy_port = 17780
+stop_runs_on_exit = true
 dns_port = 25353
 TOML
 cat > "$SETU_HOME/config/projects/e2e.toml" <<'TOML'

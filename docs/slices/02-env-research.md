@@ -39,7 +39,7 @@ So values Setu injects override `.env.local` with no file writes. Most dotenv lo
 - An optional `env.render` writes a 0600 file into the run's temp dir, for tools that insist on reading a file.
 
 ## MCP
-**Shim.** Use `rmcp` (the official Rust SDK, 3.9.0, updated 2026-11-05). `setu-rs mcp` is a stdio shim that forwards to the 0600 Unix socket, so it needs no port and no token. Set it up with `claude mcp add --transport stdio setu -- setu-rs mcp`.
+**Shim.** Use `rmcp` (the official Rust SDK, 3.9.0, updated 2026-11-05). `setu mcp` is a stdio shim that forwards to the 0600 Unix socket, so it needs no port and no token. Set it up with `claude mcp add --transport stdio setu -- setu mcp`.
 
 **Tools**
 - `env_list {scope,target?,show:names|masked}`

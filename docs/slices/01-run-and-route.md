@@ -1,9 +1,9 @@
 # Slice 1: run every worktree's app and workers, each at its own URL
 
 ## What you get
-- `setu-rs up` in any quivly-app worktree starts the web app, the Inngest dev server and the Trigger.dev worker for that worktree, with ports chosen for you.
+- `setu up` in any quivly-app worktree starts the web app, the Inngest dev server and the Trigger.dev worker for that worktree, with ports chosen for you.
 - The app is reachable at `http://<worktree>.quivly.local:7777`.
-- `setu-rs ls` shows every run, its URL, its status and its real RAM.
+- `setu ls` shows every run, its URL, its status and its real RAM.
 - Opening the URL of a stopped run starts it, showing a "Starting…" page while it boots.
 - A run that has been idle for 30 minutes stops: its app and its workers together.
 - It runs side by side with today's JS Setu without touching it:
@@ -101,10 +101,10 @@ run = "bunx trigger.dev@4.8.3 dev --max-concurrent-runs 2 --branch {run} --env-f
 
 **Toolchain.** Procs run through `sh -c` with the PATH and environment the daemon was started with, plus the run env. A `mise exec --` prefix is a per-proc option in config, so `bun` and `node` resolve per worktree.
 
-**Binary name.** The binary is built as `setu-rs` until cutover, so it never shadows v1's `setu` command or zsh function.
+**Binary name.** The binary is `setu` (it was `setu-rs` until the cutover slice, 10).
 
 ### Daemon
-`setu-rs daemon` runs in the foreground in this slice. The LaunchAgent comes later.
+`setu daemon` runs in the foreground in this slice. The LaunchAgent comes later.
 
 **Proxy**
 - Listens on `127.0.0.1:7777` and rejects any peer that is not loopback.
@@ -123,10 +123,10 @@ run = "bunx trigger.dev@4.8.3 dev --max-concurrent-runs 2 --branch {run} --env-f
 
 **Idle stop**
 - A run is idle when it has no in-flight request and no open websocket for `idle` minutes.
-- Idle stop applies only to runs that were started on demand or by `setu-rs up`.
-- `setu-rs pin <run>` exempts a run.
+- Idle stop applies only to runs that were started on demand or by `setu up`.
+- `setu pin <run>` exempts a run.
 - Only proxied traffic counts as activity. Inngest calls the app port directly and Trigger has no HTTP, so a run doing background jobs can be stopped mid-job. Pin those runs.
-- On-demand start only applies to runs registered with `setu-rs up`. A request for any other name gets a 404 page.
+- On-demand start only applies to runs registered with `setu up`. A request for any other name gets a 404 page.
 - At most N runs can be up at once (default 3). Beyond that, a start is refused with a clear message.
 
 **Logs:** one file per proc at `~/Library/Logs/Setu/<project>/<run>/<proc>.log`. The child writes straight to an append-mode file, never through a pipe to the daemon, so a daemon restart never blocks or kills it. Rotation is copy-truncate at 20 MB.
@@ -141,12 +141,12 @@ On restart, the daemon re-adopts a live process group only if both the pid and i
 
 | Command | What it does |
 |---|---|
-| `setu-rs up [path]` | Start the run for the worktree at path (default: the current directory) |
-| `setu-rs down [run]` | Stop that run |
-| `setu-rs ls [--json]` | List runs with URL, status and RAM |
-| `setu-rs logs <run> [proc] [-f]` | Show or follow logs |
-| `setu-rs pin <run>` / `unpin` | Exempt a run from idle stop, or undo that |
-| `setu-rs daemon` | Run the daemon in the foreground |
+| `setu up [path]` | Start the run for the worktree at path (default: the current directory) |
+| `setu down [run]` | Stop that run |
+| `setu ls [--json]` | List runs with URL, status and RAM |
+| `setu logs <run> [proc] [-f]` | Show or follow logs |
+| `setu pin <run>` / `unpin` | Exempt a run from idle stop, or undo that |
+| `setu daemon` | Run the daemon in the foreground |
 
 ### Code layout
 One crate, `crates/setu`, building one binary.
@@ -175,13 +175,13 @@ Before starting:
 
 When done, stop both runs. They sit outside v1's concurrency cap and memory watchdog.
 
-1. **Two runs at once.** Run `setu-rs up` in `release-lane0` and `release-lane1`. Both have `node_modules`, and v1 is not running either of them. Both apps answer on their URLs through the proxy, each with its own Inngest port. `ps` shows the three procs per run under separate process groups.
+1. **Two runs at once.** Run `setu up` in `release-lane0` and `release-lane1`. Both have `node_modules`, and v1 is not running either of them. Both apps answer on their URLs through the proxy, each with its own Inngest port. `ps` shows the three procs per run under separate process groups.
 2. **Correct routing.** `curl -H 'Host: <a>.quivly.local:7777'` and the same for `<b>` reach different upstreams.
 3. **Websockets work.** A websocket client completes an HMR upgrade on `/_next/webpack-hmr` through the proxy.
 4. **Browser page loads.** A headless browser loads an unauthenticated page with a matching `Origin`. Its JS chunks load and the dev log shows no "Blocked cross-origin" warning. This uses the agent-browser MCP; no screenshots are taken of your screen.
 5. **On-demand start and idle stop.** With `idle = "2m"` in a test config, a stopped run starts on the first request and shows the "Starting…" page. Two minutes later its whole process group is gone and the port is free.
 6. **Restart adoption.** Kill and restart the daemon. The runs are re-adopted with the same ports, and nothing is signalled that Setu does not own.
-7. **Measured.** The daemon's phys_footprint is measured, and `setu-rs ls` RAM agrees with `footprint` within 10%.
+7. **Measured.** The daemon's phys_footprint is measured, and `setu ls` RAM agrees with `footprint` within 10%.
 8. **Unit tests** cover port leasing (races, unknown listener), run naming, the config templates and the activity tracker. Run with `cargo test`.
 
 ## Known limits in this slice
@@ -221,7 +221,7 @@ Secret storage (Keychain or an encrypted file), importing `.env.local`, masked M
 - **Live reload.** Next 16 serves HMR on `/_next/hmr`, not `/_next/webpack-hmr` as the research said. A browser websocket through the proxy opened and received `turbopack-connected`.
 - **Trigger.dev workers.** Both reported "Local worker ready on branch: <run>".
 - **Daemon restart.** A daemon hot-swap with `kill -9` and a new binary re-adopted both live runs.
-- **Memory.** The RAM in `setu-rs ls` matched `footprint` within 1% (about 4.0 GB and 6.8 GB per run). The daemon itself was 2.6 MB.
+- **Memory.** The RAM in `setu ls` matched `footprint` within 1% (about 4.0 GB and 6.8 GB per run). The daemon itself was 2.6 MB.
 - **Cleanup.** Both runs were stopped afterwards, and nothing was left on 4000-4999.
 
 **Not covered**

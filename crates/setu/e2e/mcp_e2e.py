@@ -1,4 +1,4 @@
-"""Drives `setu-rs mcp` over stdio and checks that the fake secret never appears in any response."""
+"""Drives `setu mcp` over stdio and checks that the fake secret never appears in any response."""
 import json, os, socket, subprocess, sys, time
 
 binary, worktree, home = sys.argv[1:4]

@@ -9,7 +9,7 @@ Sources to port from (proven behaviour, not to copy blindly):
 ## What you get
 
 ### Lifecycle
-- **`setu-rs new <project> <branch> [--from <base>] [--start]`:**
+- **`setu new <project> <branch> [--from <base>] [--start]`:**
   - fetch;
   - `git worktree add -b <branch> <project-dir>/<branch> <base>`. The default base is `origin/staging` if it exists, else `origin/<default branch>`; the project config can set it;
   - link the env files the project declares (`[worktree] link = ["apps/quivly-app/.env.local"]`, symlinked from the main worktree);
@@ -17,8 +17,8 @@ Sources to port from (proven behaviour, not to copy blindly):
   - run the `[setup]` steps (for example `bun install --frozen-lockfile`).
 
   It refuses an existing branch worktree, a run-name collision, and a disk below the free-space floor (the v1 admission idea).
-- **`setu-rs adopt <path>`:** register an existing worktree. It installs nothing and changes nothing.
-- **`setu-rs rm <run> [--force]`:** a persisted, retryable operation. In order:
+- **`setu adopt <path>`:** register an existing worktree. It installs nothing and changes nothing.
+- **`setu rm <run> [--force]`:** a persisted, retryable operation. In order:
   1. stop the run;
   2. check the guards;
   3. archive irreplaceable ignored files;
@@ -28,10 +28,10 @@ Sources to port from (proven behaviour, not to copy blindly):
   7. write a marker.
 
   The branch is always kept, and a retry resumes from the recorded step.
-- **`setu-rs restore <run>`:** recreate the worktree from its kept branch and put back the archived files.
+- **`setu restore <run>`:** recreate the worktree from its kept branch and put back the archived files.
 
 ### Writer claims (agents coordinate edits)
-- **`setu-rs claim <run> [--as <name>] [--pid <pid>]`, `release <run>`, `claims`:**
+- **`setu claim <run> [--as <name>] [--pid <pid>]`, `release <run>`, `claims`:**
   - A claim records the holder's name, its pid and pid start time, and a heartbeat.
   - A claim is stale when its pid is gone (incarnation checked) or its heartbeat is older than a TTL (default 2 h).
   - Stale claims are shown as stale and can be taken over.
