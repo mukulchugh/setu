@@ -957,6 +957,13 @@ impl Daemon {
         )
     }
 
+    /// Read-only: configured projects with their `[worktree] base` (null = Setu picks one).
+    pub fn projects_list(&self) -> Result<Value> {
+        let mut cfgs = config::load_all()?;
+        cfgs.sort_by(|a, b| a.project.cmp(&b.project));
+        Ok(Value::Array(cfgs.into_iter().map(|c| json!({ "project": c.project, "base": c.worktree.base })).collect()))
+    }
+
     pub fn running_keys(&self) -> Vec<String> {
         self.lock()
             .state

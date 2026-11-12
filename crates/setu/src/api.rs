@@ -5,6 +5,7 @@
 use crate::daemon::Daemon;
 use crate::model::RunStatus;
 use crate::paths;
+use crate::worktree;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
@@ -145,6 +146,8 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             d.worktree_rm(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.rm needs a run"))?, force).await
         }
         "worktree.restore" => d.worktree_restore(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.restore needs a run"))?).await,
+        "worktree.removed" => Ok(Value::Array(worktree::removed_list(&paths::worktree_ops_dir()))),
+        "projects" => d.projects_list(),
         "claim" => {
             let pid = req.get("pid").and_then(Value::as_i64).map(|p| p as i32);
             d.claim(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("claim needs a run"))?, s(req, "holder").ok_or_else(|| anyhow!("claim needs a holder"))?, pid)

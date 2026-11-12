@@ -53,6 +53,7 @@ struct MenuView: View {
                     Text(humanBytes(r.ramBytes)).font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
+            RunBadges(run: r)
             Spacer(minLength: 4)
             if r.staleEnv && r.isUp {
                 IconButton(symbol: "arrow.clockwise.circle.fill", label: "Restart for new env", tint: .orange, subject: r.run) { Task { await store.act("restart", r.run) } }

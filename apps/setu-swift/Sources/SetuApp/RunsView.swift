@@ -30,6 +30,10 @@ struct StatusDot: View {
 struct RunsView: View {
     @Environment(Store.self) private var store
     @State private var query = ""
+    @State private var creating = false
+    @State private var showRemoved = false
+    @State private var removing: Run?
+    @State private var releasing: Run?
 
     private var rows: [Run] {
         let q = query.lowercased()
@@ -55,7 +59,7 @@ struct RunsView: View {
                 ContentUnavailableView {
                     Label("No runs yet", systemImage: "square.stack.3d.up.slash")
                 } actions: {
-                    Button("Add Worktree…", systemImage: "plus") { Task { await store.addWorktree() } }
+                    Button("New Worktree", systemImage: "plus.square.on.square") { creating = true }
                 }
             } else if rows.isEmpty {
                 ContentUnavailableView.search(text: query)
@@ -70,23 +74,30 @@ struct RunsView: View {
                 .inspectorColumnWidth(min: 260, ideal: 380, max: 700)
         }
         .toolbar { toolbar }
+        .sheet(isPresented: $creating) { NewWorktreeSheet() }
+        .sheet(isPresented: $showRemoved) { RemovedSheet() }
+        .confirmationDialog("Remove \(removing?.run ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { r in
+            Button("Remove", role: .destructive) { Task { await store.removeWorktree(r.run) } }
+        } message: { _ in
+            Text("The branch is kept; ignored files are archived for 30 days.")
+        }
+        .confirmationDialog("Release \(releasing?.claim?.holder ?? "")'s claim?", isPresented: Binding(get: { releasing != nil }, set: { if !$0 { releasing = nil } }), titleVisibility: .visible, presenting: releasing) { r in
+            Button("Release Claim", role: .destructive) { Task { await store.releaseClaim(r.run) } }
+        } message: { r in
+            Text("\(r.claim?.holder ?? "It") may still be working in \(r.run).")
+        }
+        .alert("Can't remove \(store.refusal?.run ?? "")", isPresented: Binding(get: { store.refusal != nil }, set: { if !$0 { store.refusal = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text((store.refusal?.reasons ?? []).map { "• \($0)" }.joined(separator: "\n"))
+        }
     }
 
     private var table: some View {
         @Bindable var store = store
         return Table(rows, selection: $store.runSelection) {
             TableColumn("") { r in StatusDot(run: r) }.width(24)
-            TableColumn("Run") { r in
-                HStack(spacing: 6) {
-                    Text(r.run).fontWeight(.semibold)
-                    if r.staleEnv && r.isUp {
-                        Image(systemName: "arrow.clockwise.circle.fill")
-                            .foregroundStyle(.orange)
-                            .help("Restart for new env")
-                            .accessibilityLabel("Restart for new env")
-                    }
-                }
-            }
+            TableColumn("Run") { r in RunNameCell(run: r) }
             TableColumn("URL") { r in
                 if let u = r.url, r.isUp {
                     Button(u.replacingOccurrences(of: "http://", with: "")) { openURL(u) }
@@ -140,6 +151,16 @@ struct RunsView: View {
                 if let u = rs[0].url {
                     Button("Copy URL", systemImage: "doc.on.doc") { copyPlain(u) }
                 }
+                Divider()
+                if rs[0].pinned {
+                    Button("Unpin", systemImage: "pin.slash") { Task { await store.setPinned(rs[0].run, false) } }
+                } else {
+                    Button("Pin", systemImage: "pin.fill") { Task { await store.setPinned(rs[0].run, true) } }
+                }
+                if rs[0].claim != nil {
+                    Button("Release Claim", systemImage: "person.crop.circle.badge.xmark") { releasing = rs[0] }
+                }
+                Button("Remove…", systemImage: "trash", role: .destructive) { removing = rs[0] }
             }
         }
     }
@@ -148,7 +169,7 @@ struct RunsView: View {
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup {
             if store.busy > 0 { ProgressView().controlSize(.small) }
-            ToolbarBtn("Add Worktree", "plus") { Task { await store.addWorktree() } }
+            ToolbarBtn("New Worktree", "plus.square.on.square") { creating = true }
             ToolbarBtn("Open", "arrow.up.right.square", key: "o", disabled: !selected.contains(where: \.isUp)) {
                 for r in selected where r.isUp { openURL(r.url) }
             }
@@ -165,6 +186,12 @@ struct RunsView: View {
                 if let u = selected.first?.url { copyPlain(u) }
             }
             ToolbarBtn("Logs", "text.alignleft", key: "l") { store.showLogs.toggle() }
+            Menu {
+                Button("Add Worktree…", systemImage: "folder.badge.plus") { Task { await store.addWorktree() } }
+                Button("Recently Removed", systemImage: "arrow.uturn.backward") { showRemoved = true }
+            } label: { Label("More", systemImage: "ellipsis") }
+                .help("More")
+                .accessibilityLabel("More")
         }
     }
 }

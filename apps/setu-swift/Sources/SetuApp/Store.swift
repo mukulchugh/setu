@@ -45,6 +45,10 @@ final class Store {
     var alertMessage: String?
     var showLogs = false
     var runSelection: Set<String> = []
+    /// Plain-word reasons the daemon gave for refusing a removal.
+    var refusal: Refusal?
+    var projects: [ProjectInfo] = []
+    var removed: [RemovedRun] = []
 
     @ObservationIgnored let daemon = Daemon()
     @ObservationIgnored private var poller: Task<Void, Never>?
@@ -71,6 +75,9 @@ final class Store {
         showLogs = false
         runSelection = []
         alertMessage = nil
+        refusal = nil
+        removed = []
+        projects = []
         pane = .runs
         nudge()
         // Hand the pages the window's views freed back to the system.
@@ -162,6 +169,67 @@ final class Store {
         await refresh()
     }
 
+    // MARK: worktree lifecycle
+
+    func loadProjects() async {
+        if let p: [ProjectInfo] = try? await daemon.call(request("projects"), timeout: 10) { projects = p }
+    }
+
+    /// Create a worktree. Returns the daemon's message on failure so the sheet can show it inline.
+    func newWorktree(project: String, branch: String, base: String, start: Bool) async -> String? {
+        busy += 1
+        defer { busy -= 1 }
+        var f: [String: Any] = ["project": project, "branch": branch, "start": start]
+        if !base.isEmpty { f["base"] = base }
+        do {
+            let _: Ignored = try await daemon.call(request("worktree.new", f))
+            await refresh()
+            return nil
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? "Something went wrong."
+        }
+    }
+
+    func removeWorktree(_ run: String) async {
+        busy += 1
+        defer { busy -= 1 }
+        do {
+            let _: RemoveReply = try await daemon.call(request("worktree.rm", ["run": run]))
+        } catch {
+            let m = (error as? LocalizedError)?.errorDescription ?? "Something went wrong."
+            if let reasons = removalRefusals(m) { refusal = Refusal(run: run, reasons: reasons) } else { alertMessage = m }
+        }
+        await refresh()
+    }
+
+    /// The person at the app releases whatever claim is there (the CLI's `release` with no holder).
+    func releaseClaim(_ run: String) async {
+        _ = await work { () -> ReleaseReply in try await daemon.call(request("release", ["run": run])) }
+        await refresh()
+    }
+
+    func setPinned(_ run: String, _ on: Bool) async {
+        await act(on ? "pin" : "unpin", run)
+    }
+
+    func loadRemoved() async {
+        if let r: [RemovedRun] = try? await daemon.call(request("worktree.removed"), timeout: 10) { removed = r }
+    }
+
+    /// Restore a removed worktree. Returns the daemon's message on failure.
+    func restore(_ run: String) async -> String? {
+        busy += 1
+        defer { busy -= 1 }
+        do {
+            let _: Ignored = try await daemon.call(request("worktree.restore", ["run": run]))
+            await refresh()
+            await loadRemoved()
+            return nil
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? "Something went wrong."
+        }
+    }
+
     func refreshDisk() async {
         if let d: DiskReport = await work({ try await daemon.call(request("disk.report", ["deps": false])) }) {
             disk = d
@@ -212,6 +280,12 @@ final class Store {
         runSelection = [run]
         showLogs = true
     }
+}
+
+struct Refusal: Identifiable {
+    let run: String
+    let reasons: [String]
+    var id: String { run }
 }
 
 /// `setu-rs` inside the bundle, next to the executable, or on PATH.

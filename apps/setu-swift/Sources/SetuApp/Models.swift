@@ -21,6 +21,10 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
     var worktree: String
     var note: String?
     var staleEnv: Bool
+    /// A writer (usually an agent) that claimed this worktree, or nil.
+    var claim: Claim?
+    /// Set while auto-removal has the worktree on its list and it is not pinned.
+    var removal: Removal?
 
     var id: String { run }
     var isUp: Bool { status == "running" || status == "starting" }
@@ -28,7 +32,7 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
     var name: String { run.split(separator: "/", maxSplits: 1).last.map(String.init) ?? run }
 
     enum CodingKeys: String, CodingKey {
-        case run, url, status, pinned, ramBytes = "ram_bytes", worktree, note, staleEnv = "stale_env"
+        case run, url, status, pinned, ramBytes = "ram_bytes", worktree, note, staleEnv = "stale_env", claim, removal
     }
 
     init(from d: Decoder) throws {
@@ -41,7 +45,162 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
         worktree = c.val(.worktree, "")
         note = try? c.decodeIfPresent(String.self, forKey: .note)
         staleEnv = c.val(.staleEnv, false)
+        claim = try? c.decodeIfPresent(Claim.self, forKey: .claim)
+        removal = try? c.decodeIfPresent(Removal.self, forKey: .removal)
     }
+}
+
+/// `claim` of an `ls` entry, and one row of `claims`.
+struct Claim: Decodable, Sendable, Hashable {
+    /// Only in the `claims` list; empty inside an `ls` entry.
+    var run: String
+    var holder: String
+    var stale: Bool
+    var pid: Int?
+    var since: UInt64?
+    var heartbeat: UInt64?
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        run = c.val(.run, "")
+        holder = c.val(.holder, "")
+        stale = c.val(.stale, false)
+        pid = try? c.decodeIfPresent(Int.self, forKey: .pid)
+        since = try? c.decodeIfPresent(UInt64.self, forKey: .since)
+        heartbeat = try? c.decodeIfPresent(UInt64.self, forKey: .heartbeat)
+    }
+    enum CodingKeys: String, CodingKey { case run, holder, stale, pid, since, heartbeat }
+
+    var tooltip: String { stale ? "Stale claim by \(holder)" : "Claimed by \(holder)" }
+}
+
+/// `removal` of an `ls` entry: when auto-removal listed the worktree, when it goes, and why.
+struct Removal: Decodable, Sendable, Hashable {
+    var candidateSince: UInt64
+    var removesAfter: UInt64
+    var reason: String
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        candidateSince = c.val(.candidateSince, 0)
+        removesAfter = c.val(.removesAfter, 0)
+        reason = c.val(.reason, "")
+    }
+    enum CodingKeys: String, CodingKey { case candidateSince = "candidate_since", removesAfter = "removes_after", reason }
+
+    func countdown(now: Date = Date()) -> String { removesIn(removesAfter, now: now) }
+}
+
+/// "removes in 5h" style words for a unix time in the future.
+func removesIn(_ at: UInt64, now: Date = Date()) -> String {
+    let left = Int64(at) - Int64(now.timeIntervalSince1970)
+    switch left {
+    case ..<1: return "removing soon"
+    case ..<60: return "removes in <1m"
+    case ..<3600: return "removes in \(left / 60)m"
+    case ..<86400: return "removes in \(left / 3600)h"
+    default: return "removes in \(left / 86400)d"
+    }
+}
+
+/// One entry of `projects`.
+struct ProjectInfo: Decodable, Sendable, Hashable, Identifiable {
+    var project: String
+    /// The project's own `[worktree] base`, or nil when Setu picks one.
+    var base: String?
+    var id: String { project }
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        project = c.val(.project, "")
+        base = try? c.decodeIfPresent(String.self, forKey: .base)
+    }
+    enum CodingKeys: String, CodingKey { case project, base }
+}
+
+/// One entry of `worktree.removed`: a removed worktree that can be restored.
+struct RemovedRun: Decodable, Sendable, Hashable, Identifiable {
+    var run: String
+    var project: String
+    var branch: String?
+    var removedAt: UInt64
+    var archive: String?
+    /// Nil once the archive was pruned: only the branch comes back.
+    var archiveSize: UInt64?
+    var id: String { run }
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        run = c.val(.run, "")
+        project = c.val(.project, "")
+        branch = try? c.decodeIfPresent(String.self, forKey: .branch)
+        removedAt = c.val(.removedAt, 0)
+        archive = try? c.decodeIfPresent(String.self, forKey: .archive)
+        archiveSize = try? c.decodeIfPresent(UInt64.self, forKey: .archiveSize)
+    }
+    enum CodingKeys: String, CodingKey { case run, project, branch, removedAt = "removed_at", archive, archiveSize = "archive_size" }
+}
+
+/// `release` reply.
+struct ReleaseReply: Decodable, Sendable {
+    var released: Bool
+    var holder: String?
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        released = c.val(.released, false)
+        holder = try? c.decodeIfPresent(String.self, forKey: .holder)
+    }
+    enum CodingKeys: String, CodingKey { case released, holder }
+}
+
+/// `worktree.rm` reply.
+struct RemoveReply: Decodable, Sendable {
+    var removed: Bool
+    var already: Bool
+    var archivedFiles: Int
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        removed = c.val(.removed, false)
+        already = c.val(.already, false)
+        archivedFiles = c.val(.archivedFiles, 0)
+    }
+    enum CodingKeys: String, CodingKey { case removed, already, archivedFiles = "archived_files" }
+}
+
+/// Why the new-worktree form can't submit yet, or nil. The daemon still has the last word.
+func branchProblem(_ branch: String) -> String? {
+    if branch.isEmpty { return "Enter a branch name." }
+    if branch.contains(where: \.isWhitespace) { return "A branch name can't have spaces." }
+    return nil
+}
+
+/// The daemon refuses a removal with `refusing to remove: [code] message; [code] message`.
+/// Returns one plain sentence per reason; nil when the message is some other error.
+func removalRefusals(_ message: String) -> [String]? {
+    let prefix = "refusing to remove: "
+    guard message.hasPrefix(prefix) else { return nil }
+    let body = String(message.dropFirst(prefix.count))
+    let codes = ["main", "dirty", "unpushed", "fetch", "processes", "claim", "running"]
+    // Split at each "[code] " marker; reason text may itself contain "; ".
+    var marks: [(code: String, start: String.Index, textStart: String.Index)] = []
+    for code in codes {
+        var from = body.startIndex
+        while let r = body.range(of: "[\(code)] ", range: from..<body.endIndex) {
+            marks.append((code, r.lowerBound, r.upperBound))
+            from = r.upperBound
+        }
+    }
+    marks.sort { $0.start < $1.start }
+    guard !marks.isEmpty else { return [message] }
+    var out: [String] = []
+    for (i, m) in marks.enumerated() {
+        let end = i + 1 < marks.count ? marks[i + 1].start : body.endIndex
+        var text = String(body[m.textStart..<end]).trimmingCharacters(in: .whitespaces)
+        if text.hasSuffix(";") { text.removeLast() }
+        if m.code == "claim", let r = text.range(of: "held by ") {
+            let holder = text[r.upperBound...].prefix { $0 != ";" && $0 != " " }
+            out.append("Claimed by \(holder). Release the claim first.")
+            continue
+        }
+        out.append(text.prefix(1).uppercased() + text.dropFirst() + ".")
+    }
+    return out
 }
 
 struct EnvVar: Decodable, Sendable, Hashable {

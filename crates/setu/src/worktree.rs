@@ -1028,6 +1028,40 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
     }
 }
 
+// ---------------------------------------------------------------- removed list
+
+/// Finished removals that `restore` can still work from, newest first (read-only, for the app).
+/// `archive_size` is null when the archive file is gone (pruned): the branch alone can still be restored.
+pub fn removed_list(ops_dir: &Path) -> Vec<serde_json::Value> {
+    let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
+    let Ok(projects) = std::fs::read_dir(ops_dir) else { return Vec::new() };
+    for p in projects.flatten() {
+        let Ok(files) = std::fs::read_dir(p.path()) else { continue };
+        for f in files.flatten() {
+            let Ok(b) = std::fs::read(f.path()) else { continue };
+            let Ok(r) = serde_json::from_slice::<OpRecord>(&b) else { continue };
+            if r.step != Step::Done {
+                continue;
+            }
+            let at = r.finished.unwrap_or(r.updated);
+            let size = r.archive.as_ref().and_then(|a| std::fs::metadata(a).ok()).map(|m| m.len());
+            rows.push((
+                at,
+                serde_json::json!({
+                    "run": format!("{}/{}", r.project, r.run),
+                    "project": r.project,
+                    "branch": r.branch,
+                    "removed_at": at,
+                    "archive": r.archive,
+                    "archive_size": size,
+                }),
+            ));
+        }
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.into_iter().map(|(_, v)| v).collect()
+}
+
 // ---------------------------------------------------------------- restore
 
 #[derive(Debug, Clone, Serialize)]
@@ -1648,6 +1682,34 @@ pub(crate) mod tests {
         assert_eq!(g(&r.path, &["status", "--porcelain"]), "");
         assert!(load_op(&f.ops, "app/feat-rs").unwrap().is_none(), "marker consumed");
         assert!(restore(&f.cfg, "feat-rs", &f.ops, &f.archives).is_err());
+    }
+
+    #[test]
+    fn removed_list_reports_finished_removals_only() {
+        let f = fx("removed");
+        assert!(removed_list(&f.ops).is_empty());
+        let o = new_wt(&f, "feat/gone");
+        fs::write(o.path.join("local.db"), "precious").unwrap();
+        let out = do_rm(&f, "feat-gone", &o.path, false, &Host::default()).unwrap();
+        let rows = removed_list(&f.ops);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["run"], "app/feat-gone");
+        assert_eq!(rows[0]["project"], "app");
+        assert_eq!(rows[0]["branch"], "feat/gone");
+        assert!(rows[0]["removed_at"].as_u64().unwrap() > 0);
+        assert_eq!(rows[0]["archive"], serde_json::json!(out.archive));
+        assert!(rows[0]["archive_size"].as_u64().unwrap() > 0);
+        // A pruned archive keeps the entry (branch restore still works) but drops the size.
+        fs::remove_file(out.archive.unwrap()).unwrap();
+        assert!(removed_list(&f.ops)[0]["archive_size"].is_null());
+        // A pending (unfinished) removal is not listed; a restored one is gone.
+        let o2 = new_wt(&f, "feat/pending");
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Stop);
+        let _ = do_rm(&f, "feat-pending", &o2.path, false, &crashy);
+        assert_eq!(removed_list(&f.ops).len(), 1);
+        restore(&f.cfg, "feat-gone", &f.ops, &f.archives).unwrap();
+        assert!(removed_list(&f.ops).is_empty());
     }
 
     #[test]
