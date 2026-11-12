@@ -1,0 +1,11 @@
+# Bundler projects.
+priority = 10
+
+[detect]
+any_of = ["Gemfile.lock"]
+
+[[disk.item]]
+name = "rails-tmp-cache"
+kind = "cache"
+paths = ["tmp/cache"]
+clean_after = "7d"

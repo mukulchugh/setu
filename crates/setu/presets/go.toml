@@ -1,0 +1,5 @@
+# Go: no per-tree items; the module cache is shared and left alone.
+priority = 10
+
+[detect]
+any_of = ["go.mod"]

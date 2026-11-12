@@ -1,0 +1,12 @@
+# npm projects.
+priority = 10
+
+[detect]
+any_of = ["package-lock.json"]
+
+[[disk.item]]
+name = "node_modules"
+kind = "deps"
+paths = ["node_modules", "*/node_modules", "*/*/node_modules"]
+install = "npm ci"
+lockfiles = ["package-lock.json"]

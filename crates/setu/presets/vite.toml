@@ -1,0 +1,11 @@
+# Vite: the dependency pre-bundle cache.
+priority = 20
+
+[detect]
+any_of = ["vite.config.*", "*/vite.config.*", "*/*/vite.config.*"]
+
+[[disk.item]]
+name = "vite-cache"
+kind = "cache"
+paths = ["node_modules/.vite", "*/*/node_modules/.vite"]
+clean_after = "24h"

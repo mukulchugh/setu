@@ -1,0 +1,17 @@
+# pnpm projects.
+priority = 10
+
+[detect]
+any_of = ["pnpm-lock.yaml"]
+
+[[disk.item]]
+name = "node_modules"
+kind = "deps"
+paths = ["node_modules", "*/node_modules", "*/*/node_modules"]
+install = "pnpm install --frozen-lockfile"
+lockfiles = ["pnpm-lock.yaml"]
+
+[[disk.store]]
+name = "pnpm-store"
+path = "~/Library/pnpm/store"
+warn_below = "512MiB"

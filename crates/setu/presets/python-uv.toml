@@ -1,0 +1,22 @@
+# uv projects: .venv is deps (never auto-cleaned); tool caches age out.
+priority = 10
+
+[detect]
+any_of = ["uv.lock"]
+
+[[disk.item]]
+name = "venv"
+kind = "deps"
+paths = [".venv", "*/.venv"]
+install = "uv sync --frozen"
+lockfiles = ["uv.lock"]
+
+[[disk.item]]
+name = "python-tool-caches"
+kind = "cache"
+paths = [".pytest_cache", ".ruff_cache", ".mypy_cache", "*/.pytest_cache", "*/.ruff_cache", "*/.mypy_cache"]
+clean_after = "7d"
+
+[[disk.store]]
+name = "uv-cache"
+path = "~/.cache/uv"

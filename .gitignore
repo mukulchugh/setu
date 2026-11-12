@@ -1,14 +1,4 @@
-node_modules/
-*.log
+/target*
 .DS_Store
-.gstack/
+*.log
 .impeccable/
-
-# Setu Links engine build output
-engines/links/target/
-engines/links/target-*/
-
-# Hoisted dependency file helper build output
-engines/dependency-files/target/
-bin/setu-dependency-files
-bin/setu-dependency-files.setu-stage-*

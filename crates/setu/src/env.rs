@@ -1,0 +1,1050 @@
+//! Layered env storage: global, project and worktree layers, each split into a plain file and a
+//! 0600 secrets file. Pure functions over files; no daemon state. Callers decide what to return
+//! over the socket: nothing here logs or audits a value.
+// The coordinator wires these into the daemon/api/cli; until then they are unused.
+
+use crate::config::load_env_layer;
+use crate::model::RunId;
+use crate::paths;
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Global,
+    Project(String),
+    Worktree(RunId),
+}
+
+impl Scope {
+    /// Refuse names that could alias another scope's files or escape the env directory: the
+    /// plain file of `x.secrets` would be the secrets file of `x` (review #12).
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Scope::Global => Ok(()),
+            Scope::Project(p) => crate::config::validate_project_name(p),
+            Scope::Worktree(id) => {
+                crate::config::validate_project_name(&id.project)?;
+                let ok = !id.run.is_empty()
+                    && id.run.split('/').all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".secrets") && !c.contains('\0') && !c.contains('\\'));
+                if !ok {
+                    bail!("run name {:?} cannot be used for env files (empty or dotted component, or ends in .secrets)", id.run);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// (plain file, secrets file) for this layer.
+    pub fn paths(&self) -> (PathBuf, PathBuf) {
+        let dir = paths::env_dir();
+        match self {
+            Scope::Global => (dir.join("global.toml"), dir.join("global.secrets.toml")),
+            Scope::Project(p) => (dir.join(format!("{p}.toml")), dir.join(format!("{p}.secrets.toml"))),
+            Scope::Worktree(id) => {
+                let d = dir.join(&id.project);
+                (d.join(format!("{}.toml", id.run)), d.join(format!("{}.secrets.toml", id.run)))
+            }
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Scope::Global => "global",
+            Scope::Project(_) => "project",
+            Scope::Worktree(_) => "worktree",
+        }
+        .to_string()
+    }
+
+    fn target(&self) -> Option<String> {
+        match self {
+            Scope::Global => None,
+            Scope::Project(p) => Some(p.clone()),
+            Scope::Worktree(id) => Some(format!("{}/{}", id.project, id.run)),
+        }
+    }
+}
+
+/// Case-insensitive: contains KEY, TOKEN, SECRET or PASSWORD; ends with PASS; is DATABASE_URL;
+/// ends with _DSN.
+pub fn is_secret_name(name: &str) -> bool {
+    let u = name.to_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|p| u.contains(p))
+        || u.ends_with("PASS")
+        || u == "DATABASE_URL"
+        || u.ends_with("_DSN")
+}
+
+/// Preview of a value: first 3 + "…" + last 4 chars; `None` under 12 chars.
+pub fn mask(value: &str) -> Option<String> {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < 12 {
+        return None;
+    }
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    Some(format!("{head}…{tail}"))
+}
+
+/// Secret values shorter than this cannot be redacted from logs without mangling ordinary text
+/// ("1" would rewrite every digit), so they are refused instead of being left unredacted.
+pub const MIN_SECRET_LEN: usize = 3;
+
+/// Refuse a value that would be classified secret but is too short to redact. Empty is fine
+/// (there is nothing to leak).
+pub fn check_redactable(name: &str, value: &str) -> Result<()> {
+    let n = value.chars().count();
+    if n > 0 && n < MIN_SECRET_LEN {
+        bail!(
+            "{name} is treated as a secret but its value is only {n} character(s); values shorter than {MIN_SECRET_LEN} cannot be redacted from logs without mangling ordinary text, so Setu refuses them. Use a longer value, or a name that does not look like a secret"
+        );
+    }
+    Ok(())
+}
+
+/// Name-based guess: a secret-looking name with a value long enough to be a credential. A 1–2
+/// character value under such a name (`MAX_TOKENS=50`) is ordinary config, not a secret.
+pub fn looks_secret(name: &str, value: &str) -> bool {
+    is_secret_name(name) && value.chars().count() >= MIN_SECRET_LEN
+}
+
+pub struct Var {
+    pub name: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+fn valid_name(name: &str) -> bool {
+    let mut c = name.chars();
+    matches!(c.next(), Some(f) if f.is_ascii_alphabetic() || f == '_')
+        && c.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Every env mutation (set, unset, import) is a read-modify-write of one or two files, and the
+/// daemon is the only writer (CLI, app and MCP all go through its socket), so one in-process lock
+/// serializes them. It also covers the shared redaction-history file, which scope-level locks
+/// could not (review B1). Readers take it too so they see a coherent plain+secrets pair.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load_pair_unlocked(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    scope.validate()?;
+    let (p, s) = scope.paths();
+    Ok((load_env_layer(&p)?, load_env_layer(&s)?))
+}
+
+fn load_pair(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    let _g = lock();
+    load_pair_unlocked(scope)
+}
+
+/// Plain file, then secrets file; secrets win on a clash and are marked secret.
+pub fn read_layer(scope: &Scope) -> Result<Vec<Var>> {
+    let (plain, secrets) = load_pair(scope)?;
+    let mut all: BTreeMap<String, Var> = BTreeMap::new();
+    for (name, value) in plain {
+        all.insert(name.clone(), Var { name, value, secret: false });
+    }
+    for (name, value) in secrets {
+        all.insert(name.clone(), Var { name, value, secret: true });
+    }
+    Ok(all.into_values().collect())
+}
+
+pub fn get_value(scope: &Scope, name: &str) -> Result<Option<String>> {
+    Ok(read_layer(scope)?.into_iter().find(|v| v.name == name).map(|v| v.value))
+}
+
+/// Merged plain + secrets, for building a run's env.
+pub fn layer_map(scope: &Scope) -> Result<BTreeMap<String, String>> {
+    Ok(read_layer(scope)?.into_iter().map(|v| (v.name, v.value)).collect())
+}
+
+/// Names marked secret across the given layers (read errors are skipped).
+#[allow(dead_code)] // kept for tests; MCP redaction reads layers directly
+pub fn secret_names(scopes: &[Scope]) -> BTreeSet<String> {
+    scopes
+        .iter()
+        .filter_map(|s| read_layer(s).ok())
+        .flatten()
+        .filter(|v| v.secret)
+        .map(|v| v.name)
+        .collect()
+}
+
+fn chmod(path: &Path, mode: u32) {
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+fn ensure_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    chmod(&paths::env_dir(), 0o700);
+    chmod(dir, 0o700);
+    Ok(())
+}
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// tmp file in the same dir (0600) -> write -> fsync -> rename -> fsync dir.
+fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_SUFFIX.lock().unwrap_or_else(|e| e.into_inner()).as_deref().is_some_and(|sfx| path.to_string_lossy().ends_with(sfx)) {
+        bail!("injected write failure");
+    }
+    let dir = path.parent().context("env path has no parent")?;
+    ensure_dir(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let res = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+fn write_map(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
+    atomic_write(path, &toml::to_string(map).context("serializing env layer")?)
+}
+
+/// Apply many (name, value, explicit secret flag) updates with one read and at most two writes.
+/// Returns the secret flag used for each, in order.
+fn apply(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Vec<bool>> {
+    let _g = lock();
+    apply_locked(scope, updates)
+}
+
+/// `apply` for callers that already hold the env lock.
+fn apply_locked(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Vec<bool>> {
+    for (n, _, _) in updates {
+        if !valid_name(n) {
+            bail!("invalid env name {n:?}: use letters, digits and underscore, not starting with a digit");
+        }
+    }
+    let (mut plain, mut secrets) = load_pair_unlocked(scope)?;
+    let (plain0, secrets0) = (plain.clone(), secrets.clone());
+    let mut flags = Vec::with_capacity(updates.len());
+    for (name, value, explicit) in updates {
+        let existing = if secrets.contains_key(name) {
+            Some(true)
+        } else if plain.contains_key(name) {
+            Some(false)
+        } else {
+            None
+        };
+        let secret = explicit.or(existing).unwrap_or_else(|| looks_secret(name, value));
+        // Same classification the effective view and log redaction use: refuse, don't leak (B5).
+        if secret {
+            check_redactable(name, value)?;
+        }
+        let (dst, other) = if secret { (&mut secrets, &mut plain) } else { (&mut plain, &mut secrets) };
+        other.remove(name);
+        dst.insert(name.clone(), value.clone());
+        flags.push(secret);
+    }
+    // A superseded secret value must stay redactable in logs that already contain it.
+    for (name, old) in &secrets0 {
+        if secrets.get(name) != Some(old) {
+            remember_secret(name, old)?;
+        }
+    }
+    write_pair(scope, (&plain0, &secrets0), (&plain, &secrets))?;
+    Ok(flags)
+}
+
+/// Write the changed files of a layer. When a name moves between the plain and the secrets file
+/// the destination is written (with the source still intact) before the source is rewritten, so a
+/// failure or crash in between leaves the value in at least one file (review #16).
+fn write_pair(scope: &Scope, before: (&BTreeMap<String, String>, &BTreeMap<String, String>), after: (&BTreeMap<String, String>, &BTreeMap<String, String>)) -> Result<()> {
+    let (pp, sp) = scope.paths();
+    let (plain0, secrets0) = before;
+    let (plain, secrets) = after;
+    let moved = plain0.keys().any(|k| !plain.contains_key(k)) && secrets.keys().any(|k| !secrets0.contains_key(k))
+        || secrets0.keys().any(|k| !secrets.contains_key(k)) && plain.keys().any(|k| !plain0.contains_key(k));
+    let (mut plain_now, mut secrets_now) = (plain0.clone(), secrets0.clone());
+    if moved {
+        let mut pu = plain.clone();
+        for (k, v) in plain0 {
+            pu.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        let mut su = secrets.clone();
+        for (k, v) in secrets0 {
+            su.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if pu != plain_now {
+            write_map(&pp, &pu)?;
+            plain_now = pu;
+        }
+        if su != secrets_now {
+            write_map(&sp, &su)?;
+            secrets_now = su;
+        }
+    }
+    if *plain != plain_now {
+        write_map(&pp, plain)?;
+    }
+    if *secrets != secrets_now {
+        write_map(&sp, secrets)?;
+    }
+    Ok(())
+}
+
+fn history_path() -> PathBuf {
+    paths::env_dir().join(".redact-history.jsonl")
+}
+
+/// One journaled secret: the value, and the unix second it stopped being current.
+struct Hist {
+    name: String,
+    value: String,
+    ts: u64,
+}
+
+fn read_history() -> Result<Vec<Hist>> {
+    let text = match std::fs::read_to_string(history_path()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).context("reading the redaction history"),
+    };
+    let now = crate::db::now_secs();
+    let mut out = Vec::new();
+    for (i, l) in text.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        // Damaged history must stop log delivery: a silently skipped line is a silent leak.
+        // The message never quotes the line (it holds a secret).
+        let damaged = || anyhow!("the redaction history is damaged at line {} ({}); logs cannot be redacted safely until it is repaired", i + 1, history_path().display());
+        let v: serde_json::Value = serde_json::from_str(l).map_err(|_| damaged())?;
+        let (Some(name), Some(value)) = (v["name"].as_str(), v["value"].as_str()) else { return Err(damaged()) };
+        // Lines written before timestamps existed are treated as current, so they are kept.
+        out.push(Hist { name: name.to_string(), value: value.to_string(), ts: v["ts"].as_u64().unwrap_or(now) });
+    }
+    Ok(out)
+}
+
+fn write_history(entries: &[Hist]) -> Result<()> {
+    let mut text = String::new();
+    for h in entries {
+        text.push_str(&serde_json::json!({ "name": h.name, "value": h.value, "ts": h.ts }).to_string());
+        text.push('\n');
+    }
+    atomic_write(&history_path(), &text).context("recording the previous secret value for log redaction")
+}
+
+/// Keep a superseded or removed secret value (0600, outside the database) so log redaction still
+/// covers output written while it was current. Failing to record it fails the change. Entries are
+/// never dropped by count: `prune_history` retires them once no log can still hold them. The
+/// caller holds the env lock.
+fn remember_secret(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.chars().count() < MIN_SECRET_LEN {
+        return Ok(());
+    }
+    ensure_dir(&paths::env_dir())?;
+    let mut entries = read_history()?;
+    if entries.iter().any(|h| h.name == name && h.value == value) {
+        return Ok(());
+    }
+    entries.push(Hist { name: name.to_string(), value: value.to_string(), ts: crate::db::now_secs() });
+    write_history(&entries)
+}
+
+/// Journal a secret value that is leaving use outside the env API (a project config `[env]`
+/// secret that was edited or removed).
+pub fn remember_superseded(name: &str, value: &str) -> Result<()> {
+    let _g = lock();
+    remember_secret(name, value)
+}
+
+/// Retire history entries that stopped being current before `horizon` (unix seconds): the daemon
+/// computes it as the moment from which every existing log file and live process can only hold
+/// newer values, so values leave the history with the log rotation that destroyed them.
+pub fn prune_history(horizon: u64) -> Result<usize> {
+    let _g = lock();
+    let entries = read_history()?;
+    let before = entries.len();
+    let kept: Vec<Hist> = entries.into_iter().filter(|h| h.ts >= horizon).collect();
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        write_history(&kept)?;
+    }
+    Ok(dropped)
+}
+
+/// Previously stored secret values (name, value), for log redaction. An unreadable or damaged file is an error.
+pub fn redaction_history() -> Result<Vec<(String, String)>> {
+    let _g = lock();
+    Ok(read_history()?.into_iter().map(|h| (h.name, h.value)).collect())
+}
+
+/// Returns the secret flag the value was stored with. Secret = explicit flag, else the name's
+/// existing flag, else name detection.
+pub fn write_var(scope: &Scope, name: &str, value: &str, secret: Option<bool>) -> Result<bool> {
+    Ok(apply(scope, &[(name.to_string(), value.to_string(), secret)])?[0])
+}
+
+/// Returns whether the name existed.
+pub fn unset_var(scope: &Scope, name: &str) -> Result<bool> {
+    let _g = lock();
+    let (mut plain, mut secrets) = load_pair_unlocked(scope)?;
+    if let Some(old) = secrets.get(name) {
+        remember_secret(name, old)?;
+    }
+    let (p, s) = (plain.remove(name).is_some(), secrets.remove(name).is_some());
+    let (pp, sp) = scope.paths();
+    if p {
+        write_map(&pp, &plain)?;
+    }
+    if s {
+        write_map(&sp, &secrets)?;
+    }
+    Ok(p || s)
+}
+
+/// Parse dotenv text. Problems carry line numbers and reasons only, never text from the input.
+pub fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let (mut out, mut problems) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < lines.len() {
+        let lineno = i + 1;
+        let mut line = lines[i].trim_start();
+        i += 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(r) = line.strip_prefix("export") {
+            if r.starts_with([' ', '\t']) {
+                line = r.trim_start();
+            }
+        }
+        let Some((raw_name, rest)) = line.split_once('=') else {
+            problems.push(format!("line {lineno}: no '=' found"));
+            continue;
+        };
+        let name = raw_name.trim();
+        let rest = rest.trim_start();
+        let value = if let Some(r) = rest.strip_prefix('\'') {
+            match r.find('\'') {
+                Some(end) => Some(r[..end].to_string()),
+                None => {
+                    problems.push(format!("line {lineno}: unterminated single quote"));
+                    None
+                }
+            }
+        } else if let Some(r) = rest.strip_prefix('"') {
+            let mut buf = String::new();
+            let mut cur = r;
+            let mut closed = false;
+            loop {
+                let mut chars = cur.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some('n') => buf.push('\n'),
+                            Some('"') => buf.push('"'),
+                            Some('\\') => buf.push('\\'),
+                            Some(o) => {
+                                buf.push('\\');
+                                buf.push(o);
+                            }
+                            None => buf.push('\\'),
+                        },
+                        o => buf.push(o),
+                    }
+                }
+                if closed || i >= lines.len() {
+                    break;
+                }
+                buf.push('\n');
+                cur = lines[i];
+                i += 1;
+            }
+            if closed {
+                Some(buf)
+            } else {
+                problems.push(format!("line {lineno}: unterminated double quote"));
+                None
+            }
+        } else {
+            let cut = rest.find(" #").or_else(|| rest.find("\t#")).unwrap_or(rest.len());
+            Some(rest[..cut].trim_end().to_string())
+        };
+        let Some(value) = value else { continue };
+        if !valid_name(name) {
+            problems.push(format!("line {lineno}: invalid name"));
+            continue;
+        }
+        out.push((name.to_string(), value));
+    }
+    (out, problems)
+}
+
+/// Names only, never values. `imported` includes `overwritten`.
+#[derive(Debug, Default, Serialize)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub skipped: Vec<String>,
+    pub overwritten: Vec<String>,
+    pub secrets: Vec<String>,
+    /// Parse problems: line numbers and reasons only.
+    pub problems: Vec<String>,
+}
+
+pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Result<ImportReport> {
+    // The existing-layer read and the write below are one transaction.
+    let _g = lock();
+    let (parsed, problems) = parse_dotenv(text);
+    // Last duplicate wins; keep first-seen order.
+    let mut order: Vec<String> = Vec::new();
+    let mut vals: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in parsed {
+        if vals.insert(k.clone(), v).is_none() {
+            order.push(k);
+        }
+    }
+    let (plain_now, secrets_now) = load_pair_unlocked(scope)?;
+    let existing: BTreeMap<String, bool> = plain_now.keys().map(|k| (k.clone(), false)).chain(secrets_now.keys().map(|k| (k.clone(), true))).collect();
+    let mut rep = ImportReport { problems, ..Default::default() };
+    let mut updates = Vec::new();
+    for name in order {
+        let prior = existing.get(&name).copied();
+        if prior.is_some() && !overwrite {
+            rep.skipped.push(name);
+            continue;
+        }
+        if prior.is_some() {
+            rep.overwritten.push(name.clone());
+        }
+        let value = vals.remove(&name).unwrap_or_default();
+        let secret = prior.unwrap_or_else(|| looks_secret(&name, &value));
+        if secret {
+            rep.secrets.push(name.clone());
+        }
+        if secret {
+            if let Err(e) = check_redactable(&name, &value) {
+                // A refused value is reported and left out; the rest of the import proceeds.
+                rep.problems.push(format!("{e}"));
+                rep.secrets.retain(|n| n != &name);
+                rep.overwritten.retain(|n| n != &name);
+                continue;
+            }
+        }
+        rep.imported.push(name.clone());
+        updates.push((name, value, None));
+    }
+    if !preview && !updates.is_empty() {
+        apply_locked(scope, &updates)?;
+    }
+    Ok(rep)
+}
+
+pub(crate) fn rfc3339_now() -> String {
+    rfc3339(crate::db::now_secs() as i64)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for unix seconds.
+pub(crate) fn rfc3339(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Record an env event in the database. By API shape there is no value parameter:
+/// callers cannot pass one. `extra` is for non-secret metadata (counts, flags); keys named
+/// `value`/`values` are dropped defensively. Failures are reported to stderr, never panics.
+pub fn audit(actor: &str, op: &str, scope: &Scope, name: Option<&str>, extra: Option<serde_json::Value>) {
+    let mut detail = serde_json::Map::new();
+    if let Some(t) = scope.target() {
+        detail.insert("target".into(), serde_json::json!(t));
+    }
+    let mut client = None;
+    if let Some(serde_json::Value::Object(x)) = extra {
+        for (k, v) in x {
+            if k == "client" {
+                client = v.as_str().map(String::from);
+            } else if k != "value" && k != "values" && !detail.contains_key(&k) {
+                detail.insert(k, v);
+            }
+        }
+    }
+    crate::db::record(crate::db::Event {
+        ts: crate::db::now_secs(),
+        actor: Some(actor.into()),
+        client,
+        kind: "env",
+        op: op.into(),
+        run_key: matches!(scope, Scope::Worktree(_)).then(|| scope.target()).flatten(),
+        scope: Some(scope.label()),
+        name: name.map(String::from),
+        detail: serde_json::Value::Object(detail),
+    });
+}
+
+/// Stable FNV-1a (64-bit) over the sorted `k=v` pairs, for `stale_env`.
+pub fn env_hash(env: &BTreeMap<String, String>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (k, v) in env {
+        feed(k.as_bytes());
+        feed(b"=");
+        feed(v.as_bytes());
+        feed(b"\0");
+    }
+    h
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Test hook: fail `atomic_write` for paths ending with this.
+    pub(crate) static FAIL_SUFFIX: Mutex<Option<String>> = Mutex::new(None);
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) struct Sandbox {
+        pub(crate) dir: PathBuf,
+        _g: MutexGuard<'static, ()>,
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    pub(crate) fn sandbox() -> Sandbox {
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "setu-env-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("SETU_HOME", &dir);
+        Sandbox { dir, _g: g }
+    }
+    fn wt() -> Scope {
+        Scope::Worktree(RunId { project: "proj".into(), run: "feat".into() })
+    }
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn secret_detection() {
+        for n in ["API_KEY", "github_token", "MY_SECRET_X", "DB_PASSWORD", "ROOT_PASS", "DATABASE_URL", "sentry_dsn", "Monkey"] {
+            assert!(is_secret_name(n), "{n}");
+        }
+        for n in ["PORT", "NODE_ENV", "DATABASE_URL_X", "DSN", "PASSENGER", "HOST"] {
+            assert!(!is_secret_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn masking() {
+        assert_eq!(mask("short"), None);
+        assert_eq!(mask("elevenchars"), None);
+        assert_eq!(mask("abcdefghijkl").unwrap(), "abc…ijkl");
+        assert_eq!(mask("ééééééééééééé").unwrap(), "ééé…éééé");
+        assert_eq!(mask("日本語日本語日本語日本語").unwrap(), "日本語…語日本語");
+        assert_eq!(mask("日本語日本語日"), None);
+    }
+
+    #[test]
+    fn parser_cases() {
+        let text = "# comment\n\nA=1\nexport B=two words\nC='lit\\n$x'\nD=\"a\\nb\\\"q\\\\\"\nE=x=y=z\nF=val # trailing\nG=\"multi\nline\" \r\nH=a#b\r\n9BAD=1\nnoequals\nI=\n";
+        let (v, p) = parse_dotenv(text);
+        let m: BTreeMap<_, _> = v.into_iter().collect();
+        assert_eq!(m["A"], "1");
+        assert_eq!(m["B"], "two words");
+        assert_eq!(m["C"], "lit\\n$x");
+        assert_eq!(m["D"], "a\nb\"q\\");
+        assert_eq!(m["E"], "x=y=z");
+        assert_eq!(m["F"], "val");
+        assert_eq!(m["G"], "multi\nline");
+        assert_eq!(m["H"], "a#b");
+        assert_eq!(m["I"], "");
+        assert_eq!(p.len(), 2, "{p:?}");
+    }
+
+    #[test]
+    fn problems_never_contain_values() {
+        let (_, p) = parse_dotenv("1bad=sk-supersecretvalue-123\nsk-supersecretvalue-123\nQ=\"sk-supersecretvalue-123\n");
+        assert_eq!(p.len(), 3);
+        assert!(p.iter().all(|s| !s.contains("supersecret") && !s.contains("1bad")), "{p:?}");
+    }
+
+    #[test]
+    fn write_read_unset_round_trip() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        assert!(read_layer(&sc).unwrap().is_empty());
+        assert!(!write_var(&sc, "PLAIN", "v1", None).unwrap());
+        assert!(write_var(&sc, "API_TOKEN", "tok1", None).unwrap());
+        let (pp, sp) = sc.paths();
+        assert!(std::fs::read_to_string(&pp).unwrap().contains("PLAIN"));
+        assert!(!std::fs::read_to_string(&pp).unwrap().contains("API_TOKEN"));
+        assert!(std::fs::read_to_string(&sp).unwrap().contains("API_TOKEN"));
+        // existing flag sticks without an explicit one
+        assert!(write_var(&sc, "API_TOKEN", "tok2", None).unwrap());
+        assert_eq!(get_value(&sc, "API_TOKEN").unwrap().as_deref(), Some("tok2"));
+        // move between files
+        assert!(write_var(&sc, "PLAIN", "val1", Some(true)).unwrap());
+        assert!(!std::fs::read_to_string(&pp).unwrap().contains("PLAIN"));
+        assert!(!write_var(&sc, "API_TOKEN", "tok2", Some(false)).unwrap());
+        assert!(std::fs::read_to_string(&pp).unwrap().contains("API_TOKEN"));
+        assert!(!std::fs::read_to_string(&sp).unwrap().contains("API_TOKEN"));
+        let vars = read_layer(&sc).unwrap();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.iter().find(|v| v.name == "PLAIN").unwrap().secret);
+        assert!(unset_var(&sc, "PLAIN").unwrap());
+        assert!(!unset_var(&sc, "PLAIN").unwrap());
+        assert_eq!(layer_map(&sc).unwrap().len(), 1);
+        assert!(write_var(&sc, "1BAD", "x", None).is_err());
+        assert!(write_var(&sc, "A-B", "x", None).is_err());
+    }
+
+    #[test]
+    fn secrets_win_on_clash() {
+        let _s = sandbox();
+        let sc = Scope::Global;
+        let (pp, sp) = sc.paths();
+        std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        std::fs::write(&pp, "X = \"plain\"\nY = \"y\"\n").unwrap();
+        std::fs::write(&sp, "X = \"secret\"\n").unwrap();
+        let vars = read_layer(&sc).unwrap();
+        let x = vars.iter().find(|v| v.name == "X").unwrap();
+        assert_eq!((x.value.as_str(), x.secret), ("secret", true));
+        assert_eq!(layer_map(&sc).unwrap()["X"], "secret");
+        assert_eq!(secret_names(&[sc]), BTreeSet::from(["X".to_string()]));
+    }
+
+    #[test]
+    fn modes_and_scopes() {
+        let _s = sandbox();
+        let sc = wt();
+        write_var(&sc, "DB_PASSWORD", "pw-123456789012", None).unwrap();
+        write_var(&sc, "HOST", "h", None).unwrap();
+        let (pp, sp) = sc.paths();
+        assert!(sp.ends_with("env/proj/feat.secrets.toml"));
+        assert!(pp.ends_with("env/proj/feat.toml"));
+        assert_eq!(mode(&sp), 0o600);
+        assert_eq!(mode(&pp), 0o600);
+        assert_eq!(mode(pp.parent().unwrap()), 0o700);
+        assert_eq!(mode(&paths::env_dir()), 0o700);
+        assert_eq!((Scope::Global.label(), Scope::Project("p".into()).label(), sc.label()), ("global".into(), "project".into(), "worktree".into()));
+        // pre-existing loose dir gets tightened
+        chmod(pp.parent().unwrap(), 0o755);
+        write_var(&sc, "A", "b", None).unwrap();
+        assert_eq!(mode(pp.parent().unwrap()), 0o700);
+        // no tmp files left behind
+        assert!(std::fs::read_dir(pp.parent().unwrap()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn import_preview_and_overwrite() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        write_var(&sc, "EXISTING", "old", None).unwrap();
+        let text = "EXISTING=new\nFRESH=1\nSTRIPE_KEY=sk-aaaaaaaaaaaa\nbad line\n";
+        let (pp, sp) = sc.paths();
+        let before = std::fs::read_to_string(&pp).unwrap();
+        let r = import(&sc, text, true, false).unwrap();
+        assert_eq!(r.imported, ["FRESH", "STRIPE_KEY"]);
+        assert_eq!(r.skipped, ["EXISTING"]);
+        assert!(r.overwritten.is_empty());
+        assert_eq!(r.secrets, ["STRIPE_KEY"]);
+        assert_eq!(r.problems.len(), 1);
+        assert_eq!(std::fs::read_to_string(&pp).unwrap(), before);
+        assert!(!sp.exists());
+        let r = import(&sc, text, false, false).unwrap();
+        assert_eq!(r.imported.len(), 2);
+        assert_eq!(get_value(&sc, "EXISTING").unwrap().as_deref(), Some("old"));
+        assert_eq!(get_value(&sc, "STRIPE_KEY").unwrap().as_deref(), Some("sk-aaaaaaaaaaaa"));
+        let r = import(&sc, text, false, true).unwrap();
+        assert_eq!(r.overwritten, ["EXISTING", "FRESH", "STRIPE_KEY"]);
+        assert_eq!(get_value(&sc, "EXISTING").unwrap().as_deref(), Some("new"));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("sk-aaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn audit_has_no_value() {
+        let _s = sandbox();
+        let sc = wt();
+        let secret = "sk-supersecretvalue-123";
+        write_var(&sc, "OPENAI_API_KEY", secret, None).unwrap();
+        audit("cli", "set", &sc, Some("OPENAI_API_KEY"), Some(serde_json::json!({"secret": true, "value": secret})));
+        audit("cli", "reveal", &Scope::Global, None, None);
+        let db = crate::db::global().unwrap();
+        let evs = crate::db::list_events(&db, Some("env"), None, None, 10).unwrap();
+        assert_eq!(evs.len(), 2);
+        let text = serde_json::to_string(&evs).unwrap();
+        assert!(!text.contains(secret));
+        let first = evs.iter().find(|e| e["op"] == "set").unwrap();
+        assert_eq!(first["scope"], "worktree");
+        assert_eq!(first["run"], "proj/feat");
+        assert_eq!(first["detail"]["target"], "proj/feat");
+        assert_eq!(first["name"], "OPENAI_API_KEY");
+        assert_eq!(first["detail"]["secret"], true);
+        assert_eq!(first["actor"], "cli");
+        // the database files themselves never hold the value
+        db.checkpoint().unwrap();
+        for f in std::fs::read_dir(db.path().parent().unwrap()).unwrap().flatten() {
+            if f.file_name().to_string_lossy().starts_with("setu.db") {
+                let bytes = std::fs::read(f.path()).unwrap();
+                assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "{}", f.path().display());
+            }
+        }
+        // non-value surfaces (names, masks, import reports) never carry it
+        let names = format!("{:?}", secret_names(&[sc.clone()]));
+        let masked = format!("{:?}", read_layer(&sc).unwrap().iter().map(|v| (v.name.clone(), v.secret, mask(&v.value))).collect::<Vec<_>>());
+        assert!(!names.contains(secret));
+        assert!(!masked.contains(secret));
+    }
+
+    #[test]
+    fn hash_stable_and_order_independent() {
+        let a: BTreeMap<String, String> = [("A", "1"), ("B", "2")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let b: BTreeMap<String, String> = [("B", "2"), ("A", "1")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(env_hash(&a), env_hash(&b));
+        assert_eq!(env_hash(&a), env_hash(&a.clone()));
+        let c: BTreeMap<String, String> = [("A", "1"), ("B", "3")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_ne!(env_hash(&a), env_hash(&c));
+        let d: BTreeMap<String, String> = [("AB", ""), ("", "")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let e: BTreeMap<String, String> = [("A", "B")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_ne!(env_hash(&d), env_hash(&e));
+        assert_eq!(env_hash(&BTreeMap::new()), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn scopes_cannot_alias_another_scopes_files() {
+        // review #12: project `demo.secrets` plain file == project `demo` secrets file
+        let _s = sandbox();
+        write_var(&Scope::Project("demo".into()), "API_TOKEN", "hunter2-hunter2", Some(true)).unwrap();
+        let alias = Scope::Project("demo.secrets".into());
+        assert!(read_layer(&alias).is_err());
+        assert!(write_var(&alias, "A", "b", None).is_err());
+        assert!(read_layer(&Scope::Project("global".into())).is_err());
+        assert!(read_layer(&Scope::Project("../x".into())).is_err());
+        let bad_run = Scope::Worktree(RunId { project: "demo".into(), run: "feat.secrets".into() });
+        assert!(read_layer(&bad_run).is_err());
+        let dotdot = Scope::Worktree(RunId { project: "demo".into(), run: "../../x".into() });
+        assert!(read_layer(&dotdot).is_err());
+        // the legitimate project still reads its own secret as a secret
+        let v = read_layer(&Scope::Project("demo".into())).unwrap();
+        assert!(v[0].secret);
+    }
+
+    #[test]
+    fn plain_to_secret_move_never_loses_the_only_copy() {
+        // review #16
+        let _s = sandbox();
+        let sc = Scope::Project("demo".into());
+        write_var(&sc, "NAME", "only-value-1234", Some(false)).unwrap();
+        *tests::FAIL_SUFFIX.lock().unwrap() = Some(".secrets.toml".into());
+        let r = write_var(&sc, "NAME", "only-value-1234", Some(true));
+        *tests::FAIL_SUFFIX.lock().unwrap() = None;
+        assert!(r.is_err());
+        let v = read_layer(&sc).unwrap();
+        assert_eq!(v.len(), 1, "the value must still exist in a file");
+        assert_eq!(v[0].value, "only-value-1234");
+        // and the move completes when writes work
+        assert!(write_var(&sc, "NAME", "only-value-1234", Some(true)).unwrap());
+        let v = read_layer(&sc).unwrap();
+        assert!(v[0].secret && v[0].value == "only-value-1234");
+        let (plain, _) = scope_files(&sc);
+        assert!(!plain.contains("NAME"), "{plain}");
+    }
+
+    fn scope_files(sc: &Scope) -> (String, String) {
+        let (p, s) = sc.paths();
+        (std::fs::read_to_string(p).unwrap_or_default(), std::fs::read_to_string(s).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_rotated_or_removed_secret_stays_in_the_redaction_history_at_0600() {
+        // review #11
+        let _s = sandbox();
+        let sc = Scope::Project("demo".into());
+        write_var(&sc, "API_TOKEN", "old-secret-value", None).unwrap();
+        write_var(&sc, "API_TOKEN", "new-secret-value", None).unwrap();
+        unset_var(&sc, "API_TOKEN").unwrap();
+        let h = redaction_history().unwrap();
+        let values: Vec<&str> = h.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(values.contains(&"old-secret-value") && values.contains(&"new-secret-value"), "{values:?}");
+        assert_eq!(mode(&history_path()), 0o600);
+    }
+
+    #[test]
+    fn b1_concurrent_writers_keep_every_edit() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let hs: Vec<_> = (0..24)
+            .map(|i| {
+                let (sc, b) = (sc.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    write_var(&sc, &format!("VAR_{i:02}"), &format!("value-{i}"), None).unwrap();
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(read_layer(&sc).unwrap().len(), 24, "acknowledged writes were lost");
+    }
+
+    #[test]
+    fn b1_concurrent_unset_import_and_history_rotations_do_not_lose_each_other() {
+        let _s = sandbox();
+        let a = Scope::Project("pa".into());
+        let b = Scope::Project("pb".into());
+        for i in 0..12 {
+            write_var(&a, &format!("KEEP_{i:02}"), "kept-value", None).unwrap();
+        }
+        write_var(&a, "ROTATE_TOKEN", "rot-0000", None).unwrap();
+        write_var(&b, "ROTATE_TOKEN", "rot-bbbb", None).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let mut hs = Vec::new();
+        for i in 0..12 {
+            let (sc, bar) = (a.clone(), barrier.clone());
+            hs.push(std::thread::spawn(move || {
+                bar.wait();
+                assert!(unset_var(&sc, &format!("KEEP_{i:02}")).unwrap());
+            }));
+        }
+        for i in 0..6 {
+            let (sc, bar) = (a.clone(), barrier.clone());
+            hs.push(std::thread::spawn(move || {
+                bar.wait();
+                import(&sc, &format!("IMP_{i}=imported\n"), false, false).unwrap();
+            }));
+        }
+        // rotations in two scopes share one history file
+        for (sc, v) in [(a.clone(), "rot-aaaa"), (b.clone(), "rot-bbb2")] {
+            for k in 0..3 {
+                let bar = barrier.clone();
+                let sc = sc.clone();
+                hs.push(std::thread::spawn(move || {
+                    bar.wait();
+                    write_var(&sc, "ROTATE_TOKEN", &format!("{v}-{k}"), None).unwrap();
+                }));
+            }
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let names: Vec<String> = read_layer(&a).unwrap().into_iter().map(|v| v.name).collect();
+        assert!(!names.iter().any(|n| n.starts_with("KEEP_")), "{names:?}");
+        assert_eq!(names.iter().filter(|n| n.starts_with("IMP_")).count(), 6, "{names:?}");
+        // 6 writes over two scopes superseded 6 values (each scope: first value + 2 of its 3 racers)
+        let hist = redaction_history().unwrap();
+        assert!(hist.iter().any(|(_, v)| v == "rot-0000"), "{hist:?}");
+        assert!(hist.iter().any(|(_, v)| v == "rot-bbbb"), "{hist:?}");
+        assert!(hist.len() >= 6, "history lost entries: {hist:?}");
+    }
+
+    #[test]
+    fn b5_history_is_never_capped_by_count_and_prunes_by_horizon() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        for i in 0..502 {
+            write_var(&sc, "DB_PASSWORD", &format!("rotated-{i:04}"), None).unwrap();
+        }
+        let h = redaction_history().unwrap();
+        assert_eq!(h.len(), 501, "every superseded value is kept");
+        assert!(h.iter().any(|(_, v)| v == "rotated-0000"));
+        assert_eq!(prune_history(0).unwrap(), 0);
+        assert_eq!(prune_history(u64::MAX).unwrap(), 501);
+        assert!(redaction_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn b5_damaged_history_is_an_error_without_quoting_the_line() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        write_var(&sc, "DB_PASSWORD", "rotated-one", None).unwrap();
+        write_var(&sc, "DB_PASSWORD", "rotated-two", None).unwrap();
+        let mut t = std::fs::read_to_string(history_path()).unwrap();
+        t.push_str("{\"name\":\"X\"}\nnot json CANARY-SECRET\n");
+        std::fs::write(history_path(), t).unwrap();
+        let e = format!("{:#}", redaction_history().unwrap_err());
+        assert!(e.contains("damaged") && !e.contains("CANARY"), "{e}");
+        // and a new rotation refuses to proceed on top of damaged history
+        assert!(write_var(&sc, "DB_PASSWORD", "rotated-three", None).is_err());
+    }
+
+    #[test]
+    fn short_values_are_plain_unless_explicitly_marked_secret() {
+        let _s = sandbox();
+        let sc = Scope::Project("proj".into());
+        // Explicitly marked secret but too short to redact: refused with a message.
+        let e = format!("{:#}", write_var(&sc, "PLAINNAME", "12", Some(true)).unwrap_err());
+        assert!(e.contains("shorter than 3") && e.contains("PLAINNAME"), "{e}");
+        // A secret-looking name with a 1–2 character value is ordinary config, stored plain.
+        write_var(&sc, "MAX_TOKENS", "50", None).unwrap();
+        write_var(&sc, "MONKEY", "12", Some(false)).unwrap();
+        write_var(&sc, "API_TOKEN", "123", None).unwrap();
+        write_var(&sc, "EMPTY_TOKEN", "", None).unwrap();
+        let layer = read_layer(&sc).unwrap();
+        let secret = |n: &str| layer.iter().find(|v| v.name == n).map(|v| v.secret);
+        assert_eq!(secret("MAX_TOKENS"), Some(false));
+        assert_eq!(secret("MONKEY"), Some(false));
+        assert_eq!(secret("API_TOKEN"), Some(true));
+        assert!(secret("PLAINNAME").is_none());
+        // Import treats short secret-looking values the same way.
+        let r = import(&sc, "A_SECRET=1\nB_SECRET=long-enough\nFINE=1\n", false, false).unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(r.secrets, vec!["B_SECRET".to_string()]);
+    }
+}

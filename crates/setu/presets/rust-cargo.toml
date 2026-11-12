@@ -1,0 +1,11 @@
+# Cargo: target/ is build output.
+priority = 10
+
+[detect]
+any_of = ["Cargo.toml"]
+
+[[disk.item]]
+name = "cargo-target"
+kind = "output"
+paths = ["target"]
+clean_after = "7d"

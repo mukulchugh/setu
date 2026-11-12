@@ -1,0 +1,17 @@
+# Bun projects: node_modules is regenerable from the lockfile and the shared cache.
+priority = 10
+
+[detect]
+any_of = ["bun.lock", "bun.lockb"]
+
+[[disk.item]]
+name = "node_modules"
+kind = "deps"
+paths = ["node_modules", "*/node_modules", "*/*/node_modules"]
+install = "bun install --frozen-lockfile"
+lockfiles = ["bun.lock", "bun.lockb"]
+
+[[disk.store]]
+name = "bun-cache"
+path = "~/.bun/install/cache"
+warn_below = "1GiB"
