@@ -87,3 +87,7 @@ scripts/bundle-swift.sh        # builds target-swift/Setu.app (macOS 26, Swift 6
 Design notes, plans and the evidence behind each part are in [docs/slices/](docs/slices/).
 
 The last JavaScript version is tagged [`v1-final`](../../tree/v1-final).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
