@@ -84,6 +84,8 @@ crates/setu/e2e/*-e2e.sh target/debug/setu   # end-to-end, each in its own sandb
 scripts/bundle-swift.sh        # builds target-swift/Setu.app (macOS 26, Swift 6.2)
 ```
 
+Releases are built on a Mac, with no CI: `scripts/release.sh <version>` tests and builds both Mac binaries and the Homebrew formula; add `--publish` to tag, create the GitHub release and update the tap.
+
 Design notes, plans and the evidence behind each part are in [docs/slices/](docs/slices/).
 
 The last JavaScript version is tagged [`v1-final`](../../tree/v1-final).
