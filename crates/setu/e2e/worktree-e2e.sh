@@ -94,7 +94,10 @@ expect_fail "live writer claim" "$BIN" down e2e/feat-one
 expect_fail "claimed by" "$BIN" claim e2e/feat-one --as agent-b
 "$BIN" ls | grep "e2e/feat-one" | grep -q running || fail "refused actions must leave the run up"
 [ -d "$WT" ] || fail "worktree must still exist"
-[ "$(sqlite3 "$SETU_HOME/state/setu.db" "select count(*) from removal_ops where run_key='e2e/feat-one'")" = "0" ] || fail "a refused rm must persist nothing"
+# Turso holds an exclusive lock on the live database, so read a point-in-time copy (db + wal) instead.
+SNAP="$SB/snap"; rm -rf "$SNAP"; mkdir -p "$SNAP"; cp "$SETU_HOME/state"/setu.db "$SETU_HOME/state"/setu.db-wal "$SNAP"/ 2>/dev/null || true
+[ "$(sqlite3 "$SNAP/setu.db" "select count(*) from removal_ops where run_key='e2e/feat-one'")" = "0" ] || fail "a refused rm must persist nothing"
+rm -rf "$SNAP"
 
 step "release, then rm (stops the run, archives local.db, removes, keeps branch)"
 "$BIN" release e2e/feat-one

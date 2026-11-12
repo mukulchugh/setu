@@ -739,9 +739,8 @@ fn check_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn op_row(c: &rusqlite::Connection, key: &str) -> Result<Option<OpRecord>> {
-    use rusqlite::OptionalExtension;
-    let json: Option<String> = c.query_row("SELECT record_json FROM removal_ops WHERE run_key = ?1", [key], |r| r.get(0)).optional()?;
+fn op_row(c: &crate::db::Conn, key: &str) -> Result<Option<OpRecord>> {
+    let json: Option<String> = c.query_opt("SELECT record_json FROM removal_ops WHERE run_key = ?1", [key], |r| Ok(r.get::<String>(0)?))?;
     json.map(|j| serde_json::from_str(&j).with_context(|| format!("corrupt operation record for {key}"))).transpose()
 }
 
@@ -751,11 +750,12 @@ pub fn load_op(db: &Db, key: &str) -> Result<Option<OpRecord>> {
 }
 
 /// Insert or replace a removal record (one row per run).
-pub fn put_op_tx(c: &rusqlite::Connection, rec: &OpRecord) -> Result<()> {
+pub fn put_op_tx(c: &crate::db::Conn, rec: &OpRecord) -> Result<()> {
     let step = serde_json::to_value(rec.step)?;
     c.execute(
-        "INSERT OR REPLACE INTO removal_ops (run_key, op_id, step, record_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![format!("{}/{}", rec.project, rec.run), rec.id, step.as_str().unwrap_or(""), serde_json::to_string(rec)?, rec.updated as i64],
+        "INSERT INTO removal_ops (run_key, op_id, step, record_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_key) DO UPDATE SET op_id=excluded.op_id, step=excluded.step, record_json=excluded.record_json, updated_at=excluded.updated_at",
+        crate::db::params![format!("{}/{}", rec.project, rec.run), rec.id.clone(), step.as_str().unwrap_or("").to_string(), serde_json::to_string(rec)?, rec.updated as i64],
     )?;
     Ok(())
 }
@@ -776,8 +776,7 @@ pub fn pending_removal(db: &Db, key: &str) -> bool {
 
 fn all_ops(db: &Db) -> Vec<OpRecord> {
     db.with(|c| {
-        let mut q = c.prepare("SELECT record_json FROM removal_ops ORDER BY run_key")?;
-        let rows: Vec<String> = q.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        let rows: Vec<String> = c.query("SELECT record_json FROM removal_ops ORDER BY run_key", (), |r| Ok(r.get::<String>(0)?))?;
         Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
     })
     .unwrap_or_default()
@@ -803,7 +802,7 @@ pub trait RmHost {
     /// Steps 5 to 7 (drop state, release lease, marker) commit together: `extra` deletes the run,
     /// lease and claim rows and writes the finished marker, and runs inside the one transaction.
     /// The daemon overrides this to write its state snapshot in the same transaction.
-    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&crate::db::Conn) -> Result<()>) -> Result<()> {
         db.tx(|tx| extra(tx))
     }
     /// Called after each step has been recorded; an error here simulates a crash (tests).
@@ -945,10 +944,9 @@ fn advance(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
     let res = ctx.db.tx(|tx| {
         if step == Step::Guards {
             let held = tx
-                .query_row("SELECT holder, pid, pid_start, since, heartbeat FROM claims WHERE run_key = ?1", [&key], |r| {
-                    Ok(crate::claims::Claim { run: key.clone(), holder: r.get(0)?, pid: r.get::<_, Option<i64>>(1)?.map(|p| p as i32), start_time: r.get::<_, Option<i64>>(2)?.map(|t| t as u64), created: r.get::<_, i64>(3)? as u64, heartbeat: r.get::<_, i64>(4)? as u64 })
-                })
-                .ok()
+                .query_opt("SELECT holder, pid, pid_start, since, heartbeat FROM claims WHERE run_key = ?1", [key.as_str()], |r| {
+                    Ok(crate::claims::Claim { run: key.clone(), holder: r.get(0)?, pid: r.get::<Option<i64>>(1)?.map(|p| p as i32), start_time: r.get::<Option<i64>>(2)?.map(|t| t as u64), created: r.get::<i64>(3)? as u64, heartbeat: r.get::<i64>(4)? as u64 })
+                })?
                 .filter(|c| !crate::claims::is_stale(c, rec.updated));
             if let Some(c) = held {
                 return Err(Refused(vec![Reason { code: "claim", message: format!("a live writer claim is held by {}; it must release it (or go stale) first", c.holder) }]).into());
@@ -974,9 +972,9 @@ fn teardown(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
     done.finished = Some(now);
     done.last_error = None;
     ctx.host.commit_teardown(ctx.db, &mut |tx| {
-        tx.execute("DELETE FROM claims WHERE run_key = ?1", [&key])?;
-        tx.execute("DELETE FROM leases WHERE run_key = ?1", [&key])?;
-        tx.execute("DELETE FROM runs WHERE key = ?1", [&key])?;
+        tx.execute("DELETE FROM claims WHERE run_key = ?1", [key.as_str()])?;
+        tx.execute("DELETE FROM leases WHERE run_key = ?1", [key.as_str()])?;
+        tx.execute("DELETE FROM runs WHERE key = ?1", [key.as_str()])?;
         put_op_tx(tx, &done)
     })?;
     *rec = done;
@@ -1144,7 +1142,7 @@ pub fn restore(cfg: &ProjectConfig, run: &str, ops: &Db, archive_root: &Path) ->
     } else {
         warnings.push("no archive for this run; only the branch was restored".into());
     }
-    ops.with(|c| Ok(c.execute("DELETE FROM removal_ops WHERE run_key = ?1", [&key])?))?;
+    ops.with(|c| c.execute("DELETE FROM removal_ops WHERE run_key = ?1", [key.as_str()]))?;
     Ok(RestoreOutcome { path: canon(&path), run: run.to_string(), branch: rec.branch, restored_from: archive, warnings })
 }
 
@@ -1274,7 +1272,7 @@ pub(crate) mod tests {
             self.calls.lock().unwrap().push("lease");
             Ok(())
         }
-        fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+        fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&crate::db::Conn) -> Result<()>) -> Result<()> {
             db.tx(|tx| {
                 extra(tx)?;
                 if self.fail_commit {
@@ -1679,8 +1677,8 @@ pub(crate) mod tests {
     fn seed_state(f: &Fx, key: &str, port: i64) {
         f.ops
             .tx(|tx| {
-                tx.execute("INSERT INTO runs (key, project, run, spec_json, status, procs_json) VALUES (?1, 'app', ?2, '{}', 'stopped', '[]')", rusqlite::params![key, key.trim_start_matches("app/")])?;
-                tx.execute("INSERT INTO leases (run_key, name, port) VALUES (?1, 'web', ?2)", rusqlite::params![key, port])?;
+                tx.execute("INSERT INTO runs (key, project, run, spec_json, status, procs_json) VALUES (?1, 'app', ?2, '{}', 'stopped', '[]')", crate::db::params![key, key.trim_start_matches("app/")])?;
+                tx.execute("INSERT INTO leases (run_key, name, port) VALUES (?1, 'web', ?2)", crate::db::params![key, port])?;
                 tx.execute("INSERT INTO claims (run_key, holder, since, heartbeat) VALUES (?1, 'gone', 1, 1)", [key])?;
                 Ok(())
             })
@@ -1690,7 +1688,7 @@ pub(crate) mod tests {
     fn rows(f: &Fx, key: &str) -> (i64, i64, i64) {
         f.ops
             .with(|c| {
-                let n = |t: &str, col: &str| c.query_row(&format!("SELECT count(*) FROM {t} WHERE {col} = ?1"), [key], |r| r.get::<_, i64>(0));
+                let n = |t: &str, col: &str| c.scalar_i64(&format!("SELECT count(*) FROM {t} WHERE {col} = ?1"), [key]);
                 Ok((n("runs", "key")?, n("leases", "run_key")?, n("claims", "run_key")?))
             })
             .unwrap()

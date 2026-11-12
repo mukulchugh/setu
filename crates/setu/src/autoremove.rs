@@ -12,7 +12,7 @@
 //! Everything is blocking; the daemon calls it from the blocking pool.
 
 use crate::config::parse_duration;
-use crate::db::Db;
+use crate::db::{params, Conn, Db};
 use crate::disk::human_secs;
 use crate::globalcfg::AutoRemoveCfg;
 use crate::model::{ProjectConfig, RunRecord, RunStatus, WorktreeCfg};
@@ -101,12 +101,10 @@ pub struct AutoState {
 pub fn load_state(db: &Db) -> Result<AutoState> {
     db.with(|c| {
         let mut st = AutoState::default();
-        let mut q = c.prepare("SELECT kind, key, since, reason, day, count FROM autoremove")?;
-        let rows = q.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?))
+        let rows = c.query("SELECT kind, key, since, reason, day, count FROM autoremove", (), |r| {
+            Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?, r.get::<Option<String>>(3)?, r.get::<Option<String>>(4)?, r.get::<Option<i64>>(5)?))
         })?;
-        for row in rows {
-            let (kind, key, since, reason, day, count) = row?;
+        for (kind, key, since, reason, day, count) in rows {
             match kind.as_str() {
                 "candidate" => {
                     st.candidates.insert(key, Candidate { since: since.unwrap_or(0) as u64, reason: reason.unwrap_or_default() });
@@ -122,15 +120,15 @@ pub fn load_state(db: &Db) -> Result<AutoState> {
 }
 
 /// Replace the whole persisted state in one transaction.
-pub fn save_tx(tx: &rusqlite::Transaction, st: &AutoState) -> Result<()> {
-    tx.execute("DELETE FROM autoremove", [])?;
+pub fn save_tx(tx: &Conn, st: &AutoState) -> Result<()> {
+    tx.execute("DELETE FROM autoremove", ())?;
     for (k, c) in &st.candidates {
-        tx.execute("INSERT INTO autoremove (kind, key, since, reason) VALUES ('candidate', ?1, ?2, ?3)", rusqlite::params![k, c.since as i64, c.reason])?;
+        tx.execute("INSERT INTO autoremove (kind, key, since, reason) VALUES ('candidate', ?1, ?2, ?3)", params![k.clone(), c.since as i64, c.reason.clone()])?;
     }
     for (k, r) in &st.skips {
-        tx.execute("INSERT INTO autoremove (kind, key, reason) VALUES ('skip', ?1, ?2)", rusqlite::params![k, r])?;
+        tx.execute("INSERT INTO autoremove (kind, key, reason) VALUES ('skip', ?1, ?2)", params![k.clone(), r.clone()])?;
     }
-    tx.execute("INSERT INTO autoremove (kind, key, day, count) VALUES ('removals', '', ?1, ?2)", rusqlite::params![st.removals.day, st.removals.count as i64])?;
+    tx.execute("INSERT INTO autoremove (kind, key, day, count) VALUES ('removals', '', ?1, ?2)", params![st.removals.day.clone(), st.removals.count as i64])?;
     Ok(())
 }
 

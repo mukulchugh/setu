@@ -7,8 +7,7 @@
 use crate::procinfo;
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
-use crate::db::Db;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{params, Conn, Db, Row};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A claim whose heartbeat is older than this is stale.
@@ -70,28 +69,29 @@ fn validate_run(run: &str) -> Result<()> {
     Ok(())
 }
 
-fn row(r: &rusqlite::Row) -> rusqlite::Result<Claim> {
+fn row(r: &Row) -> Result<Claim> {
     Ok(Claim {
         run: r.get(0)?,
         holder: r.get(1)?,
-        pid: r.get::<_, Option<i64>>(2)?.map(|p| p as i32),
-        start_time: r.get::<_, Option<i64>>(3)?.map(|t| t as u64),
-        created: r.get::<_, i64>(4)? as u64,
-        heartbeat: r.get::<_, i64>(5)? as u64,
+        pid: r.get::<Option<i64>>(2)?.map(|p| p as i32),
+        start_time: r.get::<Option<i64>>(3)?.map(|t| t as u64),
+        created: r.get::<i64>(4)? as u64,
+        heartbeat: r.get::<i64>(5)? as u64,
     })
 }
 
 const COLS: &str = "run_key, holder, pid, pid_start, since, heartbeat";
 
-fn read_tx(conn: &Connection, run: &str) -> Result<Option<Claim>> {
-    Ok(conn.query_row(&format!("SELECT {COLS} FROM claims WHERE run_key = ?1"), [run], row).optional()?)
+fn read_tx(conn: &Conn, run: &str) -> Result<Option<Claim>> {
+    conn.query_opt(&format!("SELECT {COLS} FROM claims WHERE run_key = ?1"), [run], row)
 }
 
 /// Insert or replace a claim row.
-pub fn put_tx(conn: &Connection, c: &Claim) -> Result<()> {
+pub fn put_tx(conn: &Conn, c: &Claim) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO claims (run_key, holder, pid, pid_start, since, heartbeat) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![c.run, c.holder, c.pid.map(i64::from), c.start_time.map(|t| t as i64), c.created as i64, c.heartbeat as i64],
+        "INSERT INTO claims (run_key, holder, pid, pid_start, since, heartbeat) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(run_key) DO UPDATE SET holder=excluded.holder, pid=excluded.pid, pid_start=excluded.pid_start, since=excluded.since, heartbeat=excluded.heartbeat",
+        params![c.run.clone(), c.holder.clone(), c.pid.map(i64::from), c.start_time.map(|t| t as i64), c.created as i64, c.heartbeat as i64],
     )?;
     Ok(())
 }
@@ -206,12 +206,7 @@ pub fn release(db: &Db, run: &str, holder: Option<&str>, now: u64) -> Result<Opt
 
 /// Every claim, stale ones included (callers mark them with `is_stale`).
 pub fn list(db: &Db) -> Vec<Claim> {
-    db.with(|c| {
-        let mut q = c.prepare(&format!("SELECT {COLS} FROM claims ORDER BY run_key"))?;
-        let rows = q.query_map([], row)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    })
-    .unwrap_or_default()
+    db.with(|c| c.query(&format!("SELECT {COLS} FROM claims ORDER BY run_key"), (), row)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -325,14 +320,12 @@ mod tests {
     #[test]
     fn concurrent_claims_have_exactly_one_winner() {
         let (d, dir) = temp_db("claims-race");
-        drop(d);
-        let path = dir.join("setu.db");
         let t = now();
         let wins: usize = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..8)
                 .map(|i| {
-                    let path = path.clone();
-                    sc.spawn(move || claim(&Db::open(&path).unwrap(), "p/r", &format!("agent-{i}"), None, t).is_ok())
+                    let d = &d;
+                    sc.spawn(move || claim(d, "p/r", &format!("agent-{i}"), None, t).is_ok())
                 })
                 .collect();
             hs.into_iter().map(|h| h.join().unwrap()).filter(|w| *w).count()

@@ -1171,7 +1171,7 @@ impl worktree::RmHost for DaemonHost {
         self.d.lock().state.leases.remove(&self.key);
         Ok(())
     }
-    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&crate::db::Conn) -> Result<()>) -> Result<()> {
         let (snap, ver) = self.d.snapshot_state();
         write_snapshot(db, &self.d.written, &snap, ver, extra)
     }
@@ -1179,7 +1179,7 @@ impl worktree::RmHost for DaemonHost {
 
 /// Write a state snapshot (if it is newer than the last one written) and `extra`, in one transaction.
 /// `extra` always runs: it is the part of a change that must not be skipped when a newer snapshot already landed.
-fn write_snapshot(db: &Db, written: &Mutex<u64>, snap: &State, ver: u64, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+fn write_snapshot(db: &Db, written: &Mutex<u64>, snap: &State, ver: u64, extra: &mut dyn FnMut(&crate::db::Conn) -> Result<()>) -> Result<()> {
     let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
     db.tx(|tx| {
         if ver > *w {
@@ -1301,6 +1301,10 @@ pub async fn run() -> Result<()> {
     eprintln!("setu-rs daemon: stopping runs");
     for k in daemon.running_keys() {
         let _ = daemon.stop(&k, RunStatus::Stopped).await;
+    }
+    // Fold the WAL into the main file so the next start opens a small, clean database.
+    if let Err(e) = daemon.db.with_async(|c| c.query("PRAGMA wal_checkpoint(TRUNCATE)", (), |_| Ok(())).map(|_| ())).await {
+        eprintln!("setu: final checkpoint failed: {e:#}");
     }
     let _ = std::fs::remove_file(paths::socket_path());
     Ok(())

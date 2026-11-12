@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(first["detail"]["secret"], true);
         assert_eq!(first["actor"], "cli");
         // the database files themselves never hold the value
-        db.with(|c| Ok(c.execute_batch("PRAGMA wal_checkpoint(FULL)")?)).unwrap();
+        db.checkpoint().unwrap();
         for f in std::fs::read_dir(db.path().parent().unwrap()).unwrap().flatten() {
             if f.file_name().to_string_lossy().starts_with("setu.db") {
                 let bytes = std::fs::read(f.path()).unwrap();

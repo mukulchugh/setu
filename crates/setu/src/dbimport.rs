@@ -114,7 +114,7 @@ fn disk_event(v: &Value) -> Option<Event> {
 pub fn run(db: &Db, state_dir: &Path, logs_dir: &Path) -> Result<()> {
     let mut sources: Vec<PathBuf> = Vec::new();
     let imported = db.tx(|tx| {
-        let done: Option<String> = tx.query_row("SELECT value FROM meta WHERE key = ?1", [META_KEY], |r| r.get(0)).ok();
+        let done: Option<String> = tx.query_opt("SELECT value FROM meta WHERE key = ?1", [META_KEY], |r| Ok(r.get::<String>(0)?))?;
         if done.is_some() {
             return Ok(false);
         }
@@ -184,7 +184,7 @@ pub fn run(db: &Db, state_dir: &Path, logs_dir: &Path) -> Result<()> {
         }
         counts.insert("events".into(), json!(n));
         counts.insert("at".into(), json!(crate::db::now_secs()));
-        tx.execute("INSERT INTO meta (key, value) VALUES (?1, ?2)", rusqlite::params![META_KEY, Value::Object(counts).to_string()])?;
+        tx.execute("INSERT INTO meta (key, value) VALUES (?1, ?2)", crate::db::params![META_KEY, Value::Object(counts).to_string()])?;
         Ok(true)
     })?;
     if imported {
@@ -349,7 +349,7 @@ mod tests {
         let db = Db::open(&st.join("setu.db")).unwrap();
         assert!(run(&db, &st, &logs).is_err());
         assert!(st.join("claims/app/feat-a.json").exists());
-        assert_eq!(db.with(|c| Ok(c.query_row("SELECT count(*) FROM meta", [], |r| r.get::<_, i64>(0))?)).unwrap(), 0);
+        assert_eq!(db.with(|c| c.scalar_i64("SELECT count(*) FROM meta", ())).unwrap(), 0);
         assert!(claims::get(&db, "app/feat-a").unwrap().is_none(), "the transaction rolled back");
         let _ = fs::remove_dir_all(st.parent().unwrap());
     }
@@ -359,7 +359,7 @@ mod tests {
         let root = tmp("empty");
         let db = Db::open(&root.join("state/setu.db")).unwrap();
         run(&db, &root.join("state"), &root.join("logs")).unwrap();
-        assert!(db.with(|c| Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [META_KEY], |r| r.get::<_, String>(0))?)).is_ok());
+        assert!(db.with(|c| c.query_row("SELECT value FROM meta WHERE key = ?1", [META_KEY], |r| Ok(r.get::<String>(0)?))).is_ok());
         let _ = fs::remove_dir_all(&root);
     }
 }

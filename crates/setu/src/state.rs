@@ -4,10 +4,9 @@
 //! every start rebuilds the spec fresh from config and the env layers anyway.
 #![allow(dead_code)]
 
-use crate::db::Db;
+use crate::db::{params, Conn, Db};
 use crate::model::{RunRecord, RunSpec, RunStatus};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,25 +34,27 @@ pub fn load(db: &Db) -> Result<State> {
     db.with(load_conn)
 }
 
-pub fn load_conn(c: &Connection) -> Result<State> {
+pub fn load_conn(c: &Conn) -> Result<State> {
     let mut st = State::default();
-    let mut q = c.prepare("SELECT key, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json FROM runs ORDER BY key")?;
-    let rows = q.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, bool>(3)?,
-            r.get::<_, Option<String>>(4)?,
-            r.get::<_, Option<i64>>(5)?,
-            r.get::<_, Option<i64>>(6)?,
-            r.get::<_, Option<i64>>(7)?,
-            r.get::<_, Option<String>>(8)?,
-            r.get::<_, String>(9)?,
-        ))
-    })?;
-    for row in rows {
-        let (key, spec, status, pinned, note, stopped, started, request, hash, procs) = row?;
+    let rows = c.query(
+        "SELECT key, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json FROM runs ORDER BY key",
+        (),
+        |r| {
+            Ok((
+                r.get::<String>(0)?,
+                r.get::<String>(1)?,
+                r.get::<String>(2)?,
+                r.get::<bool>(3)?,
+                r.get::<Option<String>>(4)?,
+                r.get::<Option<i64>>(5)?,
+                r.get::<Option<i64>>(6)?,
+                r.get::<Option<i64>>(7)?,
+                r.get::<Option<String>>(8)?,
+                r.get::<String>(9)?,
+            ))
+        },
+    )?;
+    for (key, spec, status, pinned, note, stopped, started, request, hash, procs) in rows {
         let rec = RunRecord {
             spec: serde_json::from_str(&spec).with_context(|| format!("run {key}: bad spec in the database"))?,
             status: serde_json::from_value(serde_json::Value::String(status)).with_context(|| format!("run {key}: bad status"))?,
@@ -67,9 +68,7 @@ pub fn load_conn(c: &Connection) -> Result<State> {
         };
         st.runs.insert(key, rec);
     }
-    let mut q = c.prepare("SELECT run_key, name, port FROM leases")?;
-    for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
-        let (k, n, p) = row?;
+    for (k, n, p) in c.query("SELECT run_key, name, port FROM leases", (), |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<i64>(2)?)))? {
         st.leases.entry(k).or_default().insert(n, p as u16);
     }
     Ok(st)
@@ -77,47 +76,42 @@ pub fn load_conn(c: &Connection) -> Result<State> {
 
 /// Make the runs and leases tables equal to `s`. Runs are upserted (never replaced, so rows that
 /// reference them stay put); leases of runs that are not registered are not stored.
-pub fn save_tx(tx: &Transaction, s: &State) -> Result<()> {
-    tx.execute("DELETE FROM leases", [])?;
-    {
-        let mut up = tx.prepare_cached(
+pub fn save_tx(tx: &Conn, s: &State) -> Result<()> {
+    tx.execute("DELETE FROM leases", ())?;
+    for (k, r) in &s.runs {
+        tx.execute(
             "INSERT INTO runs (key, project, run, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(key) DO UPDATE SET project=excluded.project, run=excluded.run, spec_json=excluded.spec_json, status=excluded.status,
                pinned=excluded.pinned, note=excluded.note, stopped_at=excluded.stopped_at, last_started_at=excluded.last_started_at,
                last_request_at=excluded.last_request_at, env_hash=excluded.env_hash, procs_json=excluded.procs_json",
-        )?;
-        for (k, r) in &s.runs {
-            up.execute(params![
-                k,
-                r.spec.id.project,
-                r.spec.id.run,
+            params![
+                k.clone(),
+                r.spec.id.project.clone(),
+                r.spec.id.run.clone(),
                 serde_json::to_string(&scrub(&r.spec))?,
                 status_text(r.status)?,
                 r.pinned,
-                r.note,
+                r.note.clone(),
                 r.stopped_at.map(|v| v as i64),
                 r.last_started_at.map(|v| v as i64),
                 r.last_request_at.map(|v| v as i64),
                 r.env_hash.map(|h| h.to_string()),
                 serde_json::to_string(&r.procs)?,
-            ])?;
-        }
+            ],
+        )?;
     }
     let keep: BTreeSet<&String> = s.runs.keys().collect();
-    let mut have = tx.prepare("SELECT key FROM runs")?;
-    let existing: Vec<String> = have.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-    drop(have);
+    let existing: Vec<String> = tx.query("SELECT key FROM runs", (), |r| Ok(r.get::<String>(0)?))?;
     for k in existing.iter().filter(|k| !keep.contains(k)) {
-        tx.execute("DELETE FROM runs WHERE key = ?1", [k])?;
+        tx.execute("DELETE FROM runs WHERE key = ?1", [k.as_str()])?;
     }
-    let mut ins = tx.prepare_cached("INSERT INTO leases (run_key, name, port) VALUES (?1, ?2, ?3)")?;
     for (k, names) in &s.leases {
         if !s.runs.contains_key(k) {
             continue;
         }
         for (n, p) in names {
-            ins.execute(params![k, n, *p as i64])?;
+            tx.execute("INSERT INTO leases (run_key, name, port) VALUES (?1, ?2, ?3)", params![k.clone(), n.clone(), *p as i64])?;
         }
     }
     Ok(())
@@ -195,19 +189,16 @@ mod tests {
     #[test]
     fn concurrent_writers_never_hold_the_same_port_twice() {
         let (db, d) = temp_db("state-conc");
-        drop(db);
-        let path = d.join("setu.db");
-        // Separate connections (as separate processes would have) race to lease the same ports.
+        // Eight threads share the daemon's one handle and race to lease the same ports.
         let wins: Vec<usize> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..8)
                 .map(|i| {
-                    let path = path.clone();
+                    let db = &db;
                     sc.spawn(move || {
-                        let db = Db::open(&path).unwrap();
                         let mut won = 0;
                         for port in 4000u16..4020 {
                             let r = db.tx(|tx| {
-                                tx.execute("INSERT OR IGNORE INTO runs (key, project, run, spec_json, status, procs_json) VALUES (?1, 'p', ?2, '{}', 'stopped', '[]')", params![format!("p/r{i}"), format!("r{i}")])?;
+                                tx.execute("INSERT INTO runs (key, project, run, spec_json, status, procs_json) VALUES (?1, 'p', ?2, '{}', 'stopped', '[]') ON CONFLICT(key) DO NOTHING", params![format!("p/r{i}"), format!("r{i}")])?;
                                 tx.execute("INSERT INTO leases (run_key, name, port) VALUES (?1, ?2, ?3)", params![format!("p/r{i}"), format!("n{port}"), port as i64])?;
                                 Ok(())
                             });
@@ -222,8 +213,7 @@ mod tests {
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         assert_eq!(wins.iter().sum::<usize>(), 20, "every port is won by exactly one writer");
-        let db = Db::open(&path).unwrap();
-        let (total, distinct): (i64, i64) = db.with(|c| Ok(c.query_row("SELECT count(*), count(DISTINCT port) FROM leases", [], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        let (total, distinct): (i64, i64) = db.with(|c| c.query_row("SELECT count(*), count(DISTINCT port) FROM leases", (), |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
         assert_eq!((total, distinct), (20, 20));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -232,7 +222,7 @@ mod tests {
     fn a_secret_canary_never_reaches_the_database_files() {
         let (db, d) = temp_db("state-canary");
         save(&db, &sample()).unwrap();
-        db.with(|c| Ok(c.execute_batch("PRAGMA wal_checkpoint(FULL)")?)).unwrap();
+        db.checkpoint().unwrap();
         for f in std::fs::read_dir(&d).unwrap().flatten() {
             let bytes = std::fs::read(f.path()).unwrap();
             assert!(!bytes.windows(19).any(|w| w == b"CANARY-STATE-SECRET"), "{}", f.path().display());

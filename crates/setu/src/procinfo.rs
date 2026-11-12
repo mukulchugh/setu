@@ -135,18 +135,23 @@ mod sys {
     }
 
     pub fn all_pids() -> Vec<i32> {
-        // SAFETY: a null buffer asks libproc for the required size in bytes.
+        // Unlike proc_listpids (which returns bytes), proc_listallpids returns a PID COUNT,
+        // both for the size probe and the filled call. Getting this wrong kept ~1/10 of PIDs
+        // and let "is anything running in this worktree?" miss live processes.
+        // SAFETY: a null buffer asks libproc for the current number of PIDs.
         let need = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         if need <= 0 {
             return Vec::new();
         }
-        let mut buf: Vec<i32> = vec![0; need as usize / 4 + 64];
+        let mut buf: Vec<i32> = vec![0; need as usize + 256];
         // SAFETY: buf is valid for buf.len()*4 writable bytes.
-        let got = unsafe { libc::proc_listallpids(buf.as_mut_ptr() as *mut c_void, (buf.len() * 4) as i32) };
+        let got = unsafe {
+            libc::proc_listallpids(buf.as_mut_ptr() as *mut c_void, (buf.len() * std::mem::size_of::<i32>()) as i32)
+        };
         if got <= 0 {
             return Vec::new();
         }
-        buf.truncate(got as usize / 4);
+        buf.truncate((got as usize).min(buf.len()));
         buf.retain(|p| *p > 0);
         buf
     }
@@ -216,5 +221,19 @@ mod tests {
         assert_eq!(got, Some(canon));
         assert!(under.contains(&pid));
         assert!(all_pids().contains(&pid) || !alive(pid));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod all_pids_count_tests {
+    #[test]
+    fn all_pids_sees_every_process() {
+        let ours = super::all_pids();
+        let ps = std::process::Command::new("ps").arg("-A").arg("-o").arg("pid=").output().unwrap();
+        let ps_count = String::from_utf8_lossy(&ps.stdout).lines().filter(|l| !l.trim().is_empty()).count();
+        // Processes come and go between the two reads; allow a small difference only.
+        assert!(ours.len() * 10 >= ps_count * 9, "all_pids saw {} of {} processes", ours.len(), ps_count);
+        assert!(ours.contains(&(std::process::id() as i32)));
+        assert!(ours.contains(&1));
     }
 }
