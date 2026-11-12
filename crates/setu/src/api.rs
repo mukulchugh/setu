@@ -89,7 +89,9 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "logs" => {
             let lines = req.get("lines").and_then(Value::as_u64).unwrap_or(100) as usize;
-            d.logs(s(req, "run").ok_or_else(|| anyhow!("logs needs a run"))?, s(req, "proc"), lines)
+            let run = s(req, "run").ok_or_else(|| anyhow!("logs needs a run"))?.to_string();
+            let proc = s(req, "proc").map(String::from);
+            blocking(d, move |d| d.logs(&run, proc.as_deref(), lines)).await
         }
         "pin" | "unpin" => {
             let k = target(d, req)?;
@@ -97,30 +99,43 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             blocking(d, move |d| d.pin(&k, on)).await
         }
         "resolve" => Ok(json!(target(d, req)?)),
-        "env.list" => d.env_list(&scope(d, req)?),
-        "env.effective" => d.env_effective(s(req, "run").ok_or_else(|| anyhow!("env.effective needs a run"))?),
+        // Env handlers read and write files: they run on the blocking pool (review #18).
+        "env.list" => {
+            let sc = scope(d, req)?;
+            blocking(d, move |d| d.env_list(&sc)).await
+        }
+        "env.effective" => {
+            let run = s(req, "run").ok_or_else(|| anyhow!("env.effective needs a run"))?.to_string();
+            blocking(d, move |d| d.env_effective(&run)).await
+        }
         "env.set" => {
             let secret = req.get("secret").and_then(Value::as_bool);
-            d.env_set(
-                actor(req),
-                client(req),
-                &scope(d, req)?,
-                s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?,
-                s(req, "value").ok_or_else(|| anyhow!("env.set needs a value"))?,
-                secret,
-            )
+            let sc = scope(d, req)?;
+            let (a, c) = (actor(req).to_string(), client(req).map(String::from));
+            let name = s(req, "name").ok_or_else(|| anyhow!("env.set needs a name"))?.to_string();
+            let value = s(req, "value").ok_or_else(|| anyhow!("env.set needs a value"))?.to_string();
+            blocking(d, move |d| d.env_set(&a, c.as_deref(), &sc, &name, &value, secret)).await
         }
-        "env.unset" => d.env_unset(actor(req), client(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.unset needs a name"))?),
-        "env.import" => d.env_import(
-            actor(req),
-            client(req),
-            &scope(d, req)?,
-            s(req, "path"),
-            s(req, "text"),
-            req.get("preview").and_then(Value::as_bool).unwrap_or(false),
-            req.get("overwrite").and_then(Value::as_bool).unwrap_or(false),
-        ),
-        "env.reveal" => d.env_reveal(actor(req), &scope(d, req)?, s(req, "name").ok_or_else(|| anyhow!("env.reveal needs a name"))?),
+        "env.unset" => {
+            let sc = scope(d, req)?;
+            let (a, c) = (actor(req).to_string(), client(req).map(String::from));
+            let name = s(req, "name").ok_or_else(|| anyhow!("env.unset needs a name"))?.to_string();
+            blocking(d, move |d| d.env_unset(&a, c.as_deref(), &sc, &name)).await
+        }
+        "env.import" => {
+            let sc = scope(d, req)?;
+            let (a, c) = (actor(req).to_string(), client(req).map(String::from));
+            let (path, text) = (s(req, "path").map(String::from), s(req, "text").map(String::from));
+            let preview = req.get("preview").and_then(Value::as_bool).unwrap_or(false);
+            let overwrite = req.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+            blocking(d, move |d| d.env_import(&a, c.as_deref(), &sc, path.as_deref(), text.as_deref(), preview, overwrite)).await
+        }
+        "env.reveal" => {
+            let sc = scope(d, req)?;
+            let a = actor(req).to_string();
+            let name = s(req, "name").ok_or_else(|| anyhow!("env.reveal needs a name"))?.to_string();
+            blocking(d, move |d| d.env_reveal(&a, &sc, &name)).await
+        }
         "disk.report" => d.disk_report(req.get("deps").and_then(Value::as_bool).unwrap_or(false)).await,
         "disk.clean" => {
             d.disk_clean(
@@ -150,7 +165,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "worktree.restore" => d.worktree_restore(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.restore needs a run"))?).await,
         "worktree.removed" => blocking(d, |d| Ok(d.removed())).await,
-        "projects" => d.projects_list(),
+        "projects" => blocking(d, |d| d.projects_list()).await,
         "claim" => {
             let pid = req.get("pid").and_then(Value::as_i64).map(|p| p as i32);
             let (a, c) = (actor(req).to_string(), client(req).map(String::from));

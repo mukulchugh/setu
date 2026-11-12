@@ -31,7 +31,7 @@ const LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_LOG_LINES: usize = 500;
 /// Only this much of a log file's end is read for `logs`.
 const LOG_TAIL_BYTES: u64 = 512 * 1024;
-/// Secret values shorter than this are not redacted (they would mangle ordinary text).
+/// Values only *guessed* to be secret (by name) and shorter than this are not redacted (they would mangle ordinary text).
 const MIN_REDACT_LEN: usize = 6;
 
 pub struct Daemon {
@@ -44,6 +44,14 @@ pub struct Daemon {
     exits: ExitTx,
     /// One auto-remove evaluation at a time (hourly tick vs `setu-rs autoremove`).
     ar_lock: Mutex<()>,
+    /// One start or stop of a run at a time (review #7).
+    life: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test hook: make `persist_durable` fail.
+    #[cfg(test)]
+    fail_persist: std::sync::atomic::AtomicBool,
+    /// Test hook: runs after `disk_clean` took its snapshot, before it deletes.
+    #[cfg(test)]
+    clean_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 struct Inner {
@@ -52,6 +60,17 @@ struct Inner {
     /// host -> run key
     hosts: HashMap<String, String>,
     version: u64,
+    /// Bumped by every stop of a run; a start that sees it change was cancelled.
+    gens: HashMap<String, u64>,
+}
+
+/// After a stop attempt: the records whose processes are still alive when the stop failed.
+/// A successful stop leaves nothing; a failed one never forgets a live process.
+fn retained_after_stop(procs: &[crate::model::ProcRecord], stop_failed: bool, unresolved: &dyn Fn(&crate::model::ProcRecord) -> bool) -> Vec<crate::model::ProcRecord> {
+    if !stop_failed {
+        return Vec::new();
+    }
+    procs.iter().filter(|p| unresolved(p)).cloned().collect()
 }
 
 fn key(id: &RunId) -> String {
@@ -91,20 +110,55 @@ impl Inner {
 }
 
 
+/// The env layers a run's spec is built from, read from disk (blocking; never call under the state lock).
+struct Layers {
+    global: BTreeMap<String, String>,
+    project: Vec<env::Var>,
+    worktree: Vec<env::Var>,
+}
+
+fn read_layers(project: &str, id: &RunId) -> Result<Layers> {
+    Ok(Layers {
+        global: env::layer_map(&env::Scope::Global)?,
+        project: env::read_layer(&env::Scope::Project(project.to_string()))?,
+        worktree: env::read_layer(&env::Scope::Worktree(id.clone()))?,
+    })
+}
+
 /// Build the RunSpec fresh, so env and config edits apply on every start.
 fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>) -> Result<RunSpec> {
+    let id = RunId { project: cfg.project.clone(), run: run.to_string() };
+    let layers = read_layers(&cfg.project, &id)?;
+    build_spec_with(cfg, worktree, run, leases, &layers)
+}
+
+fn build_spec_with(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>, layers: &Layers) -> Result<RunSpec> {
     let id = RunId { project: cfg.project.clone(), run: run.to_string() };
     let k = key(&id);
     let lease = ports::lease(leases, &k, &cfg.ports, ports::port_free)?;
     leases.insert(k, lease.clone());
     // Layers: global < project config [env] < project layer < worktree layer < computed.
+    // Plain layer values may use {templates}; secret values are literal data and are never
+    // rendered, so braces in a secret survive and cannot leak through a template error (review #10).
     let mut layered = cfg.clone();
-    for (name, value) in env::layer_map(&env::Scope::Project(cfg.project.clone()))? {
-        layered.env.insert(name, value);
+    for v in layers.project.iter().filter(|v| !v.secret) {
+        layered.env.insert(v.name.clone(), v.value.clone());
     }
-    let global = env::layer_map(&env::Scope::Global)?;
-    let worktree_env = env::layer_map(&env::Scope::Worktree(id.clone()))?;
-    config::resolve_run(&layered, worktree, run, &lease, &global, &worktree_env)
+    let worktree_plain: BTreeMap<String, String> = layers.worktree.iter().filter(|v| !v.secret).map(|v| (v.name.clone(), v.value.clone())).collect();
+    let mut spec = config::resolve_run(&layered, worktree, run, &lease, &layers.global, &worktree_plain)?;
+    let web = spec.web_port;
+    let is_computed = |name: &str| matches!(name, "SETU_PROJECT" | "SETU_RUN" | "SETU_URL") || (name == "PORT" && web.is_some());
+    for v in layers.project.iter().filter(|v| v.secret) {
+        if !layers.worktree.iter().any(|w| w.name == v.name) && !is_computed(&v.name) {
+            spec.env.insert(v.name.clone(), v.value.clone());
+        }
+    }
+    for v in layers.worktree.iter().filter(|v| v.secret) {
+        if !is_computed(&v.name) {
+            spec.env.insert(v.name.clone(), v.value.clone());
+        }
+    }
+    Ok(spec)
 }
 
 impl Daemon {
@@ -112,16 +166,33 @@ impl Daemon {
         let configs = config::load_all()?;
         let db = db::global().context("the state database could not be opened or imported; refusing to start")?;
         let state = state::load(&db).context("the state database is unreadable; refusing to start")?;
-        let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0 };
+        Ok(Self::with_parts(configs, state, db, exits))
+    }
+
+    fn with_parts(configs: Vec<ProjectConfig>, state: State, db: Arc<Db>, exits: ExitTx) -> Arc<Self> {
+        let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0, gens: HashMap::new() };
         inner.rebuild_hosts();
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             inner: Mutex::new(inner),
             db,
             written: Arc::new(Mutex::new(0)),
             activity: ActivityTracker::new(),
             exits,
             ar_lock: Mutex::new(()),
-        }))
+            life: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_persist: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            clean_hook: Mutex::new(None),
+        })
+    }
+
+    fn life_lock(&self, k: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.life.lock().unwrap_or_else(|e| e.into_inner()).entry(k.to_string()).or_default().clone()
+    }
+
+    fn generation(&self, k: &str) -> u64 {
+        self.lock().gens.get(k).copied().unwrap_or(0)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -140,12 +211,18 @@ impl Daemon {
                 self.activity.touch(&rec.spec.id);
                 continue;
             }
-            let _ = supervisor::stop_procs(&rec.procs, STOP_GRACE).await;
+            let res = supervisor::stop_procs(&rec.procs, STOP_GRACE).await;
+            // Processes that could not be stopped stay recorded, so a later stop can retry (review #9).
+            let left = retained_after_stop(&rec.procs, res.is_err(), &supervisor::unresolved);
             self.set(&k, |r| {
-                r.status = RunStatus::Stopped;
-                r.procs.clear();
-                r.stopped_at = Some(crate::disk::now_secs());
-                r.note = Some("stopped after a daemon restart".into());
+                r.status = if left.is_empty() { RunStatus::Stopped } else { RunStatus::Crashed };
+                r.procs = left.clone();
+                if left.is_empty() {
+                    r.stopped_at = Some(crate::disk::now_secs());
+                    r.note = Some("stopped after a daemon restart".into());
+                } else {
+                    r.note = Some("some processes survived the stop after a daemon restart; stop the run again".into());
+                }
             });
         }
     }
@@ -178,6 +255,18 @@ impl Daemon {
         }
     }
 
+    /// Like `persist`, but awaited: a failure is returned, so a lifecycle step is only reported
+    /// done once its ownership records are on disk (review #15).
+    async fn persist_durable(self: &Arc<Self>) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_persist.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("injected persistence failure");
+        }
+        let (snap, ver) = self.snapshot_state();
+        let (written, db) = (self.written.clone(), self.db.clone());
+        tokio::task::spawn_blocking(move || write_snapshot(&db, &written, &snap, ver, &mut |_| Ok(()))).await?
+    }
+
     fn snapshot_state(&self) -> (State, u64) {
         let mut inner = self.lock();
         inner.version += 1;
@@ -187,13 +276,17 @@ impl Daemon {
     /// Register (or refresh) the run record for a worktree and return its key and spec.
     /// Shared by `up`, `worktree.new`, `worktree.adopt` and `worktree.restore`.
     fn register(&self, cfg: &ProjectConfig, worktree: &Path, run: &str) -> Result<(String, RunSpec)> {
+        // Disk and git work happens before the state lock is taken (review #18).
+        let fresh = config::load_all().ok();
+        let id = RunId { project: cfg.project.clone(), run: run.to_string() };
+        let layers = read_layers(&cfg.project, &id)?;
         let mut inner = self.lock();
-        if let Ok(fresh) = config::load_all() {
+        if let Some(fresh) = fresh {
             domains_refresh(&fresh);
             inner.configs = fresh;
         }
         let mut leases = inner.state.leases.clone();
-        let spec = build_spec(cfg, worktree, run, &mut leases)?;
+        let spec = build_spec_with(cfg, worktree, run, &mut leases, &layers)?;
         inner.state.leases = leases;
         let k = key(&spec.id);
         if let Some(other) = inner.hosts.get(&spec.host) {
@@ -236,18 +329,27 @@ impl Daemon {
         })
         .await??;
         let run = naming::run_name(&naming::project_dir(&cfg.repo), &worktree);
-        let (k, _) = self.register(&cfg, &worktree, &run)?;
+        let me = Arc::clone(self);
+        let (c2, w2, r2) = (cfg.clone(), worktree.clone(), run.clone());
+        let (k, _) = tokio::task::spawn_blocking(move || me.register(&c2, &w2, &r2)).await??;
         self.start(&k).await?;
         self.describe_async(&k).await
     }
 
     /// Start a registered run: spawn every proc, then wait for the web port.
+    /// Start and stop of one run never overlap: a stop that arrives mid-start cancels it, and
+    /// any process spawned after that is stopped before start lets go (review #7).
     pub async fn start(self: &Arc<Self>, k: &str) -> Result<()> {
         let (db, key) = (self.db.clone(), k.to_string());
         if tokio::task::spawn_blocking(move || worktree::pending_removal(&db, &key)).await? {
             bail!("a removal of {k} is pending; retry `setu-rs rm {k}` to finish it");
         }
-        let spec = {
+        let life = self.life_lock(k);
+        let _life = life.lock().await;
+        let id = self.lock().state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.spec.id.clone();
+        // The layer files are read off the runtime thread and outside the state lock (review #18).
+        let layers = tokio::task::spawn_blocking(move || read_layers(&id.project.clone(), &id)).await??;
+        let (spec, gen) = {
             let mut inner = self.lock();
             let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
             match rec.status {
@@ -255,13 +357,17 @@ impl Daemon {
                 RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
                 _ => {}
             }
+            if let Some(p) = rec.procs.iter().find(|p| supervisor::unresolved(p)) {
+                bail!("{k} still has a process from an earlier run that could not be stopped (pid {}); run `setu-rs down {k}` again, or end it by hand", p.pid);
+            }
             let cfg = inner.config(&rec.spec.id.project)?;
             if inner.up_count(&cfg.project) >= cfg.max_running {
                 bail!("{} already has {} runs up (max_running); stop one first", cfg.project, cfg.max_running);
             }
             let mut leases = inner.state.leases.clone();
-            let spec = build_spec(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases)?;
+            let spec = build_spec_with(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases, &layers)?;
             inner.state.leases = leases;
+            let gen = inner.gens.get(k).copied().unwrap_or(0);
             if let Some(r) = inner.state.runs.get_mut(k) {
                 r.spec = spec.clone();
                 r.env_hash = Some(env::env_hash(&spec.env));
@@ -273,7 +379,7 @@ impl Daemon {
             inner.rebuild_hosts();
             drop(inner);
             self.persist();
-            spec
+            (spec, gen)
         };
         for port in spec.ports.values() {
             if !ports::port_free(*port) {
@@ -286,8 +392,38 @@ impl Daemon {
         }
         self.activity.touch(&spec.id);
         for proc in &spec.procs {
+            if self.generation(k) != gen {
+                return self.cancel_start(k).await;
+            }
             match supervisor::spawn_proc(&spec, proc, self.exits.clone()).await {
-                Ok(rec) => self.set(k, |r| r.procs.push(rec)),
+                Ok(rec) => {
+                    let pushed = {
+                        let mut inner = self.lock();
+                        if inner.gens.get(k).copied().unwrap_or(0) != gen {
+                            false
+                        } else {
+                            if let Some(r) = inner.state.runs.get_mut(k) {
+                                r.procs.push(rec.clone());
+                            }
+                            true
+                        }
+                    };
+                    if !pushed {
+                        let _ = supervisor::stop_procs(std::slice::from_ref(&rec), STOP_GRACE).await;
+                        return self.cancel_start(k).await;
+                    }
+                    // The new process is only reported started once its ownership record is saved.
+                    if let Err(e) = self.persist_durable().await {
+                        let procs = self.lock().state.runs.get(k).map(|r| r.procs.clone()).unwrap_or_default();
+                        let _ = supervisor::stop_procs(&procs, STOP_GRACE).await;
+                        self.set(k, |r| {
+                            r.status = RunStatus::Crashed;
+                            r.procs.clear();
+                            r.note = Some(format!("could not save the process record for {}: {e:#}", proc.name));
+                        });
+                        return Err(e.context(format!("could not save the process record for {}; its processes were stopped", proc.name)));
+                    }
+                }
                 Err(e) => {
                     let procs = self.lock().state.runs.get(k).map(|r| r.procs.clone()).unwrap_or_default();
                     let _ = supervisor::stop_procs(&procs, STOP_GRACE).await;
@@ -329,7 +465,30 @@ impl Daemon {
         Ok(())
     }
 
+    /// A stop arrived while start was spawning: stop what this start created and give way.
+    async fn cancel_start(self: &Arc<Self>, k: &str) -> Result<()> {
+        let procs = self.lock().state.runs.get(k).map(|r| r.procs.clone()).unwrap_or_default();
+        let res = supervisor::stop_procs(&procs, STOP_GRACE).await;
+        let left = retained_after_stop(&procs, res.is_err(), &supervisor::unresolved);
+        self.set(k, |r| {
+            r.status = RunStatus::Stopped;
+            r.procs = left.clone();
+            r.note = Some("start was cancelled by a stop".into());
+        });
+        bail!("the start of {k} was cancelled by a stop")
+    }
+
     pub async fn stop(self: &Arc<Self>, k: &str, end: RunStatus) -> Result<()> {
+        {
+            let mut inner = self.lock();
+            if !inner.state.runs.contains_key(k) {
+                bail!("unknown run {k}");
+            }
+            // Tells an in-flight start to give way, then wait for it to finish.
+            *inner.gens.entry(k.to_string()).or_default() += 1;
+        }
+        let life = self.life_lock(k);
+        let _life = life.lock().await;
         let procs = {
             let mut inner = self.lock();
             let r = inner.state.runs.get_mut(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
@@ -346,10 +505,16 @@ impl Daemon {
         let id = self.lock().state.runs.get(k).map(|r| r.spec.id.clone());
         // The tracker is forgotten below; keep its last request time (auto-removal's idle age).
         let last_req = id.as_ref().and_then(|id| self.activity.last_request_unix(id));
+        // A failed stop keeps ownership of whatever is still alive and does not claim "stopped" (review #9).
+        let left = retained_after_stop(&procs, result.is_err(), &supervisor::unresolved);
         self.set(k, |r| {
-            r.status = end;
-            r.procs.clear();
-            r.stopped_at = Some(crate::disk::now_secs());
+            r.procs = left.clone();
+            if left.is_empty() {
+                r.status = end;
+                r.stopped_at = Some(crate::disk::now_secs());
+            } else {
+                r.status = RunStatus::Crashed;
+            }
             if let Some(t) = last_req {
                 r.last_request_at = Some(r.last_request_at.map_or(t, |p| p.max(t)));
             }
@@ -383,8 +548,10 @@ impl Daemon {
             let _ = self.stop(&k, RunStatus::Crashed).await;
             self.set(&k, |r| r.note = Some(note));
         } else {
+            // A sidecar's leader is gone, but its group or escaped children may live on: the record
+            // stays until they are gone too, so Stop, restart and adoption can still reach them (review #8).
             self.set(&k, |r| {
-                r.procs.retain(|p| p.pid != ev.pid);
+                r.procs.retain(|p| p.pid != ev.pid || supervisor::unresolved(p));
                 r.note = Some(note);
             });
         }
@@ -635,7 +802,9 @@ impl Daemon {
     /// Several procs are prefixed with `[proc] `.
     pub fn logs(&self, wanted: &str, proc: Option<&str>, lines: usize) -> Result<Value> {
         let k = self.resolve(wanted)?;
-        let id = self.lock().state.runs.get(&k).map(|r| r.spec.id.clone()).ok_or_else(|| anyhow!("unknown run {k}"))?;
+        if !self.lock().state.runs.contains_key(&k) {
+            bail!("unknown run {k}");
+        }
         let lines = lines.clamp(1, MAX_LOG_LINES);
         let dir = paths::logs_dir().join(&k);
         let mut names: Vec<String> = match proc {
@@ -665,16 +834,45 @@ impl Daemon {
                 out.push(if multi { format!("[{name}] {l}") } else { l });
             }
         }
-        let mut secrets: Vec<(String, String)> = Vec::new();
-        for scope in [env::Scope::Global, env::Scope::Project(id.project.clone()), env::Scope::Worktree(id)] {
-            for v in env::read_layer(&scope).unwrap_or_default() {
-                if v.secret {
-                    secrets.push((v.name, v.value));
-                }
-            }
-        }
+        let secrets = self.redaction_set(&k)?;
         let text = redact(&out.join("\n"), &secrets);
         Ok(json!({ "run": k, "lines": text.lines().count(), "text": text }))
+    }
+
+    /// Every secret value that must never leave in a log: values flagged secret in any layer,
+    /// the effective env values whose name looks secret (config `[env]` included), and values
+    /// that were secret before (rotated or removed). Anything unreadable fails the call: log
+    /// delivery never fails open (review #11).
+    fn redaction_set(&self, k: &str) -> Result<Vec<(String, String)>> {
+        let (cfg, rec) = {
+            let inner = self.lock();
+            let rec = inner.state.runs.get(k).cloned().ok_or_else(|| anyhow!("unknown run {k}"))?;
+            (inner.config(&rec.spec.id.project)?, rec)
+        };
+        let id = rec.spec.id.clone();
+        let layers = read_layers(&cfg.project, &id).context("the env layers could not be read, so logs cannot be redacted safely")?;
+        let mut leases = self.lock().state.leases.clone();
+        let spec = build_spec_with(&cfg, &rec.spec.worktree, &id.run, &mut leases, &layers)?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut flagged: std::collections::BTreeSet<String> = Default::default();
+        for v in layers.project.iter().chain(layers.worktree.iter()).filter(|v| v.secret) {
+            flagged.insert(v.name.clone());
+            out.push((v.name.clone(), v.value.clone()));
+        }
+        for scope in [env::Scope::Global] {
+            for v in env::read_layer(&scope).context("the global env layer could not be read, so logs cannot be redacted safely")?.into_iter().filter(|v| v.secret) {
+                flagged.insert(v.name.clone());
+                out.push((v.name, v.value));
+            }
+        }
+        for (name, value) in &spec.env {
+            // Name-based guesses keep the length floor (they would otherwise mangle ordinary text).
+            if flagged.contains(name) || (env::is_secret_name(name) && value.len() >= MIN_REDACT_LEN) {
+                out.push((name.clone(), value.clone()));
+            }
+        }
+        out.extend(env::redaction_history().context("the redaction history could not be read, so logs cannot be redacted safely")?);
+        Ok(out)
     }
 
     /// Every worktree of every configured project, with what Setu knows about it.
@@ -720,9 +918,10 @@ impl Daemon {
     }
 
     /// `disk.clean`: delete eligible items (or list them when `apply` is false).
-    pub async fn disk_clean(&self, apply: bool, include_unmanaged: bool) -> Result<Value> {
+    pub async fn disk_clean(self: &Arc<Self>, apply: bool, include_unmanaged: bool) -> Result<Value> {
         let (configs, runs) = self.snapshot();
         let db = self.db.clone();
+        let me = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let policy = disk::Policy { measure: !apply, measure_deps: false, include_unmanaged };
             let now = disk::now_secs();
@@ -732,12 +931,18 @@ impl Daemon {
                 // Deepest paths first, so a nested item (.next/dev/cache) goes before its parent (.next/dev).
                 let mut eligible: Vec<_> = disk::candidates(&cfg, &wt, policy, now).into_iter().filter(|c| c.eligible).collect();
                 eligible.sort_by_key(|c| std::cmp::Reverse(c.path.components().count()));
+                #[cfg(test)]
+                if let Some(h) = me.clean_hook.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    h();
+                }
                 for c in eligible {
                     if !apply {
                         done.push(json!({ "run": c.run, "path": c.path, "item": c.item, "size": c.size, "reason": c.reason }));
                         continue;
                     }
-                    match disk::clean_one(&cfg, &wt, &c.path, policy) {
+                    // Status and claim are read again for every deletion: the snapshot above can be
+                    // minutes old by now (review #14).
+                    match disk::clean_one(&cfg, &me.fresh_info(&db, &wt), &c.path, policy) {
                         Ok(freed) => {
                             freed_total += freed;
                             done.push(json!({ "run": c.run, "path": c.path, "item": c.item, "freed_bytes": freed }));
@@ -810,7 +1015,9 @@ impl Daemon {
             Ok((cfg.clone(), wt, run))
         })
         .await??;
-        let (k, _) = self.register(&cfg, &wt, &run)?;
+        let me = Arc::clone(self);
+        let (c2, w2, r2) = (cfg.clone(), wt.clone(), run.clone());
+        let (k, _) = tokio::task::spawn_blocking(move || me.register(&c2, &w2, &r2)).await??;
         worktree::audit(actor, client, "adopt", &k, json!({ "path": wt }));
         self.describe_async(&k).await
     }
@@ -840,7 +1047,7 @@ impl Daemon {
         let host = DaemonHost { d: Arc::clone(self), key: key.clone(), rt: tokio::runtime::Handle::current() };
         let archive_root = paths::archive_dir();
         let result = tokio::task::spawn_blocking(move || {
-            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, db: &db, force, host: &host })
+            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, db: &db, force, host: &host, archive_cap: None })
         })
         .await?;
         match result {
@@ -874,11 +1081,24 @@ impl Daemon {
             Ok((cfg, run, out))
         })
         .await??;
-        let (k, _) = self.register(&cfg, &out.path, &run)?;
+        let me = Arc::clone(self);
+        let (c2, p2, r2) = (cfg.clone(), out.path.clone(), run.clone());
+        let (k, _) = tokio::task::spawn_blocking(move || me.register(&c2, &p2, &r2)).await??;
         worktree::audit(actor, client, "restore", &k, json!({ "branch": out.branch, "archive": out.restored_from }));
         let mut v = self.describe_async(&k).await?;
         v["restore"] = serde_json::to_value(&out)?;
         Ok(v)
+    }
+
+    /// `wt` with its run status, stop time and claim re-read from live state.
+    fn fresh_info(&self, db: &Db, wt: &disk::WorktreeInfo) -> disk::WorktreeInfo {
+        let k = format!("{}/{}", wt.project, wt.run);
+        let rec = self.lock().state.runs.get(&k).map(|r| (r.status, r.stopped_at));
+        let mut w = wt.clone();
+        w.status = rec.map(|r| r.0);
+        w.stopped_at = rec.and_then(|r| r.1);
+        w.claimed_by = claims::live_holder(db, &k, claims::now());
+        w
     }
 
     /// Read-only: the current auto-removal candidates and the daily count. No fetch, no evaluation.
@@ -975,7 +1195,7 @@ impl Daemon {
         Value::Array(
             claims::list(&self.db)
                 .into_iter()
-                .map(|c| json!({ "run": c.run, "holder": c.holder, "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat, "stale": claims::is_stale(&c, now) }))
+                .map(|c| json!({ "run": c.run, "holder": c.holder, "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat, "stale": claims::is_stale(&c, now), "start_time_unknown": claims::start_unknown(&c) }))
                 .collect(),
         )
     }
@@ -1030,10 +1250,11 @@ fn tail_lines(path: &Path, n: usize) -> Result<Vec<String>> {
     Ok(lines[skip..].iter().map(|l| l.to_string()).collect())
 }
 
-/// Replace every occurrence of each secret value with `[redacted:NAME]`. Values shorter than
-/// `MIN_REDACT_LEN` are skipped; longer values go first so a prefix cannot expose the rest.
+/// Replace every occurrence of each secret value with `[redacted:NAME]`. Only empty values are
+/// skipped (callers decide which guessed values are too short to be worth redacting); longer
+/// values go first so a prefix cannot expose the rest.
 pub fn redact(text: &str, secrets: &[(String, String)]) -> String {
-    let mut list: Vec<&(String, String)> = secrets.iter().filter(|(_, v)| v.len() >= MIN_REDACT_LEN).collect();
+    let mut list: Vec<&(String, String)> = secrets.iter().filter(|(_, v)| !v.is_empty()).collect();
     list.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
     for (name, value) in list {
@@ -1068,7 +1289,7 @@ fn all_worktrees(db: &Db, configs: &[ProjectConfig], runs: &BTreeMap<String, Run
 /// `{holder, stale, pid, since}` for the run's claim, or null.
 fn claim_json(db: &Db, k: &str) -> Value {
     match claims::get(db, k) {
-        Ok(Some(c)) => json!({ "holder": c.holder, "stale": claims::is_stale(&c, claims::now()), "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat }),
+        Ok(Some(c)) => json!({ "holder": c.holder, "stale": claims::is_stale(&c, claims::now()), "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat, "start_time_unknown": claims::start_unknown(&c) }),
         Ok(None) => Value::Null,
         Err(_) => json!({ "holder": "(unreadable)", "stale": false }),
     }
@@ -1308,4 +1529,241 @@ pub async fn run() -> Result<()> {
     }
     let _ = std::fs::remove_file(paths::socket_path());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::tests::{sandbox, Sandbox};
+    use std::path::PathBuf;
+
+    fn pgrep(pattern: &str) -> bool {
+        std::process::Command::new("pgrep").args(["-f", pattern]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
+    }
+
+    fn pkill(pattern: &str) {
+        let _ = std::process::Command::new("pkill").args(["-f", pattern]).status();
+    }
+
+    struct Fx {
+        _sb: Sandbox,
+        d: Arc<Daemon>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<ExitEvent>,
+        k: String,
+        wt: PathBuf,
+    }
+
+    /// A daemon over a sandboxed SETU_HOME with one project `tp` whose procs are `procs` (name -> command)
+    /// and one registered run `tp/r`.
+    fn fixture(procs: &[(String, String)], extra: &str) -> Fx {
+        let sb = sandbox();
+        let mut toml = String::from("project = \"tp\"\nrepo = \"/nonexistent/tp.git\"\ndomain = \"tp.local\"\n");
+        toml.push_str(extra);
+        for (n, c) in procs {
+            toml.push_str(&format!("[procs.{n}]\nrun = '{c}'\n"));
+        }
+        std::fs::create_dir_all(paths::projects_dir()).unwrap();
+        std::fs::write(paths::projects_dir().join("tp.toml"), toml).unwrap();
+        let wt = sb.dir.join("wt/r");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::new(tx).unwrap();
+        let cfg = config::load_all().unwrap().remove(0);
+        let (k, _) = d.register(&cfg, &wt, "r").unwrap();
+        Fx { _sb: sb, d, rx, k, wt }
+    }
+
+    fn status(f: &Fx) -> RunStatus {
+        f.d.lock().state.runs[&f.k].status
+    }
+
+    fn recorded(f: &Fx) -> usize {
+        f.d.lock().state.runs[&f.k].procs.len()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_during_start_leaves_no_process_behind() {
+        // review #7
+        let procs: Vec<(String, String)> = (0..25).map(|i| (format!("p{i:02}"), "exec sleep 300701".to_string())).collect();
+        let f = fixture(&procs, "");
+        let (d, k) = (f.d.clone(), f.k.clone());
+        let starter = {
+            let (d, k) = (d.clone(), k.clone());
+            tokio::spawn(async move { d.start(&k).await })
+        };
+        for _ in 0..2000 {
+            if recorded(&f) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(recorded(&f) >= 1, "start never got going");
+        d.stop(&k, RunStatus::Stopped).await.unwrap();
+        let _ = starter.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let leaked = pgrep("sleep 300701");
+        pkill("sleep 300701");
+        assert!(!leaked, "processes spawned by a cancelled start are still running");
+        assert_eq!(recorded(&f), 0);
+        assert_eq!(status(&f), RunStatus::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sidecar_leader_exit_keeps_its_surviving_group_owned() {
+        // review #8
+        let mut f = fixture(&[("w".to_string(), "sleep 300702 & exit 0".to_string())], "");
+        f.d.start(&f.k).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), f.rx.recv()).await.unwrap().unwrap();
+        f.d.on_exit(ev).await;
+        assert!(pgrep("sleep 300702"), "the backgrounded child should still run");
+        assert_eq!(recorded(&f), 1, "the record stays while its group survives");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let left = pgrep("sleep 300702");
+        pkill("sleep 300702");
+        assert!(!left, "stop must reach the surviving group");
+        assert_eq!(recorded(&f), 0);
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_what_is_still_alive() {
+        // review #9
+        let rec = |pid| crate::model::ProcRecord { name: "w".into(), pid, start_time: 1, escaped: vec![] };
+        let procs = [rec(10), rec(11)];
+        assert!(retained_after_stop(&procs, false, &|_| true).is_empty(), "a successful stop leaves nothing");
+        let left = retained_after_stop(&procs, true, &|p| p.pid == 11);
+        assert_eq!(left.iter().map(|p| p.pid).collect::<Vec<_>>(), [11]);
+        assert!(retained_after_stop(&procs, true, &|_| false).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_refuses_while_an_unstopped_process_is_still_recorded() {
+        // review #9: ownership is not cleared by a failed stop, and start must not clear it either
+        let f = fixture(&[("w".to_string(), "exec sleep 300703".to_string())], "");
+        use std::os::unix::process::CommandExt;
+        // like a supervised proc: its own session, so it leads its own group
+        let mut stranger = unsafe { std::process::Command::new("sleep").arg("300703").pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }).spawn().unwrap() };
+        let pid = stranger.id() as i32;
+        // reap it as soon as it dies, so it does not linger as a zombie
+        let reaper = std::thread::spawn(move || stranger.wait());
+        let rec = crate::model::ProcRecord { name: "w".into(), pid, start_time: crate::procinfo::start_time(pid).unwrap(), escaped: vec![] };
+        f.d.set(&f.k, |r| {
+            r.status = RunStatus::Crashed;
+            r.procs = vec![rec.clone()];
+        });
+        let e = f.d.start(&f.k).await.unwrap_err();
+        assert!(e.to_string().contains("still has a process"), "{e:#}");
+        assert_eq!(recorded(&f), 1, "the record survived the refused start");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        let _ = reaper.join();
+        assert_eq!(recorded(&f), 0);
+        pkill("sleep 300703");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_is_not_reported_done_when_the_process_record_cannot_be_saved() {
+        // review #15
+        let f = fixture(&[("w".to_string(), "exec sleep 300704".to_string())], "");
+        f.d.fail_persist.store(true, std::sync::atomic::Ordering::SeqCst);
+        let e = f.d.start(&f.k).await.unwrap_err();
+        assert!(format!("{e:#}").contains("could not save"), "{e:#}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let leaked = pgrep("sleep 300704");
+        pkill("sleep 300704");
+        assert!(!leaked, "a process whose ownership could not be saved must be stopped");
+        assert_eq!(status(&f), RunStatus::Crashed);
+        assert_eq!(recorded(&f), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logs_redact_config_secrets_short_declared_secrets_and_previous_values_and_fail_closed() {
+        // review #11
+        let f = fixture(&[("w".to_string(), "exec sleep 300705".to_string())], "[env]\nAPI_TOKEN = \"cfg-token-abcdefgh\"\n");
+        let id = RunId { project: "tp".into(), run: "r".into() };
+        env::write_var(&env::Scope::Worktree(id.clone()), "PIN", "12345", Some(true)).unwrap();
+        env::write_var(&env::Scope::Project("tp".into()), "DB_PASSWORD", "rotated-old-value", None).unwrap();
+        env::write_var(&env::Scope::Project("tp".into()), "DB_PASSWORD", "rotated-new-value", None).unwrap();
+        let log_dir = paths::logs_dir().join("tp/r");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("w.log"),
+            "token=cfg-token-abcdefgh\npin=12345\nold=rotated-old-value\nnew=rotated-new-value\nport 8080 is fine\n",
+        )
+        .unwrap();
+        let out = f.d.logs(&f.k, None, 50).unwrap();
+        let text = out["text"].as_str().unwrap();
+        for leaked in ["cfg-token-abcdefgh", "12345", "rotated-old-value", "rotated-new-value"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        assert!(text.contains("port 8080 is fine"), "{text}");
+        // an unreadable secret layer must stop log delivery, not skip redaction
+        let (_, secrets_path) = env::Scope::Project("tp".into()).paths();
+        std::fs::write(&secrets_path, "DB_PASSWORD = oops-not-quoted\n").unwrap();
+        let e = f.d.logs(&f.k, None, 50).unwrap_err();
+        assert!(!format!("{e:#}").contains("oops-not-quoted"), "{e:#}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn secrets_with_braces_are_literal_and_template_errors_never_echo_values() {
+        // review #10
+        let f = fixture(&[("w".to_string(), "exec sleep 300706".to_string())], "");
+        let cfg = f.d.lock().config("tp").unwrap();
+        env::write_var(&env::Scope::Project("tp".into()), "API_TOKEN", "CANARY-REVIEW-{SECRET}", None).unwrap();
+        let mut leases = f.d.lock().state.leases.clone();
+        let spec = build_spec(&cfg, &f.wt, "r", &mut leases).unwrap();
+        assert_eq!(spec.env["API_TOKEN"], "CANARY-REVIEW-{SECRET}", "a secret is stored data, not a template");
+        env::write_var(&env::Scope::Project("tp".into()), "NOTE", "CANARY-PLAIN-{broken", Some(false)).unwrap();
+        let e = f.d.env_effective("r").unwrap_err();
+        assert!(!format!("{e:#}").contains("CANARY"), "{e:#}");
+        // a malformed secrets file does not echo its line either
+        let (_, sp) = env::Scope::Project("tp".into()).paths();
+        std::fs::write(&sp, "API_TOKEN = CANARY-LINE-{X}\n").unwrap();
+        let e = f.d.env_effective("r").unwrap_err();
+        assert!(!format!("{e:#}").contains("CANARY"), "{e:#}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_clean_rereads_status_and_claims_right_before_each_deletion() {
+        // review #14
+        use crate::model::{DiskItem, DiskKind, RunSpec};
+        let sb = sandbox();
+        let f = crate::worktree::tests::fx("daemon-clean");
+        let o = crate::worktree::tests::new_wt(&f, "feat/dc");
+        std::fs::create_dir_all(o.path.join(".next")).unwrap();
+        std::fs::write(o.path.join(".next/blob"), vec![1u8; 2048]).unwrap();
+        let mut cfg = f.cfg.clone();
+        cfg.disk_items = vec![DiskItem { name: "next".into(), kind: DiskKind::Cache, paths: vec![".next".into()], clean_after: Some(Duration::from_secs(1)) }];
+        let spec = RunSpec {
+            id: RunId { project: "app".into(), run: "feat-dc".into() },
+            worktree: o.path.clone(),
+            host: "x".into(),
+            url: "http://x".into(),
+            ports: BTreeMap::new(),
+            env: BTreeMap::new(),
+            procs: vec![],
+            web_port: None,
+            idle: Duration::from_secs(60),
+        };
+        let mut st = State::default();
+        st.runs.insert(
+            "app/feat-dc".into(),
+            RunRecord { spec, status: RunStatus::Stopped, pinned: false, procs: vec![], note: None, stopped_at: Some(1), env_hash: None, last_started_at: None, last_request_at: None },
+        );
+        let db = Arc::new(Db::open(&sb.dir.join("clean.db")).unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::with_parts(vec![cfg], st, db.clone(), tx);
+        // a writer takes the claim after the sweep has already decided
+        let db2 = db.clone();
+        *d.clean_hook.lock().unwrap() = Some(Box::new(move || {
+            claims::claim(&db2, "app/feat-dc", "late-writer", None, claims::now()).unwrap();
+        }));
+        let out = d.disk_clean(true, false).await.unwrap();
+        assert!(o.path.join(".next/blob").exists(), "a claim taken mid-sweep must stop the deletion: {out}");
+        assert!(out["items"].as_array().unwrap().iter().any(|i| i["error"].as_str().is_some_and(|e| e.contains("claim"))), "{out}");
+        // without the claim the same sweep does clean it
+        claims::release(&db, "app/feat-dc", None, claims::now()).unwrap();
+        *d.clean_hook.lock().unwrap() = None;
+        d.disk_clean(true, false).await.unwrap();
+        assert!(!o.path.join(".next").exists());
+    }
 }

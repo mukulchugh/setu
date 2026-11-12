@@ -189,13 +189,11 @@ pub fn clean_one(cfg: &ProjectConfig, wt: &WorktreeInfo, path: &Path, policy: Po
     }
     let estimate = disk_measure::measure(path).private;
     let before = free_bytes(&wt.worktree);
-    // remove_dir_all removes symlinks as links and never follows them.
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
+    // Delete through descriptors opened without following links, so a parent swapped for a
+    // symlink after the checks above cannot redirect the deletion (review #4).
+    let root = wt.worktree.canonicalize()?;
+    let rel = path.strip_prefix(&wt.worktree).map_err(|_| anyhow::anyhow!("{} is not under the worktree", path.display()))?;
+    open_anchored(&root, rel)?.remove()?;
     let after = free_bytes(&wt.worktree);
     let freed = after as i64 - before as i64;
     crate::db::record(crate::db::Event {
@@ -210,6 +208,114 @@ pub fn clean_one(cfg: &ProjectConfig, wt: &WorktreeInfo, path: &Path, policy: Po
         detail: serde_json::json!({ "path": path, "estimate_bytes": estimate, "volume_free_delta_bytes": freed }),
     });
     Ok(freed)
+}
+
+/// The parent directory of a deletion target, held open by descriptor. Every component was opened
+/// with `O_NOFOLLOW`, so the descriptor stays on the verified directory even if a path component is
+/// later renamed or replaced by a link.
+pub struct Anchored {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::CString,
+}
+
+fn cstr(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+}
+
+fn open_dir_at(parent: Option<std::os::fd::RawFd>, name: &std::ffi::CStr) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: plain open/openat on a valid C string; the returned fd is owned by the OwnedFd.
+    let fd = unsafe {
+        match parent {
+            Some(p) => libc::openat(p, name.as_ptr(), flags),
+            None => libc::open(name.as_ptr(), flags),
+        }
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh, valid descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open `root` and walk `rel`'s parents without following any link.
+pub fn open_anchored(root: &Path, rel: &Path) -> std::io::Result<Anchored> {
+    use std::os::fd::AsRawFd;
+    let comps: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has an unexpected component")),
+        })
+        .collect::<std::io::Result<_>>()?;
+    let Some((last, parents)) = comps.split_last() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing to delete the worktree root"));
+    };
+    let mut cur = open_dir_at(None, &cstr(root.as_os_str())?)?;
+    for p in parents {
+        cur = open_dir_at(Some(cur.as_raw_fd()), &cstr(p)?)?;
+    }
+    Ok(Anchored { parent: cur, name: cstr(last)? })
+}
+
+fn remove_at(parent: std::os::fd::RawFd, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fstatat into a zeroed stat with a valid fd and C string.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) };
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        // A file or a link: unlinked as itself, never followed.
+        // SAFETY: unlinkat on a valid fd and C string.
+        return if unsafe { libc::unlinkat(parent, name.as_ptr(), 0) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+    }
+    let dir = open_dir_at(Some(parent), name)?;
+    let mut names: Vec<std::ffi::CString> = Vec::new();
+    {
+        // SAFETY: dup'd fd handed to fdopendir, which owns it until closedir.
+        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let d = unsafe { libc::fdopendir(dup) };
+        if d.is_null() {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(dup) };
+            return Err(e);
+        }
+        loop {
+            let ent = unsafe { libc::readdir(d) };
+            if ent.is_null() {
+                break;
+            }
+            let n = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            if n.to_bytes() != b"." && n.to_bytes() != b".." {
+                names.push(n.to_owned());
+            }
+        }
+        unsafe { libc::closedir(d) };
+    }
+    for n in &names {
+        remove_at(dir.as_raw_fd(), n)?;
+    }
+    // SAFETY: unlinkat(AT_REMOVEDIR) on a valid fd and C string.
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+impl Anchored {
+    /// Delete the target (a file, a link, or a directory tree) relative to the held parent.
+    pub fn remove(self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        remove_at(self.parent.as_raw_fd(), &self.name)
+    }
 }
 
 /// Free bytes available to the user on the volume holding `path`.
@@ -390,5 +496,50 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn an_ancestor_swapped_for_a_symlink_after_the_check_cannot_redirect_deletion() {
+        // review #4
+        let d = tempfile_lite::Dir::new();
+        let outside = tempfile_lite::Dir::new();
+        let root = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".next/dev/cache")).unwrap();
+        std::fs::write(root.join(".next/dev/cache/blob"), "mine").unwrap();
+        std::fs::create_dir_all(outside.path().join("dev/cache")).unwrap();
+        std::fs::write(outside.path().join("dev/cache/secret"), "not yours").unwrap();
+        let anchor = open_anchored(&root, Path::new(".next/dev/cache")).unwrap();
+        // the swap that happens while the candidate is being measured
+        std::fs::rename(root.join(".next"), root.join(".next-orig")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".next")).unwrap();
+        anchor.remove().unwrap();
+        assert!(outside.path().join("dev/cache/secret").exists(), "the unrelated directory must survive");
+        assert!(!root.join(".next-orig/dev/cache").exists(), "the verified directory was the one deleted");
+    }
+
+    #[test]
+    fn open_anchored_refuses_a_symlinked_ancestor_and_the_root() {
+        let d = tempfile_lite::Dir::new();
+        let outside = tempfile_lite::Dir::new();
+        let root = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(outside.path().join("dev/cache")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".next")).unwrap();
+        assert!(open_anchored(&root, Path::new(".next/dev/cache")).is_err());
+        assert!(open_anchored(&root, Path::new("")).is_err());
+        assert!(open_anchored(&root, Path::new("../x")).is_err());
+    }
+
+    #[test]
+    fn anchored_removal_unlinks_links_as_links_and_handles_trees() {
+        let d = tempfile_lite::Dir::new();
+        let outside = tempfile_lite::Dir::new();
+        let root = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("c/a/b")).unwrap();
+        std::fs::write(root.join("c/a/b/f"), "x").unwrap();
+        std::fs::write(outside.path().join("keep"), "k").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("c/a/link")).unwrap();
+        open_anchored(&root, Path::new("c")).unwrap().remove().unwrap();
+        assert!(!root.join("c").exists());
+        assert!(outside.path().join("keep").exists());
     }
 }

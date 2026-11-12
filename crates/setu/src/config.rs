@@ -227,6 +227,8 @@ fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
 /// Parse a project; `checkout` maps the repo to the checkout root used for preset detection.
 fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Option<PathBuf>) -> Result<ProjectConfig> {
     let raw: RawProject = toml::from_str(text).with_context(|| format!("invalid project config {}", file.display()))?;
+    validate_project_name(&raw.project).with_context(|| format!("in {}", file.display()))?;
+    validate_domain(&raw.domain).with_context(|| format!("in {}", file.display()))?;
     let idle = parse_duration(raw.idle.as_deref().unwrap_or("30m")).with_context(|| format!("in {}", file.display()))?;
     let mut procs = BTreeMap::new();
     for (name, p) in raw.procs {
@@ -327,7 +329,45 @@ pub fn load_env_layer(path: &Path) -> Result<BTreeMap<String, String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    toml::from_str(&text).with_context(|| format!("invalid env file {} (values must be strings)", path.display()))
+    toml::from_str(&text).map_err(|e| {
+        // toml's own message quotes the offending source line, which may be a secret value.
+        let at = e.span().map(|sp| {
+            let line = text[..sp.start.min(text.len())].matches('\n').count() + 1;
+            format!(" at line {line}")
+        });
+        anyhow!("invalid env file {}{} (values must be strings; the line is not shown because it may hold a secret)", path.display(), at.unwrap_or_default())
+    })
+}
+
+/// A project name is a single plain path component: it names files in the env directory, so a
+/// dot, a separator or the name `global` could alias another scope's files (review #12).
+pub fn validate_project_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !name.eq_ignore_ascii_case("global");
+    if !ok {
+        bail!("project name {name:?} must be 1-64 letters, digits, '-' or '_' (starting with a letter or digit) and cannot be \"global\"");
+    }
+    Ok(())
+}
+
+/// A project domain is a DNS name. It becomes a file name under /etc/resolver, so anything that
+/// is not plain labels (separators, `..`, absolute paths, control characters) is refused (review #22).
+pub fn validate_domain(domain: &str) -> Result<()> {
+    let bad = || anyhow!("domain {domain:?} is not a valid DNS name (use dot-separated labels of letters, digits and '-')");
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(bad());
+    }
+    for label in domain.split('.') {
+        let b = label.as_bytes();
+        let ok = !b.is_empty() && b.len() <= 63 && b[0] != b'-' && b[b.len() - 1] != b'-' && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-');
+        if !ok {
+            return Err(bad());
+        }
+    }
+    Ok(())
 }
 
 pub fn global_env_path() -> PathBuf {
@@ -357,15 +397,15 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String>
                     match it.next() {
                         Some('}') => break,
                         Some(ch) => name.push(ch),
-                        None => bail!("unterminated '{{' in template {template:?}"),
+                        None => bail!("unterminated '{{' in a template value"),
                     }
                 }
                 match vars.get(name.trim()) {
                     Some(v) => out.push_str(v),
-                    None => bail!("unknown template variable {{{name}}} in {template:?}"),
+                    None => bail!("unknown template variable {{{name}}}"),
                 }
             }
-            '}' => bail!("stray '}}' in template {template:?} (use '}}}}' for a literal brace)"),
+            '}' => bail!("stray '}}' in a template value (use '}}}}' for a literal brace)"),
             c => out.push(c),
         }
     }
@@ -680,5 +720,40 @@ run = "bun worker {{literal}}"
         assert!(bad("[[disk.item]]\nname='x'\nkind='junk'\npaths=['a']\n"));
         assert!(bad("[[disk.store]]\nname='s'\npath='/p'\nwarn_below='x'\n"));
         assert!(bad("[disk]\nbogus=1\n"));
+    }
+
+    #[test]
+    fn project_names_and_domains_are_validated() {
+        // review #12 and #22
+        let ok = |name: &str, domain: &str| parse_project(&format!("project='{name}'\nrepo='/r'\ndomain='{domain}'\n"), Path::new("t")).is_ok();
+        assert!(ok("demo", "demo.local") && ok("quivly-app", "quivly.local") && ok("p_1", "d"));
+        for bad in ["demo.secrets", "global", "Global", "a/b", "..", "", ".hidden", "a b"] {
+            assert!(!ok(bad, "demo.local"), "{bad:?}");
+        }
+        for bad in ["/etc/sudoers", "../x", "a/b", "a..b", "-a.b", "a.b.", "bad name", "x\u{7}.test", ""] {
+            assert!(!ok("demo", bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_env_file_error_never_quotes_the_line() {
+        // review #10: toml's own message shows the offending source line
+        let d = std::env::temp_dir().join(format!("setu-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("x.secrets.toml");
+        std::fs::write(&f, "A = \"fine\"\nTOKEN = CANARY-REVIEW-{SECRET}\n").unwrap();
+        let e = format!("{:#}", load_env_layer(&f).unwrap_err());
+        assert!(!e.contains("CANARY") && !e.contains("SECRET"), "{e}");
+        assert!(e.contains("line 2"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn template_errors_never_echo_the_value() {
+        let v = map(&[("a", "1")]);
+        for t in ["CANARY-REVIEW-{SECRET}", "CANARY-{unterminated", "CANARY-}stray"] {
+            let e = format!("{:#}", render(t, &v).unwrap_err());
+            assert!(!e.contains("CANARY"), "{e}");
+        }
     }
 }

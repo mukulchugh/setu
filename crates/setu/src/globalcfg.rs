@@ -119,10 +119,13 @@ fn capture_with(shell: &str, timeout: Duration) -> Result<String> {
         .spawn()
         .with_context(|| format!("starting {shell}"))?;
     let mut out = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let reader = std::thread::spawn(move || {
+    // The reader hands its bytes over a channel so the wait below can be bounded: a background
+    // child that inherited the pipe must not outlive the timeout (review #19).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
     let start = Instant::now();
     loop {
@@ -136,7 +139,8 @@ fn capture_with(shell: &str, timeout: Duration) -> Result<String> {
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     }
-    let buf = reader.join().map_err(|_| anyhow!("reader thread panicked"))?;
+    let left = timeout.saturating_sub(start.elapsed()).max(Duration::from_secs(1));
+    let buf = rx.recv_timeout(left).map_err(|_| anyhow!("{shell} exited but its output pipe stayed open past the timeout"))?;
     parse_path_output(&String::from_utf8_lossy(&buf))
 }
 

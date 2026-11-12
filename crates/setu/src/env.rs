@@ -22,6 +22,24 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// Refuse names that could alias another scope's files or escape the env directory: the
+    /// plain file of `x.secrets` would be the secrets file of `x` (review #12).
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Scope::Global => Ok(()),
+            Scope::Project(p) => crate::config::validate_project_name(p),
+            Scope::Worktree(id) => {
+                crate::config::validate_project_name(&id.project)?;
+                let ok = !id.run.is_empty()
+                    && id.run.split('/').all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".secrets") && !c.contains('\0') && !c.contains('\\'));
+                if !ok {
+                    bail!("run name {:?} cannot be used for env files (empty or dotted component, or ends in .secrets)", id.run);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// (plain file, secrets file) for this layer.
     pub fn paths(&self) -> (PathBuf, PathBuf) {
         let dir = paths::env_dir();
@@ -87,6 +105,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 fn load_pair(scope: &Scope) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    scope.validate()?;
     let (p, s) = scope.paths();
     Ok((load_env_layer(&p)?, load_env_layer(&s)?))
 }
@@ -144,6 +163,10 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// tmp file in the same dir (0600) -> write -> fsync -> rename -> fsync dir.
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_SUFFIX.lock().unwrap_or_else(|e| e.into_inner()).as_deref().is_some_and(|sfx| path.to_string_lossy().ends_with(sfx)) {
+        bail!("injected write failure");
+    }
     let dir = path.parent().context("env path has no parent")?;
     ensure_dir(dir)?;
     let tmp = dir.join(format!(
@@ -200,14 +223,89 @@ fn apply(scope: &Scope, updates: &[(String, String, Option<bool>)]) -> Result<Ve
         dst.insert(name.clone(), value.clone());
         flags.push(secret);
     }
-    let (pp, sp) = scope.paths();
-    if plain != plain0 {
-        write_map(&pp, &plain)?;
+    // A superseded secret value must stay redactable in logs that already contain it.
+    for (name, old) in &secrets0 {
+        if secrets.get(name) != Some(old) {
+            remember_secret(name, old)?;
+        }
     }
-    if secrets != secrets0 {
-        write_map(&sp, &secrets)?;
-    }
+    write_pair(scope, (&plain0, &secrets0), (&plain, &secrets))?;
     Ok(flags)
+}
+
+/// Write the changed files of a layer. When a name moves between the plain and the secrets file
+/// the destination is written (with the source still intact) before the source is rewritten, so a
+/// failure or crash in between leaves the value in at least one file (review #16).
+fn write_pair(scope: &Scope, before: (&BTreeMap<String, String>, &BTreeMap<String, String>), after: (&BTreeMap<String, String>, &BTreeMap<String, String>)) -> Result<()> {
+    let (pp, sp) = scope.paths();
+    let (plain0, secrets0) = before;
+    let (plain, secrets) = after;
+    let moved = plain0.keys().any(|k| !plain.contains_key(k)) && secrets.keys().any(|k| !secrets0.contains_key(k))
+        || secrets0.keys().any(|k| !secrets.contains_key(k)) && plain.keys().any(|k| !plain0.contains_key(k));
+    let (mut plain_now, mut secrets_now) = (plain0.clone(), secrets0.clone());
+    if moved {
+        let mut pu = plain.clone();
+        for (k, v) in plain0 {
+            pu.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        let mut su = secrets.clone();
+        for (k, v) in secrets0 {
+            su.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if pu != plain_now {
+            write_map(&pp, &pu)?;
+            plain_now = pu;
+        }
+        if su != secrets_now {
+            write_map(&sp, &su)?;
+            secrets_now = su;
+        }
+    }
+    if *plain != plain_now {
+        write_map(&pp, plain)?;
+    }
+    if *secrets != secrets_now {
+        write_map(&sp, secrets)?;
+    }
+    Ok(())
+}
+
+fn history_path() -> PathBuf {
+    paths::env_dir().join(".redact-history.jsonl")
+}
+
+const HISTORY_KEEP: usize = 500;
+
+/// Keep a superseded or removed secret value (0600, outside the database) so log redaction still
+/// covers output written while it was current. Failing to record it fails the change.
+fn remember_secret(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    ensure_dir(&paths::env_dir())?;
+    let path = history_path();
+    let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(String::from).collect();
+    let line = serde_json::json!({ "name": name, "value": value }).to_string();
+    if lines.contains(&line) {
+        return Ok(());
+    }
+    lines.push(line);
+    let skip = lines.len().saturating_sub(HISTORY_KEEP);
+    atomic_write(&path, &(lines[skip..].join("\n") + "\n")).context("recording the previous secret value for log redaction")
+}
+
+/// Previously stored secret values (name, value), for log redaction. An unreadable file is an error.
+pub fn redaction_history() -> Result<Vec<(String, String)>> {
+    let text = match std::fs::read_to_string(history_path()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).context("reading the redaction history"),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| Some((v["name"].as_str()?.to_string(), v["value"].as_str()?.to_string())))
+        .collect())
 }
 
 /// Returns the secret flag the value was stored with. Secret = explicit flag, else the name's
@@ -219,6 +317,9 @@ pub fn write_var(scope: &Scope, name: &str, value: &str, secret: Option<bool>) -
 /// Returns whether the name existed.
 pub fn unset_var(scope: &Scope, name: &str) -> Result<bool> {
     let (mut plain, mut secrets) = load_pair(scope)?;
+    if let Some(old) = secrets.get(name) {
+        remember_secret(name, old)?;
+    }
     let (p, s) = (plain.remove(name).is_some(), secrets.remove(name).is_some());
     let (pp, sp) = scope.paths();
     if p {
@@ -429,15 +530,18 @@ pub fn env_hash(env: &BTreeMap<String, String>) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+
+    /// Test hook: fail `atomic_write` for paths ending with this.
+    pub(crate) static FAIL_SUFFIX: Mutex<Option<String>> = Mutex::new(None);
 
     static LOCK: Mutex<()> = Mutex::new(());
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    struct Sandbox {
-        dir: PathBuf,
+    pub(crate) struct Sandbox {
+        pub(crate) dir: PathBuf,
         _g: MutexGuard<'static, ()>,
     }
     impl Drop for Sandbox {
@@ -445,7 +549,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
-    fn sandbox() -> Sandbox {
+    pub(crate) fn sandbox() -> Sandbox {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "setu-env-test-{}-{}",
@@ -648,5 +752,64 @@ mod tests {
         let e: BTreeMap<String, String> = [("A", "B")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         assert_ne!(env_hash(&d), env_hash(&e));
         assert_eq!(env_hash(&BTreeMap::new()), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn scopes_cannot_alias_another_scopes_files() {
+        // review #12: project `demo.secrets` plain file == project `demo` secrets file
+        let _s = sandbox();
+        write_var(&Scope::Project("demo".into()), "API_TOKEN", "hunter2-hunter2", Some(true)).unwrap();
+        let alias = Scope::Project("demo.secrets".into());
+        assert!(read_layer(&alias).is_err());
+        assert!(write_var(&alias, "A", "b", None).is_err());
+        assert!(read_layer(&Scope::Project("global".into())).is_err());
+        assert!(read_layer(&Scope::Project("../x".into())).is_err());
+        let bad_run = Scope::Worktree(RunId { project: "demo".into(), run: "feat.secrets".into() });
+        assert!(read_layer(&bad_run).is_err());
+        let dotdot = Scope::Worktree(RunId { project: "demo".into(), run: "../../x".into() });
+        assert!(read_layer(&dotdot).is_err());
+        // the legitimate project still reads its own secret as a secret
+        let v = read_layer(&Scope::Project("demo".into())).unwrap();
+        assert!(v[0].secret);
+    }
+
+    #[test]
+    fn plain_to_secret_move_never_loses_the_only_copy() {
+        // review #16
+        let _s = sandbox();
+        let sc = Scope::Project("demo".into());
+        write_var(&sc, "NAME", "only-value-1234", Some(false)).unwrap();
+        *tests::FAIL_SUFFIX.lock().unwrap() = Some(".secrets.toml".into());
+        let r = write_var(&sc, "NAME", "only-value-1234", Some(true));
+        *tests::FAIL_SUFFIX.lock().unwrap() = None;
+        assert!(r.is_err());
+        let v = read_layer(&sc).unwrap();
+        assert_eq!(v.len(), 1, "the value must still exist in a file");
+        assert_eq!(v[0].value, "only-value-1234");
+        // and the move completes when writes work
+        assert!(write_var(&sc, "NAME", "only-value-1234", Some(true)).unwrap());
+        let v = read_layer(&sc).unwrap();
+        assert!(v[0].secret && v[0].value == "only-value-1234");
+        let (plain, _) = scope_files(&sc);
+        assert!(!plain.contains("NAME"), "{plain}");
+    }
+
+    fn scope_files(sc: &Scope) -> (String, String) {
+        let (p, s) = sc.paths();
+        (std::fs::read_to_string(p).unwrap_or_default(), std::fs::read_to_string(s).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_rotated_or_removed_secret_stays_in_the_redaction_history_at_0600() {
+        // review #11
+        let _s = sandbox();
+        let sc = Scope::Project("demo".into());
+        write_var(&sc, "API_TOKEN", "old-secret-value", None).unwrap();
+        write_var(&sc, "API_TOKEN", "new-secret-value", None).unwrap();
+        unset_var(&sc, "API_TOKEN").unwrap();
+        let h = redaction_history().unwrap();
+        let values: Vec<&str> = h.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(values.contains(&"old-secret-value") && values.contains(&"new-secret-value"), "{values:?}");
+        assert_eq!(mode(&history_path()), 0o600);
     }
 }

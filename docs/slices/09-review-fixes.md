@@ -1,0 +1,51 @@
+# Slice 9: outside review fixes (2026-11-12)
+
+Inputs: the Codex review (`setu-rust-review/FINDINGS.md`, written against an earlier commit) and the
+prior-art changes in `07-worktrees-review.md`. Every finding was re-checked against the current code
+(Turso storage, `db.rs`) first. Tests were written with each fix and run together; they were not each
+run red against the old code first (the old behaviour was confirmed by reading the code path).
+Findings #1 (done earlier in `procinfo::all_pids`), #20 and #21 (Swift, another lane) are out of scope.
+
+Verdicts: **fixed**, **fixed (subset)** with the remainder listed, **deferred**.
+
+## Review findings
+
+| # | Finding | Verdict | Test(s) |
+|---|---|---|---|
+| 2 | Resumed removal deletes ignored data created after the archive | fixed: the `Remove` step re-checks branch identity, live guards (claim, processes, run, dirty, unpushed), submodules, and re-archives when ignored data is newer than the archive or the tar no longer lists it | `worktree::tests::a_resumed_removal_rearchives_ignored_data_created_after_the_archive`, `a_resumed_removal_rechecks_the_live_guards` |
+| 3 | A writer can claim a worktree that is being removed | fixed: `claims::claim` refuses while a non-done removal record exists (same transaction), plus the re-check above | `claims::tests::a_run_with_a_pending_removal_cannot_be_claimed`, `worktree::tests::a_claim_taken_while_guards_ran_blocks_the_transition` (updated) |
+| 4 | Ancestor symlink swap redirects disk deletion | fixed: `clean_one` deletes through `openat(O_NOFOLLOW)` descriptors (`disk::open_anchored`), recursive `unlinkat` | `disk::tests::an_ancestor_swapped_for_a_symlink_after_the_check_cannot_redirect_deletion`, `open_anchored_refuses_a_symlinked_ancestor_and_the_root`, `anchored_removal_unlinks_links_as_links_and_handles_trees` |
+| 5 | Ignored nested repositories lose local history | fixed: only `node_modules` and the worktree's own `.git` are skipped; nested `.git` is archived (and verified) | `worktree::tests::an_ignored_nested_repository_is_archived_with_its_history` |
+| 6 | Recycled PID accepted as group ownership | fixed: a leader pid that is alive with a different start time is never proof (its group is a stranger's); a dead leader with a live group is; ownership is re-proven before every signal | `supervisor::tests::a_recycled_leader_pid_is_never_treated_as_proof_of_group_ownership` |
+| 7 | Stop completes while Start is spawning | fixed: one start/stop per run at a time (per-run lock) plus a stop generation; a start that sees a stop stops its own late spawns | `daemon::tests::a_stop_during_start_leaves_no_process_behind` |
+| 8 | Exiting sidecar leaders leave surviving groups unowned | fixed: the record stays while its group or escaped children live | `daemon::tests::a_sidecar_leader_exit_keeps_its_surviving_group_owned` |
+| 9 | Failed stops clear ownership | fixed (stop, adopt, start): still-alive records are retained, status is `crashed` with no `stopped_at`, `start` refuses until they are gone. A real stop failure cannot be provoked in a test, so the decision is tested as a pure function and the refusal with a live stranger | `daemon::tests::a_failed_stop_keeps_what_is_still_alive`, `start_refuses_while_an_unstopped_process_is_still_recorded` |
+| 10 | Secrets leak through template and TOML errors | fixed: secret layer values are literal (never rendered); template and env-file errors carry no value or source line | `daemon::tests::secrets_with_braces_are_literal_and_template_errors_never_echo_values`, `config::tests::a_malformed_env_file_error_never_quotes_the_line`, `template_errors_never_echo_the_value` |
+| 11 | MCP log redaction omits known secrets and previous values | fixed (the redaction set is every layer secret, effective env values with secret names incl. config `[env]`, and a 0600 history of superseded values; short declared secrets are not exempt; an unreadable input fails the call). Not done: per-incarnation (per start) value tracking beyond the rotation history | `daemon::tests::logs_redact_config_secrets_short_declared_secrets_and_previous_values_and_fail_closed`, `env::tests::a_rotated_or_removed_secret_stays_in_the_redaction_history_at_0600` |
+| 12 | Project names alias another scope's secrets file | fixed by validation rather than moving files: project names are single plain components (not `global`, no dot), run names cannot end in `.secrets` or contain dotted components; invalid configs are rejected on load | `env::tests::scopes_cannot_alias_another_scopes_files`, `config::tests::project_names_and_domains_are_validated` |
+| 13 | Raw process and setup logs are world-readable | fixed: log dirs 0700, log and `.1` files 0600 (existing ones tightened on each spawn and rotation), setup log 0600 | `supervisor::tests::raw_logs_are_private_even_when_the_file_already_exists` |
+| 14 | Disk cleaning reuses stale status and claims | fixed (subset): status, stop time and claim are re-read from live state immediately before each deletion. Not done: a per-run exclusion held across the whole delete (the check-to-delete window is small, not zero) | `daemon::tests::disk_clean_rereads_status_and_claims_right_before_each_deletion` |
+| 15 | Start succeeds before ownership is saved | fixed (subset): `start` awaits a durable snapshot after each spawn and stops the processes if it fails. Other lifecycle paths still use the detached `persist`. Not done: a crash-window spawn journal | `daemon::tests::start_is_not_reported_done_when_the_process_record_cannot_be_saved` (injected failure; a full database is not simulated) |
+| 16 | Plain to secret change can lose the only value | fixed: both files get the union first, then the final contents, so a failure leaves the value in at least one | `env::tests::plain_to_secret_move_never_loses_the_only_copy` |
+| 17 | Restore resurrects an unrelated archive | fixed: restore uses only the archive recorded by the removal and warns when there is none | `worktree::tests::restore_needs_a_finished_removal_and_ignores_unrelated_archives` (replaces the old "latest archive wins" test) |
+| 18 | Blocking work on the daemon's sole async thread | fixed (subset): `up`, `adopt` and `restore` register on the blocking pool; config load and env layer reads happen before the state lock; `logs`, `env.*` and `projects` API handlers run on the blocking pool. Not done: port probes, lease allocation and the global-config read inside `resolve_run` still run under the short state lock. No deterministic test (timing); covered by the existing ticker and e2e runs | none new |
+| 19 | Command deadlines do not cover output drains | fixed: after the child exits, pipe draining is bounded (3 s or the remaining deadline); login-PATH capture bounded the same way | `worktree::tests::exec_stops_waiting_for_output_a_background_child_holds_open` |
+| 22 | Resolver domains can become privileged paths | fixed: domains validated as DNS labels at config load, in the setup plan and again before the sudo write; unreadable targets and symlinks are refused | `config::tests::project_names_and_domains_are_validated`, `setup::tests::resolver_domains_that_are_paths_are_never_planned_or_written`, `an_unreadable_or_linked_resolver_target_is_a_refusal_not_an_overwrite` |
+
+## Prior-art changes (`07-worktrees-review.md`)
+
+| Change | Verdict | Test(s) |
+|---|---|---|
+| 1 Merged detection: fork point, persisted pushed bit | fixed: `new` records `branch.<b>.setu-fork`; "pushed" is remembered as `branch.<b>.setu-pushed` (or an upstream setting) so it survives the remote branch being pruned; a branch still at its fork point is never "merged" | `autoremove::tests::a_pushed_branch_still_at_its_fork_point_is_not_merged`, `the_pushed_bit_survives_github_deleting_the_branch_on_merge` |
+| 2 Offline check | fixed: ancestor, then `git merge-tree --write-tree` equal to the base tree, then `git cherry` (all `-`) | `a_squash_merge_with_the_same_content_is_found_offline_by_merge_tree`, `a_rebase_merge_is_found_offline_by_patch_equivalence` |
+| 3 Tighter `gh` check | fixed: `gh pr list --head <b> --state merged --json ...`; requires `mergedAt`, head equal to local HEAD, `baseRefName` equal to our base and (for a GitHub-style origin) the same head owner; "gh unavailable" is its own, non-quiet reason shown once | `gh_must_agree_on_head_base_and_owner`, `gh_failure_counts_as_not_merged` (updated) |
+| 4 rm robustness | fixed: tar read-back (`tar -tf`) before anything is deleted; size cap (`ARCHIVE_MAX_BYTES` = 4 GiB, `RmCtx.archive_cap`) refused with code `archive-size`; initialised submodules refused (`submodule`) before anything is persisted; locked-worktree and submodule git refusals get a hint | `the_archive_size_cap_refuses_clearly_and_a_larger_cap_proceeds`, `a_locked_worktree_is_a_clear_refusal_with_a_hint_and_retry_works`, `a_worktree_with_an_initialised_submodule_is_refused_before_anything_is_persisted` |
+| 5 Claims | fixed (subset): 15 min TTL for pidless claims (2 h kept for pid-bound), `start_time_unknown` flag in `claims` and `ls` JSON (additive). Not done: mirroring a claim into `git worktree lock` | `claims::tests::stale_by_ttl_and_pidless_claims`, `a_pid_bound_claim_keeps_the_long_backstop_ttl`, `a_claim_without_a_recorded_start_time_is_flagged` |
+| 6 `--force` backup | fixed (backup): dirty tracked and untracked changes saved as a commit under `refs/setu-backup/<branch>` before removal (`backup_ref` in the removal record, shown as a restore warning). Not done: pre/post-remove hooks | `a_forced_removal_saves_dirty_changes_under_refs_setu_backup` |
+| 7 Restore | fixed: warns when the branch tip moved; refuses archives with absolute or `..` members before creating the worktree; will not extract through a link; `--no-same-owner`; existing files are kept and reported | `restore_warns_when_the_branch_moved_and_refuses_unsafe_member_paths` |
+
+## Notes
+
+- Protocol changes are additive only: `start_time_unknown` on claims, `backup_ref` in the removal record.
+- `OpRecord.backup_ref` and `RmCtx.archive_cap` are new fields; old records deserialize (`#[serde(default)]`).
+- `render()` error text no longer includes the template; project `[env]` template errors keep the variable name only.

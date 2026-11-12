@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::db::{params, Conn, Db, Row};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A claim whose heartbeat is older than this is stale.
+/// A claim bound to a live pid whose heartbeat is older than this is stale (a backstop: the pid check is the real test).
 pub const TTL_SECS: u64 = 2 * 60 * 60;
+/// A claim with no pid cannot be checked for liveness, so only a short heartbeat keeps it alive.
+pub const PIDLESS_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
@@ -96,9 +98,15 @@ pub fn put_tx(conn: &Conn, c: &Claim) -> Result<()> {
     Ok(())
 }
 
+/// A claim names a pid but no start time was recorded, so a recycled pid cannot be told apart.
+pub fn start_unknown(c: &Claim) -> bool {
+    c.pid.is_some() && c.start_time.is_none()
+}
+
 /// Stale: the holder's process is gone (or is a different incarnation), or the heartbeat is too old.
 pub fn is_stale(c: &Claim, now: u64) -> bool {
-    if now.saturating_sub(c.heartbeat) > TTL_SECS {
+    let ttl = if c.pid.is_none() { PIDLESS_TTL_SECS } else { TTL_SECS };
+    if now.saturating_sub(c.heartbeat) > ttl {
         return true;
     }
     match c.pid {
@@ -144,6 +152,12 @@ pub fn claim(db: &Db, run: &str, holder: &str, pid: Option<i32>, now: u64) -> Re
         None => None,
     };
     db.tx(|tx| {
+        // A run whose removal is pending cannot be claimed: the remover would delete under the
+        // new writer. Same transaction as the claim row, so the two cannot interleave (review #3).
+        let pending: Option<String> = tx.query_opt("SELECT step FROM removal_ops WHERE run_key = ?1", [run], |r| Ok(r.get::<String>(0)?))?;
+        if pending.is_some_and(|s| s != "done") {
+            bail!("{run} is being removed; it cannot be claimed. Wait for the removal to finish (or retry `setu-rs rm {run}`), then restore it if you still need it");
+        }
         let existing = read_tx(tx, run)?;
         let outcome = match &existing {
             None => Outcome::Created,
@@ -288,16 +302,50 @@ mod tests {
         let (d, dir) = temp_db("claims-ttl");
         let t = now();
         claim(&d, "p/r", "agent-a", None, t).unwrap();
-        assert!(live_holder(&d, "p/r", t + TTL_SECS).is_some(), "exactly at the TTL is still live");
-        assert!(live_holder(&d, "p/r", t + TTL_SECS + 1).is_none());
+        assert!(live_holder(&d, "p/r", t + PIDLESS_TTL_SECS).is_some(), "exactly at the TTL is still live");
+        assert!(live_holder(&d, "p/r", t + PIDLESS_TTL_SECS + 1).is_none(), "a pidless claim goes stale after the short TTL");
         // heartbeat resets the clock
         heartbeat(&d, "p/r", "agent-a", t + 100).unwrap();
-        assert!(live_holder(&d, "p/r", t + TTL_SECS + 50).is_some());
+        assert!(live_holder(&d, "p/r", t + PIDLESS_TTL_SECS + 50).is_some());
         // takeover after TTL
-        let (_, o) = claim(&d, "p/r", "agent-b", None, t + 100 + TTL_SECS + 1).unwrap();
+        let (_, o) = claim(&d, "p/r", "agent-b", None, t + 100 + PIDLESS_TTL_SECS + 1).unwrap();
         assert!(matches!(o, Outcome::TookOver { .. }));
         // a stale claim can be released by anyone
-        assert!(release(&d, "p/r", Some("zzz"), t + 100 + 2 * TTL_SECS + 5).unwrap().is_some());
+        assert!(release(&d, "p/r", Some("zzz"), t + 100 + 2 * PIDLESS_TTL_SECS + 5).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pid_bound_claim_keeps_the_long_backstop_ttl() {
+        let t = now();
+        let c = Claim { run: "p/r".into(), holder: "a".into(), pid: Some(me()), start_time: procinfo::start_time(me()), created: t, heartbeat: t };
+        assert!(!is_stale(&c, t + PIDLESS_TTL_SECS + 60), "a live pid is not stale after 15 minutes");
+        assert!(!is_stale(&c, t + TTL_SECS));
+        assert!(is_stale(&c, t + TTL_SECS + 1));
+    }
+
+    #[test]
+    fn a_claim_without_a_recorded_start_time_is_flagged() {
+        let t = now();
+        let mut c = Claim { run: "p/r".into(), holder: "a".into(), pid: Some(me()), start_time: None, created: t, heartbeat: t };
+        assert!(start_unknown(&c));
+        c.start_time = Some(1);
+        assert!(!start_unknown(&c));
+        c.pid = None;
+        c.start_time = None;
+        assert!(!start_unknown(&c), "a pidless claim is covered by the short TTL instead");
+    }
+
+    #[test]
+    fn a_run_with_a_pending_removal_cannot_be_claimed() {
+        // review #3
+        let (d, dir) = temp_db("claims-removing");
+        let t = now();
+        d.with(|c| c.execute("INSERT INTO removal_ops (run_key, op_id, step, record_json, updated_at) VALUES ('p/r', 'x', 'archive', '{}', 1)", ())).unwrap();
+        assert!(claim(&d, "p/r", "agent-a", Some(me()), t).unwrap_err().to_string().contains("being removed"));
+        assert!(get(&d, "p/r").unwrap().is_none());
+        d.with(|c| c.execute("UPDATE removal_ops SET step = 'done' WHERE run_key = 'p/r'", ())).unwrap();
+        claim(&d, "p/r", "agent-a", Some(me()), t).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

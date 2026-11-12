@@ -23,6 +23,10 @@ const GIT_QUICK: Duration = Duration::from_secs(30);
 const GIT_SLOW: Duration = Duration::from_secs(120);
 const TAR_TIMEOUT: Duration = Duration::from_secs(600);
 const STEP_TIMEOUT: Duration = Duration::from_secs(1800);
+/// After a command exits, how long its output pipes may stay open (a background child can hold them).
+const DRAIN_GRACE: Duration = Duration::from_secs(3);
+/// Ignored data above this is refused rather than archived (override per call with `RmCtx.archive_cap`).
+pub const ARCHIVE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// `new` refuses below this much free space unless `[worktree] min_free` says otherwise.
 pub const DEFAULT_MIN_FREE: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -67,22 +71,26 @@ impl Out {
 pub fn exec(mut cmd: Command, timeout: Duration) -> std::result::Result<Out, ExecError> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().map_err(|e| ExecError::Unknown(format!("could not run {:?}: {e}", cmd.get_program())))?;
-    let mut so = child.stdout.take();
-    let mut se = child.stderr.take();
-    let t_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = so.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = se.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
+    let drain = |s: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let b = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut s) = s {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = s.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    b.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        (buf, done_rx)
+    };
+    let (out_buf, out_done) = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let (err_buf, err_done) = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -98,8 +106,14 @@ pub fn exec(mut cmd: Command, timeout: Duration) -> std::result::Result<Out, Exe
             Err(e) => break Err(format!("waiting failed: {e}")),
         }
     };
-    let stdout = t_out.join().unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
+    // The child is gone. A background descendant may still hold the pipes open, so draining
+    // is bounded: the deadline applies to the output too (review #19).
+    let drain_until = std::cmp::min(deadline.max(Instant::now()), Instant::now() + DRAIN_GRACE);
+    for done in [&out_done, &err_done] {
+        let _ = done.recv_timeout(drain_until.saturating_duration_since(Instant::now()));
+    }
+    let stdout = out_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stderr = String::from_utf8_lossy(&err_buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     match status {
         Ok(st) if st.success() => Ok(Out { stdout }),
         Ok(st) => Err(ExecError::Failed { code: st.code(), stderr }),
@@ -362,9 +376,10 @@ pub fn run_steps(steps: &[SetupStep], wt: &Path, env: &BTreeMap<String, String>,
         return Ok(results);
     }
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
-    let mut logf = std::fs::OpenOptions::new().create(true).append(true).mode(0o644).open(log)?;
+    let mut logf = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
+    let _ = std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600));
     let mut env = env.clone();
     if !env.contains_key("PATH") {
         if let Some(p) = crate::globalcfg::login_path() {
@@ -463,6 +478,10 @@ pub fn create(
     let path_s = path.to_string_lossy().into_owned();
     let track = if tracks_remote { "--track" } else { "--no-track" };
     git(repo, &["worktree", "add", track, "-b", branch, "--", &path_s, &base], GIT_SLOW).map_err(|e| anyhow!("git worktree add: {e}"))?;
+    // The fork point lets auto-removal tell "merged" from "never had a commit of its own".
+    if let Ok(h) = git(&path, &["rev-parse", "HEAD"], GIT_QUICK) {
+        let _ = git(repo, &["config", "--local", &format!("branch.{branch}.setu-fork"), h.text().trim()], GIT_QUICK);
+    }
     let after = |e: anyhow::Error| e.context(format!("the worktree was created at {} but the next step failed; it is kept", path.display()));
     let mut warnings = link_files(cfg, &path).map_err(after)?;
     warnings.extend(copy_files(cfg, &path).map_err(after)?);
@@ -569,13 +588,22 @@ pub struct FactCtx {
 
 /// Gather the facts (blocking: fetch, status, log, libproc). Any git trouble becomes `Unknown`.
 pub fn collect_facts(wt: &Path, ctx: FactCtx) -> GuardInput {
+    collect_facts_opt(wt, ctx, true)
+}
+
+/// `collect_facts`, optionally without the network fetch (a re-check right before deleting).
+fn collect_facts_opt(wt: &Path, ctx: FactCtx, fetch: bool) -> GuardInput {
     let dirty = match git(wt, &["status", "--porcelain", "--untracked-files=all"], GIT_SLOW) {
         Ok(o) => Fact::Known(o.text().lines().map(|l| l.to_string()).collect()),
         Err(e) => Fact::Unknown(e.to_string()),
     };
-    let fetch = match git(wt, &["fetch", "--all", "--prune", "--quiet"], GIT_SLOW) {
-        Ok(_) => Fact::Known(()),
-        Err(e) => Fact::Unknown(e.to_string()),
+    let fetch = if !fetch {
+        Fact::Known(())
+    } else {
+        match git(wt, &["fetch", "--all", "--prune", "--quiet"], GIT_SLOW) {
+            Ok(_) => Fact::Known(()),
+            Err(e) => Fact::Unknown(e.to_string()),
+        }
     };
     let unpushed = match git(wt, &["log", "--format=%h %s", "--max-count=200", "HEAD", "--not", "--remotes", "--"], GIT_QUICK) {
         Ok(o) => Fact::Known(o.text().lines().map(|l| l.to_string()).collect()),
@@ -605,7 +633,10 @@ pub fn irreplaceable(wt: &Path, declared: &[String]) -> Result<Vec<PathBuf>> {
 }
 
 fn select(wt: &Path, rel: &Path, declared_abs: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
-    if rel.components().any(|c| matches!(c.as_os_str().to_str(), Some("node_modules" | ".git"))) {
+    // Only dependency trees are skipped. A nested `.git` is an independent repository whose local
+    // history exists nowhere else, so it is archived like any other ignored data (review #5);
+    // the worktree's own `.git` entry is a file that `ls-files --others` never lists.
+    if rel.components().any(|c| matches!(c.as_os_str().to_str(), Some("node_modules"))) || rel == Path::new(".git") {
         return Ok(());
     }
     let abs = wt.join(rel);
@@ -626,13 +657,13 @@ fn select(wt: &Path, rel: &Path, declared_abs: &[PathBuf], out: &mut Vec<PathBuf
     Ok(())
 }
 
-/// Does this directory contain (at any depth) a node_modules, .git or declared path? Such paths
+/// Does this directory contain (at any depth) a node_modules or declared path? Such paths
 /// are never descended into once found, so dependency trees are not walked.
 fn has_excluded(dir: &Path, declared_abs: &[PathBuf]) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
     for e in rd.flatten() {
         let p = e.path();
-        if matches!(e.file_name().to_str(), Some("node_modules" | ".git")) || declared_abs.iter().any(|d| p.starts_with(d)) {
+        if matches!(e.file_name().to_str(), Some("node_modules")) || declared_abs.iter().any(|d| p.starts_with(d)) {
             return true;
         }
         if e.file_type().is_ok_and(|t| t.is_dir()) && has_excluded(&p, declared_abs) {
@@ -727,6 +758,9 @@ pub struct OpRecord {
     pub updated: u64,
     pub finished: Option<u64>,
     pub last_error: Option<String>,
+    /// `--force` saved the dirty changes here (`refs/setu-backup/<branch>`) before removing.
+    #[serde(default)]
+    pub backup_ref: Option<String>,
 }
 
 fn check_key(key: &str) -> Result<()> {
@@ -823,6 +857,8 @@ pub struct RmCtx<'a> {
     pub db: &'a Db,
     pub force: bool,
     pub host: &'a dyn RmHost,
+    /// Refuse to archive more than this many bytes of ignored data; `None` means `ARCHIVE_MAX_BYTES`.
+    pub archive_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -883,7 +919,8 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 bail!("{} does not exist; nothing to remove", ctx.worktree.display());
             }
             // Preflight (invariant 10): nothing is persisted or signalled if the tree is not safe.
-            let reasons = guards(&collect_facts(ctx.worktree, facts_ctx(ctx, true)));
+            let mut reasons = guards(&collect_facts(ctx.worktree, facts_ctx(ctx, true)));
+            reasons.extend(submodule_reasons(ctx.worktree));
             if !reasons.is_empty() {
                 return Err(Refused(reasons).into());
             }
@@ -905,6 +942,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 updated: now,
                 finished: None,
                 last_error: None,
+                backup_ref: None,
             };
             save_op(ctx.db, &rec)?;
             rec
@@ -1004,25 +1042,15 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
             if !ctx.worktree.is_dir() {
                 return Ok(Step::Remove);
             }
-            let dest = match &rec.archive {
-                Some(p) => p.clone(),
-                None => {
-                    let p = archive_path(ctx.archive_root, ctx.project, ctx.run, &compact_ts());
-                    rec.archive = Some(p.clone());
-                    save_op(ctx.db, rec)?; // plan the name first, so a retry never writes a second archive
-                    p
-                }
-            };
-            if dest.exists() {
+            if rec.archive.is_none() {
+                let p = archive_path(ctx.archive_root, ctx.project, ctx.run, &compact_ts());
+                rec.archive = Some(p);
+                save_op(ctx.db, rec)?; // plan the name first, so a retry never writes a second archive
+            }
+            if rec.archive.as_ref().is_some_and(|d| d.exists()) {
                 return Ok(Step::Remove);
             }
-            let rels = irreplaceable(ctx.worktree, ctx.declared)?;
-            rec.archived_files = rels.len();
-            if rels.is_empty() {
-                rec.archive = None;
-            } else {
-                write_archive(ctx.worktree, &rels, &dest)?;
-            }
+            make_archive(ctx, rec)?;
             Ok(Step::Remove)
         }
         Step::Remove => {
@@ -1031,18 +1059,32 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 if !is_registered(ctx.repo, wt)? {
                     bail!("{} exists but is not a worktree of this repo any more; refusing to delete it", wt.display());
                 }
+                // A resumed removal never trusts an earlier step as permission to delete (review #2):
+                // the checkout, the live guards and the ignored data are all checked again.
+                let now_branch = git(wt, &["symbolic-ref", "--short", "-q", "HEAD"], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|b| !b.is_empty());
+                if rec.branch.is_some() && now_branch != rec.branch {
+                    bail!("{} is on {:?} but the removal was planned for {:?}; refusing to delete a different checkout", wt.display(), now_branch, rec.branch);
+                }
+                let mut reasons = guards(&collect_facts_opt(wt, facts_ctx(ctx, false), false));
+                reasons.extend(submodule_reasons(wt));
+                if !reasons.is_empty() {
+                    return Err(Refused(reasons).into());
+                }
+                refresh_archive(ctx, rec)?;
+                if ctx.force {
+                    backup_dirty(ctx, rec)?;
+                }
                 let wt_s = wt.to_string_lossy().into_owned();
                 let mut args = vec!["worktree", "remove"];
                 if ctx.force {
                     args.push("--force");
                 }
                 args.extend(["--", &wt_s]);
-                git(ctx.repo, &args, GIT_SLOW).map_err(|e| {
-                    if e.is_unknown() {
-                        anyhow!("git worktree remove finished with an unknown result ({e}); the record is kept, retry to continue")
-                    } else {
-                        anyhow!("git worktree remove: {e}")
-                    }
+                git(ctx.repo, &args, GIT_SLOW).map_err(|e| match &e {
+                    ExecError::Unknown(_) => anyhow!("git worktree remove finished with an unknown result ({e}); the record is kept, retry to continue"),
+                    ExecError::Failed { stderr, .. } if stderr.contains("locked") => anyhow!("git worktree remove refused: the worktree is locked ({}). Run `git worktree unlock {}` if the lock is stale, then retry", stderr.trim(), wt.display()),
+                    ExecError::Failed { stderr, .. } if stderr.contains("submodule") => anyhow!("git worktree remove refused: it contains submodules ({}). Deinitialise them (`git submodule deinit --all`) after saving any local commits, then retry", stderr.trim()),
+                    _ => anyhow!("git worktree remove: {e}"),
                 })?;
             }
             git(ctx.repo, &["worktree", "prune"], GIT_QUICK).map_err(|e| anyhow!("git worktree prune: {e}"))?;
@@ -1061,6 +1103,163 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
         Step::DropState | Step::ReleaseLease | Step::Marker | Step::Done => Ok(Step::Done),
     }
 }
+
+// ---------------------------------------------------------------- archive helpers
+
+/// Total bytes and newest modification time under `path` (links are never followed; a nested
+/// `.git` is counted, unlike `disk_measure`).
+fn scan(path: &Path, bytes: &mut u64, newest: &mut std::time::SystemTime) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    if let Ok(m) = meta.modified() {
+        *newest = (*newest).max(m);
+    }
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for e in rd.flatten() {
+                scan(&e.path(), bytes, newest);
+            }
+        }
+    } else {
+        *bytes += meta.len();
+    }
+}
+
+/// Members of a tar file, trailing slashes dropped; `None` when it cannot be listed.
+fn tar_members(archive: &Path) -> Option<BTreeSet<String>> {
+    let mut cmd = Command::new("tar");
+    cmd.arg("-tf").arg(archive);
+    let out = exec(cmd, TAR_TIMEOUT).ok()?;
+    Some(out.text().lines().map(|l| l.trim_end_matches('/').to_string()).collect())
+}
+
+/// Does `archive` list every one of `rels`?
+fn archive_lists(archive: &Path, rels: &[PathBuf]) -> bool {
+    tar_members(archive).is_some_and(|m| rels.iter().all(|r| m.contains(r.to_string_lossy().trim_end_matches('/'))))
+}
+
+/// Archive the irreplaceable ignored data to `rec.archive`: size cap first, then write, then
+/// read the tar back and confirm every selected path is in it before anything is deleted.
+fn make_archive(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
+    let dest = rec.archive.clone().ok_or_else(|| anyhow!("no archive path planned"))?;
+    let rels = irreplaceable(ctx.worktree, ctx.declared)?;
+    rec.archived_files = rels.len();
+    if rels.is_empty() {
+        rec.archive = None;
+        return Ok(());
+    }
+    let (mut bytes, mut newest) = (0u64, std::time::UNIX_EPOCH);
+    for r in &rels {
+        scan(&ctx.worktree.join(r), &mut bytes, &mut newest);
+    }
+    let cap = ctx.archive_cap.unwrap_or(ARCHIVE_MAX_BYTES);
+    if bytes > cap {
+        return Err(Refused(vec![Reason {
+            code: "archive-size",
+            message: format!(
+                "the ignored data that would be archived is {} (cap {}); move or delete the large files, or declare them as a [[disk.item]], then retry",
+                disk::human_bytes(bytes),
+                disk::human_bytes(cap)
+            ),
+        }])
+        .into());
+    }
+    write_archive(ctx.worktree, &rels, &dest)?;
+    if !archive_lists(&dest, &rels) {
+        let _ = std::fs::remove_file(&dest);
+        bail!("the archive {} does not list every selected file; nothing was deleted", dest.display());
+    }
+    Ok(())
+}
+
+/// Just before deleting: if ignored data changed or appeared after the archive was written, or
+/// the archive no longer lists everything, write a fresh archive generation (review #2).
+fn refresh_archive(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
+    let rels = irreplaceable(ctx.worktree, ctx.declared)?;
+    if rels.is_empty() {
+        return Ok(());
+    }
+    let ok = rec.archive.as_ref().is_some_and(|a| {
+        let Ok(am) = std::fs::metadata(a).and_then(|m| m.modified()) else { return false };
+        let (mut b, mut newest) = (0u64, std::time::UNIX_EPOCH);
+        for r in &rels {
+            scan(&ctx.worktree.join(r), &mut b, &mut newest);
+        }
+        newest <= am && archive_lists(a, &rels)
+    });
+    if ok {
+        return Ok(());
+    }
+    let mut ts = compact_ts();
+    let mut dest = archive_path(ctx.archive_root, ctx.project, ctx.run, &ts);
+    let mut n = 1;
+    while dest.exists() {
+        ts = format!("{}{n}", compact_ts());
+        dest = archive_path(ctx.archive_root, ctx.project, ctx.run, &ts);
+        n += 1;
+    }
+    rec.archive = Some(dest);
+    save_op(ctx.db, rec)?;
+    make_archive(ctx, rec)?;
+    save_op(ctx.db, rec)
+}
+
+/// Initialised submodules keep their git data inside the superproject's admin dir, which
+/// `git worktree remove` deletes: refuse until they are dealt with (never retried as "unknown").
+fn submodule_reasons(wt: &Path) -> Vec<Reason> {
+    if !wt.join(".gitmodules").exists() {
+        return vec![];
+    }
+    match git(wt, &["submodule", "status"], GIT_QUICK) {
+        Ok(o) => {
+            let live = o.text().lines().filter(|l| !l.trim().is_empty() && !l.starts_with('-')).count();
+            if live == 0 {
+                vec![]
+            } else {
+                vec![Reason { code: "submodule", message: format!("{live} initialised submodule(s): their local commits live inside the worktree's git data. Run `git submodule deinit --all` (after pushing anything local) and retry") }]
+            }
+        }
+        Err(e) => vec![Reason { code: "submodule", message: format!("could not inspect submodules: {e}") }],
+    }
+}
+
+/// `--force` discards dirty changes: save them first as a commit under `refs/setu-backup/<branch>`
+/// (tracked edits and untracked files; ignored files are archived instead).
+fn backup_dirty(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
+    let wt = ctx.worktree;
+    let dirty = git(wt, &["status", "--porcelain", "--untracked-files=all"], GIT_SLOW).map_err(|e| anyhow!("could not read the worktree status before a forced removal: {e}"))?;
+    if dirty.stdout.is_empty() {
+        return Ok(());
+    }
+    let name = match &rec.branch {
+        Some(b) => b.clone(),
+        None => format!("detached-{}", rec.head.as_deref().unwrap_or("head").chars().take(12).collect::<String>()),
+    };
+    let refname = format!("refs/setu-backup/{name}");
+    let idx = ctx.archive_root.join(format!(".backup-index-{}-{}", std::process::id(), TMP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::create_dir_all(ctx.archive_root)?;
+    let with_idx = |args: &[&str]| -> std::result::Result<Out, ExecError> {
+        let mut c = git_cmd(wt, args);
+        c.env("GIT_INDEX_FILE", &idx).env("GIT_AUTHOR_NAME", "setu").env("GIT_AUTHOR_EMAIL", "setu@localhost").env("GIT_COMMITTER_NAME", "setu").env("GIT_COMMITTER_EMAIL", "setu@localhost");
+        exec(c, GIT_SLOW)
+    };
+    let res = (|| -> Result<String> {
+        with_idx(&["read-tree", "HEAD"]).map_err(|e| anyhow!("backup: {e}"))?;
+        with_idx(&["add", "-A"]).map_err(|e| anyhow!("backup: {e}"))?;
+        let tree = with_idx(&["write-tree"]).map_err(|e| anyhow!("backup: {e}"))?.text().trim().to_string();
+        let msg = format!("setu backup of uncommitted changes before a forced removal of {}", ctx.run);
+        let commit = with_idx(&["-c", "commit.gpgsign=false", "commit-tree", &tree, "-p", "HEAD", "-m", &msg]).map_err(|e| anyhow!("backup: {e}"))?.text().trim().to_string();
+        git_ok(wt, &["update-ref", &refname, &commit])?;
+        Ok(refname.clone())
+    })();
+    let _ = std::fs::remove_file(&idx);
+    rec.backup_ref = Some(res.context("saving the uncommitted changes before a forced removal failed; nothing was deleted")?);
+    save_op(ctx.db, rec)
+}
+
+static TMP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------- removed list
 
@@ -1113,9 +1312,23 @@ pub fn restore(cfg: &ProjectConfig, run: &str, ops: &Db, archive_root: &Path) ->
     if std::fs::symlink_metadata(&path).is_ok() {
         bail!("{} already exists", path.display());
     }
+    // Only the archive this removal recorded is ever restored; another removal's archive of the
+    // same run name is a different checkout's data (review #17).
+    let archive = rec.archive.clone().filter(|a| a.exists() && a.starts_with(archive_root));
+    let members = match &archive {
+        Some(a) => {
+            let m = tar_members(a).ok_or_else(|| anyhow!("cannot read the archive {}; it is kept, nothing was restored", a.display()))?;
+            if let Some(bad) = m.iter().find(|n| Path::new(n).is_absolute() || Path::new(n).components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))) {
+                bail!("the archive {} has an unsafe member path {bad:?}; refusing to extract it", a.display());
+            }
+            m
+        }
+        None => BTreeSet::new(),
+    };
     let repo = cfg.repo.as_path();
     let _ = git(repo, &["worktree", "prune"], GIT_QUICK);
     let path_s = path.to_string_lossy().into_owned();
+    let mut warnings = Vec::new();
     match (&rec.branch, &rec.head) {
         (Some(b), _) => {
             valid_ref_arg("branch", b)?;
@@ -1133,14 +1346,40 @@ pub fn restore(cfg: &ProjectConfig, run: &str, ops: &Db, archive_root: &Path) ->
         }
         (None, None) => bail!("the removal record has neither a branch nor a commit"),
     }
-    let mut warnings = link_files(cfg, &path)?;
-    let archive = latest_archive(archive_root, &cfg.project, run);
-    if let Some(a) = &archive {
-        let mut cmd = Command::new("tar");
-        cmd.arg("-xkf").arg(a).arg("-C").arg(&path);
-        exec(cmd, TAR_TIMEOUT).map_err(|e| anyhow!("restoring {}: {e}", a.display()))?;
-    } else {
-        warnings.push("no archive for this run; only the branch was restored".into());
+    if let (Some(want), Ok(now)) = (&rec.head, git(&path, &["rev-parse", "HEAD"], GIT_QUICK)) {
+        if now.text().trim() != want {
+            warnings.push(format!("the branch moved since the removal: it was at {} and is now at {}", &want[..want.len().min(12)], &now.text().trim()[..now.text().trim().len().min(12)]));
+        }
+    }
+    if let Some(b) = &rec.backup_ref {
+        warnings.push(format!("uncommitted changes discarded by the forced removal are saved at {b}"));
+    }
+    warnings.extend(link_files(cfg, &path)?);
+    match &archive {
+        Some(a) => {
+            // A member must not be written through a link (a linked file in the new worktree points into main).
+            let through_link = members.iter().find(|m| {
+                let mut cur = path.clone();
+                let comps: Vec<_> = Path::new(m).components().collect();
+                comps.iter().take(comps.len().saturating_sub(1)).any(|c| {
+                    cur.push(c);
+                    std::fs::symlink_metadata(&cur).is_ok_and(|md| md.file_type().is_symlink())
+                })
+            });
+            if let Some(m) = through_link {
+                warnings.push(format!("the archive was not extracted: {m} would be written through a link; it is kept at {}", a.display()));
+            } else {
+                for m in &members {
+                    if std::fs::symlink_metadata(path.join(m)).is_ok_and(|md| !md.is_dir()) {
+                        warnings.push(format!("{m} already exists in the restored worktree; the archived copy was not applied"));
+                    }
+                }
+                let mut cmd = Command::new("tar");
+                cmd.arg("-xkf").arg(a).arg("--no-same-owner").arg("-C").arg(&path);
+                exec(cmd, TAR_TIMEOUT).map_err(|e| anyhow!("restoring {}: {e}", a.display()))?;
+            }
+        }
+        None => warnings.push("nothing was archived for this removal; only the branch was restored".into()),
     }
     ops.with(|c| c.execute("DELETE FROM removal_ops WHERE run_key = ?1", [key.as_str()]))?;
     Ok(RestoreOutcome { path: canon(&path), run: run.to_string(), branch: rec.branch, restored_from: archive, warnings })
@@ -1291,7 +1530,7 @@ pub(crate) mod tests {
 
     fn do_rm(f: &Fx, run: &str, wt: &Path, force: bool, host: &Host) -> Result<RmOutcome> {
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
-        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host })
+        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: None })
     }
 
     fn input() -> GuardInput {
@@ -1484,7 +1723,7 @@ pub(crate) mod tests {
         assert!(f.pdir.join("feat/e").exists());
         // a pending removal blocks new
         let key = "app/feat-f";
-        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None };
+        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None, backup_ref: None };
         save_op(&f.ops, &rec).unwrap();
         assert!(pending_removal(&f.ops, key));
         assert!(run(&f, "feat/f", &BTreeSet::new()).unwrap_err().to_string().contains("pending"));
@@ -1740,8 +1979,12 @@ pub(crate) mod tests {
         let crashy = Host::default();
         *crashy.fail_after.lock().unwrap() = Some(Step::Stop);
         assert!(do_rm(&f, "feat-cl", &o.path, false, &crashy).is_err());
-        // a writer claims the run after the preflight, before the Guards -> Archive transition
-        crate::claims::claim(&f.ops, "app/feat-cl", "agent-z", None, crate::claims::now()).unwrap();
+        // review #3: while the removal is pending the claim API refuses new claims
+        let e = crate::claims::claim(&f.ops, "app/feat-cl", "agent-z", None, crate::claims::now()).unwrap_err();
+        assert!(e.to_string().contains("being removed"), "{e:#}");
+        assert!(crate::claims::get(&f.ops, "app/feat-cl").unwrap().is_none());
+        // a claim row that got in some other way (older data) still blocks the Guards -> Archive transition
+        f.ops.with(|c| c.execute("INSERT INTO claims (run_key, holder, since, heartbeat) VALUES ('app/feat-cl', 'agent-z', ?1, ?1)", [crate::claims::now() as i64])).unwrap();
         let e = do_rm(&f, "feat-cl", &o.path, false, &Host::default()).unwrap_err();
         assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "claim"), "{e:#}");
         assert_eq!(load_op(&f.ops, "app/feat-cl").unwrap().unwrap().step, Step::Guards, "the transition was not recorded");
@@ -1823,7 +2066,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn restore_needs_a_finished_removal_and_picks_the_latest_archive() {
+    fn restore_needs_a_finished_removal_and_ignores_unrelated_archives() {
+        // review #17: an older archive of the same run name is another checkout's data
         let f = fx("restore2");
         assert!(restore(&f.cfg, "nope", &f.ops, &f.archives).unwrap_err().to_string().contains("no removal record"));
         let o = new_wt(&f, "feat/r2");
@@ -1831,16 +2075,174 @@ pub(crate) mod tests {
         *crashy.fail_after.lock().unwrap() = Some(Step::Stop);
         let _ = do_rm(&f, "feat-r2", &o.path, false, &crashy);
         assert!(restore(&f.cfg, "feat-r2", &f.ops, &f.archives).unwrap_err().to_string().contains("not finished"));
-        do_rm(&f, "feat-r2", &o.path, false, &Host::default()).unwrap();
-        // two archives: the later name wins
+        let out = do_rm(&f, "feat-r2", &o.path, false, &Host::default()).unwrap();
+        assert!(out.archive.is_none(), "nothing irreplaceable was left");
         let dir = f.archives.join("app/feat-r2");
-        for (ts, body) in [("20200101T000000Z", "old"), ("20990101T000000Z", "new")] {
-            let src = f.root.join(format!("src-{ts}"));
-            fs::create_dir_all(&src).unwrap();
-            fs::write(src.join("local.db"), body).unwrap();
-            write_archive(&src, &[PathBuf::from("local.db")], &dir.join(format!("{ts}.tar"))).unwrap();
-        }
+        let src = f.root.join("src-old");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("local.db"), "stale database the user deleted").unwrap();
+        write_archive(&src, &[PathBuf::from("local.db")], &dir.join("20200101T000000Z.tar")).unwrap();
         let r = restore(&f.cfg, "feat-r2", &f.ops, &f.archives).unwrap();
-        assert_eq!(fs::read_to_string(r.path.join("local.db")).unwrap(), "new");
+        assert!(!r.path.join("local.db").exists(), "the stray archive must not come back");
+        assert!(r.restored_from.is_none() && r.warnings.iter().any(|w| w.contains("nothing was archived")), "{:?}", r.warnings);
+    }
+
+    fn do_rm_cap(f: &Fx, run: &str, wt: &Path, force: bool, host: &Host, cap: Option<u64>) -> Result<RmOutcome> {
+        let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
+        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host, archive_cap: cap })
+    }
+
+    #[test]
+    fn a_resumed_removal_rearchives_ignored_data_created_after_the_archive() {
+        // review #2
+        let f = fx("rmresume");
+        let o = new_wt(&f, "feat/rr");
+        fs::write(o.path.join("local.db"), "v1").unwrap();
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Archive);
+        assert!(do_rm(&f, "feat-rr", &o.path, false, &crashy).is_err());
+        assert_eq!(load_op(&f.ops, "app/feat-rr").unwrap().unwrap().step, Step::Remove);
+        std::thread::sleep(Duration::from_millis(30));
+        fs::write(o.path.join("local.db"), "v2 edited after the archive").unwrap();
+        fs::write(o.path.join("new-local.db"), "created after the archive").unwrap();
+        let out = do_rm(&f, "feat-rr", &o.path, false, &Host::default()).unwrap();
+        assert!(!o.path.exists());
+        let arch = out.archive.unwrap();
+        let listing = Command::new("tar").arg("-tf").arg(&arch).output().unwrap();
+        assert!(String::from_utf8_lossy(&listing.stdout).contains("new-local.db"));
+        let r = restore(&f.cfg, "feat-rr", &f.ops, &f.archives).unwrap();
+        assert_eq!(fs::read_to_string(r.path.join("local.db")).unwrap(), "v2 edited after the archive");
+        assert_eq!(fs::read_to_string(r.path.join("new-local.db")).unwrap(), "created after the archive");
+    }
+
+    #[test]
+    fn a_resumed_removal_rechecks_the_live_guards() {
+        // review #2/#3: the claim table is read again before the delete, not only when leaving Guards
+        let f = fx("rmreguard");
+        let o = new_wt(&f, "feat/rg");
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Archive);
+        assert!(do_rm(&f, "feat-rg", &o.path, false, &crashy).is_err());
+        let claimed = Host { claim: Some("late-writer".into()), ..Default::default() };
+        let e = do_rm(&f, "feat-rg", &o.path, false, &claimed).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "claim"), "{e:#}");
+        assert!(o.path.exists());
+    }
+
+    #[test]
+    fn an_ignored_nested_repository_is_archived_with_its_history() {
+        // review #5
+        let f = fx("nested");
+        let o = new_wt(&f, "feat/ns");
+        let nested = o.path.join("scratch/nested");
+        fs::create_dir_all(&nested).unwrap();
+        g(&nested, &["init", "-q", "-b", "main"]);
+        fs::write(nested.join("README"), "local only").unwrap();
+        g(&nested, &["add", "."]);
+        g(&nested, &["commit", "-q", "-m", "local-only commit"]);
+        let rels = irreplaceable(&o.path, &["node_modules".to_string()]).unwrap();
+        assert!(rels.iter().any(|r| r.starts_with("scratch")), "{rels:?}");
+        let out = do_rm(&f, "feat-ns", &o.path, false, &Host::default()).unwrap();
+        let r = restore(&f.cfg, "feat-ns", &f.ops, &f.archives).unwrap();
+        assert!(out.archive.is_some());
+        assert_eq!(g(&r.path.join("scratch/nested"), &["log", "--format=%s"]), "local-only commit");
+    }
+
+    #[test]
+    fn the_archive_size_cap_refuses_clearly_and_a_larger_cap_proceeds() {
+        let f = fx("cap");
+        let o = new_wt(&f, "feat/cap");
+        fs::write(o.path.join("local.db"), vec![1u8; 4096]).unwrap();
+        let e = do_rm_cap(&f, "feat-cap", &o.path, false, &Host::default(), Some(1024)).unwrap_err();
+        let reasons = &e.downcast_ref::<Refused>().expect("a clear refusal").0;
+        assert_eq!(reasons[0].code, "archive-size");
+        assert!(reasons[0].message.contains("cap"), "{}", reasons[0].message);
+        assert!(o.path.join("local.db").exists());
+        assert!(do_rm_cap(&f, "feat-cap", &o.path, false, &Host::default(), Some(1 << 20)).unwrap().removed);
+    }
+
+    #[test]
+    fn a_locked_worktree_is_a_clear_refusal_with_a_hint_and_retry_works() {
+        let f = fx("locked");
+        let o = new_wt(&f, "feat/lk");
+        g(&f.repo, &["worktree", "lock", "--reason", "test", o.path.to_str().unwrap()]);
+        let e = do_rm(&f, "feat-lk", &o.path, false, &Host::default()).unwrap_err();
+        let m = format!("{e:#}");
+        assert!(m.contains("locked") && m.contains("git worktree unlock") && !m.contains("unknown"), "{m}");
+        assert!(o.path.exists());
+        g(&f.repo, &["worktree", "unlock", o.path.to_str().unwrap()]);
+        assert!(do_rm(&f, "feat-lk", &o.path, false, &Host::default()).unwrap().removed);
+    }
+
+    #[test]
+    fn a_worktree_with_an_initialised_submodule_is_refused_before_anything_is_persisted() {
+        let f = fx("submod");
+        let sub = f.root.join("subsrc");
+        fs::create_dir_all(&sub).unwrap();
+        g(&sub, &["init", "-q", "-b", "main"]);
+        fs::write(sub.join("s.txt"), "s").unwrap();
+        g(&sub, &["add", "."]);
+        g(&sub, &["commit", "-q", "-m", "sub"]);
+        let o = new_wt(&f, "feat/sm");
+        g(&o.path, &["submodule", "add", "-q", sub.to_str().unwrap(), "vendor/sub"]);
+        g(&o.path, &["commit", "-q", "-m", "add submodule"]);
+        g(&o.path, &["push", "-q", "origin", "HEAD:refs/heads/feat/sm"]);
+        let e = do_rm(&f, "feat-sm", &o.path, false, &Host::default()).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "submodule"), "{e:#}");
+        assert!(load_op(&f.ops, "app/feat-sm").unwrap().is_none());
+        assert!(o.path.exists());
+    }
+
+    #[test]
+    fn a_forced_removal_saves_dirty_changes_under_refs_setu_backup() {
+        let f = fx("backup");
+        let o = new_wt(&f, "feat/bk");
+        fs::write(o.path.join("README.md"), "edited\n").unwrap();
+        fs::write(o.path.join("u.txt"), "untracked work\n").unwrap();
+        assert!(do_rm(&f, "feat-bk", &o.path, true, &Host::default()).unwrap().removed);
+        assert!(!o.path.exists());
+        let rec = load_op(&f.ops, "app/feat-bk").unwrap().unwrap();
+        assert_eq!(rec.backup_ref.as_deref(), Some("refs/setu-backup/feat/bk"));
+        assert_eq!(g(&f.repo, &["show", "refs/setu-backup/feat/bk:u.txt"]), "untracked work");
+        assert_eq!(g(&f.repo, &["show", "refs/setu-backup/feat/bk:README.md"]), "edited");
+        let r = restore(&f.cfg, "feat-bk", &f.ops, &f.archives).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("refs/setu-backup/feat/bk")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn restore_warns_when_the_branch_moved_and_refuses_unsafe_member_paths() {
+        let f = fx("restoresafe");
+        let o = new_wt(&f, "feat/mv");
+        fs::write(o.path.join("local.db"), "x").unwrap();
+        let out = do_rm(&f, "feat-mv", &o.path, false, &Host::default()).unwrap();
+        // the branch moves while the worktree is gone
+        let head = load_op(&f.ops, "app/feat-mv").unwrap().unwrap().head.unwrap();
+        let tree = g(&f.repo, &["rev-parse", &format!("{head}^{{tree}}")]);
+        let moved = g(&f.repo, &["commit-tree", &tree, "-p", &head, "-m", "moved"]);
+        g(&f.repo, &["update-ref", "refs/heads/feat/mv", &moved]);
+        // a tar whose member climbs out of the worktree replaces the real archive
+        fs::write(f.root.join("outside.txt"), "evil").unwrap();
+        let evil = out.archive.clone().unwrap();
+        fs::remove_file(&evil).unwrap();
+        let st = Command::new("tar").arg("-cPf").arg(&evil).arg("-C").arg(&f.archives).arg("../outside.txt").status().unwrap();
+        assert!(st.success());
+        let e = restore(&f.cfg, "feat-mv", &f.ops, &f.archives).unwrap_err();
+        assert!(e.to_string().contains("unsafe member"), "{e:#}");
+        assert!(!o.path.exists(), "refused before the worktree was created");
+        // with a normal archive the move is reported
+        write_archive(&f.pdir.join("main"), &[PathBuf::from("README.md")], &evil).unwrap();
+        let r = restore(&f.cfg, "feat-mv", &f.ops, &f.archives).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("branch moved")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn exec_stops_waiting_for_output_a_background_child_holds_open() {
+        // review #19
+        let mut c = Command::new("sh");
+        c.arg("-c").arg("sleep 8 & echo hi");
+        let t = Instant::now();
+        let out = exec(c, Duration::from_secs(30)).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(6), "waited {:?}", t.elapsed());
+        assert_eq!(out.text().trim(), "hi");
     }
 }

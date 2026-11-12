@@ -212,7 +212,7 @@ pub fn plan_in(gcfg: &GlobalConfig, domains: &[String], binary: &Path, sys: &dyn
     let mut seen = std::collections::BTreeSet::new();
     for d in domains {
         let d = d.trim().trim_matches('.').to_ascii_lowercase();
-        if d.is_empty() || d.ends_with(".localhost") || d == "localhost" || !seen.insert(d.clone()) {
+        if d.is_empty() || d.ends_with(".localhost") || d == "localhost" || crate::config::validate_domain(&d).is_err() || !seen.insert(d.clone()) {
             continue;
         }
         if sys.resolves_to_loopback(&probe_host(&d)) {
@@ -263,12 +263,23 @@ fn apply_steps(steps: &[Step], gcfg: &mut GlobalConfig, binary: &Path, layout: &
             }
             id => {
                 let domain = id.strip_prefix("resolver:").ok_or_else(|| anyhow!("unknown step {id}"))?;
+                // The domain becomes a file name written with sudo: plain DNS labels only (review #22).
+                crate::config::validate_domain(domain).with_context(|| format!("refusing to write a resolver file for {domain:?}"))?;
                 let file = layout.resolver_dir.join(domain);
-                // Never overwrite a resolver file someone else wrote.
-                if let Ok(existing) = std::fs::read_to_string(&file) {
-                    if existing.lines().next() != Some(MARKER) {
-                        bail!("{} exists and is not managed by setu; leaving it alone", file.display());
-                    }
+                if file.parent() != Some(layout.resolver_dir.as_path()) {
+                    bail!("{} is not directly inside {}", file.display(), layout.resolver_dir.display());
+                }
+                // Never overwrite a resolver file someone else wrote, and never guess: a file we cannot
+                // inspect (unreadable, a link) is refused, not treated as absent.
+                match std::fs::symlink_metadata(&file) {
+                    Ok(md) if md.file_type().is_symlink() => bail!("{} is a symlink; leaving it alone", file.display()),
+                    Ok(_) => match std::fs::read_to_string(&file) {
+                        Ok(existing) if existing.lines().next() == Some(MARKER) => {}
+                        Ok(_) => bail!("{} exists and is not managed by setu; leaving it alone", file.display()),
+                        Err(e) => bail!("{} exists but cannot be read ({e}); leaving it alone", file.display()),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => bail!("cannot inspect {} ({e}); leaving it alone", file.display()),
                 }
                 sys.run_sudo_write(&file, &resolver_contents(gcfg.dns_port))?;
                 let f = file.to_string_lossy().into_owned();
@@ -447,6 +458,49 @@ mod tests {
         let mut g = GlobalConfig::default();
         let fake = Fake::default();
         let steps = vec![Step { id: "resolver:demo.test".into(), description: String::new(), sudo: true }];
+        assert!(apply(&steps, &mut g, Path::new("/b"), &l, &fake).is_err());
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn resolver_domains_that_are_paths_are_never_planned_or_written() {
+        // review #22
+        let l = layout("domainpath");
+        let g = GlobalConfig::default();
+        let bin = Path::new("/bin/setu-rs");
+        let fake = Fake::default();
+        let steps = plan_in(&g, &doms(&["/etc/sudoers", "../../etc/hosts", "a/b.test", "ok.test", "bad name.test"]), bin, &fake, &l);
+        assert_eq!(ids(&steps), ["capture-path", "launch-agent", "resolver:ok.test"]);
+        // even a hand-made step is refused before anything is written
+        let mut g2 = GlobalConfig::default();
+        for bad in ["resolver:/etc/sudoers", "resolver:../x", "resolver:a/b"] {
+            let steps = vec![Step { id: bad.into(), description: String::new(), sudo: true }];
+            assert!(apply(&steps, &mut g2, bin, &l, &fake).is_err(), "{bad}");
+        }
+        assert!(fake.calls.borrow().is_empty(), "{:?}", fake.calls.borrow());
+    }
+
+    #[test]
+    fn an_unreadable_or_linked_resolver_target_is_a_refusal_not_an_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let l = layout("unreadable");
+        std::fs::create_dir_all(&l.resolver_dir).unwrap();
+        let mut g = GlobalConfig::default();
+        let fake = Fake::default();
+        let steps = vec![Step { id: "resolver:demo.test".into(), description: String::new(), sudo: true }];
+        // a file we cannot read
+        let f = l.resolver_dir.join("demo.test");
+        std::fs::write(&f, "# managed by setu\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_to_string(&f).is_ok(); // running as root
+        let r = apply(&steps, &mut g, Path::new("/b"), &l, &fake);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !readable_anyway {
+            assert!(r.is_err() && fake.calls.borrow().is_empty());
+        }
+        // a symlink
+        std::fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", &f).unwrap();
         assert!(apply(&steps, &mut g, Path::new("/b"), &l, &fake).is_err());
         assert!(fake.calls.borrow().is_empty());
     }

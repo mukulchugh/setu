@@ -16,7 +16,7 @@ use crate::db::{params, Conn, Db};
 use crate::disk::human_secs;
 use crate::globalcfg::AutoRemoveCfg;
 use crate::model::{ProjectConfig, RunRecord, RunStatus, WorktreeCfg};
-use crate::worktree::{self, git, ExecError, FactCtx};
+use crate::worktree::{self, git, FactCtx};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -199,7 +199,7 @@ pub struct Deps<'a> {
     pub now: u64,
     /// Local day for `now` (a parameter so tests control the cap's day).
     pub day: String,
-    /// `gh pr view <branch> --json state,mergedAt,headRefOid`, run in the main worktree. Err = any failure.
+    /// `gh pr list --head <branch> --state merged --json ...` (a JSON array), run in the main worktree. Err = gh could not answer.
     pub gh: &'a dyn Fn(&Path, &str) -> std::result::Result<String, String>,
     pub audit: &'a dyn Fn(&str, &str, Value),
     /// Remove through the persisted `worktree::rm` path.
@@ -216,7 +216,9 @@ pub fn real_gh(main: &Path, branch: &str) -> std::result::Result<String, String>
         return Err("refusing a branch name that starts with '-'".into());
     }
     let mut c = Command::new("gh");
-    c.current_dir(main).args(["pr", "view", branch, "--json", "state,mergedAt,headRefOid"]).env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1");
+    c.current_dir(main)
+        .args(["pr", "list", "--head", branch, "--state", "merged", "--limit", "20", "--json", "number,headRefOid,mergedAt,baseRefName,headRepositoryOwner"])
+        .env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1");
     if let Some(p) = crate::globalcfg::login_path() {
         c.env("PATH", p);
     }
@@ -236,39 +238,100 @@ fn skip(reason: impl Into<String>, quiet: bool) -> Verdict {
     Verdict::Skip { reason: reason.into(), quiet }
 }
 
-/// Is the PR for this branch merged, by `gh`? Requires `state == MERGED`, a `mergedAt`, and the
-/// PR head equal to the local HEAD (so commits added after the merge are not mistaken for it).
-fn gh_says_merged(out: &str, local_head: &str) -> bool {
+/// Is there a merged PR for this branch, by `gh`? Some PR in the list must have a `mergedAt`, a head
+/// equal to the local HEAD (commits added after the merge are not the merge), the same base branch we
+/// compare against, and (when origin's owner is known) a head repository owned by origin's owner.
+fn gh_says_merged(out: &str, local_head: &str, base_branch: &str, origin_owner: Option<&str>) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(out) else { return false };
-    v["state"].as_str() == Some("MERGED") && v["mergedAt"].as_str().is_some_and(|s| !s.is_empty()) && v["headRefOid"].as_str() == Some(local_head)
+    let Some(list) = v.as_array() else { return false };
+    list.iter().any(|pr| {
+        pr["mergedAt"].as_str().is_some_and(|s| !s.is_empty())
+            && pr["headRefOid"].as_str() == Some(local_head)
+            && pr["baseRefName"].as_str() == Some(base_branch)
+            && origin_owner.is_none_or(|o| pr["headRepositoryOwner"]["login"].as_str().is_some_and(|l| l.eq_ignore_ascii_case(o)))
+    })
 }
 
-/// "ancestor" or "pull request" when proven merged. Every failure, timeout or doubt is `None`.
-fn merged_how(it: &Item, fetch_ok: bool, d: &Deps) -> Option<&'static str> {
-    let head = git(&it.worktree, &["rev-parse", "HEAD"], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|h| !h.is_empty())?;
+/// `owner` of a GitHub-style origin URL (`git@github.com:owner/repo.git`, `https://github.com/owner/repo`).
+fn origin_owner(repo: &Path) -> Option<String> {
+    origin_owner_from(git(repo, &["remote", "get-url", "origin"], GIT_QUICK).ok()?.text().trim())
+}
+
+fn origin_owner_from(url: &str) -> Option<String> {
+    let rest = url.split_once("github.com").map(|(_, r)| r)?;
+    let rest = rest.trim_start_matches([':', '/']);
+    let owner = rest.split('/').next()?;
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
+/// Why a branch is or is not considered merged.
+#[derive(Debug, PartialEq)]
+enum Merged {
+    Yes(&'static str),
+    No,
+    /// `gh` could not answer (not installed, not logged in, offline): not the same as "not merged".
+    GhUnavailable(String),
+}
+
+fn git_cfg(repo: &Path, key: &str) -> Option<String> {
+    git(repo, &["config", "--local", "--get", key], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Offline proof that `head` is already in `base`: reachable ("ancestor"), or merging it changes
+/// nothing (`merge-tree`: squash merges), or every commit has an equivalent patch there (`cherry`:
+/// rebase merges). Any failure or doubt is `None`.
+fn merged_offline(worktree: &Path, head: &str, base: &str) -> Option<&'static str> {
+    if git(worktree, &["merge-base", "--is-ancestor", head, base], GIT_QUICK).is_ok() {
+        return Some("ancestor");
+    }
+    if let (Ok(m), Ok(t)) = (git(worktree, &["merge-tree", "--write-tree", base, head], GIT_QUICK), git(worktree, &["rev-parse", &format!("{base}^{{tree}}")], GIT_QUICK)) {
+        if m.text().lines().next().map(str::trim) == Some(t.text().trim()) {
+            return Some("merge-tree: merging it would change nothing");
+        }
+    }
+    if let Ok(c) = git(worktree, &["cherry", base, head], GIT_QUICK) {
+        let t = c.text();
+        let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !lines.is_empty() && lines.iter().all(|l| l.starts_with('-')) {
+            return Some("cherry: every commit has an equivalent in the base");
+        }
+    }
+    None
+}
+
+/// Is the branch proven merged? Every failure, timeout or doubt is `No` (or `GhUnavailable`).
+fn merged_how(it: &Item, fetch_ok: bool, d: &Deps) -> Merged {
+    let Some(head) = git(&it.worktree, &["rev-parse", "HEAD"], GIT_QUICK).ok().map(|o| o.text().trim().to_string()).filter(|h| !h.is_empty()) else { return Merged::No };
     let branch = match git(&it.worktree, &["symbolic-ref", "--short", "-q", "HEAD"], GIT_QUICK) {
         Ok(o) => o.text().trim().to_string(),
-        Err(ExecError::Failed { .. }) | Err(ExecError::Unknown(_)) => return None,
+        Err(_) => return Merged::No,
     };
     if branch.is_empty() {
-        return None;
+        return Merged::No;
     }
-    // Ancestry alone also matches a fresh, untouched branch cut from base. It only proves a
-    // merge when the branch was pushed (origin/<branch> exists); otherwise the idle rule applies.
-    let pushed = matches!(
-        git(&it.worktree, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")], GIT_QUICK),
-        Ok(_)
-    );
-    if fetch_ok && pushed {
-        if let Ok(base) = worktree::resolve_base(&it.repo, &it.wt_cfg, None) {
-            if matches!(git(&it.worktree, &["merge-base", "--is-ancestor", &head, &base], GIT_QUICK), Ok(_)) {
-                return Some("ancestor");
+    // "Was pushed" must survive GitHub deleting the branch on merge (a pruning fetch then drops
+    // origin/<branch>), so it is remembered in the repo config once seen, and an upstream setting counts too.
+    let (pushed_key, fork_key) = (format!("branch.{branch}.setu-pushed"), format!("branch.{branch}.setu-fork"));
+    let seen_now = git(&it.worktree, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")], GIT_QUICK).is_ok();
+    if seen_now && git_cfg(&it.repo, &pushed_key).is_none() {
+        let _ = git(&it.repo, &["config", "--local", &pushed_key, "true"], GIT_QUICK);
+    }
+    let pushed = seen_now || git_cfg(&it.repo, &pushed_key).is_some() || (git_cfg(&it.repo, &format!("branch.{branch}.remote")).is_some() && git_cfg(&it.repo, &format!("branch.{branch}.merge")).is_some());
+    // A branch still at its fork point has nothing of its own to be "merged".
+    let has_own_commits = git_cfg(&it.repo, &fork_key).is_none_or(|fork| fork != head);
+    let base = worktree::resolve_base(&it.repo, &it.wt_cfg, None).ok();
+    if fetch_ok && pushed && has_own_commits {
+        if let Some(base) = &base {
+            if let Some(how) = merged_offline(&it.worktree, &head, base) {
+                return Merged::Yes(how);
             }
         }
     }
+    let base_branch = base.as_deref().map(|b| b.strip_prefix("origin/").unwrap_or(b).to_string()).unwrap_or_default();
     match (d.gh)(&it.main_dir, &branch) {
-        Ok(out) if gh_says_merged(&out, &head) => Some("pull request"),
-        _ => None,
+        Ok(out) if gh_says_merged(&out, &head, &base_branch, origin_owner(&it.repo).as_deref()) => Merged::Yes("pull request"),
+        Ok(_) => Merged::No,
+        Err(e) => Merged::GhUnavailable(e.lines().next().unwrap_or("").chars().take(120).collect()),
     }
 }
 
@@ -299,15 +362,22 @@ pub fn evaluate(it: &Item, p: &Policy, d: &Deps) -> Verdict {
         let list: Vec<String> = reasons.iter().map(|r| format!("[{}] {}", r.code, r.message)).collect();
         return skip(list.join("; "), false);
     }
+    let mut gh_down = None;
     if age >= p.merged_after {
-        if let Some(how) = merged_how(it, fetch_ok, d) {
-            return Verdict::Eligible(format!("merged ({how}), idle {}", human_secs(age)));
+        match merged_how(it, fetch_ok, d) {
+            Merged::Yes(how) => return Verdict::Eligible(format!("merged ({how}), idle {}", human_secs(age))),
+            Merged::GhUnavailable(e) => gh_down = Some(e),
+            Merged::No => {}
         }
     }
     if age >= p.idle_after {
         return Verdict::Eligible(format!("idle {}", human_secs(age)));
     }
-    skip(format!("not proven merged and idle {} is below idle_after", human_secs(age)), true)
+    match gh_down {
+        // Shown once per change (not quiet): users see why a merged branch is not being cleaned.
+        Some(e) => skip(format!("could not check for a merged pull request: gh unavailable ({e}); idle {} is below idle_after", human_secs(age)), false),
+        None => skip(format!("not proven merged and idle {} is below idle_after", human_secs(age)), true),
+    }
 }
 
 // ---------------------------------------------------------------- the sweep
@@ -535,7 +605,7 @@ mod tests {
         let audit = |op: &str, run: &str, _x: Value| log.borrow_mut().push((op.to_string(), run.to_string()));
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
         let remove = |it: &Item| -> Result<()> {
-            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost }).map(|_| ())
+            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost, archive_cap: None }).map(|_| ())
         };
         let save = |_: &AutoState| -> Result<()> { Ok(()) };
         let d = Deps { now, day: day.into(), gh, audit: &audit, remove: &remove, save: &save, dry_run: dry };
@@ -572,7 +642,18 @@ mod tests {
     }
 
     fn merged_json(head: &str) -> String {
-        json!({ "state": "MERGED", "mergedAt": "2026-11-01T00:00:00Z", "headRefOid": head }).to_string()
+        json!([{ "number": 7, "mergedAt": "2026-11-01T00:00:00Z", "headRefOid": head, "baseRefName": "main", "headRepositoryOwner": { "login": "someone" } }]).to_string()
+    }
+
+    /// Land `files` on origin's main as new commits (what a squash or rebase merge looks like to the branch).
+    fn land_on_origin_main(f: &Fx, steps: &[&dyn Fn(&Path)]) {
+        let other = f.root.join("other-land");
+        let _ = fs::remove_dir_all(&other);
+        g(&f.root, &["clone", "-q", "origin.git", "other-land"]);
+        for s in steps {
+            s(&other);
+        }
+        g(&other, &["push", "-q", "origin", "HEAD:main"]);
     }
 
     // ---- D1
@@ -640,7 +721,99 @@ mod tests {
         let mut st = AutoState::default();
         let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
         assert!(st.candidates.is_empty(), "{dec:?}");
-        assert!(dec.iter().all(|d| !d.reason.contains("merged")), "{dec:?}");
+        assert!(dec.iter().all(|d| !d.reason.contains("merged (")), "{dec:?}");
+    }
+
+    #[test]
+    fn a_pushed_branch_still_at_its_fork_point_is_not_merged() {
+        // prior art 1: ancestry of base alone also matches a branch with no commit of its own
+        let f = fx("forkpoint");
+        let o = new_wt(&f, "feat/fp");
+        g(&o.path, &["push", "-q", "origin", &format!("HEAD:refs/heads/{}", o.branch)]);
+        let it = item(&f, &o, Some(2 * DAY));
+        let mut st = AutoState::default();
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert!(st.candidates.is_empty(), "{dec:?}");
+        assert!(dec.iter().all(|d| !d.reason.contains("merged (")), "{dec:?}");
+    }
+
+    #[test]
+    fn the_pushed_bit_survives_github_deleting_the_branch_on_merge() {
+        // prior art 1: a pruning fetch removes origin/<branch>; the remembered bit still proves it was pushed
+        let f = fx("pushedbit");
+        let o = new_wt(&f, "feat/pb");
+        let sha = push_commit(&o, "a.txt");
+        let it = item(&f, &o, Some(2 * DAY));
+        let mut st = AutoState::default();
+        run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert!(st.candidates.is_empty(), "not merged yet");
+        merge_into_origin_main(&f, &sha);
+        g(&f.origin, &["update-ref", "-d", &format!("refs/heads/{}", o.branch)]);
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert_eq!(dec[0].action, "candidate-added", "{dec:?}");
+        assert!(dec[0].reason.contains("merged (ancestor)"), "{dec:?}");
+    }
+
+    #[test]
+    fn a_squash_merge_with_the_same_content_is_found_offline_by_merge_tree() {
+        // prior art 2
+        let f = fx("mergetree");
+        let o = new_wt(&f, "feat/mt");
+        push_commit(&o, "a.txt");
+        let put = |d: &Path| {
+            fs::write(d.join("a.txt"), "x\n").unwrap();
+            g(d, &["add", "."]);
+            g(d, &["commit", "-q", "-m", "squash of feat/mt"]);
+        };
+        land_on_origin_main(&f, &[&put]);
+        let it = item(&f, &o, Some(2 * DAY));
+        let mut st = AutoState::default();
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert_eq!(dec[0].action, "candidate-added", "{dec:?}");
+        assert!(dec[0].reason.contains("merge-tree"), "{dec:?}");
+    }
+
+    #[test]
+    fn a_rebase_merge_is_found_offline_by_patch_equivalence() {
+        // prior art 2: base later edited the same file, so merge-tree cannot prove it; `git cherry` can
+        let f = fx("cherry");
+        let o = new_wt(&f, "feat/ch");
+        let sha = push_commit(&o, "a.txt");
+        let other = |d: &Path| {
+            fs::write(d.join("other.txt"), "o\n").unwrap();
+            g(d, &["add", "."]);
+            g(d, &["commit", "-q", "-m", "someone else landed first"]);
+        };
+        let pick = |d: &Path| {
+            g(d, &["cherry-pick", &sha]);
+        };
+        let edit = |d: &Path| {
+            fs::write(d.join("a.txt"), "changed later\n").unwrap();
+            g(d, &["commit", "-q", "-am", "later edit"]);
+        };
+        let fetch = |d: &Path| {
+            g(d, &["fetch", "-q", "origin", &format!("refs/heads/{}", "feat/ch")]);
+        };
+        land_on_origin_main(&f, &[&fetch, &other, &pick, &edit]);
+        let it = item(&f, &o, Some(2 * DAY));
+        let mut st = AutoState::default();
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &no_gh, false);
+        assert_eq!(dec[0].action, "candidate-added", "{dec:?}");
+        assert!(dec[0].reason.contains("cherry"), "{dec:?}");
+    }
+
+    #[test]
+    fn gh_must_agree_on_head_base_and_owner() {
+        let pr = |head: &str, base: &str, owner: &str| json!([{ "mergedAt": "2026-11-01T00:00:00Z", "headRefOid": head, "baseRefName": base, "headRepositoryOwner": { "login": owner } }]).to_string();
+        assert!(gh_says_merged(&pr("h1", "main", "acme"), "h1", "main", Some("Acme")));
+        assert!(!gh_says_merged(&pr("h1", "release", "acme"), "h1", "main", Some("acme")), "merged into a different base");
+        assert!(!gh_says_merged(&pr("h1", "main", "forker"), "h1", "main", Some("acme")), "a PR from someone else's fork");
+        assert!(!gh_says_merged(&pr("h2", "main", "acme"), "h1", "main", Some("acme")), "head moved after the merge");
+        assert!(!gh_says_merged("[]", "h1", "main", None));
+        assert!(!gh_says_merged(&json!([{ "mergedAt": "", "headRefOid": "h1", "baseRefName": "main" }]).to_string(), "h1", "main", None));
+        assert_eq!(origin_owner_from("git@github.com:acme/app.git"), Some("acme".to_string()));
+        assert_eq!(origin_owner_from("https://github.com/acme/app"), Some("acme".to_string()));
+        assert_eq!(origin_owner_from("/tmp/local/origin.git"), None);
     }
 
     #[test]
@@ -659,7 +832,7 @@ mod tests {
         run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &stale, false);
         assert!(st.candidates.is_empty());
         // Open or unmerged PR: not merged.
-        let open = |_: &Path, _: &str| Ok(json!({ "state": "OPEN", "mergedAt": null, "headRefOid": sha }).to_string());
+        let open = |_: &Path, _: &str| Ok("[]".to_string());
         run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &open, false);
         assert!(st.candidates.is_empty());
         // Garbage output: not merged.
@@ -685,9 +858,19 @@ mod tests {
         push_commit(&o, "a.txt");
         let it = item(&f, &o, Some(2 * DAY));
         let mut st = AutoState::default();
-        let boom = |_: &Path, _: &str| Err("exit 1: no pull requests found".to_string());
+        let boom = |_: &Path, _: &str| Err("exit 1: gh auth login required".to_string());
         let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &boom, false);
-        assert!(st.candidates.is_empty() && dec.is_empty(), "{dec:?}");
+        // prior art 3: "gh could not answer" is its own reason, shown once, not silence
+        assert!(st.candidates.is_empty(), "{dec:?}");
+        assert_eq!(dec.len(), 1, "{dec:?}");
+        assert!(dec[0].action == "skipped" && dec[0].reason.contains("gh unavailable") && dec[0].reason.contains("auth login"), "{dec:?}");
+        let (again, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st, T0, "d", &boom, false);
+        assert!(again.is_empty(), "the same reason is not repeated: {again:?}");
+        // an answer of "no merged PR" is a quiet no, not an outage
+        let none = |_: &Path, _: &str| Ok("[]".to_string());
+        let mut st2 = AutoState::default();
+        let (dec, _) = run(&f, std::slice::from_ref(&it), &policy(), &mut st2, T0, "d", &none, false);
+        assert!(dec.is_empty(), "{dec:?}");
     }
 
     #[test]

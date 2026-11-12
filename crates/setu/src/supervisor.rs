@@ -24,14 +24,17 @@ pub struct ExitEvent {
 
 pub async fn spawn_proc(spec: &RunSpec, proc: &ResolvedProc, exits: ExitTx) -> anyhow::Result<ProcRecord> {
     if let Some(dir) = proc.log_path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create log dir {}", dir.display()))?;
+        secure_log_dirs(dir).with_context(|| format!("create log dir {}", dir.display()))?;
     }
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(&proc.log_path)
         .with_context(|| format!("open log {}", proc.log_path.display()))?;
+    // Raw output can hold secrets (redaction only happens when logs are served): files that
+    // already exist, and their rotated copy, are tightened too (review #13).
+    secure_log_file(&proc.log_path);
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     writeln!(log, "[setu] {ts} start {}: {}", proc.name, proc.command)?;
     let out = log.try_clone()?;
@@ -102,6 +105,32 @@ pub async fn spawn_proc(spec: &RunSpec, proc: &ResolvedProc, exits: ExitTx) -> a
     Ok(ProcRecord { name: proc.name.clone(), pid, start_time, escaped: vec![] })
 }
 
+/// Create the log directory 0700 and tighten it and every ancestor up to the logs root.
+fn secure_log_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let root = crate::paths::logs_dir();
+    for d in dir.ancestors().take_while(|a| a.starts_with(&root)) {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+    }
+    if !dir.starts_with(&root) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// 0600 for a log and its `.1` rotation.
+pub(crate) fn secure_log_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    for p in [path.to_path_buf(), std::path::PathBuf::from(rotated)] {
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 /// Env names never inherited from the daemon's own environment.
 pub(crate) const LEAKY_ENV: &[&str] = &["PORT", "INIT_CWD", "OLDPWD", "PWD"];
 pub(crate) const LEAKY_PREFIXES: &[&str] = &["npm_", "NX_", "DIRENV_", "__MISE"];
@@ -122,6 +151,24 @@ pub fn refresh_escaped(rec: &mut ProcRecord) {
             rec.escaped.push((p, st));
         }
     }
+}
+
+/// The leader is the recorded process, or is gone with a live group whose members all started
+/// after it did.
+fn group_provably_ours(rec: &ProcRecord) -> bool {
+    if owned_and_alive(rec) {
+        return true;
+    }
+    if procinfo::alive(rec.pid) {
+        return false;
+    }
+    let group = procinfo::group_pids(rec.pid);
+    !group.is_empty() && group.iter().all(|p| procinfo::start_time(*p).is_some_and(|t| t >= rec.start_time))
+}
+
+/// Is anything this record owns still running (the root, its group, or a recorded escaped child)?
+pub fn unresolved(rec: &ProcRecord) -> bool {
+    owned_and_alive(rec) || group_provably_ours(rec) && !procinfo::group_pids(rec.pid).is_empty() || rec.escaped.iter().any(|&(p, st)| procinfo::start_time(p) == Some(st))
 }
 
 pub fn owned_and_alive(rec: &ProcRecord) -> bool {
@@ -145,31 +192,31 @@ fn sig_group(pgid: i32, s: i32) {
 pub async fn stop_procs(procs: &[ProcRecord], grace: Duration) -> anyhow::Result<()> {
     // (group leader pid, collected pids with their start times)
     let mut targets: Vec<(i32, Vec<(i32, Option<u64>)>)> = Vec::new();
-    // Group leaders we may killpg: root provably ours, or a live group whose every member
-    // started after the root (so the pgid cannot belong to a recycled stranger).
+    // Group leaders we may killpg. Ownership of a group is proven only by the leader itself
+    // (same pid, same start time) or by the leader being gone while its group lives on: a pid is
+    // never reused while a group with that id exists. A leader pid that is alive with a different
+    // start time was recycled, and the group it leads is a stranger's (review #6).
     let mut group_ok: Vec<i32> = Vec::new();
     for rec in procs {
+        let root_alive = procinfo::alive(rec.pid);
         let mut members: Vec<(i32, Option<u64>)> = if owned_and_alive(rec) {
             procinfo::tree(rec.pid).into_iter().map(|p| (p, procinfo::start_time(p))).collect()
-        } else {
+        } else if !root_alive {
             // Root gone but its group may live on (e.g. `bun dev` died, next-server didn't).
-            // pgid == root pid, and macOS won't reuse a pid while its group exists; still
-            // only take members that started after the root did.
             procinfo::group_pids(rec.pid)
                 .into_iter()
                 .map(|p| (p, procinfo::start_time(p)))
                 .filter(|(_, st)| st.is_some_and(|t| t >= rec.start_time))
                 .collect()
+        } else {
+            Vec::new()
         };
         for &(pid, st) in &rec.escaped {
             if procinfo::start_time(pid) == Some(st) && !members.iter().any(|(p, _)| *p == pid) {
                 members.push((pid, Some(st)));
             }
         }
-        let group = procinfo::group_pids(rec.pid);
-        if owned_and_alive(rec)
-            || (!group.is_empty() && group.iter().all(|p| procinfo::start_time(*p).is_some_and(|t| t >= rec.start_time)))
-        {
+        if group_provably_ours(rec) {
             group_ok.push(rec.pid);
         }
         if !members.is_empty() {
@@ -182,7 +229,9 @@ pub async fn stop_procs(procs: &[ProcRecord], grace: Duration) -> anyhow::Result
 
     let signal_all = |s: i32, targets: &[(i32, Vec<(i32, Option<u64>)>)]| {
         for (leader, members) in targets {
-            let group = if group_ok.contains(leader) {
+            // Ownership is re-proven right before each signal, not cached across the grace period.
+            let ok = group_ok.contains(leader) && procs.iter().find(|r| r.pid == *leader).is_some_and(group_provably_ours);
+            let group = if ok {
                 sig_group(*leader, s);
                 procinfo::group_pids(*leader)
             } else {
@@ -264,6 +313,7 @@ pub fn rotate_log(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
     rotated.push(".1");
     std::fs::copy(path, &rotated)?;
     std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
+    secure_log_file(path);
     Ok(true)
 }
 
@@ -426,5 +476,59 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 0);
         f.write_all(b"xy").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"xy");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_recycled_leader_pid_is_never_treated_as_proof_of_group_ownership() {
+        // review #6: an unrelated live process group whose leader pid equals a recorded pid
+        use std::os::unix::process::CommandExt;
+        let mut stranger = unsafe {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        let pid = stranger.id() as i32;
+        let real = procinfo::start_time(pid).unwrap();
+        // the old incarnation started earlier, so every member of the stranger's group "started after" it
+        let rec = ProcRecord { name: "web".into(), pid, start_time: real - 5_000_000, escaped: vec![] };
+        assert!(!owned_and_alive(&rec));
+        let _ = stop_procs(std::slice::from_ref(&rec), Duration::from_millis(500)).await;
+        let alive = procinfo::alive(pid);
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(alive, "the stranger's process group must not be signalled");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_logs_are_private_even_when_the_file_already_exists() {
+        // review #13
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("logperm");
+        let (spec, proc) = fixture(&d, "echo secret-ish", None);
+        std::fs::create_dir_all(proc.log_path.parent().unwrap()).unwrap();
+        std::fs::write(&proc.log_path, "old\n").unwrap();
+        std::fs::set_permissions(&proc.log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut rotated = proc.log_path.as_os_str().to_owned();
+        rotated.push(".1");
+        std::fs::write(&rotated, "older\n").unwrap();
+        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rec = spawn_proc(&spec, &proc, tx).await.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&proc.log_path), 0o600);
+        assert_eq!(mode(Path::new(&rotated)), 0o600);
+        assert_eq!(mode(proc.log_path.parent().unwrap()), 0o700);
+        stop_procs(std::slice::from_ref(&rec), Duration::from_secs(1)).await.ok();
+        // rotation keeps the copy private too
+        std::fs::write(&proc.log_path, vec![b'x'; 100]).unwrap();
+        assert!(rotate_log(&proc.log_path, 10).unwrap());
+        assert_eq!(mode(Path::new(&rotated)), 0o600);
     }
 }
