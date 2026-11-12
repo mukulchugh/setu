@@ -5,7 +5,6 @@
 use crate::daemon::Daemon;
 use crate::model::RunStatus;
 use crate::paths;
-use crate::worktree;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
@@ -65,34 +64,38 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
     let cmd = s(req, "cmd").ok_or_else(|| anyhow!("missing cmd"))?;
     match cmd {
         "ping" => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
-        "ls" => Ok(d.list()),
+        "ls" => blocking(d, |d| Ok(d.list())).await,
         "up" => {
             let path = PathBuf::from(s(req, "path").ok_or_else(|| anyhow!("up needs a path"))?);
             d.up(&path).await
         }
         "down" => {
             let k = target(d, req)?;
-            d.check_holder(&k, s(req, "holder"))?;
+            check_holder(d, &k, s(req, "holder")).await?;
             d.stop(&k, RunStatus::Stopped).await?;
-            d.describe(&k)
+            d.describe_async(&k).await
         }
         "start" => {
             let k = target(d, req)?;
             d.start(&k).await?;
-            d.describe(&k)
+            d.describe_async(&k).await
         }
         "restart" => {
             let k = target(d, req)?;
-            d.check_holder(&k, s(req, "holder"))?;
+            check_holder(d, &k, s(req, "holder")).await?;
             d.stop(&k, RunStatus::Stopped).await?;
             d.start(&k).await?;
-            d.describe(&k)
+            d.describe_async(&k).await
         }
         "logs" => {
             let lines = req.get("lines").and_then(Value::as_u64).unwrap_or(100) as usize;
             d.logs(s(req, "run").ok_or_else(|| anyhow!("logs needs a run"))?, s(req, "proc"), lines)
         }
-        "pin" | "unpin" => d.pin(&target(d, req)?, cmd == "pin"),
+        "pin" | "unpin" => {
+            let k = target(d, req)?;
+            let on = cmd == "pin";
+            blocking(d, move |d| d.pin(&k, on)).await
+        }
         "resolve" => Ok(json!(target(d, req)?)),
         "env.list" => d.env_list(&scope(d, req)?),
         "env.effective" => d.env_effective(s(req, "run").ok_or_else(|| anyhow!("env.effective needs a run"))?),
@@ -146,14 +149,29 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             d.worktree_rm(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.rm needs a run"))?, force).await
         }
         "worktree.restore" => d.worktree_restore(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("worktree.restore needs a run"))?).await,
-        "worktree.removed" => Ok(Value::Array(worktree::removed_list(&paths::worktree_ops_dir()))),
+        "worktree.removed" => blocking(d, |d| Ok(d.removed())).await,
         "projects" => d.projects_list(),
         "claim" => {
             let pid = req.get("pid").and_then(Value::as_i64).map(|p| p as i32);
-            d.claim(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("claim needs a run"))?, s(req, "holder").ok_or_else(|| anyhow!("claim needs a holder"))?, pid)
+            let (a, c) = (actor(req).to_string(), client(req).map(String::from));
+            let run = s(req, "run").ok_or_else(|| anyhow!("claim needs a run"))?.to_string();
+            let holder = s(req, "holder").ok_or_else(|| anyhow!("claim needs a holder"))?.to_string();
+            blocking(d, move |d| d.claim(&a, c.as_deref(), &run, &holder, pid)).await
         }
-        "release" => d.release(actor(req), client(req), s(req, "run").ok_or_else(|| anyhow!("release needs a run"))?, s(req, "holder")),
-        "claims" => Ok(d.claims_list()),
+        "release" => {
+            let (a, c) = (actor(req).to_string(), client(req).map(String::from));
+            let run = s(req, "run").ok_or_else(|| anyhow!("release needs a run"))?.to_string();
+            let holder = s(req, "holder").map(String::from);
+            blocking(d, move |d| d.release(&a, c.as_deref(), &run, holder.as_deref())).await
+        }
+        "claims" => blocking(d, |d| Ok(d.claims_list())).await,
+        "events.list" => {
+            let kind = s(req, "kind").map(String::from);
+            let run = s(req, "run").map(String::from);
+            let since = req.get("since").and_then(Value::as_u64);
+            let limit = req.get("limit").and_then(Value::as_u64).map_or(crate::db::DEFAULT_EVENTS, |l| l as usize);
+            blocking(d, move |d| d.events(kind.as_deref(), run.as_deref(), since, limit)).await
+        }
         "autoremove" => {
             let dry = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
             if !dry && actor(req) == "mcp" {
@@ -161,9 +179,20 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             }
             d.autoremove(dry).await
         }
-        "autoremove.candidates" => d.autoremove_candidates(),
+        "autoremove.candidates" => blocking(d, |d| d.autoremove_candidates()).await,
         other => bail!("unknown cmd {other}"),
     }
+}
+
+/// Run a daemon call that reads or writes the database on the blocking pool.
+async fn blocking<T: Send + 'static>(d: &Arc<Daemon>, f: impl FnOnce(&Daemon) -> Result<T> + Send + 'static) -> Result<T> {
+    let d = d.clone();
+    tokio::task::spawn_blocking(move || f(&d)).await?
+}
+
+async fn check_holder(d: &Arc<Daemon>, k: &str, holder: Option<&str>) -> Result<()> {
+    let (k, holder) = (k.to_string(), holder.map(String::from));
+    blocking(d, move |d| d.check_holder(&k, holder.as_deref())).await
 }
 
 /// Who is asking: "cli" (default), "app" or "mcp". The MCP shim always sets "mcp".

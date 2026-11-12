@@ -38,8 +38,11 @@ sleep 1
 "$BIN" env set project e2e 'API_TOKEN=sk-fake-MCPLEAK-0123456789' --secret
 python3 -I "$HERE/mcp_e2e.py" "$BIN" "$SB/wt-main" "$SETU_HOME"
 echo "audit log entries (names only):"
-cut -c1-160 "$SETU_HOME/logs/env-audit.jsonl"
-! grep -q MCPLEAK "$SETU_HOME/logs/env-audit.jsonl"
+"$BIN" history --kind env --limit 20 | cut -c1-200
+! "$BIN" history --kind env --limit 1000 --json | grep -q MCPLEAK
+# the secret value is in no database file (main file, WAL or shared memory)
+ls "$SETU_HOME/state"/setu.db* >/dev/null
+! grep -q MCPLEAK "$SETU_HOME/state"/setu.db*
 "$BIN" down e2e/wt-main >/dev/null 2>&1 || true
 kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null || true; DAEMON_PID=""
 echo "E2E OK"

@@ -12,11 +12,12 @@
 //! Everything is blocking; the daemon calls it from the blocking pool.
 
 use crate::config::parse_duration;
+use crate::db::Db;
 use crate::disk::human_secs;
 use crate::globalcfg::AutoRemoveCfg;
 use crate::model::{ProjectConfig, RunRecord, RunStatus, WorktreeCfg};
 use crate::worktree::{self, git, ExecError, FactCtx};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,7 +87,7 @@ pub struct Removals {
     pub count: u32,
 }
 
-/// `<state>/autoremove.json`.
+/// The `autoremove` table.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoState {
@@ -96,21 +97,45 @@ pub struct AutoState {
     pub skips: BTreeMap<String, String>,
 }
 
-pub fn state_path() -> PathBuf {
-    crate::paths::state_dir().join("autoremove.json")
+/// Candidates, last audited skips and the daily counter, from the `autoremove` table.
+pub fn load_state(db: &Db) -> Result<AutoState> {
+    db.with(|c| {
+        let mut st = AutoState::default();
+        let mut q = c.prepare("SELECT kind, key, since, reason, day, count FROM autoremove")?;
+        let rows = q.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?))
+        })?;
+        for row in rows {
+            let (kind, key, since, reason, day, count) = row?;
+            match kind.as_str() {
+                "candidate" => {
+                    st.candidates.insert(key, Candidate { since: since.unwrap_or(0) as u64, reason: reason.unwrap_or_default() });
+                }
+                "skip" => {
+                    st.skips.insert(key, reason.unwrap_or_default());
+                }
+                _ => st.removals = Removals { day: day.unwrap_or_default(), count: count.unwrap_or(0) as u32 },
+            }
+        }
+        Ok(st)
+    })
 }
 
-/// Missing file is an empty state; an unreadable or corrupt one is an error (the sweep then does nothing).
-pub fn load_state(path: &Path) -> Result<AutoState> {
-    match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("corrupt {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AutoState::default()),
-        Err(e) => Err(anyhow!(e).context(format!("reading {}", path.display()))),
+/// Replace the whole persisted state in one transaction.
+pub fn save_tx(tx: &rusqlite::Transaction, st: &AutoState) -> Result<()> {
+    tx.execute("DELETE FROM autoremove", [])?;
+    for (k, c) in &st.candidates {
+        tx.execute("INSERT INTO autoremove (kind, key, since, reason) VALUES ('candidate', ?1, ?2, ?3)", rusqlite::params![k, c.since as i64, c.reason])?;
     }
+    for (k, r) in &st.skips {
+        tx.execute("INSERT INTO autoremove (kind, key, reason) VALUES ('skip', ?1, ?2)", rusqlite::params![k, r])?;
+    }
+    tx.execute("INSERT INTO autoremove (kind, key, day, count) VALUES ('removals', '', ?1, ?2)", rusqlite::params![st.removals.day, st.removals.count as i64])?;
+    Ok(())
 }
 
-pub fn save_state(path: &Path, st: &AutoState) -> Result<()> {
-    worktree::write_json_atomic(path, st)
+pub fn save_state(db: &Db, st: &AutoState) -> Result<()> {
+    db.tx(|tx| save_tx(tx, st))
 }
 
 /// Local calendar day for the daily cap.
@@ -512,7 +537,7 @@ mod tests {
         let audit = |op: &str, run: &str, _x: Value| log.borrow_mut().push((op.to_string(), run.to_string()));
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
         let remove = |it: &Item| -> Result<()> {
-            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, ops_dir: &f.ops, force: false, host: &NoopHost }).map(|_| ())
+            worktree::rm(&RmCtx { project: "app", run: &it.run, worktree: &it.worktree, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force: false, host: &NoopHost }).map(|_| ())
         };
         let save = |_: &AutoState| -> Result<()> { Ok(()) };
         let d = Deps { now, day: day.into(), gh, audit: &audit, remove: &remove, save: &save, dry_run: dry };
@@ -882,18 +907,18 @@ mod tests {
     // ---- state, config, archives
 
     #[test]
-    fn state_roundtrips_and_corrupt_is_an_error() {
-        let d = std::env::temp_dir().join(format!("setu-ar-state-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        let p = d.join("autoremove.json");
-        assert_eq!(load_state(&p).unwrap(), AutoState::default());
+    fn state_roundtrips_and_save_replaces() {
+        let (db, d) = crate::db::tests::temp_db("ar-state");
+        assert_eq!(load_state(&db).unwrap(), AutoState::default());
         let mut st = AutoState::default();
         st.candidates.insert("a/b".into(), Candidate { since: 5, reason: "idle 14d".into() });
+        st.skips.insert("a/c".into(), "pinned".into());
         st.removals = Removals { day: "2026-11-12".into(), count: 3 };
-        save_state(&p, &st).unwrap();
-        assert_eq!(load_state(&p).unwrap(), st);
-        fs::write(&p, "{ nope").unwrap();
-        assert!(load_state(&p).is_err());
+        save_state(&db, &st).unwrap();
+        assert_eq!(load_state(&db).unwrap(), st);
+        st.candidates.clear();
+        save_state(&db, &st).unwrap();
+        assert_eq!(load_state(&db).unwrap(), st);
         let _ = fs::remove_dir_all(&d);
     }
 

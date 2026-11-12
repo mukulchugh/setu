@@ -8,6 +8,8 @@ mod claims;
 mod cli;
 mod config;
 mod daemon;
+mod db;
+mod dbimport;
 mod disk;
 mod disk_measure;
 mod dns;

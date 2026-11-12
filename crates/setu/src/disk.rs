@@ -4,7 +4,6 @@
 
 use crate::disk_measure::{self, Size};
 use crate::model::{DiskItem, DiskKind, ProjectConfig, RunStatus};
-use crate::paths;
 use crate::presets;
 use crate::procinfo;
 use anyhow::{bail, Result};
@@ -199,26 +198,18 @@ pub fn clean_one(cfg: &ProjectConfig, wt: &WorktreeInfo, path: &Path, policy: Po
     }
     let after = free_bytes(&wt.worktree);
     let freed = after as i64 - before as i64;
-    audit(&serde_json::json!({
-        "ts": now_secs(),
-        "run": format!("{}/{}", wt.project, wt.run),
-        "item": item.name,
-        "path": path,
-        "estimate_bytes": estimate,
-        "volume_free_delta_bytes": freed,
-    }));
+    crate::db::record(crate::db::Event {
+        ts: now_secs(),
+        actor: Some("system".into()),
+        client: None,
+        kind: "disk",
+        op: "clean".into(),
+        run_key: Some(format!("{}/{}", wt.project, wt.run)),
+        scope: None,
+        name: Some(item.name.clone()),
+        detail: serde_json::json!({ "path": path, "estimate_bytes": estimate, "volume_free_delta_bytes": freed }),
+    });
     Ok(freed)
-}
-
-fn audit(entry: &serde_json::Value) {
-    use std::io::Write;
-    let path = paths::logs_dir().join("disk-audit.jsonl");
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{entry}");
-    }
 }
 
 /// Free bytes available to the user on the volume holding `path`.

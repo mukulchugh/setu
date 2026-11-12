@@ -121,9 +121,10 @@ ARC=$(ls "$SETU_HOME"/archive/ar/feat-merged/*.tar) || fail "archive missing"
 echo "archive: $ARC"
 tar -tf "$ARC" | grep -q '.env.local' || fail "archive should hold the ignored .env.local"
 $G -C "$SB/app.git" rev-parse --verify -q refs/heads/feat/merged >/dev/null || fail "branch must be kept"
-grep -q '"op":"autoremove-candidate"' "$SETU_HOME/logs/worktree-audit.jsonl" || fail "candidate not audited"
-grep -q '"op":"autoremove-removed"' "$SETU_HOME/logs/worktree-audit.jsonl" || fail "removal not audited"
-grep -q '"op":"autoremove-skipped"' "$SETU_HOME/logs/worktree-audit.jsonl" || fail "skip not audited"
+EV=$("$BIN" history --kind autoremove --limit 200 --json)
+echo "$EV" | grep -q '"op": "autoremove-candidate"' || fail "candidate not audited"
+echo "$EV" | grep -q '"op": "autoremove-removed"' || fail "removal not audited"
+echo "$EV" | grep -q '"op": "autoremove-skipped"' || fail "skip not audited"
 
 step "the unmerged dirty branch was never touched"
 [ -f "$D/wip.txt" ] || fail "dirty worktree was touched"

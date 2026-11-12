@@ -37,6 +37,8 @@ setu-rs: run every worktree's app and workers at its own local URL
   setu-rs release <run> [--as name]  drop a claim (without --as: whatever claim is there)
   setu-rs claims                     who holds which worktree
   setu-rs autoremove [--dry-run]     evaluate auto-removal now (needs [auto_remove] enabled) and print every decision
+  setu-rs history [run] [--kind env|worktree|disk|autoremove] [--limit N] [--json]
+                                     recent audit events, newest first (names only, never values)
   setu-rs mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
@@ -200,6 +202,42 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                 println!("  setup {}: {}", st["name"].as_str().unwrap_or("?"), if st["ok"].as_bool() == Some(true) { "ok" } else { "failed" });
             }
             println!("  {}", if start { "starting; `setu-rs ls` shows when it is up" } else { "start it with `setu-rs up` in that directory" });
+            Ok(())
+        }
+        Some("history") => {
+            let (mut run, mut kind, mut limit, mut json_out) = (None, None, None, false);
+            let mut it = args.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--kind" => kind = Some(it.next().ok_or_else(|| anyhow!("--kind needs a value"))?.clone()),
+                    "--limit" => limit = Some(it.next().and_then(|n| n.parse::<u64>().ok()).ok_or_else(|| anyhow!("--limit needs a number"))?),
+                    "--json" => json_out = true,
+                    f if f.starts_with("--") => bail!("unknown flag {f}; usage: setu-rs history [run] [--kind K] [--limit N] [--json]"),
+                    r => run = Some(r.to_string()),
+                }
+            }
+            let out = api::call(json!({ "cmd": "events.list", "run": run, "kind": kind, "limit": limit })).await?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            let list = out.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no events");
+            }
+            for e in &list {
+                let detail = e["detail"].as_object().filter(|o| !o.is_empty()).map(|_| e["detail"].to_string()).unwrap_or_default();
+                println!(
+                    "{} {:<10} {:<8} {:<20} {:<34} {} {}",
+                    crate::env::rfc3339(e["ts"].as_i64().unwrap_or(0)),
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["actor"].as_str().unwrap_or("-"),
+                    e["op"].as_str().unwrap_or("?"),
+                    e["run"].as_str().unwrap_or("-"),
+                    e["name"].as_str().unwrap_or(""),
+                    detail
+                );
+            }
             Ok(())
         }
         Some("autoremove") => {

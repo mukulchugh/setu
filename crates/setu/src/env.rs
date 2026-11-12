@@ -360,10 +360,11 @@ pub fn import(scope: &Scope, text: &str, preview: bool, overwrite: bool) -> Resu
 }
 
 pub(crate) fn rfc3339_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    rfc3339(crate::db::now_secs() as i64)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for unix seconds.
+pub(crate) fn rfc3339(secs: i64) -> String {
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
@@ -378,39 +379,35 @@ pub(crate) fn rfc3339_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Append one JSON line to `env-audit.jsonl` (0600). By API shape there is no value parameter:
+/// Record an env event in the database. By API shape there is no value parameter:
 /// callers cannot pass one. `extra` is for non-secret metadata (counts, flags); keys named
 /// `value`/`values` are dropped defensively. Failures are reported to stderr, never panics.
 pub fn audit(actor: &str, op: &str, scope: &Scope, name: Option<&str>, extra: Option<serde_json::Value>) {
-    let mut line = serde_json::json!({
-        "ts": rfc3339_now(),
-        "actor": actor,
-        "op": op,
-        "scope": scope.label(),
-        "target": scope.target(),
-        "name": name,
-    });
-    if let (Some(serde_json::Value::Object(x)), Some(obj)) = (extra, line.as_object_mut()) {
+    let mut detail = serde_json::Map::new();
+    if let Some(t) = scope.target() {
+        detail.insert("target".into(), serde_json::json!(t));
+    }
+    let mut client = None;
+    if let Some(serde_json::Value::Object(x)) = extra {
         for (k, v) in x {
-            if k != "value" && k != "values" && !obj.contains_key(&k) {
-                obj.insert(k, v);
+            if k == "client" {
+                client = v.as_str().map(String::from);
+            } else if k != "value" && k != "values" && !detail.contains_key(&k) {
+                detail.insert(k, v);
             }
         }
     }
-    let dir = paths::logs_dir();
-    let res = (|| -> Result<()> {
-        std::fs::DirBuilder::new().recursive(true).create(&dir)?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(dir.join("env-audit.jsonl"))?;
-        f.write_all(format!("{line}\n").as_bytes())?;
-        Ok(())
-    })();
-    if let Err(e) = res {
-        eprintln!("env audit write failed: {e:#}");
-    }
+    crate::db::record(crate::db::Event {
+        ts: crate::db::now_secs(),
+        actor: Some(actor.into()),
+        client,
+        kind: "env",
+        op: op.into(),
+        run_key: matches!(scope, Scope::Worktree(_)).then(|| scope.target()).flatten(),
+        scope: Some(scope.label()),
+        name: name.map(String::from),
+        detail: serde_json::Value::Object(detail),
+    });
 }
 
 /// Stable FNV-1a (64-bit) over the sorted `k=v` pairs, for `stale_env`.
@@ -612,17 +609,26 @@ mod tests {
         write_var(&sc, "OPENAI_API_KEY", secret, None).unwrap();
         audit("cli", "set", &sc, Some("OPENAI_API_KEY"), Some(serde_json::json!({"secret": true, "value": secret})));
         audit("cli", "reveal", &Scope::Global, None, None);
-        let log = paths::logs_dir().join("env-audit.jsonl");
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(text.lines().count(), 2);
+        let db = crate::db::global().unwrap();
+        let evs = crate::db::list_events(&db, Some("env"), None, None, 10).unwrap();
+        assert_eq!(evs.len(), 2);
+        let text = serde_json::to_string(&evs).unwrap();
         assert!(!text.contains(secret));
-        assert_eq!(mode(&log), 0o600);
-        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let first = evs.iter().find(|e| e["op"] == "set").unwrap();
         assert_eq!(first["scope"], "worktree");
-        assert_eq!(first["target"], "proj/feat");
+        assert_eq!(first["run"], "proj/feat");
+        assert_eq!(first["detail"]["target"], "proj/feat");
         assert_eq!(first["name"], "OPENAI_API_KEY");
-        assert_eq!(first["secret"], true);
-        assert!(first["ts"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(first["detail"]["secret"], true);
+        assert_eq!(first["actor"], "cli");
+        // the database files themselves never hold the value
+        db.with(|c| Ok(c.execute_batch("PRAGMA wal_checkpoint(FULL)")?)).unwrap();
+        for f in std::fs::read_dir(db.path().parent().unwrap()).unwrap().flatten() {
+            if f.file_name().to_string_lossy().starts_with("setu.db") {
+                let bytes = std::fs::read(f.path()).unwrap();
+                assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "{}", f.path().display());
+            }
+        }
         // non-value surfaces (names, masks, import reports) never carry it
         let names = format!("{:?}", secret_names(&[sc.clone()]));
         let masked = format!("{:?}", read_layer(&sc).unwrap().iter().map(|v| (v.name.clone(), v.secret, mask(&v.value))).collect::<Vec<_>>());

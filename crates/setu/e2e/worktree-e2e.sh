@@ -94,7 +94,7 @@ expect_fail "live writer claim" "$BIN" down e2e/feat-one
 expect_fail "claimed by" "$BIN" claim e2e/feat-one --as agent-b
 "$BIN" ls | grep "e2e/feat-one" | grep -q running || fail "refused actions must leave the run up"
 [ -d "$WT" ] || fail "worktree must still exist"
-[ ! -e "$SETU_HOME/state/worktrees/e2e/feat-one.json" ] || fail "a refused rm must persist nothing"
+[ "$(sqlite3 "$SETU_HOME/state/setu.db" "select count(*) from removal_ops where run_key='e2e/feat-one'")" = "0" ] || fail "a refused rm must persist nothing"
 
 step "release, then rm (stops the run, archives local.db, removes, keeps branch)"
 "$BIN" release e2e/feat-one
@@ -125,8 +125,9 @@ kill "$DEAD"; wait "$DEAD" 2>/dev/null || true
 "$BIN" release e2e/feat-one
 
 step "worktree audit log (names only)"
-cut -c1-170 "$SETU_HOME/logs/worktree-audit.jsonl"
-! grep -q "fake-value" "$SETU_HOME/logs/worktree-audit.jsonl" || fail "no values in audit"
+"$BIN" history --kind worktree --limit 50 | cut -c1-170
+! "$BIN" history --limit 1000 --json | grep -q "fake-value" || fail "no values in audit"
+! grep -q "fake-value" "$SETU_HOME/state"/setu.db* || fail "no values in the database"
 
 "$BIN" down e2e/feat-one >/dev/null 2>&1 || true
 kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null || true; DAEMON_PID=""

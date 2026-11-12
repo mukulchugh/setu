@@ -5,6 +5,7 @@
 //! plugs into `rm` through `RmHost`, so the state machine is testable without a daemon.
 #![allow(dead_code)]
 
+use crate::db::Db;
 use crate::disk;
 use crate::model::{ProjectConfig, SetupStep, WorktreeCfg};
 use crate::{naming, presets, procinfo};
@@ -131,25 +132,6 @@ fn git_probe(dir: &Path, args: &[&str]) -> Result<bool> {
         Err(ExecError::Failed { code: Some(1) | Some(128), .. }) => Ok(false),
         Err(e) => bail!("git {}: {e}", args.first().copied().unwrap_or("")),
     }
-}
-
-pub fn write_json_atomic<T: Serialize>(path: &Path, v: &T) -> Result<()> {
-    use std::io::Write;
-    let parent = path.parent().ok_or_else(|| anyhow!("bad path {}", path.display()))?;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
-    let tmp = parent.join(format!(".{}.tmp.{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("op"), std::process::id()));
-    let res = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(v)?)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    res.with_context(|| format!("writing {}", path.display()))
 }
 
 // ---------------------------------------------------------------- names and refs
@@ -432,7 +414,7 @@ pub fn create(
     branch: &str,
     from: Option<&str>,
     existing_runs: &BTreeSet<String>,
-    ops_dir: &Path,
+    ops: &Db,
     log_dir: &Path,
     env_for: impl FnOnce(&Path, &str) -> Result<BTreeMap<String, String>>,
 ) -> Result<NewOutcome> {
@@ -448,7 +430,7 @@ pub fn create(
         bail!("{branch:?} would be the main worktree's slot; pick another branch name");
     }
     let key = format!("{}/{run}", cfg.project);
-    if pending_removal(ops_dir, &key) {
+    if pending_removal(ops, &key) {
         bail!("a removal of {key} is pending; retry `setu-rs rm {key}` first");
     }
     if existing_runs.contains(&key) {
@@ -747,55 +729,63 @@ pub struct OpRecord {
     pub last_error: Option<String>,
 }
 
-pub fn op_path(ops_dir: &Path, key: &str) -> Result<PathBuf> {
+fn check_key(key: &str) -> Result<()> {
     let (p, r) = key.split_once('/').ok_or_else(|| anyhow!("run {key:?} must be project/run"))?;
     for part in [p, r] {
         if part.is_empty() || part.contains('/') || part.starts_with('.') {
             bail!("bad run name {key:?}");
         }
     }
-    Ok(ops_dir.join(p).join(format!("{r}.json")))
+    Ok(())
 }
 
-pub fn load_op(ops_dir: &Path, key: &str) -> Result<Option<OpRecord>> {
-    let path = op_path(ops_dir, key)?;
-    match std::fs::read(&path) {
-        Ok(b) => Ok(Some(serde_json::from_slice(&b).with_context(|| format!("corrupt operation record {}", path.display()))?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+fn op_row(c: &rusqlite::Connection, key: &str) -> Result<Option<OpRecord>> {
+    use rusqlite::OptionalExtension;
+    let json: Option<String> = c.query_row("SELECT record_json FROM removal_ops WHERE run_key = ?1", [key], |r| r.get(0)).optional()?;
+    json.map(|j| serde_json::from_str(&j).with_context(|| format!("corrupt operation record for {key}"))).transpose()
 }
 
-fn save_op(ops_dir: &Path, rec: &OpRecord) -> Result<()> {
-    write_json_atomic(&op_path(ops_dir, &format!("{}/{}", rec.project, rec.run))?, rec)
+pub fn load_op(db: &Db, key: &str) -> Result<Option<OpRecord>> {
+    check_key(key)?;
+    db.with(|c| op_row(c, key))
+}
+
+/// Insert or replace a removal record (one row per run).
+pub fn put_op_tx(c: &rusqlite::Connection, rec: &OpRecord) -> Result<()> {
+    let step = serde_json::to_value(rec.step)?;
+    c.execute(
+        "INSERT OR REPLACE INTO removal_ops (run_key, op_id, step, record_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![format!("{}/{}", rec.project, rec.run), rec.id, step.as_str().unwrap_or(""), serde_json::to_string(rec)?, rec.updated as i64],
+    )?;
+    Ok(())
+}
+
+fn save_op(db: &Db, rec: &OpRecord) -> Result<()> {
+    check_key(&format!("{}/{}", rec.project, rec.run))?;
+    db.with(|c| put_op_tx(c, rec))
 }
 
 /// An unfinished removal blocks `new` and `start` for that run. An unreadable record counts as pending.
-pub fn pending_removal(ops_dir: &Path, key: &str) -> bool {
-    match load_op(ops_dir, key) {
+pub fn pending_removal(db: &Db, key: &str) -> bool {
+    match load_op(db, key) {
         Ok(None) => false,
         Ok(Some(r)) => r.step != Step::Done,
         Err(_) => true,
     }
 }
 
+fn all_ops(db: &Db) -> Vec<OpRecord> {
+    db.with(|c| {
+        let mut q = c.prepare("SELECT record_json FROM removal_ops ORDER BY run_key")?;
+        let rows: Vec<String> = q.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+    })
+    .unwrap_or_default()
+}
+
 /// Every unfinished removal, for `doctor` and the app.
-pub fn pending_ops(ops_dir: &Path) -> Vec<OpRecord> {
-    let mut out = Vec::new();
-    let Ok(projects) = std::fs::read_dir(ops_dir) else { return out };
-    for p in projects.flatten() {
-        let Ok(files) = std::fs::read_dir(p.path()) else { continue };
-        for f in files.flatten() {
-            if let Ok(b) = std::fs::read(f.path()) {
-                if let Ok(r) = serde_json::from_slice::<OpRecord>(&b) {
-                    if r.step != Step::Done {
-                        out.push(r);
-                    }
-                }
-            }
-        }
-    }
-    out
+pub fn pending_ops(db: &Db) -> Vec<OpRecord> {
+    all_ops(db).into_iter().filter(|r| r.step != Step::Done).collect()
 }
 
 /// What the daemon (or a test) provides to `rm`.
@@ -810,6 +800,12 @@ pub trait RmHost {
     fn drop_state(&self) -> Result<()>;
     /// Release the port lease; idempotent.
     fn release_lease(&self) -> Result<()>;
+    /// Steps 5 to 7 (drop state, release lease, marker) commit together: `extra` deletes the run,
+    /// lease and claim rows and writes the finished marker, and runs inside the one transaction.
+    /// The daemon overrides this to write its state snapshot in the same transaction.
+    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+        db.tx(|tx| extra(tx))
+    }
     /// Called after each step has been recorded; an error here simulates a crash (tests).
     fn after_step(&self, _step: Step) -> Result<()> {
         Ok(())
@@ -825,7 +821,7 @@ pub struct RmCtx<'a> {
     /// `[[disk.item]]` path patterns (every kind): never archived.
     pub declared: &'a [String],
     pub archive_root: &'a Path,
-    pub ops_dir: &'a Path,
+    pub db: &'a Db,
     pub force: bool,
     pub host: &'a dyn RmHost,
 }
@@ -868,7 +864,7 @@ fn facts_ctx(ctx: &RmCtx, skip_procs: bool) -> FactCtx {
 /// Resumable: a record at `step` continues there. The branch is never deleted.
 pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
     let key = format!("{}/{}", ctx.project, ctx.run);
-    let existing = load_op(ctx.ops_dir, &key)?;
+    let existing = load_op(ctx.db, &key)?;
     let mut rec = match existing {
         Some(r) if r.step == Step::Done => {
             return Ok(RmOutcome { run: key, removed: true, archive: r.archive, archived_files: r.archived_files, branch: r.branch, already: true });
@@ -911,32 +907,80 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 finished: None,
                 last_error: None,
             };
-            save_op(ctx.ops_dir, &rec)?;
+            save_op(ctx.db, &rec)?;
             rec
         }
     };
     while rec.step != Step::Done {
         let step = rec.step;
-        match run_step(ctx, &mut rec) {
-            Ok(next) => {
-                rec.step = next;
-                rec.updated = crate::claims::now();
-                rec.last_error = None;
-                if next == Step::Done {
-                    rec.finished = Some(rec.updated);
+        let res = if matches!(step, Step::DropState | Step::ReleaseLease | Step::Marker) { teardown(ctx, &mut rec) } else { advance(ctx, &mut rec) };
+        match res {
+            Ok(()) => {
+                // Steps 5 to 7 are one commit; the hook still fires for each so a crash can be simulated after any of them.
+                let steps: &[Step] = if matches!(step, Step::DropState | Step::ReleaseLease | Step::Marker) { &[Step::DropState, Step::ReleaseLease, Step::Marker] } else { &[step] };
+                for s in steps {
+                    ctx.host.after_step(*s)?;
                 }
-                save_op(ctx.ops_dir, &rec)?;
-                ctx.host.after_step(step)?;
             }
             Err(e) => {
                 rec.last_error = Some(format!("{e:#}"));
                 rec.updated = crate::claims::now();
-                let _ = save_op(ctx.ops_dir, &rec);
+                let _ = save_op(ctx.db, &rec);
                 return Err(e);
             }
         }
     }
     Ok(RmOutcome { run: key, removed: true, archive: rec.archive, archived_files: rec.archived_files, branch: rec.branch, already: false })
+}
+
+/// Run one step and record the next. Leaving `Guards` re-checks the claim table in the same
+/// transaction that records the transition, so a claim taken meanwhile cannot slip past.
+fn advance(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
+    let step = rec.step;
+    let next = run_step(ctx, rec)?;
+    rec.step = next;
+    rec.updated = crate::claims::now();
+    rec.last_error = None;
+    let key = format!("{}/{}", rec.project, rec.run);
+    let res = ctx.db.tx(|tx| {
+        if step == Step::Guards {
+            let held = tx
+                .query_row("SELECT holder, pid, pid_start, since, heartbeat FROM claims WHERE run_key = ?1", [&key], |r| {
+                    Ok(crate::claims::Claim { run: key.clone(), holder: r.get(0)?, pid: r.get::<_, Option<i64>>(1)?.map(|p| p as i32), start_time: r.get::<_, Option<i64>>(2)?.map(|t| t as u64), created: r.get::<_, i64>(3)? as u64, heartbeat: r.get::<_, i64>(4)? as u64 })
+                })
+                .ok()
+                .filter(|c| !crate::claims::is_stale(c, rec.updated));
+            if let Some(c) = held {
+                return Err(Refused(vec![Reason { code: "claim", message: format!("a live writer claim is held by {}; it must release it (or go stale) first", c.holder) }]).into());
+            }
+        }
+        put_op_tx(tx, rec)
+    });
+    if res.is_err() {
+        rec.step = step;
+    }
+    res
+}
+
+/// Steps 5 to 7 in one transaction: forget the run, release its lease and claim, write the marker.
+fn teardown(ctx: &RmCtx, rec: &mut OpRecord) -> Result<()> {
+    ctx.host.drop_state()?;
+    ctx.host.release_lease()?;
+    let key = format!("{}/{}", rec.project, rec.run);
+    let now = crate::claims::now();
+    let mut done = rec.clone();
+    done.step = Step::Done;
+    done.updated = now;
+    done.finished = Some(now);
+    done.last_error = None;
+    ctx.host.commit_teardown(ctx.db, &mut |tx| {
+        tx.execute("DELETE FROM claims WHERE run_key = ?1", [&key])?;
+        tx.execute("DELETE FROM leases WHERE run_key = ?1", [&key])?;
+        tx.execute("DELETE FROM runs WHERE key = ?1", [&key])?;
+        put_op_tx(tx, &done)
+    })?;
+    *rec = done;
+    Ok(())
 }
 
 /// Execute `rec.step`; returns the step to record next. May update other record fields.
@@ -967,7 +1011,7 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 None => {
                     let p = archive_path(ctx.archive_root, ctx.project, ctx.run, &compact_ts());
                     rec.archive = Some(p.clone());
-                    save_op(ctx.ops_dir, rec)?; // plan the name first, so a retry never writes a second archive
+                    save_op(ctx.db, rec)?; // plan the name first, so a retry never writes a second archive
                     p
                 }
             };
@@ -1015,16 +1059,8 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
             }
             Ok(Step::DropState)
         }
-        Step::DropState => {
-            ctx.host.drop_state()?;
-            Ok(Step::ReleaseLease)
-        }
-        Step::ReleaseLease => {
-            ctx.host.release_lease()?;
-            Ok(Step::Marker)
-        }
-        Step::Marker => Ok(Step::Done),
-        Step::Done => Ok(Step::Done),
+        // Steps 5 to 7 run together in `teardown`; a record left at either of the later two (older data) finishes there too.
+        Step::DropState | Step::ReleaseLease | Step::Marker | Step::Done => Ok(Step::Done),
     }
 }
 
@@ -1032,31 +1068,25 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
 
 /// Finished removals that `restore` can still work from, newest first (read-only, for the app).
 /// `archive_size` is null when the archive file is gone (pruned): the branch alone can still be restored.
-pub fn removed_list(ops_dir: &Path) -> Vec<serde_json::Value> {
+pub fn removed_list(db: &Db) -> Vec<serde_json::Value> {
     let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
-    let Ok(projects) = std::fs::read_dir(ops_dir) else { return Vec::new() };
-    for p in projects.flatten() {
-        let Ok(files) = std::fs::read_dir(p.path()) else { continue };
-        for f in files.flatten() {
-            let Ok(b) = std::fs::read(f.path()) else { continue };
-            let Ok(r) = serde_json::from_slice::<OpRecord>(&b) else { continue };
-            if r.step != Step::Done {
-                continue;
-            }
-            let at = r.finished.unwrap_or(r.updated);
-            let size = r.archive.as_ref().and_then(|a| std::fs::metadata(a).ok()).map(|m| m.len());
-            rows.push((
-                at,
-                serde_json::json!({
-                    "run": format!("{}/{}", r.project, r.run),
-                    "project": r.project,
-                    "branch": r.branch,
-                    "removed_at": at,
-                    "archive": r.archive,
-                    "archive_size": size,
-                }),
-            ));
+    for r in all_ops(db) {
+        if r.step != Step::Done {
+            continue;
         }
+        let at = r.finished.unwrap_or(r.updated);
+        let size = r.archive.as_ref().and_then(|a| std::fs::metadata(a).ok()).map(|m| m.len());
+        rows.push((
+            at,
+            serde_json::json!({
+                "run": format!("{}/{}", r.project, r.run),
+                "project": r.project,
+                "branch": r.branch,
+                "removed_at": at,
+                "archive": r.archive,
+                "archive_size": size,
+            }),
+        ));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     rows.into_iter().map(|(_, v)| v).collect()
@@ -1075,9 +1105,9 @@ pub struct RestoreOutcome {
 
 /// Recreate a removed worktree from its kept branch and put the archived files back. Setup
 /// steps are not rerun (dependencies come back through the project's own install).
-pub fn restore(cfg: &ProjectConfig, run: &str, ops_dir: &Path, archive_root: &Path) -> Result<RestoreOutcome> {
+pub fn restore(cfg: &ProjectConfig, run: &str, ops: &Db, archive_root: &Path) -> Result<RestoreOutcome> {
     let key = format!("{}/{run}", cfg.project);
-    let rec = load_op(ops_dir, &key)?.ok_or_else(|| anyhow!("no removal record for {key}; nothing to restore"))?;
+    let rec = load_op(ops, &key)?.ok_or_else(|| anyhow!("no removal record for {key}; nothing to restore"))?;
     if rec.step != Step::Done {
         bail!("the removal of {key} is not finished (at step {:?}); retry `setu-rs rm {key}` first", rec.step);
     }
@@ -1114,31 +1144,26 @@ pub fn restore(cfg: &ProjectConfig, run: &str, ops_dir: &Path, archive_root: &Pa
     } else {
         warnings.push("no archive for this run; only the branch was restored".into());
     }
-    std::fs::remove_file(op_path(ops_dir, &key)?).ok();
+    ops.with(|c| Ok(c.execute("DELETE FROM removal_ops WHERE run_key = ?1", [&key])?))?;
     Ok(RestoreOutcome { path: canon(&path), run: run.to_string(), branch: rec.branch, restored_from: archive, warnings })
 }
 
 // ---------------------------------------------------------------- audit
 
-/// Append one line to `<logs>/worktree-audit.jsonl` (mode 0600). Failures are ignored.
+/// Record a worktree event (`autoremove-*` ops are kind `autoremove`). Failures are reported, never raised.
 pub fn audit(actor: &str, client: Option<&str>, op: &str, run: &str, extra: serde_json::Value) {
-    use std::io::Write;
-    let mut line = serde_json::json!({ "ts": crate::env::rfc3339_now(), "actor": actor, "op": op, "run": run });
-    if let (Some(c), Some(o)) = (client, line.as_object_mut()) {
-        o.insert("client".into(), serde_json::json!(c));
-    }
-    if let (serde_json::Value::Object(x), Some(o)) = (extra, line.as_object_mut()) {
-        for (k, v) in x {
-            o.entry(k).or_insert(v);
-        }
-    }
-    let dir = crate::paths::logs_dir();
-    let _ = (|| -> Result<()> {
-        std::fs::DirBuilder::new().recursive(true).create(&dir)?;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("worktree-audit.jsonl"))?;
-        f.write_all(format!("{line}\n").as_bytes())?;
-        Ok(())
-    })();
+    let kind = if op.starts_with("autoremove-") { "autoremove" } else { "worktree" };
+    crate::db::record(crate::db::Event {
+        ts: crate::db::now_secs(),
+        actor: Some(actor.into()),
+        client: client.map(String::from),
+        kind,
+        op: op.into(),
+        run_key: Some(run.to_string()).filter(|r| !r.is_empty()),
+        scope: None,
+        name: None,
+        detail: extra,
+    });
 }
 
 #[cfg(test)]
@@ -1164,7 +1189,7 @@ pub(crate) mod tests {
         pub(crate) origin: PathBuf,
         pub(crate) repo: PathBuf,
         pub(crate) pdir: PathBuf,
-        pub(crate) ops: PathBuf,
+        pub(crate) ops: Db,
         pub(crate) logs: PathBuf,
         pub(crate) archives: PathBuf,
         pub(crate) cfg: ProjectConfig,
@@ -1213,7 +1238,7 @@ pub(crate) mod tests {
             worktree: WorktreeCfg { min_free: Some(0), ..Default::default() },
             setup_steps: vec![],
         };
-        Fx { origin: root.join("origin.git"), ops: root.join("ops"), logs: root.join("logs"), archives: root.join("archives"), root, repo, pdir, cfg }
+        Fx { origin: root.join("origin.git"), ops: Db::open(&root.join("ops/setu.db")).unwrap(), logs: root.join("logs"), archives: root.join("archives"), root, repo, pdir, cfg }
     }
 
     pub(crate) fn new_wt(f: &Fx, branch: &str) -> NewOutcome {
@@ -1224,6 +1249,8 @@ pub(crate) mod tests {
     struct Host {
         claim: Option<String>,
         running: Option<String>,
+        /// Run the teardown statements, then fail before commit (a crash inside steps 5 to 7).
+        fail_commit: bool,
         fail_after: Mutex<Option<Step>>,
         calls: Mutex<Vec<&'static str>>,
     }
@@ -1247,6 +1274,15 @@ pub(crate) mod tests {
             self.calls.lock().unwrap().push("lease");
             Ok(())
         }
+        fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+            db.tx(|tx| {
+                extra(tx)?;
+                if self.fail_commit {
+                    bail!("simulated crash before commit");
+                }
+                Ok(())
+            })
+        }
         fn after_step(&self, step: Step) -> Result<()> {
             if *self.fail_after.lock().unwrap() == Some(step) {
                 bail!("simulated crash after {step:?}");
@@ -1257,7 +1293,7 @@ pub(crate) mod tests {
 
     fn do_rm(f: &Fx, run: &str, wt: &Path, force: bool, host: &Host) -> Result<RmOutcome> {
         let declared: Vec<String> = f.cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
-        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, ops_dir: &f.ops, force, host })
+        rm(&RmCtx { project: "app", run, worktree: wt, repo: &f.repo, declared: &declared, archive_root: &f.archives, db: &f.ops, force, host })
     }
 
     fn input() -> GuardInput {
@@ -1638,6 +1674,82 @@ pub(crate) mod tests {
         assert!(out.removed);
         assert_eq!(*ok.calls.lock().unwrap(), ["drop", "lease"]);
         assert!(!worktree_entries(&f.repo).unwrap().iter().any(|(p, _)| canon(p) == canon(&o.path) || p.ends_with("feat/v")));
+    }
+
+    fn seed_state(f: &Fx, key: &str, port: i64) {
+        f.ops
+            .tx(|tx| {
+                tx.execute("INSERT INTO runs (key, project, run, spec_json, status, procs_json) VALUES (?1, 'app', ?2, '{}', 'stopped', '[]')", rusqlite::params![key, key.trim_start_matches("app/")])?;
+                tx.execute("INSERT INTO leases (run_key, name, port) VALUES (?1, 'web', ?2)", rusqlite::params![key, port])?;
+                tx.execute("INSERT INTO claims (run_key, holder, since, heartbeat) VALUES (?1, 'gone', 1, 1)", [key])?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn rows(f: &Fx, key: &str) -> (i64, i64, i64) {
+        f.ops
+            .with(|c| {
+                let n = |t: &str, col: &str| c.query_row(&format!("SELECT count(*) FROM {t} WHERE {col} = ?1"), [key], |r| r.get::<_, i64>(0));
+                Ok((n("runs", "key")?, n("leases", "run_key")?, n("claims", "run_key")?))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn rm_steps_5_to_7_commit_together_and_a_crash_inside_rolls_back() {
+        let f = fx("rmtx");
+        let o = new_wt(&f, "feat/t");
+        seed_state(&f, "app/feat-t", 4500);
+        // a crash after the statements but before the commit: nothing changed, the record still says DropState
+        let crashy = Host { fail_commit: true, ..Default::default() };
+        let e = do_rm(&f, "feat-t", &o.path, false, &crashy).unwrap_err();
+        assert!(e.to_string().contains("simulated crash before commit"));
+        assert_eq!(rows(&f, "app/feat-t"), (1, 1, 1), "run, lease and claim survive a rolled-back teardown");
+        let rec = load_op(&f.ops, "app/feat-t").unwrap().unwrap();
+        assert_eq!(rec.step, Step::DropState);
+        assert!(pending_removal(&f.ops, "app/feat-t"));
+        // retry with a healthy host completes all three steps at once
+        let ok = Host::default();
+        assert!(do_rm(&f, "feat-t", &o.path, false, &ok).unwrap().removed);
+        assert_eq!(*ok.calls.lock().unwrap(), ["drop", "lease"], "stop was already recorded");
+        assert_eq!(rows(&f, "app/feat-t"), (0, 0, 0));
+        assert_eq!(load_op(&f.ops, "app/feat-t").unwrap().unwrap().step, Step::Done);
+        assert!(!pending_removal(&f.ops, "app/feat-t"));
+    }
+
+    #[test]
+    fn rm_crash_after_the_teardown_commit_leaves_a_finished_record() {
+        for hook in [Step::DropState, Step::ReleaseLease, Step::Marker] {
+            let f = fx("rmtx2");
+            let o = new_wt(&f, "feat/t2");
+            seed_state(&f, "app/feat-t2", 4501);
+            let crashy = Host::default();
+            *crashy.fail_after.lock().unwrap() = Some(hook);
+            assert!(do_rm(&f, "feat-t2", &o.path, false, &crashy).is_err());
+            // committed as one unit regardless of where the process died afterwards
+            assert_eq!(rows(&f, "app/feat-t2"), (0, 0, 0), "{hook:?}");
+            assert_eq!(load_op(&f.ops, "app/feat-t2").unwrap().unwrap().step, Step::Done);
+            let again = do_rm(&f, "feat-t2", &o.path, false, &Host::default()).unwrap();
+            assert!(again.already);
+        }
+    }
+
+    #[test]
+    fn a_claim_taken_while_guards_ran_blocks_the_transition() {
+        let f = fx("rmclaim");
+        let o = new_wt(&f, "feat/cl");
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Stop);
+        assert!(do_rm(&f, "feat-cl", &o.path, false, &crashy).is_err());
+        // a writer claims the run after the preflight, before the Guards -> Archive transition
+        crate::claims::claim(&f.ops, "app/feat-cl", "agent-z", None, crate::claims::now()).unwrap();
+        let e = do_rm(&f, "feat-cl", &o.path, false, &Host::default()).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "claim"), "{e:#}");
+        assert_eq!(load_op(&f.ops, "app/feat-cl").unwrap().unwrap().step, Step::Guards, "the transition was not recorded");
+        assert!(o.path.exists());
+        crate::claims::release(&f.ops, "app/feat-cl", None, crate::claims::now()).unwrap();
+        assert!(do_rm(&f, "feat-cl", &o.path, false, &Host::default()).unwrap().removed);
     }
 
     #[test]

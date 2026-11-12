@@ -25,23 +25,9 @@ pub fn env_dir() -> PathBuf {
     config_dir().join("env")
 }
 
-/// `~/Library/Application Support/Setu`: state.json and the socket.
+/// `~/Library/Application Support/Setu`: `setu.db` and the socket.
 pub fn state_dir() -> PathBuf {
     root_override().map(|r| r.join("state")).unwrap_or_else(|| home().join("Library/Application Support/Setu"))
-}
-
-pub fn state_file() -> PathBuf {
-    state_dir().join("state.json")
-}
-
-/// Writer claims: `<state>/claims/<project>/<run>.json`.
-pub fn claims_dir() -> PathBuf {
-    state_dir().join("claims")
-}
-
-/// Worktree operation records and removal markers: `<state>/worktrees/<project>/<run>.json`.
-pub fn worktree_ops_dir() -> PathBuf {
-    state_dir().join("worktrees")
 }
 
 /// `~/.local/share/setu/archive/<project>/<run>/<ts>.tar`

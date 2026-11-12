@@ -13,6 +13,7 @@ use crate::disk_measure;
 use crate::naming;
 use crate::paths;
 use crate::ports;
+use crate::db::{self, Db};
 use crate::state::{self, State};
 use crate::supervisor::{self, ExitEvent, ExitTx};
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,6 +36,8 @@ const MIN_REDACT_LEN: usize = 6;
 
 pub struct Daemon {
     inner: Mutex<Inner>,
+    /// The one database; used only from blocking threads.
+    db: Arc<Db>,
     /// Highest state version written to disk; older snapshots are skipped.
     written: Arc<Mutex<u64>>,
     pub activity: Arc<ActivityTracker>,
@@ -107,11 +110,13 @@ fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTre
 impl Daemon {
     pub fn new(exits: ExitTx) -> Result<Arc<Self>> {
         let configs = config::load_all()?;
-        let state = state::load(&paths::state_file()).context("state.json is unreadable; refusing to start")?;
+        let db = db::global().context("the state database could not be opened or imported; refusing to start")?;
+        let state = state::load(&db).context("the state database is unreadable; refusing to start")?;
         let mut inner = Inner { configs, state, hosts: HashMap::new(), version: 0 };
         inner.rebuild_hosts();
         Ok(Arc::new(Self {
             inner: Mutex::new(inner),
+            db,
             written: Arc::new(Mutex::new(0)),
             activity: ActivityTracker::new(),
             exits,
@@ -155,22 +160,14 @@ impl Daemon {
         self.persist();
     }
 
-    /// Snapshot under the lock, write (with fsync) on the blocking pool. Snapshots are
+    /// Snapshot under the lock, write on the blocking pool in one transaction. Snapshots are
     /// versioned so a slow older write can never overwrite a newer one.
     fn persist(&self) {
-        let (snap, ver) = {
-            let mut inner = self.lock();
-            inner.version += 1;
-            (inner.state.clone(), inner.version)
-        };
-        let written = self.written.clone();
+        let (snap, ver) = self.snapshot_state();
+        let (written, db) = (self.written.clone(), self.db.clone());
         let job = move || {
-            let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
-            if ver > *w {
-                match state::save(&snap, &paths::state_file()) {
-                    Ok(()) => *w = ver,
-                    Err(e) => eprintln!("setu: saving state failed: {e:#}"),
-                }
+            if let Err(e) = write_snapshot(&db, &written, &snap, ver, &mut |_| Ok(())) {
+                eprintln!("setu: saving state failed: {e:#}");
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -181,6 +178,11 @@ impl Daemon {
         }
     }
 
+    fn snapshot_state(&self) -> (State, u64) {
+        let mut inner = self.lock();
+        inner.version += 1;
+        (inner.state.clone(), inner.version)
+    }
 
     /// Register (or refresh) the run record for a worktree and return its key and spec.
     /// Shared by `up`, `worktree.new`, `worktree.adopt` and `worktree.restore`.
@@ -236,17 +238,18 @@ impl Daemon {
         let run = naming::run_name(&naming::project_dir(&cfg.repo), &worktree);
         let (k, _) = self.register(&cfg, &worktree, &run)?;
         self.start(&k).await?;
-        self.describe(&k)
+        self.describe_async(&k).await
     }
 
     /// Start a registered run: spawn every proc, then wait for the web port.
     pub async fn start(self: &Arc<Self>, k: &str) -> Result<()> {
+        let (db, key) = (self.db.clone(), k.to_string());
+        if tokio::task::spawn_blocking(move || worktree::pending_removal(&db, &key)).await? {
+            bail!("a removal of {k} is pending; retry `setu-rs rm {k}` to finish it");
+        }
         let spec = {
             let mut inner = self.lock();
             let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
-            if worktree::pending_removal(&paths::worktree_ops_dir(), k) {
-                bail!("a removal of {k} is pending; retry `setu-rs rm {k}` to finish it");
-            }
             match rec.status {
                 RunStatus::Running | RunStatus::Starting => return Ok(()),
                 RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
@@ -454,12 +457,18 @@ impl Daemon {
     pub fn describe(&self, k: &str) -> Result<Value> {
         let inner = self.lock();
         let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
-        Ok(run_json(k, r))
+        Ok(run_json(&self.db, k, r))
+    }
+
+    /// `describe` on the blocking pool (it reads the claim from the database).
+    pub async fn describe_async(self: &Arc<Self>, k: &str) -> Result<Value> {
+        let (me, k) = (Arc::clone(self), k.to_string());
+        tokio::task::spawn_blocking(move || me.describe(&k)).await?
     }
 
     pub fn list(&self) -> Value {
         let gcfg = globalcfg::GlobalConfig::load().ok();
-        let auto = autoremove::load_state(&autoremove::state_path()).ok();
+        let auto = autoremove::load_state(&self.db).ok();
         let inner = self.lock();
         let mut leases = inner.state.leases.clone();
         Value::Array(
@@ -475,7 +484,7 @@ impl Daemon {
                             .config(&r.spec.id.project)
                             .and_then(|cfg| build_spec(&cfg, &r.spec.worktree, &r.spec.id.run, &mut leases))
                             .is_ok_and(|spec| Some(env::env_hash(&spec.env)) != r.env_hash);
-                    let mut v = run_json(k, r);
+                    let mut v = run_json(&self.db, k, r);
                     v["stale_env"] = json!(stale);
                     v["removal"] = match (&gcfg, &auto) {
                         (Some(g), Some(a)) => autoremove::removal_json(a, k, &g.auto_remove, r.pinned),
@@ -677,13 +686,14 @@ impl Daemon {
     /// `disk.report`: declared items per worktree, stores health, volume free space.
     pub async fn disk_report(&self, measure_deps: bool) -> Result<Value> {
         let (configs, runs) = self.snapshot();
+        let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let policy = disk::Policy { measure: true, measure_deps, include_unmanaged: false };
             let now = disk::now_secs();
             let mut worktrees = Vec::new();
             let mut stores = Vec::new();
             let mut free = 0;
-            for (cfg, wt) in all_worktrees(&configs, &runs) {
+            for (cfg, wt) in all_worktrees(&db, &configs, &runs) {
                 free = disk::free_bytes(&wt.worktree);
                 let items = disk::candidates(&cfg, &wt, policy, now);
                 if items.is_empty() {
@@ -712,12 +722,13 @@ impl Daemon {
     /// `disk.clean`: delete eligible items (or list them when `apply` is false).
     pub async fn disk_clean(&self, apply: bool, include_unmanaged: bool) -> Result<Value> {
         let (configs, runs) = self.snapshot();
+        let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let policy = disk::Policy { measure: !apply, measure_deps: false, include_unmanaged };
             let now = disk::now_secs();
             let mut done = Vec::new();
             let mut freed_total: i64 = 0;
-            for (cfg, wt) in all_worktrees(&configs, &runs) {
+            for (cfg, wt) in all_worktrees(&db, &configs, &runs) {
                 // Deepest paths first, so a nested item (.next/dev/cache) goes before its parent (.next/dev).
                 let mut eligible: Vec<_> = disk::candidates(&cfg, &wt, policy, now).into_iter().filter(|c| c.eligible).collect();
                 eligible.sort_by_key(|c| std::cmp::Reverse(c.path.components().count()));
@@ -745,7 +756,7 @@ impl Daemon {
 
     /// Refuse a destructive action by someone who is not the claim holder.
     pub fn check_holder(&self, k: &str, holder: Option<&str>) -> Result<()> {
-        if let Some(h) = claims::live_holder(&paths::claims_dir(), k, claims::now()) {
+        if let Some(h) = claims::live_holder(&self.db, k, claims::now()) {
             if holder != Some(h.as_str()) {
                 bail!(
                     "{k} has a live writer claim held by {h}; only {h} can do this. Ask it to release, or run `setu-rs release {k}` yourself"
@@ -766,7 +777,7 @@ impl Daemon {
         let me = Arc::clone(self);
         let (b, f) = (branch.to_string(), from.map(String::from));
         let out = tokio::task::spawn_blocking(move || {
-            worktree::create(&cfg, &b, f.as_deref(), &existing, &paths::worktree_ops_dir(), &paths::logs_dir(), |path, run| {
+            worktree::create(&cfg, &b, f.as_deref(), &existing, &me.db, &paths::logs_dir(), |path, run| {
                 let wt = path.canonicalize()?;
                 let (_, spec) = me.register(&cfg, &wt, run)?;
                 Ok(spec.env)
@@ -785,7 +796,7 @@ impl Daemon {
         if start {
             self.start(&k).await?;
         }
-        let mut v = self.describe(&k)?;
+        let mut v = self.describe_async(&k).await?;
         v["worktree_new"] = serde_json::to_value(&out)?;
         Ok(v)
     }
@@ -801,31 +812,35 @@ impl Daemon {
         .await??;
         let (k, _) = self.register(&cfg, &wt, &run)?;
         worktree::audit(actor, client, "adopt", &k, json!({ "path": wt }));
-        self.describe(&k)
+        self.describe_async(&k).await
     }
 
     pub async fn worktree_rm(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str, force: bool) -> Result<Value> {
-        let ops = paths::worktree_ops_dir();
         // The run may already be gone from state (a retry after DropState): fall back to the record.
-        let (key, project, run, wt) = {
+        let found = {
             let inner = self.lock();
-            match inner.resolve_key(wanted) {
-                Ok(k) => {
-                    let r = &inner.state.runs[&k];
-                    (k.clone(), r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone())
-                }
-                Err(e) => match worktree::load_op(&ops, wanted) {
+            inner.resolve_key(wanted).map(|k| {
+                let r = &inner.state.runs[&k];
+                (k.clone(), r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone())
+            })
+        };
+        let (key, project, run, wt) = match found {
+            Ok(f) => f,
+            Err(e) => {
+                let (db, w) = (self.db.clone(), wanted.to_string());
+                match tokio::task::spawn_blocking(move || worktree::load_op(&db, &w)).await? {
                     Ok(Some(rec)) => (wanted.to_string(), rec.project, rec.run, rec.worktree),
                     _ => return Err(e),
-                },
+                }
             }
         };
+        let db = self.db.clone();
         let cfg = self.project_config(&project)?;
         let declared: Vec<String> = cfg.disk_items.iter().flat_map(|i| i.paths.clone()).collect();
         let host = DaemonHost { d: Arc::clone(self), key: key.clone(), rt: tokio::runtime::Handle::current() };
         let archive_root = paths::archive_dir();
         let result = tokio::task::spawn_blocking(move || {
-            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, ops_dir: &ops, force, host: &host })
+            worktree::rm(&worktree::RmCtx { project: &project, run: &run, worktree: &wt, repo: &cfg.repo, declared: &declared, archive_root: &archive_root, db: &db, force, host: &host })
         })
         .await?;
         match result {
@@ -841,24 +856,27 @@ impl Daemon {
     }
 
     pub async fn worktree_restore(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str) -> Result<Value> {
-        let ops = paths::worktree_ops_dir();
         let configs = config::load_all()?;
-        let (cfg, run) = if let Some((p, r)) = wanted.split_once('/') {
-            (configs.into_iter().find(|c| c.project == p).ok_or_else(|| anyhow!("no project config named {p}"))?, r.to_string())
-        } else {
-            let hits: Vec<_> = configs.into_iter().filter(|c| matches!(worktree::load_op(&ops, &format!("{}/{wanted}", c.project)), Ok(Some(_)))).collect();
-            match hits.len() {
-                1 => (hits.into_iter().next().unwrap_or_else(|| unreachable!()), wanted.to_string()),
-                0 => bail!("no removal record for {wanted}"),
-                _ => bail!("{wanted} matches several projects; use project/run"),
-            }
-        };
         let archive_root = paths::archive_dir();
-        let (c2, r2) = (cfg.clone(), run.clone());
-        let out = tokio::task::spawn_blocking(move || worktree::restore(&c2, &r2, &ops, &archive_root)).await??;
+        let (db, w) = (self.db.clone(), wanted.to_string());
+        let (cfg, run, out) = tokio::task::spawn_blocking(move || -> Result<(ProjectConfig, String, worktree::RestoreOutcome)> {
+            let (cfg, run) = if let Some((p, r)) = w.split_once('/') {
+                (configs.into_iter().find(|c| c.project == p).ok_or_else(|| anyhow!("no project config named {p}"))?, r.to_string())
+            } else {
+                let hits: Vec<_> = configs.into_iter().filter(|c| matches!(worktree::load_op(&db, &format!("{}/{w}", c.project)), Ok(Some(_)))).collect();
+                match hits.len() {
+                    1 => (hits.into_iter().next().unwrap_or_else(|| unreachable!()), w.clone()),
+                    0 => bail!("no removal record for {w}"),
+                    _ => bail!("{w} matches several projects; use project/run"),
+                }
+            };
+            let out = worktree::restore(&cfg, &run, &db, &archive_root)?;
+            Ok((cfg, run, out))
+        })
+        .await??;
         let (k, _) = self.register(&cfg, &out.path, &run)?;
         worktree::audit(actor, client, "restore", &k, json!({ "branch": out.branch, "archive": out.restored_from }));
-        let mut v = self.describe(&k)?;
+        let mut v = self.describe_async(&k).await?;
         v["restore"] = serde_json::to_value(&out)?;
         Ok(v)
     }
@@ -866,7 +884,7 @@ impl Daemon {
     /// Read-only: the current auto-removal candidates and the daily count. No fetch, no evaluation.
     pub fn autoremove_candidates(&self) -> Result<Value> {
         let gcfg = globalcfg::GlobalConfig::load()?;
-        let st = autoremove::load_state(&autoremove::state_path())?;
+        let st = autoremove::load_state(&self.db)?;
         autoremove::candidates_json(&st, &gcfg.auto_remove)
     }
 
@@ -885,9 +903,8 @@ impl Daemon {
         let rt = tokio::runtime::Handle::current();
         let job = tokio::task::spawn_blocking(move || -> Result<Value> {
             let _guard = me.ar_lock.try_lock().map_err(|_| anyhow!("an auto-remove evaluation is already running"))?;
-            let items = autoremove::items_from(&cfgs, &runs, |k| claims::live_holder(&paths::claims_dir(), k, claims::now()));
-            let path = autoremove::state_path();
-            let mut st = autoremove::load_state(&path)?;
+            let items = autoremove::items_from(&cfgs, &runs, |k| claims::live_holder(&me.db, k, claims::now()));
+            let mut st = autoremove::load_state(&me.db)?;
             let now = crate::disk::now_secs();
             let audit = |op: &str, run: &str, extra: Value| worktree::audit("autoremove", None, op, run, extra);
             let remove = |it: &autoremove::Item| -> Result<()> {
@@ -904,12 +921,12 @@ impl Daemon {
                 }
                 rt.block_on(me.worktree_rm("autoremove", None, &it.key, false)).map(|_| ())
             };
-            let save = |s: &autoremove::AutoState| autoremove::save_state(&path, s);
+            let save = |s: &autoremove::AutoState| autoremove::save_state(&me.db, s);
             let deps = autoremove::Deps { now, day: autoremove::local_day(now), gh: &autoremove::real_gh, audit: &audit, remove: &remove, save: &save, dry_run };
             let decisions = autoremove::sweep(&items, &policy, &mut st, &deps);
             let mut pruned = Vec::new();
             if !dry_run {
-                autoremove::save_state(&path, &st)?;
+                autoremove::save_state(&me.db, &st)?;
                 pruned = autoremove::prune_archives(&paths::archive_dir(), now);
                 for p in &pruned {
                     worktree::audit("autoremove", None, "autoremove-pruned-archive", "", json!({ "archive": p }));
@@ -922,7 +939,7 @@ impl Daemon {
 
     pub fn claim(&self, actor: &str, client: Option<&str>, wanted: &str, holder: &str, pid: Option<i32>) -> Result<Value> {
         let k = self.resolve(wanted)?;
-        let (c, outcome) = claims::claim(&paths::claims_dir(), &k, holder, pid, claims::now())?;
+        let (c, outcome) = claims::claim(&self.db, &k, holder, pid, claims::now())?;
         let how = match &outcome {
             claims::Outcome::Created => "claimed",
             claims::Outcome::Refreshed => "refreshed",
@@ -942,15 +959,21 @@ impl Daemon {
             bail!("release needs `holder`: the name you claimed with");
         }
         let k = self.resolve(wanted)?;
-        let removed = claims::release(&paths::claims_dir(), &k, holder, claims::now())?;
+        let removed = claims::release(&self.db, &k, holder, claims::now())?;
         worktree::audit(actor, client, "release", &k, json!({ "holder": removed.as_ref().map(|c| c.holder.clone()) }));
         Ok(json!({ "run": k, "released": removed.is_some(), "holder": removed.map(|c| c.holder) }))
+    }
+
+    /// `events.list`: audit events, newest first. `run` may be a short run name; a removed run is matched as written.
+    pub fn events(&self, kind: Option<&str>, run: Option<&str>, since: Option<u64>, limit: usize) -> Result<Value> {
+        let run = run.map(|r| self.resolve(r).unwrap_or_else(|_| r.to_string()));
+        Ok(Value::Array(db::list_events(&self.db, kind, run.as_deref(), since, limit)?))
     }
 
     pub fn claims_list(&self) -> Value {
         let now = claims::now();
         Value::Array(
-            claims::list(&paths::claims_dir(), now)
+            claims::list(&self.db)
                 .into_iter()
                 .map(|c| json!({ "run": c.run, "holder": c.holder, "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat, "stale": claims::is_stale(&c, now) }))
                 .collect(),
@@ -958,6 +981,11 @@ impl Daemon {
     }
 
     /// Read-only: configured projects with their `[worktree] base` (null = Setu picks one).
+    /// Finished removals `restore` can still work from (read from the database).
+    pub fn removed(&self) -> Value {
+        Value::Array(worktree::removed_list(&self.db))
+    }
+
     pub fn projects_list(&self) -> Result<Value> {
         let mut cfgs = config::load_all()?;
         cfgs.sort_by(|a, b| a.project.cmp(&b.project));
@@ -1014,7 +1042,7 @@ pub fn redact(text: &str, secrets: &[(String, String)]) -> String {
     out
 }
 
-fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) -> Vec<(ProjectConfig, disk::WorktreeInfo)> {
+fn all_worktrees(db: &Db, configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) -> Vec<(ProjectConfig, disk::WorktreeInfo)> {
     let mut out = Vec::new();
     for cfg in configs {
         let pdir = naming::project_dir(&cfg.repo);
@@ -1029,7 +1057,7 @@ fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) 
                     worktree: wt,
                     status: rec.map(|r| r.status),
                     stopped_at: rec.and_then(|r| r.stopped_at),
-                    claimed_by: claims::live_holder(&paths::claims_dir(), &format!("{}/{run}", cfg.project), claims::now()),
+                    claimed_by: claims::live_holder(db, &format!("{}/{run}", cfg.project), claims::now()),
                 },
             ));
         }
@@ -1038,15 +1066,15 @@ fn all_worktrees(configs: &[ProjectConfig], runs: &BTreeMap<String, RunRecord>) 
 }
 
 /// `{holder, stale, pid, since}` for the run's claim, or null.
-fn claim_json(k: &str) -> Value {
-    match claims::get(&paths::claims_dir(), k) {
+fn claim_json(db: &Db, k: &str) -> Value {
+    match claims::get(db, k) {
         Ok(Some(c)) => json!({ "holder": c.holder, "stale": claims::is_stale(&c, claims::now()), "pid": c.pid, "since": c.created, "heartbeat": c.heartbeat }),
         Ok(None) => Value::Null,
         Err(_) => json!({ "holder": "(unreadable)", "stale": false }),
     }
 }
 
-fn run_json(k: &str, r: &RunRecord) -> Value {
+fn run_json(db: &Db, k: &str, r: &RunRecord) -> Value {
     let ram = if r.procs.is_empty() { 0 } else { supervisor::run_footprint(&r.procs) };
     json!({
         "run": k,
@@ -1058,7 +1086,7 @@ fn run_json(k: &str, r: &RunRecord) -> Value {
         "worktree": r.spec.worktree,
         "procs": r.procs.iter().map(|p| json!({"name": p.name, "pid": p.pid})).collect::<Vec<_>>(),
         "note": r.note,
-        "claim": claim_json(k),
+        "claim": claim_json(db, k),
     })
 }
 
@@ -1117,7 +1145,7 @@ impl worktree::RmHost for DaemonHost {
         self.rt.block_on(self.d.stop(&self.key, RunStatus::Stopped))
     }
     fn claim_holder(&self) -> Option<String> {
-        claims::live_holder(&paths::claims_dir(), &self.key, claims::now())
+        claims::live_holder(&self.d.db, &self.key, claims::now())
     }
     fn running(&self) -> Option<String> {
         let inner = self.d.lock();
@@ -1126,6 +1154,7 @@ impl worktree::RmHost for DaemonHost {
             _ => None,
         }
     }
+    /// In memory only; `commit_teardown` writes the result together with the lease and marker.
     fn drop_state(&self) -> Result<()> {
         let id = {
             let mut inner = self.d.lock();
@@ -1136,15 +1165,32 @@ impl worktree::RmHost for DaemonHost {
         if let Some(id) = id {
             self.d.activity.forget(&id);
         }
-        self.d.persist();
-        claims::release(&paths::claims_dir(), &self.key, None, claims::now())?;
         Ok(())
     }
     fn release_lease(&self) -> Result<()> {
         self.d.lock().state.leases.remove(&self.key);
-        self.d.persist();
         Ok(())
     }
+    fn commit_teardown(&self, db: &Db, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+        let (snap, ver) = self.d.snapshot_state();
+        write_snapshot(db, &self.d.written, &snap, ver, extra)
+    }
+}
+
+/// Write a state snapshot (if it is newer than the last one written) and `extra`, in one transaction.
+/// `extra` always runs: it is the part of a change that must not be skipped when a newer snapshot already landed.
+fn write_snapshot(db: &Db, written: &Mutex<u64>, snap: &State, ver: u64, extra: &mut dyn FnMut(&rusqlite::Transaction) -> Result<()>) -> Result<()> {
+    let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
+    db.tx(|tx| {
+        if ver > *w {
+            state::save_tx(tx, snap)?;
+        }
+        extra(tx)
+    })?;
+    if ver > *w {
+        *w = ver;
+    }
+    Ok(())
 }
 
 static SELF: std::sync::OnceLock<Arc<Daemon>> = std::sync::OnceLock::new();
@@ -1187,7 +1233,7 @@ pub async fn run() -> Result<()> {
         .await
         .with_context(|| format!("binding the proxy on {bind_ip}:{proxy_port}"))?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExitEvent>();
-    let daemon = Daemon::new(tx)?;
+    let daemon = tokio::task::spawn_blocking(move || Daemon::new(tx)).await??;
     let _ = SELF.set(Arc::clone(&daemon));
     daemon.adopt().await;
     let routes: Arc<dyn Routes> = daemon.clone();
