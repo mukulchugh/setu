@@ -314,6 +314,45 @@ pub struct Stack {
     pub convex: Option<String>,
     /// Package manager, for the Convex command.
     pub pm: &'static str,
+    /// Env files the old Setu linked from main into every worktree (`[worktree] link`).
+    pub links: Vec<String>,
+}
+
+/// Env files v1 shared by symlinking them from the main worktree (`.env.local`,
+/// `apps/<app>/.env.local`, ...): a path counts when some other worktree has it as a symlink
+/// to the same file in main. Only names are looked at; file contents are never read.
+pub fn detect_shared_links(main: &Path, others: &[&Path]) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let env_names = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.starts_with(".env") && !n.ends_with(".example") && !n.ends_with(".sample") && !n.ends_with(".template"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    candidates.extend(env_names(main));
+    for sub in ["apps", "packages"] {
+        if let Ok(rd) = std::fs::read_dir(main.join(sub)) {
+            for e in rd.filter_map(Result::ok).filter(|e| e.path().is_dir()) {
+                let app = e.file_name().to_string_lossy().into_owned();
+                candidates.extend(env_names(&e.path()).into_iter().map(|n| format!("{sub}/{app}/{n}")));
+            }
+        }
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .filter(|rel| {
+            let Ok(target) = main.join(rel).canonicalize() else { return false };
+            others.iter().any(|w| {
+                let p = w.join(rel);
+                std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) && p.canonicalize().is_ok_and(|t| t == target)
+            })
+        })
+        .collect()
 }
 
 fn package_deps(dir: &Path) -> Option<BTreeSet<String>> {
@@ -429,6 +468,10 @@ pub fn generate_config(project: &str, repo_display: &str, domain: &str, inferred
             t.push_str(&format!("{k:<w$} = \"{v}\"\n"));
         }
     }
+    if !stack.links.is_empty() {
+        let list: Vec<String> = stack.links.iter().map(|l| format!("\"{l}\"")).collect();
+        t.push_str(&format!("\n# Shared env files, symlinked from the main worktree into every worktree (as the old Setu did).\n[worktree]\nlink = [{}]\n", list.join(", ")));
+    }
     t.push('\n');
     match inferred {
         Some(i) => t.push_str(&format!("[procs.web]\nrun  = \"{}\"\nport = \"web\"\n", i.run)),
@@ -541,7 +584,11 @@ pub fn plan(v1: &V1, registered: &Registered, port_is_free: &dyn Fn(u16) -> bool
                     plan.notes.push(format!("{name}: the v1 host {alias} is not a valid DNS name, so the main URL changes to {}", url_for(&name, "main", &v1.zone, proxy_port)));
                 }
                 let aliases: Vec<String> = if alias_ok { vec![alias] } else { vec![] };
-                let stack = main.map(|m| detect_stack(&m.path, &v1name)).unwrap_or_default();
+                let mut stack = main.map(|m| detect_stack(&m.path, &v1name)).unwrap_or_default();
+                if let Some(m) = main {
+                    let others: Vec<&Path> = entries.iter().filter(usable).filter(|e| e.path != m.path).map(|e| e.path.as_path()).collect();
+                    stack.links = detect_shared_links(&m.path, &others);
+                }
                 let (t, st) = generate_config(&name, &home_relative(&repo_abs), &v1.zone, inferred.as_ref(), &aliases, &stack);
                 config::parse_project(&t, &cfg_path).with_context(|| format!("generated config for {name} is invalid"))?;
                 plan.configs.push(ConfigToWrite { project: name.clone(), path: cfg_path.clone(), text: t.clone(), state: st.clone() });
@@ -558,6 +605,18 @@ pub fn plan(v1: &V1, registered: &Registered, port_is_free: &dyn Fn(u16) -> bool
                 plan.notes.push(format!("{name}: main also answers at {} (the v1 URL, kept as an alias)", url(&alias)));
             } else if !plan.configs.iter().any(|c| c.project == name) {
                 plan.notes.push(format!("{name}: the existing config has no alias for {alias}, so the main URL changes from {} to {}; add `aliases = [\"{alias}\"]` to keep the old one", url(&alias), url_for(&name, "main", &domain, proxy_port)));
+            }
+        }
+        if !plan.configs.iter().any(|c| c.project == name) {
+            let usable = |e: &&WtEntry| !e.prunable && e.path.is_dir();
+            if let Some(m) = entries.iter().filter(usable).find(|e| naming::run_name(&pd, &e.path) == "main") {
+                let others: Vec<&Path> = entries.iter().filter(usable).filter(|e| e.path != m.path).map(|e| e.path.as_path()).collect();
+                let declared: Vec<String> = parsed.get("worktree").and_then(|w| w.get("link")).and_then(toml::Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                let missing: Vec<String> = detect_shared_links(&m.path, &others).into_iter().filter(|l| !declared.contains(l)).collect();
+                if !missing.is_empty() {
+                    let list: Vec<String> = missing.iter().map(|l| format!("\"{l}\"")).collect();
+                    plan.notes.push(format!("{name}: worktrees share {} from main, but the existing config does not declare it; add `[worktree] link = [{}]` so new worktrees get it too", missing.join(", "), list.join(", ")));
+                }
             }
         }
         let has_web = parsed.get("ports").and_then(|p| p.get("web")).is_some();
@@ -709,6 +768,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_env_links_from_main_are_detected_and_declared() {
+        let d = std::env::temp_dir().join(format!("setu-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let main = d.join("main");
+        std::fs::create_dir_all(main.join("apps/web")).unwrap();
+        for f in [".env.local", ".env.example", "apps/web/.env.local", "apps/web/.env.test"] {
+            std::fs::write(main.join(f), "X=1\n").unwrap();
+        }
+        let (a, b) = (d.join("feat-a"), d.join("feat-b"));
+        std::fs::create_dir_all(a.join("apps/web")).unwrap();
+        std::fs::create_dir_all(b.join("apps/web")).unwrap();
+        std::os::unix::fs::symlink(main.join("apps/web/.env.local"), a.join("apps/web/.env.local")).unwrap();
+        std::fs::write(b.join("apps/web/.env.test"), "OWN=1\n").unwrap(); // its own copy: not shared
+        let links = detect_shared_links(&main, &[a.as_path(), b.as_path()]);
+        assert_eq!(links, vec!["apps/web/.env.local".to_string()]);
+        let st = Stack { links, ..Default::default() };
+        let (t, _) = generate_config("p", "~/workspace/p.git", "q.local", None, &[], &st);
+        assert!(t.contains("[worktree]\nlink = [\"apps/web/.env.local\"]"), "{t}");
+        config::parse_project(&t, Path::new("p.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn infers_package_managers() {
         let d = std::env::temp_dir().join(format!("setu-infer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -750,7 +832,7 @@ mod tests {
         let st = detect_stack(&d, "quivly-app");
         assert_eq!(
             st,
-            Stack { js: true, workos: true, nx: true, trigger: Some(String::new()), trigger_env_file: Some("apps/quivly-app/.env.local".into()), inngest: true, convex: None, pm: "bun" }
+            Stack { js: true, workos: true, nx: true, trigger: Some(String::new()), trigger_env_file: Some("apps/quivly-app/.env.local".into()), inngest: true, convex: None, pm: "bun", links: vec![] }
         );
         let inf = infer_dev(&d);
         let (t, state) = generate_config("quivly-app", "~/workspace/quivly-app.git", "quivly.local", inf.as_ref(), &[], &st);
