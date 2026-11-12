@@ -24,6 +24,10 @@ pub trait Sys {
     fn login_path(&self) -> Result<String> {
         crate::globalcfg::capture_login_path()
     }
+    /// Wait between launchd polls (no-op in tests).
+    fn pause(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }
 
 pub struct RealSys;
@@ -254,8 +258,24 @@ fn apply_steps(steps: &[Step], gcfg: &mut GlobalConfig, binary: &Path, layout: &
                 }
                 std::fs::write(&layout.plist, plist(binary, &path_for_plist(gcfg), &layout.log))?;
                 let target = format!("gui/{}", sys.uid());
-                let _ = sys.run("launchctl", &["bootout", &format!("{target}/{LABEL}")]);
-                let (code, _) = sys.run("launchctl", &["bootstrap", &target, &layout.plist.to_string_lossy()])?;
+                let service = format!("{target}/{LABEL}");
+                let _ = sys.run("launchctl", &["bootout", &service]);
+                // bootout returns before the old daemon has gone; loading again too early fails
+                // with exit 5 (EIO). Wait for it to be unloaded (up to 10 s), then retry briefly.
+                for _ in 0..100 {
+                    if sys.run("launchctl", &["print", &service])?.0 != 0 {
+                        break;
+                    }
+                    sys.pause(100);
+                }
+                let mut code = 0;
+                for _ in 0..10 {
+                    code = sys.run("launchctl", &["bootstrap", &target, &layout.plist.to_string_lossy()])?.0;
+                    if code != 5 {
+                        break;
+                    }
+                    sys.pause(500);
+                }
                 if code != 0 {
                     bail!("launchctl bootstrap exited {code}");
                 }
@@ -337,6 +357,8 @@ mod tests {
         resolving: Vec<String>,
         loaded: bool,
         bootstrap_code: i32,
+        /// The first N bootstraps fail with 5, as when the old job is still being torn down.
+        boot_busy: std::cell::Cell<u32>,
     }
 
     impl Sys for Fake {
@@ -346,6 +368,10 @@ mod tests {
                 return Ok((if self.loaded { 0 } else { 113 }, String::new()));
             }
             if args.first() == Some(&"bootstrap") {
+                if self.boot_busy.get() > 0 {
+                    self.boot_busy.set(self.boot_busy.get() - 1);
+                    return Ok((5, String::new()));
+                }
                 return Ok((self.bootstrap_code, String::new()));
             }
             Ok((0, String::new()))
@@ -364,6 +390,7 @@ mod tests {
         fn resolves_to_loopback(&self, host: &str) -> bool {
             self.resolving.iter().any(|d| host.ends_with(d.as_str()))
         }
+        fn pause(&self, _ms: u64) {}
         fn uid(&self) -> u32 {
             501
         }
@@ -513,6 +540,19 @@ mod tests {
         let steps = vec![Step { id: "launch-agent".into(), description: String::new(), sudo: false }];
         assert!(apply(&steps, &mut g, Path::new("/b"), &l, &fake).is_err());
         assert!(SetupRecord::load(&l.record).unwrap().plist.is_none());
+    }
+
+    #[test]
+    fn a_reinstall_retries_while_the_old_daemon_is_still_unloading() {
+        // Live: `setu setup` over an existing install failed with "launchctl bootstrap exited 5"
+        // because bootout is asynchronous.
+        let l = layout("bootbusy");
+        let mut g = GlobalConfig::default();
+        let fake = Fake { boot_busy: std::cell::Cell::new(3), ..Default::default() };
+        let steps = vec![Step { id: "launch-agent".into(), description: String::new(), sudo: false }];
+        apply(&steps, &mut g, Path::new("/b"), &l, &fake).unwrap();
+        assert_eq!(fake.calls.borrow().iter().filter(|c| c.starts_with("launchctl bootstrap")).count(), 4);
+        assert!(SetupRecord::load(&l.record).unwrap().plist.is_some());
     }
 
     #[test]
