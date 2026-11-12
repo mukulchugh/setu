@@ -143,8 +143,8 @@ struct RunsView: View {
                 Button("Restart", systemImage: "arrow.clockwise") { Task { await store.act("restart", rs) } }
                 Button("Stop", systemImage: "stop.fill") { Task { await store.act("down", rs) } }
             }
-            if rs.contains(where: { !$0.isUp }) {
-                Button("Start", systemImage: "play.fill") { Task { await store.act("start", rs.filter { !$0.isUp }) } }
+            if rs.contains(where: \.canStart) {
+                Button("Start", systemImage: "play.fill") { Task { await store.act("start", rs.filter(\.canStart)) } }
             }
             if rs.count == 1 {
                 Button("Logs", systemImage: "text.alignleft") { store.requestLogs(rs[0].run) }
@@ -173,8 +173,8 @@ struct RunsView: View {
             ToolbarBtn("Open", "arrow.up.right.square", key: "o", disabled: !selected.contains(where: \.isUp)) {
                 for r in selected where r.isUp { openURL(r.url) }
             }
-            ToolbarBtn("Start", "play.fill", disabled: !selected.contains(where: { !$0.isUp })) {
-                Task { await store.act("start", selected.filter { !$0.isUp }) }
+            ToolbarBtn("Start", "play.fill", disabled: !selected.contains(where: \.canStart)) {
+                Task { await store.act("start", selected.filter(\.canStart)) }
             }
             ToolbarBtn("Restart", "arrow.clockwise", key: "r", disabled: !selected.contains(where: \.isUp)) {
                 Task { await store.act("restart", selected.filter(\.isUp)) }

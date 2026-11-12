@@ -171,7 +171,9 @@ r={x["run"]:x for x in json.load(sys.stdin)}
 assert r["app/main"]["ports"]["web"]==41311, r["app/main"]
 assert r["app/feat-x"]["ports"]["web"]==41312
 assert r["app/feat-x"]["status"]=="running" and r["app/feat-x"]["external"] is True, r["app/feat-x"]
-assert all(x["status"]=="stopped" for k,x in r.items() if k!="app/feat-x"), r
+# a project with no procs (plain: no recognisable stack) is no-server, with no URL
+assert r["plain/main"]["status"]=="no-server" and r["plain/main"]["url"] is None, r["plain/main"]
+assert all(x["status"]=="stopped" for k,x in r.items() if k not in ("app/feat-x","plain/main")), r
 assert not any(x["external"] for k,x in r.items() if k!="app/feat-x")
 assert r["app/busy"]["ports"]["web"]!=41313 and 4000<=r["app/busy"]["ports"]["web"]<=4999, r["app/busy"]
 assert r["keep/main"]["ports"]["web"]==41317

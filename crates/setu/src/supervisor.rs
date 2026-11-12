@@ -447,20 +447,9 @@ pub async fn stop_procs(procs: &[ProcRecord], grace: Duration) -> anyhow::Result
     }
 }
 
-pub async fn wait_port(port: u16, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        for addr in [("127.0.0.1", port), ("::1", port)] {
-            let t = Duration::from_millis(250);
-            if let Ok(Ok(_)) = tokio::time::timeout(t, tokio::net::TcpStream::connect(addr)).await {
-                return true;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+/// Readiness: the same probe the proxy uses, so "up" here means the proxy can reach it.
+pub async fn wait_port(run: &RunId, port: u16, timeout: Duration) -> bool {
+    crate::upstream::wait(run, port, timeout, Duration::from_millis(250), Duration::from_millis(250)).await.is_some()
 }
 
 pub fn run_footprint(procs: &[ProcRecord]) -> u64 {
@@ -662,12 +651,12 @@ mod tests {
     async fn port_wait() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        assert!(wait_port(port, Duration::from_secs(2)).await);
+        assert!(wait_port(&RunId { project: "p".into(), run: "port-wait".into() }, port, Duration::from_secs(2)).await);
         drop(l);
         // Port 1 (tcpmux) never has a listener on macOS; a freed ephemeral port may be
         // reused by a parallel test.
         let t = std::time::Instant::now();
-        assert!(!wait_port(1, Duration::from_millis(600)).await);
+        assert!(!wait_port(&RunId { project: "p".into(), run: "port-wait".into() }, 1, Duration::from_millis(600)).await);
         assert!(t.elapsed() < Duration::from_secs(3));
     }
 

@@ -82,6 +82,7 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
         }
         "restart" => {
             let k = target(d, req)?;
+            d.require_server(&k).await?;
             check_holder(d, &k, s(req, "holder")).await?;
             d.stop(&k, RunStatus::Stopped).await?;
             d.start(&k).await?;

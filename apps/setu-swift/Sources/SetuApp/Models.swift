@@ -28,6 +28,8 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
 
     var id: String { run }
     var isUp: Bool { status == "running" || status == "starting" }
+    /// A project with no `[procs]` has nothing to start and no URL (`status == "no-server"`).
+    var canStart: Bool { !isUp && status != "no-server" }
     var project: String { run.split(separator: "/", maxSplits: 1).first.map(String.init) ?? run }
     var name: String { run.split(separator: "/", maxSplits: 1).last.map(String.init) ?? run }
 

@@ -25,6 +25,17 @@ private func fixture(_ name: String) throws -> Data {
     #expect(!stopped.isUp)
 }
 
+@Test func noServerRunHasNoUrlAndCannotStart() throws {
+    let runs: [Run] = try decodeReply(fixture("ls-no-server"))
+    let r = try #require(runs.first)
+    #expect(r.status == "no-server")
+    #expect(r.url == nil)
+    #expect(!r.isUp)
+    #expect(!r.canStart)
+    #expect(r.note?.contains("no dev server configured") == true)
+    #expect(statusSymbol(r).word == "No dev server")
+}
+
 @Test func staleEnvKeyMaps() throws {
     let line = Data(#"{"ok":true,"data":[{"run":"p/r","status":"running","stale_env":true,"ram_bytes":5,"pinned":true}]}"#.utf8)
     let runs: [Run] = try decodeReply(line)

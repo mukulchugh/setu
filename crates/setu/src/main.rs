@@ -32,6 +32,7 @@ mod setup;
 mod state;
 mod supervisor;
 mod trigger;
+mod upstream;
 mod worktree;
 
 fn main() {

@@ -1,0 +1,1 @@
+{"data":[{"aliases":[],"claim":null,"config_error":null,"external":false,"note":"altr/dev has no dev server configured. Add a [procs.web] to ~/.config/setu/projects/altr.toml","pinned":false,"ports":{"web":4700},"procs":[],"ram_bytes":0,"removal":null,"run":"altr/dev","stale_env":false,"status":"no-server","url":null,"worktree":"/private/tmp/ws/altr/dev"}],"ok":true}

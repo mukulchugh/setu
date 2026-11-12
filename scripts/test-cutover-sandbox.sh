@@ -77,6 +77,15 @@ T
 cat > "$SB/shims/launchctl" <<'S'
 #!/bin/bash
 echo "launchctl $*" >> "$SB/calls.log"
+# A fake Caddy LaunchAgent (label com.example.caddy) is loaded while $SB/caddy-agent-loaded exists.
+case "$*" in
+  *caddy*)
+    case "$1" in
+      print) [ -f "$SB/caddy-agent-loaded" ] && exit 0; exit 1 ;;
+      bootout) rm -f "$SB/caddy-agent-loaded"; exit 0 ;;
+      bootstrap) touch "$SB/caddy-agent-loaded"; exit 0 ;;
+    esac ;;
+esac
 case "$1" in
   bootstrap) nohup env HOME="$HOME" SETU_HOME="$SETU_HOME" "$BIN" daemon >"$SB/daemon.log" 2>&1 </dev/null & echo $! > "$SB/daemon.pid"; exit 0 ;;
   bootout) [ -f "$SB/daemon.pid" ] && kill "$(cat "$SB/daemon.pid")" 2>/dev/null; rm -f "$SB/daemon.pid"; sleep 1; exit 0 ;;
@@ -234,6 +243,32 @@ MIG rollback >/dev/null || fail "rollback without caddy failed"
 grep -q "brew services start" "$SB/calls.log" && fail "no caddy: nothing may be started" || true
 snap | diff - "$SB/before.sum" || fail "fixtures differ after the no-caddy rollback"
 sleep 1; pgrep -f "$HOME/.setu/portal.js" >> "$SB/portal.pids" || fail "old portal not restarted (no caddy)"
+unset NO_CADDY
+
+step "Caddy as a LaunchAgent (no brew service): run unloads it, rollback reloads the same plist byte for byte"
+AGENT_PLIST="$HOME/Library/LaunchAgents/com.example.caddy.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>com.example.caddy</string>\n<key>ProgramArguments</key><array><string>/opt/homebrew/bin/caddy</string><string>run</string></array></dict></plist>' > "$AGENT_PLIST"
+AGENT_SUM=$(shasum -a 256 "$AGENT_PLIST")
+touch "$SB/caddy-agent-loaded"
+: > "$SB/calls.log"
+export NO_CADDY=1
+MIG plan > "$SB/plan5.out" 2>&1 || fail "plan (caddy agent) failed"
+grep -q "caddy .*LaunchAgent com.example.caddy .*unloads it" "$SB/plan5.out" || { cat "$SB/plan5.out"; fail "plan should find the caddy LaunchAgent"; }
+MIG run --yes > "$SB/run5.out" 2>&1 || { cat "$SB/run5.out"; fail "run with a caddy LaunchAgent failed"; }
+grep -q "caddy stopped (LaunchAgent com.example.caddy)" "$SB/run5.out" || fail "run should say it unloaded the agent"
+grep -q "^launchctl bootout gui/[0-9]*/com.example.caddy$" "$SB/calls.log" || { cat "$SB/calls.log"; fail "run did not bootout the caddy agent"; }
+[ ! -f "$SB/caddy-agent-loaded" ] || fail "the caddy agent should be unloaded after run"
+grep -q "brew services stop" "$SB/calls.log" && fail "an agent-run caddy must not go through brew" || true
+[ "$(shasum -a 256 "$AGENT_PLIST")" = "$AGENT_SUM" ] || fail "the caddy plist changed during run"
+MIG rollback > "$SB/rollback5.out" 2>&1 || { cat "$SB/rollback5.out"; fail "rollback (caddy agent) failed"; }
+grep -q "^launchctl bootstrap gui/[0-9]* $AGENT_PLIST$" "$SB/calls.log" || { cat "$SB/calls.log"; fail "rollback did not bootstrap the same caddy plist"; }
+[ -f "$SB/caddy-agent-loaded" ] || fail "the caddy agent should be loaded again after rollback"
+[ "$(shasum -a 256 "$AGENT_PLIST")" = "$AGENT_SUM" ] || fail "the caddy plist is not byte-identical after rollback"
+grep -q "brew services start" "$SB/calls.log" && fail "an agent-run caddy must not be started through brew" || true
+snap | diff - "$SB/before.sum" || fail "fixtures differ after the caddy-agent rollback"
+sleep 1; pgrep -f "$HOME/.setu/portal.js" >> "$SB/portal.pids" || fail "old portal not restarted (caddy agent)"
+rm -f "$AGENT_PLIST" "$SB/caddy-agent-loaded"
 unset NO_CADDY
 
 step "failure midway: caddy refuses to stop -> run stops, says how to roll back, rollback restores"

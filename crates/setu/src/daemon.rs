@@ -79,6 +79,11 @@ fn retained_after_stop(procs: &[crate::model::ProcRecord], stop_failed: bool, un
     procs.iter().filter(|p| unresolved(p)).cloned().collect()
 }
 
+/// What `up`, `start` and `restart` say about a project with no procs.
+fn no_server_msg(run: &str, project: &str) -> String {
+    format!("{run} has no dev server configured. Add a [procs.web] to ~/.config/setu/projects/{project}.toml")
+}
+
 fn key(id: &RunId) -> String {
     id.to_string()
 }
@@ -99,6 +104,19 @@ impl Inner {
             .find(|c| c.project == project)
             .cloned()
             .ok_or_else(|| anyhow!("no project config named {project}"))
+    }
+    /// A run whose project config declares no procs: there is nothing to start, ever. Judged from
+    /// the config the daemon holds (refreshed by `ls`, `up` and `start`), so adding a `[procs.web]`
+    /// takes effect without a restart. Runs that are preparing, failed setup or are being stopped
+    /// keep their own status.
+    fn no_server(&self, r: &RunRecord) -> bool {
+        if !r.procs.is_empty() || !matches!(r.status, RunStatus::Stopped | RunStatus::Crashed | RunStatus::Running | RunStatus::Starting) {
+            return false;
+        }
+        match self.configs.iter().find(|c| c.project == r.spec.id.project) {
+            Some(c) => c.procs.is_empty(),
+            None => r.spec.procs.is_empty(),
+        }
     }
     fn up_count(&self, project: &str) -> usize {
         self.state
@@ -559,6 +577,17 @@ impl Daemon {
         self.describe_async(&k).await
     }
 
+    /// Refuse a run whose project declares no procs, before anything is stopped.
+    pub async fn require_server(self: &Arc<Self>, k: &str) -> Result<()> {
+        let project = self.lock().state.runs.get(k).map(|r| r.spec.id.project.clone()).ok_or_else(|| anyhow!("unknown run {k}"))?;
+        let (me, p) = (Arc::clone(self), project.clone());
+        let cfg = tokio::task::spawn_blocking(move || me.fresh_config(&p)).await??;
+        if cfg.procs.is_empty() {
+            bail!("{}", no_server_msg(k, &project));
+        }
+        Ok(())
+    }
+
     /// Start a registered run: spawn every proc, then wait for the web port.
     /// Start and stop of one run never overlap: a stop that arrives mid-start cancels it, and
     /// any process spawned after that is stopped before start lets go (review #7).
@@ -596,6 +625,21 @@ impl Daemon {
         let (spec, gen, install) = {
             let mut inner = self.lock();
             let rec = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?.clone();
+            if fresh_cfg.procs.is_empty() {
+                // Nothing to run. A legacy Running/Starting/Crashed record without processes is
+                // settled to Stopped so it never reads as a crash.
+                if rec.procs.is_empty() && matches!(rec.status, RunStatus::Running | RunStatus::Starting | RunStatus::Crashed) {
+                    if let Some(r) = inner.state.runs.get_mut(k) {
+                        r.status = RunStatus::Stopped;
+                        r.note = None;
+                    }
+                    drop(inner);
+                    self.persist();
+                } else {
+                    drop(inner);
+                }
+                bail!("{}", no_server_msg(k, &rec.spec.id.project));
+            }
             match rec.status {
                 RunStatus::Running | RunStatus::Starting => return Ok(()),
                 RunStatus::Stopping => bail!("{k} is stopping; try again in a moment"),
@@ -738,7 +782,7 @@ impl Daemon {
         let generation: Vec<i32> = self.lock().state.runs.get(k).map(|r| r.procs.iter().map(|p| p.pid).collect()).unwrap_or_default();
         tokio::spawn(async move {
             let ready = match spec.web_port {
-                Some(p) => supervisor::wait_port(p, START_TIMEOUT).await,
+                Some(p) => supervisor::wait_port(&spec.id, p, START_TIMEOUT).await,
                 None => true,
             };
             let current: Vec<i32> = me.lock().state.runs.get(&k2).map(|r| r.procs.iter().map(|p| p.pid).collect()).unwrap_or_default();
@@ -994,6 +1038,16 @@ impl Daemon {
             if r.status != RunStatus::Running {
                 continue;
             }
+            // A run with no procs (a project with no dev server) is not a crash.
+            if r.procs.is_empty() && r.spec.procs.is_empty() {
+                self.set(&k, |x| {
+                    if x.status == RunStatus::Running && x.procs.is_empty() {
+                        x.status = RunStatus::Stopped;
+                        x.note = None;
+                    }
+                });
+                continue;
+            }
             // An external server is never crash-stopped or idle-stopped by Setu; if it exits the run is simply stopped.
             if r.procs.iter().any(supervisor::is_external) {
                 // The run lives while the listener's group (or bare listener) lives.
@@ -1054,7 +1108,7 @@ impl Daemon {
     pub fn describe(&self, k: &str) -> Result<Value> {
         let inner = self.lock();
         let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
-        Ok(run_json(&self.db, k, r))
+        Ok(run_json(&self.db, k, r, inner.no_server(r)))
     }
 
     /// `describe` on the blocking pool (it reads the claim from the database).
@@ -1092,7 +1146,7 @@ impl Daemon {
                             None => (false, None),
                         }
                     };
-                    let mut v = run_json(&self.db, k, r);
+                    let mut v = run_json(&self.db, k, r, inner.no_server(r));
                     v["stale_env"] = json!(stale);
                     v["config_error"] = json!(config_error);
                     v["removal"] = match (&gcfg, &auto) {
@@ -1420,6 +1474,7 @@ impl Daemon {
 
     pub async fn worktree_new(self: &Arc<Self>, actor: &str, client: Option<&str>, project: &str, branch: &str, from: Option<&str>, start: bool) -> Result<Value> {
         let cfg = self.project_config(project)?;
+        let has_procs = !cfg.procs.is_empty();
         let existing: std::collections::BTreeSet<String> = self.lock().state.runs.keys().cloned().collect();
         let me = Arc::clone(self);
         let (b, f) = (branch.to_string(), from.map(String::from));
@@ -1460,7 +1515,8 @@ impl Daemon {
             }
         });
         worktree::audit(actor, client, "new", &k, json!({ "branch": out.branch, "base": out.base, "path": out.path }));
-        if start {
+        // A project with no dev server has nothing to start; its worktree is still created and adopted.
+        if start && has_procs {
             self.start(&k).await?;
         }
         let mut v = self.describe_async(&k).await?;
@@ -1859,20 +1915,26 @@ fn claim_json(db: &Db, k: &str) -> Value {
     }
 }
 
-fn run_json(db: &Db, k: &str, r: &RunRecord) -> Value {
+fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
     let ram = if r.procs.is_empty() { 0 } else { supervisor::run_footprint(&r.procs) };
+    // A project with no procs has no URL to open: its status is `no-server` and the note says what to add.
+    let (status, url, note) = if no_server {
+        (json!("no-server"), Value::Null, Some(no_server_msg(k, &r.spec.id.project)))
+    } else {
+        (json!(r.status), json!(r.spec.url), r.note.clone())
+    };
     json!({
         "run": k,
-        "url": r.spec.url,
+        "url": url,
         "aliases": r.spec.aliases,
         "external": r.procs.iter().any(supervisor::is_external),
-        "status": r.status,
+        "status": status,
         "pinned": r.pinned,
         "ram_bytes": ram,
         "ports": r.spec.ports,
         "worktree": r.spec.worktree,
         "procs": r.procs.iter().map(|p| json!({"name": p.name, "pid": p.pid})).collect::<Vec<_>>(),
-        "note": r.note,
+        "note": note,
         "claim": claim_json(db, k),
     })
 }
@@ -1883,8 +1945,13 @@ impl Routes for Daemon {
         let Some(k) = inner.hosts.get(host) else { return Lookup::Unknown };
         let Some(r) = inner.state.runs.get(k) else { return Lookup::Unknown };
         let run = r.spec.id.clone();
+        if inner.no_server(r) {
+            return Lookup::NoServer { run };
+        }
         match (r.status, r.spec.web_port) {
             (RunStatus::Running, Some(port)) => Lookup::Up { run, port },
+            // Procs without a port: it runs, but there is nothing for a browser to reach.
+            (RunStatus::Running, None) => Lookup::NoHttp { run },
             (RunStatus::Starting, _) | (RunStatus::Stopping, _) => Lookup::Starting { run },
             (RunStatus::Preparing, _) => Lookup::Preparing { installing: inner.installing.contains(k.as_str()), run },
             (RunStatus::SetupFailed, _) => Lookup::SetupFailed { run },
@@ -1894,11 +1961,13 @@ impl Routes for Daemon {
 
     fn request_start(&self, run: &RunId) -> std::result::Result<(), String> {
         // Needs an Arc to spawn; the daemon registers itself in `handle()` at startup.
-        let me = SELF.get().cloned().ok_or("daemon not ready")?;
         let k = key(run);
         {
             let inner = self.lock();
             let r = inner.state.runs.get(&k).ok_or("unknown run")?;
+            if inner.no_server(r) {
+                return Err(no_server_msg(&k, &run.project));
+            }
             match r.status {
                 RunStatus::Preparing => return Err(format!("{k} is still being prepared (setup is running)")),
                 RunStatus::SetupFailed => return Err(format!("setup failed for {k}; run `setu retry-setup {k}`")),
@@ -1914,6 +1983,7 @@ impl Routes for Daemon {
                 }
             }
         }
+        let me = SELF.get().cloned().ok_or("daemon not ready")?;
         tokio::spawn(async move {
             if let Err(e) = me.start(&k).await {
                 eprintln!("setu: on-demand start of {k} failed: {e:#}");
@@ -2549,7 +2619,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(f.wt.join("keep.txt")).unwrap(), "mine");
         let disk = crate::state::load(&f.d.db).unwrap();
         assert!(!disk.runs.contains_key(&f.k) && !disk.leases.contains_key(&f.k));
-        let ev = f.d.events(Some("worktree"), Some(&f.k), None, 50).unwrap();
+        // Audit events are written on a blocking thread; wait for it instead of racing it.
+        let mut ev = serde_json::Value::Null;
+        for _ in 0..50 {
+            ev = f.d.events(Some("worktree"), Some(&f.k), None, 50).unwrap();
+            if ev.to_string().contains("forget") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         assert!(ev.to_string().contains("forget"), "{ev}");
         assert!(f.d.worktree_forget("cli", None, &f.k).await.is_err(), "unknown after forgetting");
     }
@@ -2745,7 +2823,7 @@ mod tests {
         let wf = crate::worktree::tests::fx("b10");
         let (go, fail) = (sb.dir.join("go"), sb.dir.join("fail"));
         let toml = format!(
-            "project = \"app\"\nrepo = '{}'\ndomain = \"app.local\"\n[worktree]\nmin_free = \"0\"\n[[setup.step]]\nname = \"slow\"\nrun = 'i=0; while [ ! -f {} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; [ ! -f {} ]'\n",
+            "project = \"app\"\nrepo = '{}'\ndomain = \"app.local\"\n[worktree]\nmin_free = \"0\"\n[[setup.step]]\nname = \"slow\"\nrun = 'i=0; while [ ! -f {} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; [ ! -f {} ]'\n[procs.w]\nrun = 'exec sleep 300719'\n",
             wf.repo.display(),
             go.display(),
             fail.display()
@@ -3227,5 +3305,66 @@ while True:
         assert!(all_gone(&side, &sm).await, "leftover sidecar group stopped");
         let rec = d.lock().state.runs[&k].clone();
         assert!(rec.status == RunStatus::Stopped && rec.procs.is_empty(), "{:?} {:?}", rec.status, rec.procs);
+    }
+
+    const NO_SERVER_MSG: &str = "tp/r has no dev server configured. Add a [procs.web] to ~/.config/setu/projects/tp.toml";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_project_with_no_procs_is_never_started_and_reports_no_server() {
+        let f = fixture(&[], "");
+        let (d, k) = (f.d.clone(), f.k.clone());
+        // start and restart refuse with the clear message and change nothing.
+        let e = d.start(&k).await.unwrap_err();
+        assert_eq!(format!("{e:#}"), NO_SERVER_MSG);
+        let e = d.require_server(&k).await.unwrap_err();
+        assert_eq!(format!("{e:#}"), NO_SERVER_MSG);
+        assert_eq!(status(&f), RunStatus::Stopped);
+        assert_eq!(recorded(&f), 0);
+        // ls and describe: status no-server, no URL, the note says what to add.
+        let ls = d.list();
+        let v = &ls.as_array().unwrap()[0];
+        assert_eq!((v["status"].as_str(), v["url"].is_null(), v["note"].as_str()), (Some("no-server"), true, Some(NO_SERVER_MSG)));
+        assert_eq!(d.describe(&k).unwrap()["status"], "no-server");
+        // The proxy hears NoServer and an on-demand start is refused too.
+        assert!(matches!(d.lookup(&format!("r.tp.local")), Lookup::NoServer { .. }));
+        assert_eq!(d.request_start(&RunId { project: "tp".into(), run: "r".into() }).unwrap_err(), NO_SERVER_MSG);
+        // The worktree stays adopted: it can be claimed and released, and is still a run.
+        d.claim("t", None, &k, "agent", None).unwrap();
+        assert_eq!(d.claims_list().as_array().unwrap().len(), 1);
+        d.release("t", None, &k, Some("agent")).unwrap();
+        assert!(d.lock().state.runs.contains_key(&k));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_no_server_run_left_crashed_by_an_older_daemon_is_no_server_not_a_crash() {
+        let f = fixture(&[], "");
+        f.d.set(&f.k, |r| {
+            r.status = RunStatus::Crashed;
+            r.note = Some("the web process is gone".into());
+        });
+        let v = f.d.describe(&f.k).unwrap();
+        assert_eq!((v["status"].as_str(), v["note"].as_str()), (Some("no-server"), Some(NO_SERVER_MSG)));
+        f.d.set(&f.k, |r| r.status = RunStatus::Running);
+        f.d.sweep().await;
+        assert_eq!(status(&f), RunStatus::Stopped, "a no-proc run is never crash-stopped");
+        assert!(f.d.lock().state.runs[&f.k].note.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn procs_without_a_port_start_normally_and_the_url_says_no_http() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300703".to_string())], "");
+        let host = "r.tp.local";
+        f.d.start(&f.k).await.unwrap();
+        for _ in 0..100 {
+            if status(&f) == RunStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status(&f), RunStatus::Running);
+        assert!(matches!(f.d.lookup(host), Lookup::NoHttp { .. }));
+        assert_eq!(f.d.describe(&f.k).unwrap()["status"], "running");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        pkill("sleep 300703");
     }
 }

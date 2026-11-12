@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
@@ -254,6 +254,12 @@ async fn handle(
         Lookup::SetupFailed { run } => {
             return page(StatusCode::SERVICE_UNAVAILABLE, &format!("Setup failed for {run}"), &format!("The new worktree's setup did not finish, so it was not started. Fix the cause (see the setup log), then run `setu retry-setup {run}`."), false);
         }
+        Lookup::NoServer { run } => {
+            return page(StatusCode::SERVICE_UNAVAILABLE, &format!("{run} has no dev server"), &format!("{run} has no dev server configured. Add a [procs.web] to ~/.config/setu/projects/{}.toml", run.project), false);
+        }
+        Lookup::NoHttp { run } => {
+            return page(StatusCode::SERVICE_UNAVAILABLE, &format!("{run} serves no HTTP"), &format!("{run} serves no HTTP: none of its procs has a port. Give a proc `port = \"web\"` in ~/.config/setu/projects/{}.toml to get a URL here.", run.project), false);
+        }
         Lookup::Down { run } => {
             if let Err(msg) = st.routes.request_start(&run) {
                 return page(
@@ -383,15 +389,6 @@ async fn forward(
         .path_and_query()
         .map_or("/", |p| p.as_str())
         .to_string();
-    let Ok(uri) = format!("http://127.0.0.1:{port}{pq}").parse() else {
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Bad request",
-            "Invalid request target.",
-            false,
-        );
-    };
-    *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_11;
 
     let h = req.headers_mut();
@@ -427,14 +424,23 @@ async fn forward(
     let client_upgrade = is_upgrade.then(|| hyper::upgrade::on(&mut req));
 
     // The server may still be binding: wait for the port before sending the (unreplayable) request.
-    if !wait_for_port(port).await {
+    let Some(fam) = wait_for_port(run, port).await else {
         return page(
             StatusCode::BAD_GATEWAY,
             "Bad gateway",
             &format!("{run} is not answering on port {port}"),
             false,
         );
-    }
+    };
+    let Ok(uri) = format!("http://{}:{port}{pq}", fam.authority_host()).parse() else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Bad request",
+            "Invalid request target.",
+            false,
+        );
+    };
+    *req.uri_mut() = uri;
     let mut resp = match st.client.request(req).await {
         Ok(r) => r,
         Err(e) => {
@@ -467,17 +473,10 @@ async fn forward(
     Response::from_parts(parts, boxed(GuardedBody::new(body, guard)))
 }
 
-async fn wait_for_port(port: u16) -> bool {
-    let deadline = tokio::time::Instant::now() + CONNECT_RETRY;
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(RETRY_STEP).await;
-    }
+/// Wait for the upstream to accept a connection on either loopback family (IPv4 first); the
+/// family that answered decides the request's target.
+async fn wait_for_port(run: &RunId, port: u16) -> Option<crate::upstream::Family> {
+    crate::upstream::wait(run, port, CONNECT_RETRY, Duration::from_millis(250), RETRY_STEP).await
 }
 
 #[cfg(test)]
@@ -489,6 +488,7 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     struct Mock {
         map: Mutex<HashMap<String, Lookup>>,
@@ -947,5 +947,93 @@ mod tests {
         );
         assert!(t0.elapsed() >= CONNECT_RETRY);
         assert_eq!(act.snapshot(&rid("a")).in_flight, 0);
+    }
+
+    /// A dev server that listens only on `[::1]` (like `mintlify dev`): plain HTTP, and a
+    /// websocket-style upgrade that echoes. Returns the child and its port.
+    fn v6_only_server() -> (std::process::Child, u16) {
+        let script = r#"
+import socket, http.server, sys
+class S(http.server.HTTPServer):
+    address_family = socket.AF_INET6
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.end_headers()
+            self.wfile.flush()
+            while True:
+                d = self.connection.recv(1024)
+                if not d: break
+                self.connection.sendall(d)
+            self.close_connection = True
+            return
+        b = b"hello-from-v6"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+s = S(("::1", 0), H)
+print(s.server_address[1], flush=True)
+s.serve_forever()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut line).unwrap();
+        (child, line.trim().parse().expect("python printed its port"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn b20_an_upstream_listening_only_on_ipv6_is_reached_for_http_and_upgrade_and_readiness_agrees() {
+        let (mut child, port) = v6_only_server();
+        let run = rid("v6only");
+        // Readiness (the daemon's probe) and the proxy must agree that it is up.
+        assert!(crate::supervisor::wait_port(&run, port, Duration::from_secs(3)).await, "readiness");
+        assert_eq!(crate::upstream::remembered(&run, port), Some(crate::upstream::Family::V6));
+        let m = Mock::new();
+        m.set("a.test", Lookup::Up { run: run.clone(), port });
+        let (p, _) = proxy(&m).await;
+        let r = raw(p, &get("a.test", "")).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("hello-from-v6"), "{r}");
+        let mut c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+        c.write_all(b"GET /ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = c.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "closed before 101: {}", String::from_utf8_lossy(&buf));
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 101"), "{}", String::from_utf8_lossy(&buf));
+        c.write_all(b"hello").await.unwrap();
+        let mut echo = [0u8; 5];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_with_no_dev_server_or_no_http_gets_a_plain_page_not_starting_forever() {
+        let m = Mock::new();
+        m.set("n.test", Lookup::NoServer { run: rid("n") });
+        m.set("h.test", Lookup::NoHttp { run: rid("h") });
+        let (p, _) = proxy(&m).await;
+        let r = raw(p, &get("n.test", "Accept: text/html\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 503") && !r.contains("refresh"), "{r}");
+        assert!(r.contains("p/n has no dev server configured. Add a [procs.web] to ~/.config/setu/projects/p.toml"), "{r}");
+        assert!(!r.contains("Starting"), "{r}");
+        let r = raw(p, &get("h.test", "Accept: text/html\r\n")).await;
+        assert!(r.contains("p/h serves no HTTP") && !r.contains("refresh") && !r.contains("Starting"), "{r}");
+        assert_eq!(m.starts.load(Ordering::SeqCst), 0);
     }
 }

@@ -243,6 +243,10 @@ pub enum Lookup {
     Preparing { run: RunId, installing: bool },
     /// Setup failed: never started on demand; the proxy says how to retry.
     SetupFailed { run: RunId },
+    /// The project declares no procs: there is nothing to start.
+    NoServer { run: RunId },
+    /// The run has procs but none has a port, so nothing serves HTTP.
+    NoHttp { run: RunId },
     Unknown,
 }
 

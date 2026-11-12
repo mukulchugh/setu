@@ -373,6 +373,7 @@ func statusSymbol(_ r: Run) -> (name: String, color: Color, word: String) {
     case "crashed": ("exclamationmark.circle.fill", .red, "Crashed")
     case "preparing": ("circle.dotted", .orange, "Preparing")
     case "setup-failed": ("exclamationmark.triangle.fill", .red, "Setup failed")
+    case "no-server": ("minus.circle", .secondary, "No dev server")
     default: ("circle", .secondary, "Stopped")
     }
 }
