@@ -10,6 +10,7 @@
 - `crates/setu/e2e/*-e2e.sh <binary>`: each script runs in its own HOME and SETU_HOME, on non-80 ports.
 - `scripts/test-cutover-sandbox.sh <binary>`: `setu migrate` run and rollback in a fake home.
 - `scripts/test-swift.sh`: the app tests. They work with Command Line Tools only.
+- `scripts/release.sh <version> [--publish]`: releases are built and published from this Mac. There is no CI on purpose.
 
 ## Rules
 - The daemon is the only writer of state (`setu.db`, a Turso database). The CLI, the app and MCP all go through the socket.
