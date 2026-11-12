@@ -6,7 +6,7 @@ publish = false
 description = "Runs every worktree's app and workers side by side, each at its own local URL"
 repository = "https://github.com/mukulchugh/setu"
 homepage = "https://github.com/mukulchugh/setu"
-license = "UNLICENSED"
+license = "MIT"
 
 [[bin]]
 name = "setu"
