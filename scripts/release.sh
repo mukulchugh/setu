@@ -33,7 +33,7 @@ done
 MAIN_VERSION="$(git show origin/main:crates/setu/Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
 [ "$MAIN_VERSION" = "$VERSION" ] || die "origin/main is at version $MAIN_VERSION, not $VERSION; bump crates/setu/Cargo.toml and merge first"
 
-if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+if [ "$PUBLISH" = "--publish" ] && git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   [ "$(git rev-parse "$TAG^{commit}")" = "$(git rev-parse origin/main)" ] || die "$TAG already exists and is not origin/main"
 fi
 if [ "$PUBLISH" = "--publish" ] && gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
