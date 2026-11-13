@@ -49,11 +49,11 @@ git --git-dir="$COMMON" worktree add -q --detach "$WORK/src" origin/main
 cd "$WORK/src"
 
 say "running cargo test"
-CARGO_TARGET_DIR="$WORK/target" cargo test -q 2>&1 | grep -E "^test result" || die "tests failed"
+CARGO_TARGET_DIR="$WORK/src/target" cargo test -q 2>&1 | grep -E "^test result" || die "tests failed"
 
 say "building $TAG for Apple silicon and Intel"
-CARGO_TARGET_DIR="$WORK/target" dist build --tag "$TAG" --artifacts=all > "$WORK/dist.log" 2>&1 || { tail -20 "$WORK/dist.log"; die "dist build failed"; }
-OUT="$WORK/target/distrib"
+CARGO_TARGET_DIR="$WORK/src/target" dist build --tag "$TAG" --artifacts=all > "$WORK/dist.log" 2>&1 || { tail -20 "$WORK/dist.log"; die "dist build failed"; }
+OUT="$WORK/src/target/distrib"
 for f in setu-aarch64-apple-darwin.tar.xz setu-x86_64-apple-darwin.tar.xz setu.rb sha256.sum; do
   [ -s "$OUT/$f" ] || die "missing artifact $f"
 done
