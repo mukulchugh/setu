@@ -670,6 +670,7 @@ async fn setup_cmd(args: &[String]) -> Result<()> {
     use crate::setup::{self, Layout, RealSys};
     let flag = |f: &str| args.iter().any(|a| a == f);
     if flag("--undo") {
+        agent_guard()?;
         for line in setup::undo(&Layout::real(), &RealSys)? {
             println!("{line}");
         }
@@ -706,6 +707,7 @@ async fn setup_cmd(args: &[String]) -> Result<()> {
             }
         }
         let system: Vec<_> = steps.iter().filter(|s| s.id != "app").cloned().collect();
+        agent_guard()?;
         let record = setup::apply(&system, &mut gcfg, &ctx.binary, &ctx.layout, ctx.sys)?;
         println!("done. Recorded in {}. Undo with `setu setup --undo`.", setup::record_path().display());
         if let Some(p) = record.plist {
@@ -756,11 +758,26 @@ fn needs_daemon(args: &[String]) -> bool {
     }
 }
 
+/// The LaunchAgent label is machine-wide, so a Setu with a custom root (`SETU_HOME`: tests,
+/// sandboxes, a second install) must never install, reload or kickstart it: that would replace
+/// the user's real service. `SETU_ALLOW_AGENT=1` opts in, for tests that shim `launchctl`.
+fn agent_guard() -> Result<()> {
+    if std::env::var_os("SETU_HOME").is_some() && std::env::var_os("SETU_ALLOW_AGENT").is_none() {
+        bail!(
+            "{}
+SETU_HOME is set, so Setu will not install or start the login service (it is shared by the whole machine). Start this root's daemon with `setu daemon`.",
+            api::DaemonDown
+        );
+    }
+    Ok(())
+}
+
 /// Make sure a daemon answers before a command that needs one: first-run setup, or a kickstart.
 async fn ensure_ready(say: &mut dyn FnMut(&str)) -> Result<()> {
     if api::daemon_up() {
         return Ok(());
     }
+    agent_guard()?;
     if with_real_ctx(|ctx| crate::onboard::ensure_daemon(ctx, say))?? == crate::onboard::Ensure::SetUp {
         doctor_summary(say).await;
     }
@@ -789,6 +806,7 @@ async fn doctor_summary(say: &mut dyn FnMut(&str)) {
 /// Bare `setu`: first run sets everything up and says what to do next; afterwards it lists runs.
 async fn bare() -> Result<()> {
     if with_real_ctx(|ctx| !crate::onboard::installed(&ctx.layout))? {
+        agent_guard()?;
         let mut say = |l: &str| println!("{l}");
         say("Welcome to Setu. Setting it up now...");
         with_real_ctx(|ctx| crate::onboard::first_run(ctx, &mut say))??;
