@@ -37,7 +37,7 @@ pub fn load(db: &Db) -> Result<State> {
 pub fn load_conn(c: &Conn) -> Result<State> {
     let mut st = State::default();
     let rows = c.query(
-        "SELECT key, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json FROM runs ORDER BY key",
+        "SELECT key, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json, custom_aliases_json FROM runs ORDER BY key",
         (),
         |r| {
             Ok((
@@ -51,10 +51,11 @@ pub fn load_conn(c: &Conn) -> Result<State> {
                 r.get::<Option<i64>>(7)?,
                 r.get::<Option<String>>(8)?,
                 r.get::<String>(9)?,
+                r.get::<String>(10)?,
             ))
         },
     )?;
-    for (key, spec, status, pinned, note, stopped, started, request, hash, procs) in rows {
+    for (key, spec, status, pinned, note, stopped, started, request, hash, procs, aliases) in rows {
         let rec = RunRecord {
             spec: serde_json::from_str(&spec).with_context(|| format!("run {key}: bad spec in the database"))?,
             status: serde_json::from_value(serde_json::Value::String(status)).with_context(|| format!("run {key}: bad status"))?,
@@ -65,6 +66,7 @@ pub fn load_conn(c: &Conn) -> Result<State> {
             env_hash: hash.and_then(|h| h.parse().ok()),
             last_started_at: started.map(|v| v as u64),
             last_request_at: request.map(|v| v as u64),
+            custom_aliases: serde_json::from_str(&aliases).with_context(|| format!("run {key}: bad custom aliases"))?,
         };
         st.runs.insert(key, rec);
     }
@@ -80,11 +82,11 @@ pub fn save_tx(tx: &Conn, s: &State) -> Result<()> {
     tx.execute("DELETE FROM leases", ())?;
     for (k, r) in &s.runs {
         tx.execute(
-            "INSERT INTO runs (key, project, run, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO runs (key, project, run, spec_json, status, pinned, note, stopped_at, last_started_at, last_request_at, env_hash, procs_json, custom_aliases_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(key) DO UPDATE SET project=excluded.project, run=excluded.run, spec_json=excluded.spec_json, status=excluded.status,
                pinned=excluded.pinned, note=excluded.note, stopped_at=excluded.stopped_at, last_started_at=excluded.last_started_at,
-               last_request_at=excluded.last_request_at, env_hash=excluded.env_hash, procs_json=excluded.procs_json",
+               last_request_at=excluded.last_request_at, env_hash=excluded.env_hash, procs_json=excluded.procs_json, custom_aliases_json=excluded.custom_aliases_json",
             params![
                 k.clone(),
                 r.spec.id.project.clone(),
@@ -98,6 +100,7 @@ pub fn save_tx(tx: &Conn, s: &State) -> Result<()> {
                 r.last_request_at.map(|v| v as i64),
                 r.env_hash.map(|h| h.to_string()),
                 serde_json::to_string(&r.procs)?,
+                serde_json::to_string(&r.custom_aliases)?,
             ],
         )?;
     }
@@ -142,7 +145,7 @@ mod tests {
             idle: Duration::from_secs(60),
             aliases: vec![],
         };
-        s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None, env_hash: Some(u64::MAX), last_started_at: None, last_request_at: None });
+        s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None, env_hash: Some(u64::MAX), last_started_at: None, last_request_at: None, custom_aliases: vec![] });
         s.leases.insert("p/r".into(), BTreeMap::from([("web".to_string(), 4001u16)]));
         s
     }

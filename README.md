@@ -51,6 +51,18 @@ setu ls                       # every run: status, real memory, URL
 
 Already have worktrees? `setu adopt <path>` registers one without touching it.
 
+### Custom URLs
+
+Give any run, branches included, an extra hostname:
+
+```bash
+setu alias my-feature demo.example.test    # <run> is project/run, a run name, or . for this worktree
+setu alias ls [run]                        # extra URLs (config and custom); `setu ls` shows +N
+setu alias rm my-feature demo.example.test
+```
+
+It routes like the main URL (on-demand start, websockets, status pages). Names must be unique across all runs and projects. Names outside a project `domain`, `localhost` or an installed resolver are accepted with a warning that nothing resolves them yet: add the domain as a project `domain` or run `setu setup` (`.test` is better than `.local`). Custom URLs are stored with the run, survive restarts, and are dropped by `setu rm`/`forget`; `setu restore` does not bring them back. `{url}` in env stays the main URL, so an app that checks allowed origins may need the alias added.
+
 ## What it does
 
 | | |
@@ -60,14 +72,14 @@ Already have worktrees? `setu adopt <path>` registers one without touching it.
 | **Env** | Global, project and worktree layers. Secrets are stored separately, shown masked, and redacted from logs. Agents never see their values. |
 | **Disk** | `setu disk` shows what each worktree really costs, counting APFS clones correctly. `setu disk clean` removes only declared, rebuildable output from stopped worktrees. |
 | **Worktrees** | `new`, `adopt`, `rm` and `restore`. Removal archives ignored files and keeps the branch. Agents take writer claims on a worktree. Optional auto-removal applies to merged worktrees only. |
-| **Agents** | `setu mcp` is a stdio MCP server with 20 tools for runs, logs, env, disk and worktrees. |
+| **Agents** | `setu mcp` is a stdio MCP server with 23 tools for runs, aliases, logs, env, disk and worktrees. |
 | **App** | Setu.app: Runs, Environments, Disk and Config, in the menu bar or a window. |
 
 ## Commands
 
 ```
 setu ls | up | down | restart | logs [-f] | path | cd
-setu new | adopt | rm | restore | forget | claim | release | claims
+setu new | adopt | rm | restore | forget | claim | release | claims | alias
 setu env set | unset | list | import | effective
 setu disk [clean]
 setu setup | doctor | migrate | history | mcp

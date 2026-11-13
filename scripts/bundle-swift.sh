@@ -8,9 +8,11 @@ APP="$ROOT/target-swift/Setu.app"
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/crates/setu/Cargo.toml" | head -1)"
 : "${VERSION:?could not read the version from crates/setu/Cargo.toml}"
 
+# shellcheck source=swift-sdk.sh
+. "$ROOT/scripts/swift-sdk.sh"
 cd "$ROOT/apps/setu-swift"
-swift build -c release
-SWIFT_BIN="$(swift build -c release --show-bin-path)/SetuApp"
+swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"}
+SWIFT_BIN="$(swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} --show-bin-path)/SetuApp"
 
 cd "$ROOT"
 cargo build --release -p setu

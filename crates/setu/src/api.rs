@@ -60,7 +60,7 @@ fn s<'a>(req: &'a Value, field: &str) -> Option<&'a str> {
     req.get(field).and_then(Value::as_str)
 }
 
-async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
+pub(crate) async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
     let cmd = s(req, "cmd").ok_or_else(|| anyhow!("missing cmd"))?;
     match cmd {
         "ping" => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
@@ -209,6 +209,19 @@ async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
                 bail!("agents can only preview auto-removal; ask the user to run `setu autoremove`");
             }
             d.autoremove(dry).await
+        }
+        "alias.add" | "alias.rm" => {
+            let k = target(d, req)?;
+            let host = s(req, "host").ok_or_else(|| anyhow!("{cmd} needs a host"))?;
+            if cmd == "alias.add" {
+                d.alias_add(actor(req), client(req), &k, host).await
+            } else {
+                d.alias_remove(actor(req), client(req), &k, host).await
+            }
+        }
+        "alias.ls" => {
+            let k = if s(req, "run").is_some() || s(req, "path").is_some() { Some(target(d, req)?) } else { None };
+            blocking(d, move |d| d.alias_list(k.as_deref())).await
         }
         "autoremove.candidates" => blocking(d, |d| d.autoremove_candidates()).await,
         other => bail!("unknown cmd {other}"),

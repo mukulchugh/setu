@@ -440,7 +440,7 @@ pub fn generate_config(project: &str, repo_display: &str, domain: &str, inferred
     }
     t.push_str("preset  = \"auto\"\nidle    = \"30m\"\n\n[ports]\nweb = {}\n");
     if stack.inngest {
-        t.push_str("inngest = {}\n");
+        t.push_str("inngest = {}\n# Inngest dev also opens a connect gateway and two gRPC ports; lease them so worktrees never collide.\ninngest_gw = {}\ninngest_gw_grpc = {}\ninngest_exec_grpc = {}\n");
     }
     // The env v1's .envrc wrote, plus what v1's portal gave its sidecars.
     let mut env: Vec<(&str, &str)> = Vec::new();
@@ -479,7 +479,7 @@ pub fn generate_config(project: &str, repo_display: &str, domain: &str, inferred
     }
     if stack.inngest {
         t.push_str("\n# Inngest dev server (`brew install inngest/tap/inngest`; the binary is `inngest`), on its own port.\n");
-        t.push_str("[procs.inngest]\nrun = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery\"\n");
+        t.push_str("[procs.inngest]\nrun = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery --connect-gateway-port {port.inngest_gw} --connect-gateway-grpc-port {port.inngest_gw_grpc} --connect-executor-grpc-port {port.inngest_exec_grpc}\"\n");
     }
     if let Some(dir) = &stack.trigger {
         t.push_str("\n# The Trigger.dev CLI version follows the worktree's pinned SDK; --branch only where supported.\n");
@@ -848,14 +848,15 @@ mod tests {
             "TRIGGER_DEV_BRANCH = \"{run}\"",
             "TRIGGER_PREVIEW_BRANCH = \"{run}\"",
             "run = \"bun run dev\"",
-            "run = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery\"",
+            "run = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery --connect-gateway-port {port.inngest_gw} --connect-gateway-grpc-port {port.inngest_gw_grpc} --connect-executor-grpc-port {port.inngest_exec_grpc}\"",
+            "inngest_gw = {}",
             "run = \"setu x trigger-dev --max-concurrent-runs 2 --env-file apps/quivly-app/.env.local\"",
         ] {
             assert!(squeezed.contains(want), "missing {want:?} in:\n{t}");
         }
         assert!(!t.contains("[procs.convex]"));
         let cfg = config::parse_project(&t, Path::new("quivly-app.toml")).unwrap();
-        let run = config::resolve_run(&cfg, Path::new("/w"), "feat-x", &BTreeMap::from([("web".to_string(), 4001u16), ("inngest".to_string(), 4002u16)]), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let run = config::resolve_run(&cfg, Path::new("/w"), "feat-x", &BTreeMap::from([("web".to_string(), 4001u16), ("inngest".to_string(), 4002u16), ("inngest_gw".to_string(), 4003u16), ("inngest_gw_grpc".to_string(), 4004u16), ("inngest_exec_grpc".to_string(), 4005u16)]), &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(run.env["TRIGGER_DEV_BRANCH"], "feat-x");
         assert_eq!(run.env["INNGEST_BASE_URL"], "http://127.0.0.1:4002");
         assert_eq!(run.env["NEXT_PUBLIC_WORKOS_REDIRECT_URI"], format!("{}/authentication/callback", run.env["NEXT_PUBLIC_APP_BASE_URL"]));

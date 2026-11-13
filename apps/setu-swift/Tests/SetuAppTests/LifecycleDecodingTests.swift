@@ -121,3 +121,16 @@ private func fixture(_ name: String) throws -> Data {
     #expect(branchProblem("feat\tx") != nil)
     #expect(branchProblem("feat/x") == nil)
 }
+
+@Test func lsCarriesConfigAndCustomAliases() throws {
+    let runs: [Run] = try decodeReply(fixture("ls-aliases"))
+    let run = try #require(runs.first)
+    #expect(run.aliases.map(\.host) == ["old.acme.localhost", "demo.acme.test"])
+    #expect(run.aliases.map(\.source) == ["config", "custom"])
+    #expect(run.aliasURL("demo.acme.test") == "http://demo.acme.test:7777")
+    // entries from a daemon that predates custom aliases decode with none
+    let plain: [Run] = try decodeReply(fixture("ls-no-server"))
+    #expect(plain[0].aliases.isEmpty)
+    let old: [Run] = try decodeReply(fixture("ls"))
+    #expect(old[0].aliases.isEmpty)
+}

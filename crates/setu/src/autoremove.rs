@@ -1234,7 +1234,7 @@ mod tests {
             idle: Duration::from_secs(1),
             aliases: vec![],
         };
-        let rec = RunRecord { spec, status: RunStatus::Crashed, pinned: true, procs: vec![], note: None, stopped_at: Some(7), env_hash: None, last_started_at: Some(3), last_request_at: None };
+        let rec = RunRecord { spec, status: RunStatus::Crashed, pinned: true, procs: vec![], note: None, stopped_at: Some(7), env_hash: None, last_started_at: Some(3), last_request_at: None, custom_aliases: vec![] };
         let mut runs = BTreeMap::new();
         runs.insert(format!("app/{}", o.run), rec);
         let items = items_from(std::slice::from_ref(&f.cfg), &runs, |k| (k.ends_with("it")).then(|| "me".to_string()));

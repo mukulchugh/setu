@@ -81,6 +81,21 @@ for _ in $(seq 1 50); do "$BIN" ls | grep -q "e2e/feat-one *running" && break; s
 "$BIN" ls | grep "e2e/feat-one" | grep -q running || fail "run did not reach running"
 "$BIN" ls
 
+step "custom URL: a branch run answers at demo.e2e.local (setu alias)"
+"$BIN" alias e2e/feat-one Demo.e2e.local | tee "$SB/alias.out"
+grep -q "now also answers at http://demo.e2e.local:17780" "$SB/alias.out" || fail "alias add output"
+for _ in $(seq 1 30); do curl -s -H "Host: demo.e2e.local" http://127.0.0.1:17780/ | grep -q "Directory listing" && break; sleep 0.3; done
+curl -s -H "Host: demo.e2e.local" http://127.0.0.1:17780/ | grep -q "Directory listing" || fail "alias host did not reach the run"
+curl -s -H "Host: feat-one.e2e.local" http://127.0.0.1:17780/ | grep -q "Directory listing" || fail "main host stopped working"
+expect_fail "main URL" "$BIN" alias e2e/feat-one feat-one.e2e.local
+expect_fail "IP address" "$BIN" alias e2e/feat-one 10.1.2.3
+"$BIN" alias ls e2e/feat-one | grep -q "demo.e2e.local" || fail "alias ls"
+"$BIN" ls | grep "e2e/feat-one" | grep -q " +1" || fail "ls should show +1"
+"$BIN" ls --json | python3 -I -c 'import json,sys; r=[x for x in json.load(sys.stdin) if x["run"]=="e2e/feat-one"][0]; assert r["aliases"]==["demo.e2e.local"] and r["alias_sources"]==[{"host":"demo.e2e.local","source":"custom"}], r; print("ls json aliases ok")'
+(cd "$SB/app/feat/one" && "$BIN" alias . second.e2e.local >/dev/null && "$BIN" alias rm . second.e2e.local >/dev/null) || fail "alias with ."
+for _ in $(seq 1 30); do HIST=$("$BIN" history e2e/feat-one --kind worktree); case "$HIST" in *alias-add*) break;; esac; sleep 0.2; done
+case "$HIST" in *alias-add*alias-add*) ;; *alias-add*) ;; *) fail "alias-add event missing";; esac
+
 step "ignored local data appears"
 echo "precious rows" > "$WT/local.db"
 
@@ -101,17 +116,20 @@ rm -rf "$SNAP"
 
 step "release, then rm (stops the run, archives local.db, removes, keeps branch)"
 "$BIN" release e2e/feat-one
-"$BIN" rm e2e/feat-one
+"$BIN" rm e2e/feat-one | tee "$SB/rm.out"
+grep -q "custom URL(s) dropped: demo.e2e.local" "$SB/rm.out" || fail "rm should name the dropped custom URL"
 [ ! -e "$WT" ] || fail "worktree dir should be gone"
 git -C "$SB/app.git" show-ref --verify refs/heads/feat/one >/dev/null || fail "branch must be kept"
 ARCH=$(ls "$SETU_HOME"/archive/e2e/feat-one/*.tar)
 tar -tf "$ARCH" | grep -q "local.db" || fail "archive should hold local.db"
 if "$BIN" ls | grep -q "e2e/feat-one"; then fail "run should be dropped from ls"; fi
 echo "archive: $ARCH ($(tar -tf "$ARCH" | tr '\n' ' '))"
-"$BIN" rm e2e/feat-one | grep -q "already removed" || fail "second rm should be a no-op"
+OUT2=$("$BIN" rm e2e/feat-one 2>&1 || true); echo "second rm: $OUT2"; case "$OUT2" in *"already removed"*) ;; *) fail "second rm should be a no-op";; esac
 
 step "restore (branch checked out again, local.db back)"
-"$BIN" restore e2e/feat-one
+"$BIN" restore e2e/feat-one | tee "$SB/restore.out"
+grep -q "custom URLs added with .setu alias. are not restored" "$SB/restore.out" || fail "restore must say aliases are not restored"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: demo.e2e.local' http://127.0.0.1:17780/)" != "200" ] || fail "alias must not survive rm/restore"
 [ "$(cat "$WT/local.db")" = "precious rows" ] || fail "local.db not restored"
 [ -L "$WT/.env.local" ] || fail "link not recreated"
 [ "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" = "feat/one" ] || fail "wrong branch after restore"

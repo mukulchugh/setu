@@ -229,6 +229,10 @@ pub struct RunRecord {
     /// Unix seconds of the last request the proxy served for this run (updated at most once a minute).
     #[serde(default)]
     pub last_request_at: Option<u64>,
+    /// Extra hosts added with `setu alias`. They belong to this record (any run, branches
+    /// included), are stored in the database, and are dropped with the run.
+    #[serde(default)]
+    pub custom_aliases: Vec<String>,
 }
 
 /// What the proxy learns about a Host.
