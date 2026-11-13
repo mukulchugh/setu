@@ -268,6 +268,28 @@ fn target(d: &Arc<Daemon>, req: &Value) -> Result<String> {
     bail!("give a run name or a path")
 }
 
+/// The daemon socket did not answer. A distinct type so callers (the CLI's auto-setup, the MCP shim) can tell
+/// "nothing is listening" from an error the daemon itself returned.
+#[derive(Debug)]
+pub struct DaemonDown;
+
+impl std::fmt::Display for DaemonDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "setu daemon is not running. Start it with `setu daemon`.")
+    }
+}
+
+impl std::error::Error for DaemonDown {}
+
+pub fn is_daemon_down(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<DaemonDown>().is_some()
+}
+
+/// One connect attempt, no waiting: does a daemon answer on the socket right now?
+pub fn daemon_up() -> bool {
+    std::os::unix::net::UnixStream::connect(paths::socket_path()).is_ok()
+}
+
 /// Client side: one request, one reply.
 pub async fn call(req: Value) -> Result<Value> {
     let path = paths::socket_path();
@@ -280,7 +302,7 @@ pub async fn call(req: Value) -> Result<Value> {
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(_) => bail!("setu daemon is not running. Start it with `setu daemon`."),
+            Err(_) => return Err(DaemonDown.into()),
         }
     };
     let (read, mut write) = stream.into_split();

@@ -8,8 +8,9 @@ use serde_json::{json, Value};
 const USAGE: &str = "\
 setu: run every worktree's app and workers at its own local URL
 
+  setu                            first run: set everything up; afterwards: setu ls
   setu setup [--dry-run] [--yes] [--undo]
-                                     one-time setup: login PATH, start at login, custom domains
+                                     one-time setup: login PATH, start at login, custom domains, Setu.app
   setu doctor [--json]            check every layer and print the exact fix
   setu daemon                     run the daemon in the foreground
   setu up [path]                  start the run for a worktree (default: current dir)
@@ -139,12 +140,21 @@ fn removal_note(removes_after: u64, now: u64, reason: &str) -> String {
 
 async fn dispatch(args: Vec<String>) -> Result<()> {
     let first = args.first().map(String::as_str);
+    if needs_daemon(&args) {
+        // Output of the command itself stays on stdout (`ls --json` must stay parseable); setup chatter goes to stderr.
+        ensure_ready(&mut |l| eprintln!("{l}")).await?;
+    }
     match first {
-        None | Some("-h" | "--help" | "help") => {
+        None => bare().await,
+        Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             Ok(())
         }
-        Some("daemon") => crate::daemon::run().await,
+        Some("daemon") => match crate::daemon::run().await? {
+            0 => Ok(()),
+            // Not an error: the binary on disk changed, so exit non-zero and let launchd start the new one.
+            code => std::process::exit(code),
+        },
         Some("mcp") => crate::mcp::run().await,
         Some("app") => crate::app::main(&args[1..]),
         Some("recipes") => crate::recipes::main(&args[1..]),
@@ -185,42 +195,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             println!("{} {}", run["run"].as_str().unwrap_or("?"), if c == "pin" { "pinned: idle stop is off" } else { "unpinned" });
             Ok(())
         }
-        Some("ls") => {
-            let runs = api::call(json!({ "cmd": "ls" })).await?;
-            if args.iter().any(|a| a == "--json") {
-                println!("{}", serde_json::to_string_pretty(&runs)?);
-                return Ok(());
-            }
-            let list = runs.as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                println!("no runs yet. In a worktree, run `setu up`.");
-            }
-            for r in list {
-                let mb = r["ram_bytes"].as_u64().unwrap_or(0) / (1024 * 1024);
-                println!(
-                    "{:<44} {:<9} {:>6} MB{}  {}{}",
-                    r["run"].as_str().unwrap_or("?"),
-                    r["status"].as_str().unwrap_or("?"),
-                    mb,
-                    if r["pinned"].as_bool() == Some(true) { " pinned" } else { "" },
-                    format!("{}{}", r["url"].as_str().unwrap_or(""), match r["aliases"].as_array().map_or(0, Vec::len) {
-                        0 => String::new(),
-                        n => format!(" +{n}"),
-                    }),
-                    r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
-                );
-                if let Some(h) = r["claim"]["holder"].as_str() {
-                    println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
-                }
-                if let (Some(after), Some(why)) = (r["removal"]["removes_after"].as_u64(), r["removal"]["reason"].as_str()) {
-                    println!("    {}; `setu pin {}` to keep", removal_note(after, crate::disk::now_secs(), why), r["run"].as_str().unwrap_or("<run>"));
-                }
-                if r["stale_env"].as_bool() == Some(true) {
-                    println!("    env changed since this run started; `setu down` then `setu up` to apply");
-                }
-            }
-            Ok(())
-        }
+        Some("ls") => ls_cmd(&args).await,
         Some("alias") => alias_cmd(&args[1..]).await,
         Some("new") => {
             let (rest, from) = extract_opt(&args[1..], "--from")?;
@@ -413,6 +388,43 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         Some("env") => env(&args[1..]).await,
         Some(other) => bail!("unknown command {other}\n\n{USAGE}"),
     }
+}
+
+async fn ls_cmd(args: &[String]) -> Result<()> {
+    let runs = api::call(json!({ "cmd": "ls" })).await?;
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+    let list = runs.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no runs yet. In a worktree, run `setu up`.");
+    }
+    for r in list {
+        let mb = r["ram_bytes"].as_u64().unwrap_or(0) / (1024 * 1024);
+        println!(
+            "{:<44} {:<9} {:>6} MB{}  {}{}",
+            r["run"].as_str().unwrap_or("?"),
+            r["status"].as_str().unwrap_or("?"),
+            mb,
+            if r["pinned"].as_bool() == Some(true) { " pinned" } else { "" },
+            format!("{}{}", r["url"].as_str().unwrap_or(""), match r["aliases"].as_array().map_or(0, Vec::len) {
+                0 => String::new(),
+                n => format!(" +{n}"),
+            }),
+            r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
+        );
+        if let Some(h) = r["claim"]["holder"].as_str() {
+            println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
+        }
+        if let (Some(after), Some(why)) = (r["removal"]["removes_after"].as_u64(), r["removal"]["reason"].as_str()) {
+            println!("    {}; `setu pin {}` to keep", removal_note(after, crate::disk::now_secs(), why), r["run"].as_str().unwrap_or("<run>"));
+        }
+        if r["stale_env"].as_bool() == Some(true) {
+            println!("    env changed since this run started; `setu down` then `setu up` to apply");
+        }
+    }
+    Ok(())
 }
 
 async fn logs(args: &[String]) -> Result<()> {
@@ -655,54 +667,143 @@ async fn disk(args: &[String]) -> Result<()> {
 }
 
 async fn setup_cmd(args: &[String]) -> Result<()> {
-    use crate::globalcfg::GlobalConfig;
     use crate::setup::{self, Layout, RealSys};
     let flag = |f: &str| args.iter().any(|a| a == f);
-    let sys = RealSys;
-    let layout = Layout::real();
     if flag("--undo") {
-        for line in setup::undo(&layout, &sys)? {
+        for line in setup::undo(&Layout::real(), &RealSys)? {
             println!("{line}");
         }
+        println!("Setu.app is left in place; `setu app uninstall` removes it.");
         return Ok(());
     }
-    let mut gcfg = GlobalConfig::load()?;
     let mut domains: Vec<String> = crate::config::load_all()?.into_iter().map(|c| c.domain).collect();
     domains.sort();
     domains.dedup();
-    let binary = setup::stable_binary_path();
-    let steps = setup::plan(&gcfg, &domains, &binary, &sys);
-    if steps.is_empty() {
-        println!("everything is already set up. `setu doctor` checks it.");
-        return Ok(());
-    }
-    println!("setu setup will:");
-    for s in &steps {
-        println!("  {} {}", if s.sudo { "[sudo]" } else { "      " }, s.description);
-    }
-    if flag("--dry-run") {
-        return Ok(());
-    }
-    if !flag("--yes") {
-        use std::io::{BufRead, Write};
-        print!("continue? [y/N] ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes") {
-            println!("nothing changed");
+    with_real_ctx(|ctx| -> Result<()> {
+        ctx.domains = domains;
+        let mut gcfg = (ctx.load_gcfg)()?;
+        let steps = crate::onboard::plan(ctx, &gcfg);
+        if steps.is_empty() {
+            println!("everything is already set up. `setu doctor` checks it.");
             return Ok(());
         }
+        println!("setu setup will:");
+        for s in &steps {
+            println!("  {} {}", if s.sudo { "[sudo]" } else { "      " }, s.description);
+        }
+        if flag("--dry-run") {
+            return Ok(());
+        }
+        if !flag("--yes") {
+            use std::io::{BufRead, Write};
+            print!("continue? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if !matches!(line.trim(), "y" | "Y" | "yes") {
+                println!("nothing changed");
+                return Ok(());
+            }
+        }
+        let system: Vec<_> = steps.iter().filter(|s| s.id != "app").cloned().collect();
+        let record = setup::apply(&system, &mut gcfg, &ctx.binary, &ctx.layout, ctx.sys)?;
+        println!("done. Recorded in {}. Undo with `setu setup --undo`.", setup::record_path().display());
+        if let Some(p) = record.plist {
+            println!("daemon starts at login from {p}");
+        }
+        if steps.iter().any(|s| s.id == "app") {
+            match crate::onboard::install_app(ctx) {
+                Ok(m) => println!("{m}"),
+                Err(e) => println!("Setu.app not installed: {e:#}"),
+            }
+        }
+        Ok(())
+    })?
+}
+
+/// Build the real onboarding context (real HOME, config, `launchctl` and `sudo` from PATH).
+fn with_real_ctx<R>(f: impl FnOnce(&mut crate::onboard::Ctx) -> R) -> Result<R> {
+    use crate::setup::{Layout, RealSys};
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or_else(|| anyhow!("HOME is not set"))?;
+    let sys = RealSys;
+    let running = |p: &std::path::Path| crate::app::is_running(p);
+    let up = api::daemon_up;
+    let load = crate::globalcfg::GlobalConfig::load;
+    let mut ctx = crate::onboard::Ctx {
+        sys: &sys,
+        layout: Layout::real(),
+        home,
+        bundled: crate::app::find_bundled(),
+        running: &running,
+        tty: unsafe { libc::isatty(0) } == 1,
+        daemon_up: &up,
+        wait_secs: 10,
+        load_gcfg: &load,
+        domains: crate::config::load_all().map(|c| c.into_iter().map(|c| c.domain).collect()).unwrap_or_default(),
+        binary: crate::setup::stable_binary_path(),
+    };
+    Ok(f(&mut ctx))
+}
+
+/// Commands that talk to the daemon, so they start (or set up) one when none answers. Everything else
+/// (`setup`, `doctor`, `daemon`, `mcp`, `migrate`, `recipes`, `path`, `app`, `logs`, `help`, an unknown
+/// word, `import-v1` without `--apply`) never installs or starts anything.
+fn needs_daemon(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("up" | "down" | "restart" | "pin" | "unpin" | "ls" | "alias" | "new" | "history" | "autoremove" | "adopt" | "rm" | "retry-setup" | "forget" | "restore" | "claim" | "release" | "claims" | "disk" | "env") => true,
+        Some("import-v1") => args.iter().any(|a| a == "--apply"),
+        _ => false,
     }
-    let record = setup::apply(&steps, &mut gcfg, &binary, &layout, &sys)?;
-    println!("done. Recorded in {}. Undo with `setu setup --undo`.", setup::record_path().display());
-    if let Some(p) = record.plist {
-        println!("daemon starts at login from {p}");
+}
+
+/// Make sure a daemon answers before a command that needs one: first-run setup, or a kickstart.
+async fn ensure_ready(say: &mut dyn FnMut(&str)) -> Result<()> {
+    if api::daemon_up() {
+        return Ok(());
+    }
+    if with_real_ctx(|ctx| crate::onboard::ensure_daemon(ctx, say))?? == crate::onboard::Ensure::SetUp {
+        doctor_summary(say).await;
     }
     Ok(())
 }
 
-async fn doctor_cmd(args: &[String]) -> Result<()> {
+/// A short doctor result: one line when all is well, the failing checks with their fixes otherwise.
+async fn doctor_summary(say: &mut dyn FnMut(&str)) {
+    match doctor_checks().await {
+        Ok(checks) => {
+            let bad: Vec<_> = checks.iter().filter(|c| !c.ok).collect();
+            if bad.is_empty() {
+                say(&format!("doctor: all {} checks ok", checks.len()));
+            }
+            for c in bad {
+                say(&format!("doctor: {} FAILED: {}", c.name, c.detail));
+                if let Some(fix) = &c.fix {
+                    say(&format!("  fix: {fix}"));
+                }
+            }
+        }
+        Err(e) => say(&format!("doctor could not run: {e:#}")),
+    }
+}
+
+/// Bare `setu`: first run sets everything up and says what to do next; afterwards it lists runs.
+async fn bare() -> Result<()> {
+    if with_real_ctx(|ctx| !crate::onboard::installed(&ctx.layout))? {
+        let mut say = |l: &str| println!("{l}");
+        say("Welcome to Setu. Setting it up now...");
+        with_real_ctx(|ctx| crate::onboard::first_run(ctx, &mut say))??;
+        doctor_summary(&mut say).await;
+        let (v1, app) = with_real_ctx(|ctx| (crate::migrate::v1_detected(&ctx.home), ctx.home.join("Applications/Setu.app").exists()))?;
+        print!("{}", crate::onboard::next_steps(&paths::projects_dir(), v1, app));
+        return Ok(());
+    }
+    ensure_ready(&mut |l| eprintln!("{l}")).await?;
+    ls_cmd(&[]).await?;
+    println!("\nRun `setu help` for all commands.");
+    Ok(())
+}
+
+async fn doctor_checks() -> Result<Vec<crate::doctor::Check>> {
     use crate::doctor::{self, DoctorInputs};
     use crate::globalcfg::GlobalConfig;
     use crate::setup::{RealSys, Sys, LABEL};
@@ -723,7 +824,7 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
         std::time::Duration::from_millis(300),
     )
     .is_ok();
-    let checks = doctor::run(
+    Ok(doctor::run(
         DoctorInputs {
             daemon_ping,
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -733,10 +834,14 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
             proxy_listening,
             proxy_binding,
             proxy_port,
-            setu_app: std::env::var_os("HOME").and_then(|h| crate::app::doctor_status(crate::app::find_bundled().as_deref(), std::path::Path::new(&h))),
+            setu_app: std::env::var_os("HOME").and_then(|h| crate::app::doctor_status(crate::app::find_bundled().as_deref(), std::path::Path::new(&h), &crate::app::is_running)),
         },
         &sys,
-    );
+    ))
+}
+
+async fn doctor_cmd(args: &[String]) -> Result<()> {
+    let checks = doctor_checks().await?;
     let failed = checks.iter().filter(|c| !c.ok).count();
     if args.iter().any(|a| a == "--json") {
         let v: Vec<Value> = checks.iter().map(|c| json!({ "name": c.name, "ok": c.ok, "detail": c.detail, "fix": c.fix })).collect();
@@ -901,5 +1006,26 @@ async fn alias_cmd(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => bail!("{USAGE}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_daemon_commands_set_up_or_start_the_daemon() {
+        for c in ["ls", "up", "down", "restart", "new", "adopt", "rm", "env", "disk", "claims", "history"] {
+            assert!(needs_daemon(&args(&[c])), "{c}");
+        }
+        // the exceptions: never auto-setup
+        for c in [&["setup", "--dry-run"][..], &["setup", "--undo"], &["setup"], &["doctor"], &["help"], &["--version"], &["daemon"], &["mcp"], &["migrate"], &["migrate", "run", "--yes"], &["import-v1"], &["import-v1", "--dry-run"], &["recipes"], &["path", "p"], &["app"], &["app", "path"], &["logs"], &["frobnicate"], &[]] {
+            assert!(!needs_daemon(&args(c)), "{c:?}");
+        }
+        assert!(needs_daemon(&args(&["import-v1", "--apply"])), "applying needs the daemon");
     }
 }

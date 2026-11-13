@@ -34,21 +34,21 @@ Open a worktree's URL and Setu starts it. If dependencies are missing, it instal
 You need macOS 26 or later (Apple silicon or Intel) and [Homebrew](https://brew.sh).
 
 ```bash
-brew install mukulchugh/tap/setu
-setu setup        # start at login, capture your shell PATH, set up DNS for your domains
-setu app          # copy Setu.app into ~/Applications (open it from Spotlight)
-setu doctor       # every check should say ok
+brew install mukulchugh/tap/setu && setu
 ```
 
-`setu setup` shows what it will do and asks first; `--yes` skips the question and `--undo` reverses it. It only needs sudo for one thing: writing `/etc/resolver/<domain>` for a custom domain, and only if that domain doesn't already resolve.
+The first `setu` sets everything up without asking: it captures your shell PATH, starts the Setu service at login, installs Setu.app into `~/Applications`, and runs `setu doctor`, then prints what to do next. The only step that can need `sudo` is writing `/etc/resolver/<domain>` for a custom domain; in a terminal you get one normal password prompt, and without a terminal Setu skips it and prints the exact command.
 
-**Upgrade:**
+**Upgrade** is just `brew upgrade setu`: the service notices its binary changed and restarts itself within a minute (running dev servers keep running), and Setu.app updates itself the next time it isn't open. Setu never opens or quits the app.
 
-```bash
-brew update && brew upgrade setu
-launchctl kickstart -k gui/$UID/dev.setu.daemon    # running dev servers keep running
-setu app                                           # update Setu.app too
-```
+You can also run the steps yourself: `setu setup` shows its plan and asks first (`--dry-run` only shows it, `--yes` skips the question, `--undo` reverses it; the app is left in place, `setu app uninstall` removes it). Any command that needs the service, like `setu ls`, sets Setu up the first time or restarts the service if it is down. `setu doctor`, `setu mcp` and `setu migrate` never install anything: an AI agent that finds Setu not running is told to ask you to run `setu` once.
+
+**Without Homebrew:**
+1. Download `setu-universal-apple-darwin.tar.xz` from [Releases](../../releases). It holds one `setu` for any Mac, plus Setu.app.
+2. Put `setu` on your PATH and run `setu`.
+3. If you open a downloaded Setu.app directly, macOS says it "is damaged". That happens because the app is signed for local use rather than with a paid Apple Developer ID, and the browser marks the download. Clear the mark once with `xattr -dr com.apple.quarantine Setu.app`, or let `setu app` install it, which does that for you.
+
+Homebrew installs never show this message.
 
 ## Quick start
 
@@ -324,7 +324,8 @@ In Cursor's `~/.cursor/mcp.json`: `"setu": { "command": "setu", "args": ["mcp"] 
 | `setu recipes [ls\|show <name>]` | Recipes |
 | `setu history [run] [--kind …]` | Audit log of env, worktree, disk and auto-removal events (names only) |
 | `setu autoremove [--dry-run]` | Evaluate auto-removal now |
-| `setu setup [--dry-run\|--yes\|--undo]` | Login service, PATH, DNS |
+| `setu` | First run: set everything up. Afterwards: `setu ls` |
+| `setu setup [--dry-run\|--yes\|--undo]` | Login service, PATH, DNS, Setu.app |
 | `setu doctor [--json]` | Check every layer and print the exact fix |
 | `setu app [install\|path\|uninstall]` | Setu.app |
 | `setu migrate [plan\|run --yes\|rollback]` | Move from the old JS Setu |

@@ -28,9 +28,11 @@ struct ClaimBadge: View {
 }
 
 /// Run name with its claim, pin and pending-removal markers (Runs table).
+/// Table cells must not read the Store from the environment: on macOS 27, cells built during a
+/// scroll can be laid out without it and SwiftUI traps. Everything a cell needs is passed in.
 struct RunNameCell: View {
-    @Environment(Store.self) private var store
     let run: Run
+    let onPin: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
@@ -53,7 +55,7 @@ struct RunNameCell: View {
                 HStack(spacing: 4) {
                     Image(systemName: "clock.badge.exclamationmark")
                     Text(r.countdown())
-                    IconButton(symbol: "pin.fill", label: "Pin", subject: run.run) { Task { await store.setPinned(run.run, true) } }
+                    IconButton(symbol: "pin.fill", label: "Pin", subject: run.run, action: onPin)
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)

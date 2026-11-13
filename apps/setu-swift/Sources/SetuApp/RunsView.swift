@@ -97,7 +97,7 @@ struct RunsView: View {
         @Bindable var store = store
         return Table(rows, selection: $store.runSelection) {
             TableColumn("") { r in StatusDot(run: r) }.width(24)
-            TableColumn("Run") { r in RunNameCell(run: r) }
+            TableColumn("Run") { r in RunNameCell(run: r) { Task { await store.setPinned(r.run, true) } } }
             TableColumn("URL") { r in
                 if let u = r.url, r.isUp {
                     Button(u.replacingOccurrences(of: "http://", with: "")) { openURL(u) }
