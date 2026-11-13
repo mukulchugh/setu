@@ -5,14 +5,16 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.34.0"
-# Releases are built and published locally (scripts/release.sh); no CI workflow is generated.
-ci = "github"
-allow-dirty = ["ci"]
+# No `ci` key on purpose: releases are built and published locally (scripts/release.sh),
+# and without it `dist init` / `dist generate` cannot recreate a GitHub Actions workflow.
+# `hosting` replaces what `ci` used to imply: artifacts and the formula point at GitHub releases.
+hosting = ["github"]
 # The installers to generate for each app
 installers = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
-# A GitHub repo to push Homebrew formulas to
+# The Homebrew tap. It sets the install hint (`brew install mukulchugh/tap/setu`); release.sh
+# pushes the formula itself, so dist's "publish job is disabled" warning is expected.
 tap = "mukulchugh/homebrew-tap"
 # Customize the Homebrew formula name
 formula = "setu"
