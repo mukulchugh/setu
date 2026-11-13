@@ -9,6 +9,7 @@ set -euo pipefail
 BIN="$(cd "$(dirname "${1:?path to setu binary}")" && pwd)/$(basename "$1")"
 SB=/tmp/setu-onecmd-e2e
 export HOME="$SB/home" SETU_HOME="$SB/setu" SB BIN
+export SETU_ALLOW_AGENT=1   # this test exercises the login service setup, with a launchctl shim
 export SETU_MAINTENANCE_SECS=1
 export SETU_APP_SOURCE="$SB/pkg/Setu.app"
 export PATH="$SB/shims:$PATH"

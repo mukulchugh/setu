@@ -12,6 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SB=/tmp/setu-cutover-proof
 export HOME="$SB/home"
 export SETU_HOME="$SB/setu"
+export SETU_ALLOW_AGENT=1   # migrate runs `setu setup`; launchctl is shimmed below
 export SETU_LINK_DIR="$SB/home/linkdir"
 export SB BIN
 export PATH="$SB/shims:$PATH"
