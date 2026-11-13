@@ -48,22 +48,37 @@ say "checking out origin/main ($(git rev-parse --short origin/main)) in $WORK/sr
 git --git-dir="$COMMON" worktree add -q --detach "$WORK/src" origin/main
 cd "$WORK/src"
 
+# A persistent build cache: dependencies compile once, so later releases rebuild only Setu.
+# (dist still writes its archives to the checkout's target/distrib.)
+export CARGO_TARGET_DIR="${SETU_RELEASE_CACHE:-$HOME/Library/Caches/setu-release/target}"
+mkdir -p "$CARGO_TARGET_DIR"
+
 say "running cargo test"
-CARGO_TARGET_DIR="$WORK/src/target" cargo test -q 2>&1 | grep -E "^test result" || die "tests failed"
+cargo test -q 2>&1 | grep -E "^test result" || die "tests failed"
 
 say "building Setu.app (universal, uses the Homebrew-installed setu)"
 SETU_APP_UNIVERSAL=1 SETU_APP_NO_CLI=1 bash scripts/bundle-swift.sh > "$WORK/app.log" 2>&1 || { tail -20 "$WORK/app.log"; die "Setu.app build failed"; }
 [ "$(lipo -archs target-swift/Setu.app/Contents/MacOS/SetuApp)" = "x86_64 arm64" ] || die "Setu.app is not universal"
 
 say "building $TAG for Apple silicon and Intel"
-CARGO_TARGET_DIR="$WORK/src/target" dist build --tag "$TAG" --artifacts=all > "$WORK/dist.log" 2>&1 || { tail -20 "$WORK/dist.log"; die "dist build failed"; }
+dist build --tag "$TAG" --artifacts=all > "$WORK/dist.log" 2>&1 || { tail -20 "$WORK/dist.log"; die "dist build failed"; }
 OUT="$WORK/src/target/distrib"
+[ -d "$OUT" ] || OUT="$CARGO_TARGET_DIR/distrib"
 for f in setu-aarch64-apple-darwin.tar.xz setu-x86_64-apple-darwin.tar.xz setu.rb sha256.sum; do
   [ -s "$OUT/$f" ] || die "missing artifact $f"
 done
 for a in aarch64 x86_64; do
   tar -tJf "$OUT/setu-$a-apple-darwin.tar.xz" | grep -q "Setu.app/Contents/MacOS/SetuApp" || die "Setu.app missing from the $a archive"
 done
+# One universal download for any Mac (Homebrew keeps using the per-architecture archives).
+UNI="setu-universal-apple-darwin"
+rm -rf "${OUT:?}/$UNI"; mkdir -p "$OUT/$UNI"
+lipo -create "$OUT/setu-aarch64-apple-darwin/setu" "$OUT/setu-x86_64-apple-darwin/setu" -output "$OUT/$UNI/setu"
+codesign --force --sign - "$OUT/$UNI/setu"
+cp -R target-swift/Setu.app "$OUT/$UNI/"
+cp README.md LICENSE "$OUT/$UNI/"
+(cd "$OUT" && tar -cJf "$UNI.tar.xz" "$UNI" && shasum -a 256 "$UNI.tar.xz" > "$UNI.tar.xz.sha256" && cat "$UNI.tar.xz.sha256" >> sha256.sum)
+[ "$(lipo -archs "$OUT/$UNI/setu")" = "x86_64 arm64" ] || die "the universal setu is not universal"
 BUILT="$("$OUT/setu-aarch64-apple-darwin/setu" --version)"
 [ "$BUILT" = "setu $VERSION" ] || die "built binary reports '$BUILT', expected 'setu $VERSION'"
 say "built: $(cd "$OUT" && ls setu-*.tar.xz setu.rb | tr '\n' ' ')"
@@ -83,6 +98,7 @@ say "creating the GitHub release"
 (cd "$OUT" && gh release create "$TAG" -R "$REPO" --title "setu $VERSION" --generate-notes \
   setu-aarch64-apple-darwin.tar.xz setu-aarch64-apple-darwin.tar.xz.sha256 \
   setu-x86_64-apple-darwin.tar.xz setu-x86_64-apple-darwin.tar.xz.sha256 \
+  setu-universal-apple-darwin.tar.xz setu-universal-apple-darwin.tar.xz.sha256 \
   sha256.sum source.tar.gz source.tar.gz.sha256 setu.rb)
 
 say "updating the Homebrew tap"

@@ -2254,8 +2254,37 @@ async fn bind_proxy() -> Result<(Vec<tokio::net::TcpListener>, &'static str, u16
     }
 }
 
-/// Run the daemon until SIGINT/SIGTERM. Stops every run it started on the way out.
-pub async fn run() -> Result<()> {
+/// Setu.app update after an upgrade, off the async threads. `true` = the app is running, so try again later.
+async fn update_app(first: bool) -> bool {
+    use crate::app::{self, AutoUpdate};
+    let res = tokio::task::spawn_blocking(|| {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        Some(app::auto_update(&app::Ctx { home, bundled: app::find_bundled(), running: &app::is_running }))
+    })
+    .await;
+    match res {
+        Ok(Some(AutoUpdate::Updated(v))) => {
+            eprintln!("setu daemon: updated ~/Applications/Setu.app to {v}");
+            false
+        }
+        Ok(Some(AutoUpdate::Pending)) => {
+            if first {
+                eprintln!("setu daemon: Setu.app update pending; it finishes once Setu.app is quit");
+            }
+            true
+        }
+        Ok(Some(AutoUpdate::Failed(e))) => {
+            eprintln!("setu daemon: Setu.app update failed: {e}");
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Run the daemon until SIGINT/SIGTERM or until its own binary is replaced (an upgrade). Stops every run
+/// it started on the way out when `stop_runs_on_exit` is set. Returns the process exit code: 0, or
+/// `selfupdate::RESTART_EXIT_CODE` so launchd restarts the daemon from the new binary.
+pub async fn run() -> Result<i32> {
     // One daemon only: hold an exclusive lock for our lifetime, before touching state.
     let _lock = single_instance_lock()?;
     let (listeners, bind_ip, proxy_port, binding) = bind_proxy().await?;
@@ -2296,6 +2325,19 @@ pub async fn run() -> Result<()> {
         }
     });
     eprintln!("setu daemon: proxy on http://{bind_ip}:{proxy_port}, socket {}", paths::socket_path().display());
+    // Serving now: bring an installed Setu.app up to the bundled version (never quits or opens it).
+    let app_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let pending = app_pending.clone();
+        tokio::spawn(async move { pending.store(update_app(true).await, std::sync::atomic::Ordering::SeqCst) });
+    }
+    let watch = crate::selfupdate::Watch::from_env();
+    if let Some(w) = &watch {
+        eprintln!("setu daemon: watching {} for an upgrade", w.path().display());
+    }
+    let maint_every = crate::selfupdate::maintenance_every();
+    let mut maint = tokio::time::interval_at(tokio::time::Instant::now() + maint_every, maint_every);
+    let mut exit_code = 0;
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut tick = tokio::time::interval(SWEEP_EVERY);
@@ -2326,11 +2368,23 @@ pub async fn run() -> Result<()> {
                     });
                 }
             }
+            _ = maint.tick() => {
+                if app_pending.load(std::sync::atomic::Ordering::SeqCst) {
+                    app_pending.store(update_app(false).await, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Some(code) = crate::selfupdate::restart_code(watch.as_ref()) {
+                    eprintln!("setu daemon: the setu binary was replaced; restarting to run the new version");
+                    exit_code = code;
+                    break;
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = term.recv() => break,
         }
     }
-    if globalcfg::GlobalConfig::load().is_ok_and(|c| c.stop_runs_on_exit) {
+    // An upgrade restart (the binary was replaced) never stops dev servers, whatever
+    // `stop_runs_on_exit` says: the next daemon adopts them.
+    if exit_code == 0 && globalcfg::GlobalConfig::load().is_ok_and(|c| c.stop_runs_on_exit) {
         eprintln!("setu daemon: stopping Setu-started runs (stop_runs_on_exit)");
         for k in daemon.running_keys() {
             if daemon.is_external_run(&k) {
@@ -2347,7 +2401,7 @@ pub async fn run() -> Result<()> {
     }
     let _ = std::fs::remove_file(globalcfg::proxy_binding_path());
     let _ = std::fs::remove_file(paths::socket_path());
-    Ok(())
+    Ok(exit_code)
 }
 
 #[cfg(test)]

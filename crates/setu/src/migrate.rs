@@ -334,6 +334,11 @@ fn home_rel(cx: &Cx, p: &Path) -> String {
     }
 }
 
+/// Read-only: does this home still hold the old JavaScript Setu (its install folder or settings file)?
+pub fn v1_detected(home: &Path) -> bool {
+    home.join(".setu/portal.js").exists() || home.join(".setu.json").exists()
+}
+
 // ------------------------------------------------------------------------------------- entry
 
 pub fn main(args: &[String]) -> Result<()> {

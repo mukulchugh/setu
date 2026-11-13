@@ -205,10 +205,6 @@ fn agent_loaded(sys: &dyn Sys) -> bool {
     sys.run("launchctl", &["print", &format!("gui/{}/{LABEL}", sys.uid())]).map(|(c, _)| c == 0).unwrap_or(false)
 }
 
-pub fn plan(gcfg: &GlobalConfig, domains: &[String], binary: &Path, sys: &dyn Sys) -> Vec<Step> {
-    plan_in(gcfg, domains, binary, sys, &Layout::real())
-}
-
 pub fn plan_in(gcfg: &GlobalConfig, domains: &[String], binary: &Path, sys: &dyn Sys, layout: &Layout) -> Vec<Step> {
     let mut steps = vec![Step { id: "capture-path".into(), description: "Capture your login-shell PATH into config.toml".into(), sudo: false }];
     let want = plist(binary, &path_for_plist(gcfg), &layout.log);

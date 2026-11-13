@@ -217,8 +217,11 @@ async fn daemon(mut req: Value, client: Option<&str>, write: bool) -> Result<Val
             req["client"] = json!(c);
         }
     }
-    api::call(req).await
+    api::call(req).await.map_err(|e| if api::is_daemon_down(&e) { anyhow!("{NOT_SET_UP}") } else { e })
 }
+
+/// An agent never installs or starts anything: it tells the human what to run.
+pub(crate) const NOT_SET_UP: &str = "Setu is not running (or not set up yet). Ask the user to run `setu` once in a terminal; it sets everything up. Nothing was installed.";
 
 /// Scope fields shared by the env tools. The scope value is validated by the daemon.
 fn scope_req(cmd: &str, args: &Value) -> Result<Value> {
@@ -384,5 +387,20 @@ mod tests {
         let r = call_tool("env_set", &json!({ "scope": "project", "target": "app", "name": "API_TOKEN" }), None).await.unwrap();
         assert_eq!(r["status"], "pending_user_input");
         assert_eq!(r["next"], "Ask the user to run: setu env set project app API_TOKEN --secret");
+    }
+
+    #[tokio::test]
+    async fn an_agent_gets_a_clear_error_and_nothing_is_installed_when_the_daemon_is_down() {
+        let sb = crate::env::tests::sandbox();
+        for (tool, args) in [("run_list", json!({})), ("run_start", json!({ "path": "/tmp" })), ("worktree_claims", json!({}))] {
+            let e = call_tool(tool, &args, Some("test-client")).await.unwrap_err().to_string();
+            assert!(e.contains("run `setu` once"), "{tool}: {e}");
+            assert!(!e.contains("setu daemon"), "{tool}: an agent must not be told to start things itself: {e}");
+        }
+        // it never set anything up: no socket, no setup record, nothing in the sandboxed Setu home
+        assert!(!crate::paths::socket_path().exists());
+        assert!(!crate::setup::record_path().exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&sb.dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }

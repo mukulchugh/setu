@@ -29,6 +29,8 @@ New things you can use right away:
    brew install mukulchugh/tap/setu
    ```
 
+   Do not run bare `setu` yet if the old JavaScript `setu` is still your `setu` command: use the full path in the next steps. (Once the new binary is the one you get, a bare `setu` sets up Setu and, if it finds the old one, tells you to run `setu migrate`.)
+
 2. See what would happen. This is read only. Use the full path to the new binary for this step and the next one, because until the migration has run, `setu` in your terminal may still be the old JavaScript one (it sits earlier on your PATH, and your shell's `setu()` function calls it).
 
    ```
