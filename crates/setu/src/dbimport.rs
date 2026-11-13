@@ -249,6 +249,7 @@ mod tests {
             env_hash: Some(u64::MAX - 5),
             last_started_at: Some(12),
             last_request_at: Some(13),
+            custom_aliases: vec![],
         };
         let mut s = State::default();
         s.runs.insert("app/feat-a".into(), rec);

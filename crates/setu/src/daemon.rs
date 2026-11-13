@@ -97,6 +97,30 @@ impl Inner {
                 self.hosts.entry(a.clone()).or_insert_with(|| k.clone());
             }
         }
+        for (k, r) in &self.state.runs {
+            for a in &r.custom_aliases {
+                self.hosts.entry(a.clone()).or_insert_with(|| k.clone());
+            }
+        }
+    }
+    /// Which run owns `host`, and how ("the main URL", "a config alias" or "a custom alias").
+    fn host_owner(&self, host: &str) -> Option<(String, &'static str)> {
+        let k = self.hosts.get(host)?;
+        let r = self.state.runs.get(k)?;
+        let how = if r.spec.host == host {
+            "the main URL"
+        } else if r.spec.aliases.iter().any(|a| a == host) {
+            "a config alias"
+        } else {
+            "a custom alias"
+        };
+        Some((k.clone(), how))
+    }
+    /// True when Setu itself answers DNS for `host`: `localhost`, or under a project domain.
+    fn host_is_served(&self, host: &str) -> bool {
+        host == "localhost"
+            || host.ends_with(".localhost")
+            || self.configs.iter().map(|c| c.domain.to_lowercase()).chain(self.state.runs.values().filter_map(|r| r.spec.host.split_once('.').map(|(_, d)| d.to_string()))).any(|d| host == d || host.ends_with(&format!(".{d}")))
     }
     fn config(&self, project: &str) -> Result<ProjectConfig> {
         self.configs
@@ -526,6 +550,7 @@ impl Daemon {
             env_hash: None,
             last_started_at: None,
             last_request_at: None,
+            custom_aliases: vec![],
         });
         rec.spec = spec.clone();
         inner.rebuild_hosts();
@@ -1165,6 +1190,85 @@ impl Daemon {
         )
     }
 
+    /// `setu alias <run> <host>`: route one more hostname to a run (any run, branches included).
+    /// Persisted with the run; dropped when the run is removed or forgotten. Returns warnings
+    /// (for example that nothing resolves the name yet).
+    pub async fn alias_add(self: &Arc<Self>, actor: &str, client: Option<&str>, k: &str, raw: &str) -> Result<Value> {
+        let host = config::validate_custom_host(raw)?;
+        let (url, warnings, added) = {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("{k} is not registered; run `setu up` in its worktree first"))?;
+            let url = r.spec.url.replacen(&r.spec.host, &host, 1);
+            if let Some((owner, how)) = inner.host_owner(&host) {
+                if owner == k && how == "a custom alias" {
+                    return Ok(json!({ "run": k, "host": host, "url": url, "added": false, "warnings": [] }));
+                }
+                bail!("{host} is already {how} of run {owner}{}", if owner == k { " (it already routes there)" } else { "" });
+            }
+            let mut warnings = Vec::new();
+            if !inner.host_is_served(&host) {
+                warnings.push(format!(
+                    "nothing resolves {host} yet: add its domain as a project `domain`, or run `setu setup` to install a resolver for it (`.test` is recommended over `.local`)"
+                ));
+            }
+            if let Some(r) = inner.state.runs.get_mut(k) {
+                r.custom_aliases.push(host.clone());
+            }
+            inner.rebuild_hosts();
+            (url, warnings, true)
+        };
+        if let Err(e) = self.persist_durable().await {
+            let mut inner = self.lock();
+            if let Some(r) = inner.state.runs.get_mut(k) {
+                r.custom_aliases.retain(|a| *a != host);
+            }
+            inner.rebuild_hosts();
+            return Err(e.context("saving the alias"));
+        }
+        worktree::audit(actor, client, "alias-add", k, json!({ "host": host }));
+        Ok(json!({ "run": k, "host": host, "url": url, "added": added, "warnings": warnings }))
+    }
+
+    /// `setu alias rm <run> <host>`: drop a custom alias. Config aliases come from the project file.
+    pub async fn alias_remove(self: &Arc<Self>, actor: &str, client: Option<&str>, k: &str, raw: &str) -> Result<Value> {
+        let host = raw.trim().to_lowercase();
+        {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get_mut(k).ok_or_else(|| anyhow!("{k} is not registered"))?;
+            if !r.custom_aliases.contains(&host) {
+                if r.spec.aliases.contains(&host) {
+                    bail!("{host} is a config alias of {k}; remove it from `aliases` in the project config");
+                }
+                bail!("{host} is not a custom alias of {k}; see `setu alias ls {k}`");
+            }
+            r.custom_aliases.retain(|a| *a != host);
+            inner.rebuild_hosts();
+        }
+        self.persist_durable().await?;
+        worktree::audit(actor, client, "alias-remove", k, json!({ "host": host }));
+        Ok(json!({ "run": k, "host": host, "removed": true }))
+    }
+
+    /// Every extra host (config and custom) of one run, or of all runs.
+    pub fn alias_list(&self, k: Option<&str>) -> Result<Value> {
+        let inner = self.lock();
+        if let Some(k) = k {
+            if !inner.state.runs.contains_key(k) {
+                bail!("{k} is not registered");
+            }
+        }
+        let mut out = Vec::new();
+        for (key, r) in &inner.state.runs {
+            if k.is_some_and(|k| k != key) {
+                continue;
+            }
+            for (host, source) in alias_sources(r) {
+                out.push(json!({ "run": key, "host": host, "source": source, "url": r.spec.url.replacen(&r.spec.host, &host, 1) }));
+            }
+        }
+        Ok(Value::Array(out))
+    }
+
     pub fn pin(&self, wanted: &str, on: bool) -> Result<Value> {
         let k = self.lock().resolve_key(wanted)?;
         self.set(&k, |r| r.pinned = on);
@@ -1620,7 +1724,7 @@ impl Daemon {
         let k = self.resolve(wanted)?;
         let life = self.life_lock(&k);
         let _life = life.lock().await;
-        let (id, wt) = {
+        let (id, wt, dropped) = {
             let mut inner = self.lock();
             let r = inner.state.runs.get(&k).ok_or_else(|| anyhow!("unknown run {k}"))?;
             if matches!(r.status, RunStatus::Running | RunStatus::Starting | RunStatus::Stopping | RunStatus::Preparing) {
@@ -1636,12 +1740,12 @@ impl Daemon {
             inner.state.leases.remove(&k);
             inner.gens.remove(&k);
             inner.rebuild_hosts();
-            (removed.spec.id, removed.spec.worktree)
+            (removed.spec.id, removed.spec.worktree, removed.custom_aliases)
         };
         self.activity.forget(&id);
         self.persist_durable().await?;
-        worktree::audit(actor, client, "forget", &k, json!({ "path": wt }));
-        Ok(json!({ "run": k, "forgotten": true, "worktree": wt }))
+        worktree::audit(actor, client, "forget", &k, json!({ "path": wt, "custom_aliases": dropped }));
+        Ok(json!({ "run": k, "forgotten": true, "worktree": wt, "dropped_aliases": dropped }))
     }
 
     pub async fn worktree_rm(self: &Arc<Self>, actor: &str, client: Option<&str>, wanted: &str, force: bool) -> Result<Value> {
@@ -1650,15 +1754,15 @@ impl Daemon {
             let inner = self.lock();
             inner.resolve_key(wanted).map(|k| {
                 let r = &inner.state.runs[&k];
-                (k.clone(), r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone())
+                (k.clone(), r.spec.id.project.clone(), r.spec.id.run.clone(), r.spec.worktree.clone(), r.custom_aliases.clone())
             })
         };
-        let (key, project, run, wt) = match found {
+        let (key, project, run, wt, aliases) = match found {
             Ok(f) => f,
             Err(e) => {
                 let (db, w) = (self.db.clone(), wanted.to_string());
                 match tokio::task::spawn_blocking(move || worktree::load_op(&db, &w)).await? {
-                    Ok(Some(rec)) => (wanted.to_string(), rec.project, rec.run, rec.worktree),
+                    Ok(Some(rec)) => (wanted.to_string(), rec.project, rec.run, rec.worktree, Vec::new()),
                     _ => return Err(e),
                 }
             }
@@ -1677,8 +1781,10 @@ impl Daemon {
         .await?;
         match result {
             Ok(o) => {
-                worktree::audit(actor, client, "rm", &key, json!({ "force": force, "archive": o.archive, "archived_files": o.archived_files, "already": o.already }));
-                Ok(serde_json::to_value(o)?)
+                worktree::audit(actor, client, "rm", &key, json!({ "force": force, "archive": o.archive, "archived_files": o.archived_files, "already": o.already, "custom_aliases": aliases }));
+                let mut v = serde_json::to_value(o)?;
+                v["dropped_aliases"] = json!(aliases);
+                Ok(v)
             }
             Err(e) => {
                 worktree::audit(actor, client, "rm-refused", &key, json!({ "force": force, "error": format!("{e:#}") }));
@@ -1925,6 +2031,11 @@ fn claim_json(db: &Db, k: &str) -> Value {
     }
 }
 
+/// (host, "config" | "custom") for every extra host of a run.
+fn alias_sources(r: &RunRecord) -> Vec<(String, &'static str)> {
+    r.spec.aliases.iter().map(|a| (a.clone(), "config")).chain(r.custom_aliases.iter().map(|a| (a.clone(), "custom"))).collect()
+}
+
 fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
     let ram = if r.procs.is_empty() { 0 } else { supervisor::run_footprint(&r.procs) };
     // A project with no procs has no URL to open: its status is `no-server` and the note says what to add.
@@ -1936,7 +2047,8 @@ fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
     json!({
         "run": k,
         "url": url,
-        "aliases": r.spec.aliases,
+        "aliases": alias_sources(r).into_iter().map(|(h, _)| h).collect::<Vec<_>>(),
+        "alias_sources": alias_sources(r).into_iter().map(|(host, source)| json!({ "host": host, "source": source })).collect::<Vec<_>>(),
         "external": r.procs.iter().any(supervisor::is_external),
         "status": status,
         "pinned": r.pinned,
@@ -2466,7 +2578,7 @@ mod tests {
         let mut st = State::default();
         st.runs.insert(
             "app/feat-dc".into(),
-            RunRecord { spec, status: RunStatus::Stopped, pinned: false, procs: vec![], note: None, stopped_at: Some(1), env_hash: None, last_started_at: None, last_request_at: None },
+            RunRecord { spec, status: RunStatus::Stopped, pinned: false, procs: vec![], note: None, stopped_at: Some(1), env_hash: None, last_started_at: None, last_request_at: None, custom_aliases: vec![] },
         );
         let db = Arc::new(Db::open(&sb.dir.join("clean.db")).unwrap());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2944,6 +3056,178 @@ mod tests {
         let e = f.d.register(&other, &f._sb.dir.join("wt/main2"), "main").unwrap_err();
         assert!(e.to_string().contains("already belongs to run"), "{e:#}");
         let _ = km;
+    }
+
+    fn lk(d: &Arc<Daemon>, host: &str) -> String {
+        format!("{:?}", d.lookup(host))
+    }
+
+    async fn events_text(d: &Arc<Daemon>, k: &str, want: &str) -> String {
+        let mut ev = String::new();
+        for _ in 0..50 {
+            ev = d.events(Some("worktree"), Some(k), None, 50).unwrap().to_string();
+            if ev.contains(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ev
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_alias_routes_like_the_main_host_through_the_proxy_and_can_be_removed() {
+        let (_sb, d, k, port, wt) = web_fixture();
+        let main = d.lock().state.runs[&k].spec.host.clone();
+        assert!(matches!(d.lookup("demo.tp.local"), Lookup::Unknown));
+        let out = d.alias_add("cli", None, &k, " Demo.TP.local ").await.unwrap();
+        assert_eq!(out["host"], "demo.tp.local", "lowercased");
+        assert_eq!(out["added"], true);
+        assert_eq!(out["warnings"], json!([]), "under the project domain: nothing to warn about");
+        assert!(out["url"].as_str().unwrap().starts_with("http://demo.tp.local:"), "{out}");
+        // same lookup as the main host in every state the proxy distinguishes
+        for st in [RunStatus::Stopped, RunStatus::Crashed, RunStatus::Starting, RunStatus::Stopping, RunStatus::Preparing, RunStatus::SetupFailed, RunStatus::Running] {
+            d.set(&k, |r| r.status = st);
+            let (a, m) = (lk(&d, "demo.tp.local"), lk(&d, &main));
+            assert_eq!(a, m, "{st:?}");
+            assert!(!a.contains("Unknown"), "{st:?}");
+        }
+        // the real proxy: pages and a forwarded request (a server in the worktree on the run's port)
+        std::fs::write(wt.join("index.html"), "alias-says-hello").unwrap();
+        let mut child = serve_in(&wt, port);
+        let proxy = demand_proxy(&d).await;
+        d.set(&k, |r| r.status = RunStatus::Preparing);
+        let page = html_get(proxy, "demo.tp.local").await;
+        assert!(page.contains("503") && page.contains("Setting up"), "{page}");
+        d.set(&k, |r| r.status = RunStatus::Running);
+        let body = html_get(proxy, "demo.tp.local").await;
+        assert!(body.contains("alias-says-hello"), "{body}");
+        assert!(html_get(proxy, &main).await.contains("alias-says-hello"));
+        // ls shows it with its source; the main URL stays the run's URL
+        let ls = d.list();
+        assert_eq!(ls[0]["aliases"], json!(["demo.tp.local"]));
+        assert_eq!(ls[0]["alias_sources"], json!([{ "host": "demo.tp.local", "source": "custom" }]));
+        assert!(ls[0]["url"].as_str().unwrap().contains(&main));
+        // removal
+        let rm = d.alias_remove("cli", None, &k, "demo.tp.local").await.unwrap();
+        assert_eq!(rm["removed"], true);
+        assert!(matches!(d.lookup("demo.tp.local"), Lookup::Unknown));
+        assert!(!html_get(proxy, "demo.tp.local").await.contains("alias-says-hello"));
+        assert!(html_get(proxy, &main).await.contains("alias-says-hello"), "the main host still works");
+        assert!(d.alias_remove("cli", None, &k, "demo.tp.local").await.unwrap_err().to_string().contains("not a custom alias"));
+        assert_eq!(d.alias_list(None).unwrap(), json!([]));
+        let _ = child.kill();
+        // add and remove each wrote an event
+        let ev = events_text(&d, &k, "alias-remove").await;
+        assert!(ev.contains("alias-add") && ev.contains("alias-remove") && ev.contains("demo.tp.local"), "{ev}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_aliases_are_collision_checked_against_every_run_and_every_kind_of_host() {
+        let f = fixture(&[("w".to_string(), "exec sleep 300731".to_string())], "aliases = [\"Old.Name.tp.local\"]\n");
+        let cfg = config::load_all().unwrap().remove(0);
+        let (km, mspec) = f.d.register(&cfg, &f._sb.dir.join("wt/main"), "main").unwrap();
+        let d = &f.d;
+        let r_host = d.lock().state.runs[&f.k].spec.host.clone();
+        // another run's config alias, its main host, and the run's own main host
+        let e = d.alias_add("cli", None, &f.k, "old.name.tp.local").await.unwrap_err().to_string();
+        assert!(e.contains("config alias") && e.contains(&km), "{e}");
+        let e = d.alias_add("cli", None, &f.k, &mspec.host).await.unwrap_err().to_string();
+        assert!(e.contains("the main URL") && e.contains(&km), "{e}");
+        let e = d.alias_add("cli", None, &km, &r_host).await.unwrap_err().to_string();
+        assert!(e.contains("the main URL") && e.contains(&f.k), "{e}");
+        // a custom alias of one run blocks the same name on another
+        d.alias_add("cli", None, &f.k, "shared.example.test").await.unwrap();
+        let e = d.alias_add("cli", None, &km, "SHARED.example.test").await.unwrap_err().to_string();
+        assert!(e.contains("custom alias") && e.contains(&f.k), "{e}");
+        assert!(matches!(d.lookup("shared.example.test"), Lookup::Down { run } if format!("{run}") == f.k), "the first owner keeps it");
+        // adding the same one again is a no-op
+        assert_eq!(d.alias_add("cli", None, &f.k, "shared.example.test").await.unwrap()["added"], false);
+        assert_eq!(d.lock().state.runs[&f.k].custom_aliases, ["shared.example.test"]);
+        // a run that would register with that name as its main host is refused too
+        let mut cfg2 = cfg.clone();
+        cfg2.domain = "example.test".into();
+        let e = d.register(&cfg2, &f._sb.dir.join("wt/shared"), "shared").unwrap_err().to_string();
+        assert!(e.contains("already belongs to run"), "{e}");
+        // and so is a config alias of a newly registered run
+        let mut cfg3 = cfg.clone();
+        cfg3.project = "tq".into();
+        cfg3.aliases = vec!["shared.example.test".into()];
+        assert!(d.register(&cfg3, &f._sb.dir.join("wt/main3"), "main").unwrap_err().to_string().contains("already belongs to run"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_alias_rejects_invalid_hosts_and_warns_when_nothing_resolves_the_name() {
+        let (_sb, d, k, _port, _wt) = web_fixture();
+        let long = format!("{}.tp.local", vec!["a".repeat(63); 4].join("."));
+        for bad in ["127.0.0.1", "::1", "*.tp.local", "a b.tp.local", "under_score.tp.local", "", "tp.local:8080", long.as_str()] {
+            assert!(d.alias_add("cli", None, &k, bad).await.is_err(), "{bad:?}");
+        }
+        assert!(d.lock().state.runs[&k].custom_aliases.is_empty(), "refusals change nothing");
+        // anything else is accepted; unresolvable names come with the fix
+        let w = d.alias_add("cli", None, &k, "demo.example.test").await.unwrap();
+        let text = w["warnings"][0].as_str().unwrap();
+        assert!(text.contains("nothing resolves") && text.contains("`domain`") && text.contains("setu setup") && text.contains(".test"), "{text}");
+        for ok in ["demo.localhost", "localhost", "deep.er.tp.local", "tp.local"] {
+            let o = d.alias_add("cli", None, &k, ok).await.unwrap();
+            assert_eq!(o["warnings"], json!([]), "{ok}: Setu already answers for it");
+        }
+        assert_eq!(d.lock().state.runs[&k].custom_aliases.len(), 5);
+        // a name that merely ends like a domain is not under it
+        let o = d.alias_add("cli", None, &k, "notp.local").await.unwrap();
+        assert_eq!(o["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_aliases_survive_a_daemon_restart_and_are_dropped_with_forget_and_rm() {
+        let (_sb, d, k, _port, _wt) = web_fixture();
+        d.alias_add("cli", None, &k, "keep.tp.local").await.unwrap();
+        d.alias_add("cli", None, &k, "demo.example.test").await.unwrap();
+        assert_eq!(crate::state::load(&d.db).unwrap().runs[&k].custom_aliases, ["keep.tp.local", "demo.example.test"]);
+        // a fresh daemon over the same database, as after a restart
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d2 = Daemon::new(tx).unwrap();
+        d2.adopt().await;
+        assert!(matches!(d2.lookup("keep.tp.local"), Lookup::Down { .. }));
+        assert!(matches!(d2.lookup("demo.example.test"), Lookup::Down { .. }));
+        assert_eq!(d2.list()[0]["alias_sources"].as_array().unwrap().len(), 2);
+        // a config re-registration (what `up` does) keeps them
+        let cfg = config::load_all().unwrap().remove(0);
+        let wt = d2.lock().state.runs[&k].spec.worktree.clone();
+        d2.register(&cfg, &wt, "r").unwrap();
+        assert_eq!(d2.lock().state.runs[&k].custom_aliases.len(), 2);
+        // forget drops them, in memory and on disk, and frees the names
+        d2.worktree_forget("cli", None, &k).await.unwrap();
+        assert!(matches!(d2.lookup("keep.tp.local"), Lookup::Unknown));
+        assert!(!crate::state::load(&d2.db).unwrap().runs.contains_key(&k));
+        let ev = events_text(&d2, &k, "forget").await;
+        assert!(ev.contains("keep.tp.local"), "the forget event names what was dropped: {ev}");
+        // rm's teardown step (DaemonHost::drop_state) drops them too
+        let (k2, _) = d2.register(&cfg, &wt, "r").unwrap();
+        assert!(d2.lock().state.runs[&k2].custom_aliases.is_empty(), "a re-registered run starts with none");
+        d2.alias_add("cli", None, &k2, "keep.tp.local").await.unwrap();
+        let host = DaemonHost { d: Arc::clone(&d2), key: k2.clone(), rt: tokio::runtime::Handle::current() };
+        crate::worktree::RmHost::drop_state(&host).unwrap();
+        assert!(matches!(d2.lookup("keep.tp.local"), Lookup::Unknown));
+        d2.persist_durable().await.unwrap();
+        assert!(!crate::state::load(&d2.db).unwrap().runs.contains_key(&k2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alias_socket_commands_add_list_and_remove() {
+        let (_sb, d, k, _port, _wt) = web_fixture();
+        let add = crate::api::handle(&d, &json!({ "cmd": "alias.add", "run": "r", "host": "api.tp.local", "actor": "mcp", "client": "t" })).await.unwrap();
+        assert_eq!(add["run"], k);
+        let all = crate::api::handle(&d, &json!({ "cmd": "alias.ls" })).await.unwrap();
+        assert_eq!(all[0]["host"], "api.tp.local");
+        assert_eq!(all[0]["source"], "custom");
+        let one = crate::api::handle(&d, &json!({ "cmd": "alias.ls", "run": k })).await.unwrap();
+        assert_eq!(one.as_array().unwrap().len(), 1);
+        assert!(crate::api::handle(&d, &json!({ "cmd": "alias.add", "run": "r" })).await.is_err(), "host is required");
+        assert!(crate::api::handle(&d, &json!({ "cmd": "alias.add", "run": "nope", "host": "x.tp.local" })).await.is_err());
+        crate::api::handle(&d, &json!({ "cmd": "alias.rm", "run": k, "host": "api.tp.local" })).await.unwrap();
+        assert_eq!(crate::api::handle(&d, &json!({ "cmd": "alias.ls" })).await.unwrap(), json!([]));
+        let ev = events_text(&d, &k, "alias-remove").await;
+        assert!(ev.contains("\"mcp\"") && ev.contains("alias-add"), "{ev}");
     }
 
     /// A daemon with one run `tp/r` whose web proc is declared (not started) and a leased web port.

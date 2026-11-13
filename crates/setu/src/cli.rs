@@ -36,6 +36,14 @@ setu: run every worktree's app and workers at its own local URL
   setu retry-setup <run>          re-run the setup steps of a new worktree whose setup failed
   setu forget <run>               unregister a stopped run and release its lease; its files are not touched
   setu restore <run>              bring a removed worktree back, with its archived files
+                                  (custom URLs from `setu alias` are not restored)
+  setu alias <run> <host>         add a custom URL to any run, e.g. `setu alias my-feature demo.example.test`
+  setu alias rm <run> <host>      remove a custom URL
+  setu alias ls [run] [--json]    list a run's extra URLs (config and custom), or all runs'
+                                  <run> is project/run, a run name, or `.` for this worktree. {url} in
+                                  env stays the main URL: an app that checks allowed origins may need
+                                  the alias added there. Names outside a project domain, localhost or a
+                                  resolver are accepted with a warning that nothing resolves them yet.
   setu claim <run> [--as name] [--pid N]
                                      mark a worktree as being edited by you (default pid: the parent shell)
   setu release <run> [--as name]  drop a claim (without --as: whatever claim is there)
@@ -79,6 +87,11 @@ fn target(arg: Option<&String>) -> Result<Value> {
         Some(run) => json!({ "run": run }),
         None => json!({ "path": cwd()? }),
     })
+}
+
+/// A run argument where `.` means the worktree we are standing in.
+fn run_arg(arg: &str) -> Result<Value> {
+    Ok(if arg == "." { json!({ "path": cwd()? }) } else { json!({ "run": arg }) })
 }
 
 /// Remove `--as <name>` from the args.
@@ -186,7 +199,10 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                     r["status"].as_str().unwrap_or("?"),
                     mb,
                     if r["pinned"].as_bool() == Some(true) { " pinned" } else { "" },
-                    r["url"].as_str().unwrap_or(""),
+                    format!("{}{}", r["url"].as_str().unwrap_or(""), match r["aliases"].as_array().map_or(0, Vec::len) {
+                        0 => String::new(),
+                        n => format!(" +{n}"),
+                    }),
                     r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
                 );
                 if let Some(h) = r["claim"]["holder"].as_str() {
@@ -201,6 +217,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             }
             Ok(())
         }
+        Some("alias") => alias_cmd(&args[1..]).await,
         Some("new") => {
             let (rest, from) = extract_opt(&args[1..], "--from")?;
             let start = rest.iter().any(|a| a == "--start");
@@ -299,6 +316,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             } else {
                 println!("{} removed; branch {} kept", out["run"].as_str().unwrap_or("?"), out["branch"].as_str().unwrap_or("(detached)"));
             }
+            print_dropped_aliases(&out);
             if let Some(a) = out["archive"].as_str() {
                 println!("  {} ignored file(s) archived to {a}; `setu restore {}` brings them back", out["archived_files"].as_u64().unwrap_or(0), out["run"].as_str().unwrap_or(""));
             }
@@ -314,6 +332,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             let run = args.get(1).ok_or_else(|| anyhow!("usage: setu forget <run>"))?;
             let out = api::call(json!({ "cmd": "worktree.forget", "run": run })).await?;
             println!("{} forgotten; its files at {} were not touched", out["run"].as_str().unwrap_or("?"), out["worktree"].as_str().unwrap_or("?"));
+            print_dropped_aliases(&out);
             Ok(())
         }
         Some("restore") => {
@@ -327,6 +346,7 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             for w in r["warnings"].as_array().cloned().unwrap_or_default() {
                 println!("  note: {}", w.as_str().unwrap_or(""));
             }
+            println!("  custom URLs added with `setu alias` are not restored; add them again if you still need them");
             println!("  dependencies are not reinstalled; run the project's install, then `setu up`");
             Ok(())
         }
@@ -818,4 +838,63 @@ async fn import_v1(args: &[String]) -> Result<()> {
         bail!("{failed} worktree(s) failed; fix them and re-run (done items are skipped)");
     }
     Ok(())
+}
+
+fn print_dropped_aliases(out: &Value) {
+    let hosts: Vec<&str> = out["dropped_aliases"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if !hosts.is_empty() {
+        println!("  custom URL(s) dropped: {} (`setu restore` does not bring them back)", hosts.join(", "));
+    }
+}
+
+/// `setu alias <run> <host>`, `setu alias rm <run> <host>`, `setu alias ls [run] [--json]`.
+async fn alias_cmd(args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: setu alias <run> <host> | setu alias rm <run> <host> | setu alias ls [run] [--json]   (<run> may be `.`)";
+    let json_out = args.iter().any(|a| a == "--json");
+    let pos: Vec<&String> = args.iter().filter(|a| *a != "--json").collect();
+    match pos.as_slice() {
+        [c, rest @ ..] if c.as_str() == "ls" && rest.len() <= 1 => {
+            let req = match rest.first() {
+                Some(r) => with_cmd("alias.ls", run_arg(r)?),
+                None => json!({ "cmd": "alias.ls" }),
+            };
+            let out = api::call(req).await?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            let list = out.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no custom URLs or aliases; add one with `setu alias <run> <host>`");
+            }
+            for a in &list {
+                println!("{:<44} {:<8} {}", a["run"].as_str().unwrap_or("?"), a["source"].as_str().unwrap_or("?"), a["url"].as_str().unwrap_or("?"));
+            }
+            Ok(())
+        }
+        [c, run, host] if c.as_str() == "rm" => {
+            let mut req = with_cmd("alias.rm", run_arg(run)?);
+            req["host"] = json!(host);
+            let out = api::call(req).await?;
+            println!("{} no longer answers at {}", out["run"].as_str().unwrap_or("?"), out["host"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        [run, host] if !matches!(run.as_str(), "rm" | "ls") => {
+            let mut req = with_cmd("alias.add", run_arg(run)?);
+            req["host"] = json!(host);
+            let out = api::call(req).await?;
+            let (r, u) = (out["run"].as_str().unwrap_or("?"), out["url"].as_str().unwrap_or("?"));
+            if out["added"].as_bool() == Some(false) {
+                println!("{r} already answers at {u}");
+            } else {
+                println!("{r} now also answers at {u}");
+            }
+            for w in out["warnings"].as_array().cloned().unwrap_or_default() {
+                println!("  warning: {}", w.as_str().unwrap_or(""));
+            }
+            println!("  {{url}} in env stays the main URL; an app that checks allowed origins may need this host added");
+            Ok(())
+        }
+        _ => bail!("{USAGE}"),
+    }
 }

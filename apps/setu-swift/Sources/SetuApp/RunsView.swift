@@ -151,6 +151,13 @@ struct RunsView: View {
                 if let u = rs[0].url {
                     Button("Copy URL", systemImage: "doc.on.doc") { copyPlain(u) }
                 }
+                if !rs[0].aliases.isEmpty {
+                    Menu("Other URLs", systemImage: "link") {
+                        ForEach(rs[0].aliases, id: \.host) { a in
+                            Button(a.host) { openURL(rs[0].aliasURL(a.host)) }
+                        }
+                    }
+                }
                 Divider()
                 if rs[0].pinned {
                     Button("Unpin", systemImage: "pin.slash") { Task { await store.setPinned(rs[0].run, false) } }

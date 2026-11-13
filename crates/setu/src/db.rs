@@ -110,9 +110,12 @@ DROP TABLE meta;
 ALTER TABLE meta_new RENAME TO meta;
 ";
 
+/// Version 4: custom hosts added with `setu alias`, kept with the run (JSON array of hostnames).
+const V4: &str = "ALTER TABLE runs ADD COLUMN custom_aliases_json TEXT NOT NULL DEFAULT '[]';";
+
 /// Forward-only; the schema version is `PRAGMA user_version` = number of steps applied (the same
 /// numbering `rusqlite_migration` used, so existing files line up).
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 const BACKUPS_KEEP: usize = 3;
@@ -697,6 +700,45 @@ pub(crate) mod tests {
         }
     }
 
+    /// A database exactly as the previous build (schema v3) left it, with one run in it.
+    fn stage_v3(tag: &str) -> (PathBuf, PathBuf) {
+        let d = tmp(tag);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("setu.db");
+        {
+            let p = path.to_str().unwrap();
+            let db = block_on(turso::Builder::new_local(p).build()).unwrap();
+            let conn = db.connect().unwrap();
+            let c = Conn { c: &conn, failed: Cell::new(false) };
+            migrate(&c, &[V1, V2, V3]).unwrap();
+            assert_eq!(c.scalar_i64("PRAGMA user_version", ()).unwrap(), 3);
+            let spec = r#"{"id":{"project":"p","run":"r"},"worktree":"/w","host":"r.p.local","url":"http://r.p.local:7777","ports":{"web":4001},"env":{},"procs":[],"web_port":4001,"idle":{"secs":60,"nanos":0}}"#;
+            c.execute("INSERT INTO runs (key, project, run, spec_json, status, procs_json) VALUES ('p/r', 'p', 'r', ?1, 'stopped', '[]')", [spec]).unwrap();
+        }
+        (d, path)
+    }
+
+    #[test]
+    fn migrating_from_schema_v3_adds_custom_aliases_and_keeps_the_runs() {
+        let (d, path) = stage_v3("mig-v4");
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            assert_eq!(c.scalar_i64("PRAGMA user_version", ())?, 4);
+            assert_eq!(c.scalar_i64("SELECT count(*) FROM runs WHERE key = 'p/r' AND custom_aliases_json = '[]'", ())?, 1, "old rows get an empty list");
+            Ok(())
+        })
+        .unwrap();
+        let mut st = crate::state::load(&db).unwrap();
+        assert!(st.runs["p/r"].custom_aliases.is_empty());
+        st.runs.get_mut("p/r").unwrap().custom_aliases = vec!["demo.p.test".into()];
+        crate::state::save(&db, &st).unwrap();
+        assert_eq!(crate::state::load(&db).unwrap().runs["p/r"].custom_aliases, ["demo.p.test"]);
+        let backups: Vec<_> = std::fs::read_dir(d.join("backups")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(backups.iter().any(|b| b.starts_with("setu-v3-")), "{backups:?}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_backup_is_taken_before_migrating_and_only_the_last_three_are_kept() {
         let (d, path) = stage_fixture("backup", "rusqlite-v2.db");
@@ -802,10 +844,10 @@ pub(crate) mod tests {
     fn a_failed_migration_step_rolls_back_with_its_version_bump() {
         let (db, d) = temp_db("migfail");
         let r = db.with(|c| {
-            let steps: &[&str] = &[V1, V2, V3, "CREATE TABLE half (x INTEGER); INSERT INTO half VALUES (1); INSERT INTO no_such_table VALUES (1);"];
+            let steps: &[&str] = &[V1, V2, V3, V4, "CREATE TABLE half (x INTEGER); INSERT INTO half VALUES (1); INSERT INTO no_such_table VALUES (1);"];
             migrate(c, steps)
         });
-        assert!(r.unwrap_err().to_string().contains("migration to schema v4"));
+        assert!(r.unwrap_err().to_string().contains("migration to schema v5"));
         db.with(|c| {
             assert_eq!(c.scalar_i64("PRAGMA user_version", ())?, SCHEMA_VERSION, "the version did not advance");
             assert_eq!(c.scalar_i64("SELECT count(*) FROM sqlite_master WHERE name = 'half'", ())?, 0, "the half-applied step left nothing");

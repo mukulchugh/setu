@@ -135,6 +135,14 @@ pub fn tools() -> Vec<Value> {
             &["run"],
         ),
         tool("run_url", "The local URL and status of a run.", json!({ "run": run.clone() }), &["run"]),
+        tool(
+            "run_alias_add",
+            "Give a run an extra custom hostname (any run, branches included), e.g. demo.example.test. It routes exactly like the main URL (on-demand start included). The name must not belong to another run. Names Setu cannot resolve yet are accepted with a warning. {url} in env stays the main URL.",
+            json!({ "run": run.clone(), "host": { "type": "string", "description": "A lowercase DNS name, e.g. demo.example.test. No IPs or wildcards." } }),
+            &["run", "host"],
+        ),
+        tool("run_alias_remove", "Remove a custom hostname from a run (config aliases come from the project file and cannot be removed here).", json!({ "run": run.clone(), "host": { "type": "string" } }), &["run", "host"]),
+        tool("run_alias_list", "List the extra hostnames of a run, or of every run when `run` is omitted, with their source (config or custom).", json!({ "run": run.clone() }), &[]),
         tool("env_list", "List the variables set in one env layer: names, whether each is secret, and a masked preview. Secret values are never returned.", with_scope(json!({})), &["scope"]),
         tool("env_effective", "Every variable a run receives, with the layer each comes from and what it overrides. Secret values are masked.", json!({ "run": run.clone() }), &["run"]),
         tool(
@@ -273,6 +281,12 @@ async fn call_tool(name: &str, args: &Value, client: Option<&str>) -> Result<Val
                 .map(|r| json!({ "run": r["run"], "url": r["url"], "status": r["status"] }))
                 .ok_or_else(|| anyhow!("run {key} not found"))
         }
+        "run_alias_add" => daemon(json!({ "cmd": "alias.add", "run": need(args, "run")?, "host": need(args, "host")? }), client, true).await,
+        "run_alias_remove" => daemon(json!({ "cmd": "alias.rm", "run": need(args, "run")?, "host": need(args, "host")? }), client, true).await,
+        "run_alias_list" => match str_arg(args, "run") {
+            Some(r) => daemon(json!({ "cmd": "alias.ls", "run": r }), client, false).await,
+            None => daemon(json!({ "cmd": "alias.ls" }), client, false).await,
+        },
         "env_list" => daemon(scope_req("env.list", args)?, client, false).await,
         "env_effective" => daemon(json!({ "cmd": "env.effective", "run": need(args, "run")? }), client, false).await,
         "env_set" => {
@@ -319,7 +333,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_object_schema() {
         let list = tools();
-        assert_eq!(list.len(), 20);
+        assert_eq!(list.len(), 23);
         for t in &list {
             let name = t["name"].as_str().unwrap();
             assert!(!t["description"].as_str().unwrap().is_empty(), "{name}");
@@ -329,6 +343,17 @@ mod tests {
                 assert!(t["inputSchema"]["properties"].get(r.as_str().unwrap()).is_some(), "{name} requires unknown {r}");
             }
         }
+    }
+
+    #[test]
+    fn alias_tools_exist_and_require_a_run_and_host() {
+        let list = tools();
+        let by = |n: &str| list.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("missing tool {n}")).clone();
+        for n in ["run_alias_add", "run_alias_remove"] {
+            assert_eq!(by(n)["inputSchema"]["required"], json!(["run", "host"]), "{n}");
+        }
+        assert_eq!(by("run_alias_list")["inputSchema"]["required"], json!([]));
+        assert!(by("run_alias_add")["description"].as_str().unwrap().contains("{url}"));
     }
 
     #[test]
@@ -349,7 +374,7 @@ mod tests {
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&note, &mut client).await.is_none());
         let l = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &mut client).await.unwrap();
-        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 20);
+        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 23);
         let bad = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "env_reveal" } }), &mut client).await.unwrap();
         assert_eq!(bad["error"]["code"], -32602);
     }

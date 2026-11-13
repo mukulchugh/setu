@@ -25,6 +25,8 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
     var claim: Claim?
     /// Set while auto-removal has the worktree on its list and it is not pinned.
     var removal: Removal?
+    /// Extra hostnames that reach this run: from the project config or added with `setu alias`.
+    var aliases: [AliasHost]
 
     var id: String { run }
     var isUp: Bool { status == "running" || status == "starting" }
@@ -33,8 +35,16 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
     var project: String { run.split(separator: "/", maxSplits: 1).first.map(String.init) ?? run }
     var name: String { run.split(separator: "/", maxSplits: 1).last.map(String.init) ?? run }
 
+    /// The run's URL with an alias host swapped in (same scheme and port).
+    func aliasURL(_ host: String) -> String? {
+        guard let url, var parts = URLComponents(string: url) else { return nil }
+        parts.host = host
+        return parts.string
+    }
+
     enum CodingKeys: String, CodingKey {
         case run, url, status, pinned, ramBytes = "ram_bytes", worktree, note, staleEnv = "stale_env", claim, removal
+        case aliases, aliasSources = "alias_sources"
     }
 
     init(from d: Decoder) throws {
@@ -49,7 +59,29 @@ struct Run: Decodable, Sendable, Hashable, Identifiable {
         staleEnv = c.val(.staleEnv, false)
         claim = try? c.decodeIfPresent(Claim.self, forKey: .claim)
         removal = try? c.decodeIfPresent(Removal.self, forKey: .removal)
+        // `alias_sources` carries the source; older daemons only send the plain `aliases` hostnames.
+        if let withSource = try? c.decodeIfPresent([AliasHost].self, forKey: .aliasSources) {
+            aliases = withSource
+        } else {
+            aliases = c.val(.aliases, [String]()).map { AliasHost(host: $0, source: "config") }
+        }
     }
+}
+
+/// One extra hostname of a run; `source` is "config" or "custom" (`setu alias`).
+struct AliasHost: Decodable, Sendable, Hashable {
+    var host: String
+    var source: String
+    init(host: String, source: String) {
+        self.host = host
+        self.source = source
+    }
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        host = c.val(.host, "")
+        source = c.val(.source, "config")
+    }
+    enum CodingKeys: String, CodingKey { case host, source }
 }
 
 /// `claim` of an `ls` entry, and one row of `claims`.

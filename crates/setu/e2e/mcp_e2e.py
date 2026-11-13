@@ -76,6 +76,22 @@ err, url = m.tool("run_url", run=key)
 assert not err and url["url"].startswith("http://"), url
 print("run_url ->", url["url"])
 
+err, al = m.tool("run_alias_add", run=key, host="Demo.E2E.local")
+assert not err and al["host"] == "demo.e2e.local" and al["warnings"] == [], al
+err, bad_alias = m.tool("run_alias_add", run=key, host="10.0.0.1")
+assert err, "an IP must be refused"
+err, al_list = m.tool("run_alias_list", run=key)
+assert not err and [(a["host"], a["source"]) for a in al_list] == [("demo.e2e.local", "custom")], al_list
+err, al_all = m.tool("run_alias_list")
+assert not err and len(al_all) == 1, al_all
+err, ls_after = m.tool("run_list")
+assert [r for r in ls_after if r["run"] == key][0]["aliases"] == ["demo.e2e.local"]
+err, al_rm = m.tool("run_alias_remove", run=key, host="demo.e2e.local")
+assert not err and al_rm["removed"] is True, al_rm
+err, al_none = m.tool("run_alias_list", run=key)
+assert not err and al_none == [], al_none
+print("run_alias_add/list/remove -> ok")
+
 err, lst = m.tool("env_list", scope="project", target="e2e")
 assert not err and any(v["name"] == "API_TOKEN" and v["secret"] for v in lst["vars"]), lst
 print("env_list -> names:", [v["name"] for v in lst["vars"]])

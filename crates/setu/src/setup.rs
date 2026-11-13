@@ -171,15 +171,22 @@ pub fn plist(binary: &Path, path_env: &str, log: &Path) -> String {
     )
 }
 
-/// Homebrew's stable symlink if present (survives upgrades), else this binary.
+/// The path the LaunchAgent should run: Homebrew's stable `opt` symlink (survives upgrades) when
+/// this binary *is* the Homebrew one, else this binary itself. A dev or sandbox build never
+/// points the agent at an unrelated Homebrew install.
 pub fn stable_binary_path() -> PathBuf {
-    for p in ["/opt/homebrew/opt/setu/bin/setu", "/usr/local/opt/setu/bin/setu"] {
-        if Path::new(p).exists() {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("setu"));
+    let exe = exe.canonicalize().unwrap_or(exe);
+    stable_for(&exe, &["/opt/homebrew/opt/setu/bin/setu", "/usr/local/opt/setu/bin/setu"])
+}
+
+fn stable_for(exe: &Path, brew: &[&str]) -> PathBuf {
+    for p in brew {
+        if Path::new(p).canonicalize().is_ok_and(|c| c == exe) {
             return PathBuf::from(p);
         }
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("setu"));
-    exe.canonicalize().unwrap_or(exe)
+    exe.to_path_buf()
 }
 
 pub fn resolver_contents(dns_port: u16) -> String {
@@ -553,6 +560,24 @@ mod tests {
         apply(&steps, &mut g, Path::new("/b"), &l, &fake).unwrap();
         assert_eq!(fake.calls.borrow().iter().filter(|c| c.starts_with("launchctl bootstrap")).count(), 4);
         assert!(SetupRecord::load(&l.record).unwrap().plist.is_some());
+    }
+
+    #[test]
+    fn the_homebrew_path_is_used_only_when_this_binary_is_the_homebrew_one() {
+        let d = std::env::temp_dir().join(format!("setu-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Cellar/setu/1/bin")).unwrap();
+        std::fs::create_dir_all(d.join("opt/setu/bin")).unwrap();
+        let cellar = d.join("Cellar/setu/1/bin/setu");
+        std::fs::write(&cellar, "").unwrap();
+        let opt = d.join("opt/setu/bin/setu");
+        std::os::unix::fs::symlink(&cellar, &opt).unwrap();
+        let other = d.join("dev-setu");
+        std::fs::write(&other, "").unwrap();
+        let brew = [opt.to_str().unwrap()];
+        assert_eq!(stable_for(&cellar.canonicalize().unwrap(), &brew), opt, "the Homebrew binary gets the stable opt path");
+        assert_eq!(stable_for(&other.canonicalize().unwrap(), &brew), other.canonicalize().unwrap(), "a dev build is never swapped for Homebrew's");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

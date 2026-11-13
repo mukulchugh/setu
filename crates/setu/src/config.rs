@@ -408,6 +408,29 @@ pub fn validate_domain(domain: &str) -> Result<()> {
     Ok(())
 }
 
+/// A hostname for `setu alias`: trimmed, lowercased, a valid DNS name. IPs, wildcards, ports and
+/// anything over 253 characters are refused.
+pub fn validate_custom_host(raw: &str) -> Result<String> {
+    let host = raw.trim().to_lowercase();
+    if host.is_empty() {
+        bail!("give a hostname, e.g. demo.example.test");
+    }
+    if host.contains('*') {
+        bail!("{raw:?}: wildcards are not supported; give one exact hostname");
+    }
+    if host.len() > 253 {
+        bail!("{raw:?}: a hostname is at most 253 characters");
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() || host.rsplit('.').next().is_some_and(|l| l.bytes().all(|c| c.is_ascii_digit())) {
+        bail!("{raw:?}: an IP address is not a hostname; Setu routes by name");
+    }
+    if host.contains(':') || host.contains('/') {
+        bail!("{raw:?}: give the bare hostname, without a port or path");
+    }
+    validate_domain(&host).map_err(|_| anyhow!("{raw:?} is not a valid hostname (lowercase letters, digits and '-', dot-separated labels of at most 63 characters)"))?;
+    Ok(host)
+}
+
 pub fn global_env_path() -> PathBuf {
     paths::env_dir().join("global.toml")
 }
@@ -839,5 +862,17 @@ run = "bun worker {{literal}}"
         assert_eq!(main.aliases, cfg.aliases);
         let feat = resolve_run(&cfg, Path::new("/w"), "feat-x", &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert!(feat.aliases.is_empty());
+    }
+
+    #[test]
+    fn custom_hosts_are_lowercased_and_ips_wildcards_and_long_names_are_refused() {
+        assert_eq!(validate_custom_host(" Demo.Example.TEST ").unwrap(), "demo.example.test");
+        assert_eq!(validate_custom_host("localhost").unwrap(), "localhost");
+        assert_eq!(validate_custom_host("a-b.c1.test").unwrap(), "a-b.c1.test");
+        for bad in ["", "   ", "127.0.0.1", "10.0.0.1.", "::1", "[::1]", "*.example.test", "a*.test", "demo.example.test:8080", "demo/x.test", "-a.test", "a-.test", "a..test", "a b.test", "dem\u{f6}.test", "under_score.test", "a.123"] {
+            assert!(validate_custom_host(bad).is_err(), "{bad:?} should be refused");
+        }
+        let too_long = format!("{}.test", vec!["a".repeat(63); 4].join("."));
+        assert!(too_long.len() > 253 && validate_custom_host(&too_long).unwrap_err().to_string().contains("253"));
     }
 }
