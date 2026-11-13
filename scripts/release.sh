@@ -54,7 +54,11 @@ export CARGO_TARGET_DIR="${SETU_RELEASE_CACHE:-$HOME/Library/Caches/setu-release
 mkdir -p "$CARGO_TARGET_DIR"
 
 say "running cargo test"
-cargo test -q 2>&1 | grep -E "^test result" || die "tests failed"
+if ! cargo test -q > "$WORK/test.log" 2>&1; then
+  grep -E "^---- |panicked at|^test result" "$WORK/test.log" | head -20 >&2
+  die "tests failed (full log: $WORK/test.log is removed on exit; re-run \`cargo test\` to see it)"
+fi
+grep -E "^test result" "$WORK/test.log"
 
 say "building Setu.app (universal, uses the Homebrew-installed setu)"
 SETU_APP_UNIVERSAL=1 SETU_APP_NO_CLI=1 bash scripts/bundle-swift.sh > "$WORK/app.log" 2>&1 || { tail -20 "$WORK/app.log"; die "Setu.app build failed"; }
