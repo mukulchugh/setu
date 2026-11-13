@@ -1,0 +1,8 @@
+name = "workos-authkit"
+description = "The sign-in redirect address follows each worktree's own URL."
+
+[detect]
+any_of = [{ dependency = "@workos-inc/authkit-nextjs" }]
+
+[env]
+NEXT_PUBLIC_WORKOS_REDIRECT_URI = "{url}/authentication/callback"

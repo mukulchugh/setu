@@ -150,16 +150,21 @@ grep -q 'aliases = \["mukulchugh.com.e2e.local"\]' "$SETU_HOME/config/projects/m
 grep -q 'aliases = \["quivly-site2.0.e2e.local"\]' "$SETU_HOME/config/projects/quivly-site2-0.toml" || fail "v1 host alias missing (site2)"
 grep -q 'quivly-site2.0.git' "$SETU_HOME/config/projects/quivly-site2-0.toml" || fail "config must still point at the dotted v1 repo"
 cmp "$SETU_HOME/config/projects/keep.toml" "$SB/keep.toml.orig" || fail "existing config must stay byte-identical"
-# a repo with trigger.config.ts, an inngest dependency and authkit gets the sidecars and the env v1 gave it
+# a repo with trigger.config.ts, an inngest dependency and authkit names those recipes instead of pasting their commands
 FULL="$SETU_HOME/config/projects/full.toml"
-for want in 'inngest = {}' 'NEXT_PUBLIC_APP_BASE_URL *= "{url}"' 'NEXT_PUBLIC_WORKOS_REDIRECT_URI *= "{url}/authentication/callback"' 'NX_DAEMON *= "false"' 'INNGEST_DEV *= "1"' 'INNGEST_BASE_URL *= "http://127.0.0.1:{port.inngest}"' 'TRIGGER_DEV_BRANCH *= "{run}"' 'TRIGGER_PREVIEW_BRANCH *= "{run}"' '^\[procs.inngest\]' 'inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery' '^\[procs.trigger\]' 'run = "setu x trigger-dev --max-concurrent-runs 2"'; do
-  grep -q -- "$want" "$FULL" || { cat "$FULL"; fail "full.toml is missing: $want"; }
+grep -qF 'recipes = ["inngest", "next-env", "nx", "trigger", "workos-authkit"]' "$FULL" || { cat "$FULL"; fail "full.toml should name its recipes"; }
+for pasted in '^\[procs.inngest\]' '^\[procs.trigger\]' '^\[env\]' 'exec bunx' 'NX_DAEMON' 'inngest dev -p'; do
+  ! grep -q -- "$pasted" "$FULL" || { cat "$FULL"; fail "full.toml must not paste the recipe: $pasted"; }
 done
+! grep -q 'setu x' "$FULL" || fail "generated configs must not use the removed setu x helpers"
 ! grep -q 'procs.convex' "$FULL" || fail "no convex dependency, so no convex proc"
 ! grep -q 'WORKOS\|TRIGGER\|INNGEST' "$SETU_HOME/config/projects/app.toml" || fail "app uses none of them, so it gets none"
-grep -q 'NEXT_PUBLIC_APP_BASE_URL' "$SETU_HOME/config/projects/app.toml" || fail "a JS app still gets its base URL"
+grep -qF 'recipes = ["next-env"]' "$SETU_HOME/config/projects/app.toml" || fail "a JS app still gets its base URL, through the next-env recipe"
+has "$("$BIN" env effective app/main)" 'NEXT_PUBLIC_APP_BASE_URL'
 "$BIN" env effective full/main > "$SB/env-full.out"
 has "$(cat "$SB/env-full.out")" "TRIGGER_DEV_BRANCH .*main"
+has "$(cat "$SB/env-full.out")" "NX_DAEMON .*false"
+has "$(cat "$SB/env-full.out")" "INNGEST_BASE_URL .*http://127.0.0.1:"
 has "$(cat "$SB/env-full.out")" "NEXT_PUBLIC_WORKOS_REDIRECT_URI .*http://full.e2e.local:17782/authentication/callback"
 LS=$("$BIN" ls)
 has "$LS" "mukulchugh-com/main"; has "$LS" "quivly-site2-0/main"; has "$LS" "quivly-site2-0/feat-dot"

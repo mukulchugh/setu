@@ -1,0 +1,9 @@
+name = "convex"
+description = "Convex dev server (a watch process against your Convex dev deployment)."
+
+[detect]
+any_of = [{ dependency = "convex" }, { dir = "convex" }, { dir = "apps/*/convex" }]
+
+[procs.convex]
+run = "{pm_exec} convex dev"
+cwd = "{dir}"

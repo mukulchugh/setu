@@ -26,6 +26,8 @@ pub struct DoctorInputs {
     pub proxy_binding: Option<crate::globalcfg::ProxyBinding>,
     /// The port the proxy is expected on (binding, else config, else :80).
     pub proxy_port: u16,
+    /// (state, detail) of the bundled Setu.app against the installed one; `None` when this build has no bundled app.
+    pub setu_app: Option<(String, String)>,
 }
 
 const BUILTINS: &[&str] = &[
@@ -92,6 +94,26 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
         }
     };
 
+    if let Some((state, detail)) = &inp.setu_app {
+        out.push(ok("Setu.app", format!("{state}: {detail}")));
+    }
+
+    for pc in &inp.projects {
+        for (name, spec) in &pc.procs {
+            let mut words = spec.run.split_whitespace();
+            if words.next() != Some("setu") || words.next() != Some("x") {
+                continue;
+            }
+            let label = format!("{}/{} command `setu x`", pc.project, name);
+            let helper = words.next().unwrap_or("");
+            let fix = match crate::recipes::recipe_for_helper(helper) {
+                Some(recipe) => format!("`setu x` is gone. In the {0} project config, replace proc {name} with `recipes = [\"{recipe}\"]` (a top-level line, above the first [table]) and delete the old [procs.{name}] block. The recipe's command is built in and stays current; `setu recipes show {recipe}` prints it, and a proc you write yourself still overrides it.", pc.project),
+                None => format!("`setu x` is gone and no recipe replaces `{helper}`; put the command itself in the run of proc {name} (`setu recipes ls` lists the recipes)"),
+            };
+            out.push(bad(label, "`setu x` helpers were removed", fix));
+        }
+    }
+
     if let Some(path) = captured {
         for pc in &inp.projects {
             for (name, spec) in &pc.procs {
@@ -105,7 +127,7 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
                 for w in words {
                     let label = format!("{}/{} command `{w}`", pc.project, name);
                     // The shell that runs procs expands a leading `~`; the daemon also puts its own
-                    // directory on procs' PATH, so `setu x …` always resolves.
+                    // directory on procs' PATH, so `setu` always resolves.
                     let expanded = match w.strip_prefix("~/") {
                         Some(rest) => std::env::var_os("HOME").map(|h| Path::new(&h).join(rest)).unwrap_or_else(|| Path::new(w).to_path_buf()),
                         None => Path::new(w).to_path_buf(),
@@ -235,6 +257,7 @@ mod tests {
             proxy_listening: true,
             proxy_binding: None,
             proxy_port: 7777,
+            setu_app: None,
         }
     }
 
@@ -294,15 +317,39 @@ mod tests {
     #[test]
     fn missing_commands_builtins_and_paths() {
         let d = tmpdir("cmds");
-        let p = project(&[("a", "inngest dev", false), ("b", "cd x && ls", false), ("c", "{{bin}}/x", false), ("d", "/does/not/exist --x", false), ("e", "node a.js", true)], "q.test", vec![]);
+        let p = project(&[("a", "somecli dev", false), ("b", "cd x && ls", false), ("c", "{{bin}}/x", false), ("d", "/does/not/exist --x", false), ("e", "node a.js", true)], "q.test", vec![]);
         let cs = run(inputs(Some(d.display().to_string()), vec![p]), &FakeSys { resolving: vec!["q.test".into()] });
         let a = find(&cs, "p/a command");
-        assert!(!a.ok && a.fix.as_deref().unwrap().contains("inngest"));
+        assert!(!a.ok && a.fix.as_deref().unwrap().contains("somecli"));
         assert!(!cs.iter().any(|c| c.name.contains("p/b command") && c.name.contains("`cd`")));
         assert!(!cs.iter().any(|c| c.name.starts_with("p/c")));
         assert!(!find(&cs, "p/d command").ok);
         assert!(!find(&cs, "command `mise`").ok);
         assert!(find(&cs, "domain q.test").ok);
+    }
+
+    #[test]
+    fn setu_x_procs_are_flagged_with_the_recipe_replacement() {
+        let d = tmpdir("setux");
+        let p = project(&[("trigger", "setu x trigger-dev --max-concurrent-runs 2", false), ("other", "setu x nothing-like-it", false), ("web", "setu up", false)], "q.test", vec![]);
+        let cs = run(inputs(Some(d.display().to_string()), vec![p]), &FakeSys { resolving: vec!["q.test".into()] });
+        let c = find(&cs, "p/trigger command `setu x`");
+        let fix = c.fix.as_deref().unwrap();
+        assert!(!c.ok && fix.contains("`setu x` is gone") && fix.contains("recipes = [\"trigger\"]") && fix.contains("delete the old [procs.trigger] block"), "{fix}");
+        let o = find(&cs, "p/other command `setu x`");
+        assert!(!o.ok && o.fix.as_deref().unwrap().contains("no recipe replaces `nothing-like-it`"));
+        assert!(!cs.iter().any(|c| c.name.starts_with("p/web") && !c.ok));
+    }
+
+    #[test]
+    fn setu_app_is_an_informational_check_only_when_an_app_is_bundled() {
+        let d = tmpdir("app");
+        let mut i = inputs(Some(d.display().to_string()), vec![]);
+        assert!(!run(inputs(Some(d.display().to_string()), vec![]), &FakeSys { resolving: vec![] }).iter().any(|c| c.name == "Setu.app"));
+        i.setu_app = Some(("update available".into(), "installed 0.1.0, bundled 0.2.0; run `setu app` to update".into()));
+        let cs = run(i, &FakeSys { resolving: vec![] });
+        let c = find(&cs, "Setu.app");
+        assert!(c.ok && c.detail.contains("run `setu app` to update"), "{c:?}");
     }
 
     #[test]

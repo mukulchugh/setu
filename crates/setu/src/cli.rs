@@ -54,8 +54,10 @@ setu: run every worktree's app and workers at its own local URL
   setu restart [run]              stop a run and start it again (also takes over a running external one)
   setu migrate [plan|run --yes|rollback]
                                      move from the old JS Setu (v1): plan is read-only, run needs --yes
-  setu x trigger-dev [--max-concurrent-runs N] [--env-file PATH]
-                                     Trigger.dev dev worker with the CLI version this worktree pins
+  setu recipes [ls|show <name>]   the recipes a project config names (`recipes = [...]`) for its sidecars and env
+                                  (shipped ones, and yours in the config dir's recipes/)
+  setu app [install|path|uninstall]   put the Setu.app that came with setu into ~/Applications
+                                  (never opens it; refuses while it is running)
   setu mcp                        MCP server over stdio for AI agents (no secrets, no reveal)
 ";
 
@@ -144,7 +146,9 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
         }
         Some("daemon") => crate::daemon::run().await,
         Some("mcp") => crate::mcp::run().await,
-        Some("x") => crate::trigger::x_main(&args[1..]),
+        Some("app") => crate::app::main(&args[1..]),
+        Some("recipes") => crate::recipes::main(&args[1..]),
+        Some("x") => bail!("`setu x` helpers are gone: a proc's run command now comes from a recipe; see `setu recipes ls`, and `setu doctor` for what to put in your config"),
         Some("migrate") => crate::migrate::main(&args[1..]),
         Some("up") => {
             let path = match args.get(1) {
@@ -729,6 +733,7 @@ async fn doctor_cmd(args: &[String]) -> Result<()> {
             proxy_listening,
             proxy_binding,
             proxy_port,
+            setu_app: std::env::var_os("HOME").and_then(|h| crate::app::doctor_status(crate::app::find_bundled().as_deref(), std::path::Path::new(&h))),
         },
         &sys,
     );

@@ -1,0 +1,8 @@
+name = "next-env"
+description = "NEXT_PUBLIC_APP_BASE_URL follows each worktree's own URL."
+
+[detect]
+any_of = [{ file = "package.json" }]
+
+[env]
+NEXT_PUBLIC_APP_BASE_URL = "{url}"

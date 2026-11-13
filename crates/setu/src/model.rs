@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Leased app ports live here: above v1's 3000-3999, clear of its 8288-9287 Inngest range.
+/// Leased app ports live here: above v1's 3000-3999, clear of its 8288-9287 sidecar range.
 pub const PORT_RANGE: std::ops::RangeInclusive<u16> = 4000..=4999;
 
 /// One project, parsed from `~/.config/setu/projects/<project>.toml`.
@@ -21,7 +21,7 @@ pub struct ProjectConfig {
     pub idle: Duration,
     /// Max runs up at once across this project (default 3).
     pub max_running: usize,
-    /// Named ports leased per run, e.g. "web", "inngest". Values are reserved for later options.
+    /// Named ports leased per run, e.g. "web", "queue". Values are reserved for later options.
     pub ports: Vec<String>,
     /// Project env layer (unrendered templates).
     pub env: BTreeMap<String, String>,

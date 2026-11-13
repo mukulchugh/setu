@@ -3,7 +3,7 @@
 
 use crate::model::{DiskItem, DiskKind, DiskStore, Install, ProcSpec, ProjectConfig, ResolvedProc, RunId, RunSpec, SetupStep, WorktreeCfg};
 use crate::presets::{self, RawItem};
-use crate::{naming, paths};
+use crate::{naming, paths, recipes, worktree};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -26,6 +26,9 @@ struct RawProject {
     env: BTreeMap<String, String>,
     #[serde(default)]
     procs: BTreeMap<String, RawProc>,
+    /// Recipes to merge in (shipped ones and `<config dir>/recipes/*.toml`); keys written here win.
+    #[serde(default)]
+    recipes: Vec<String>,
     preset: Option<RawPresetSel>,
     #[serde(default)]
     disk: RawDisk,
@@ -251,6 +254,11 @@ pub(crate) fn parse_project(text: &str, file: &Path) -> Result<ProjectConfig> {
 
 /// Parse a project; `checkout` maps the repo to the checkout root used for preset detection.
 fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Option<PathBuf>) -> Result<ProjectConfig> {
+    parse_project_with(text, file, checkout, Some(&recipes::user_dir()))
+}
+
+/// `parse_project_in` with the directory that holds the user's own recipes spelled out.
+pub(crate) fn parse_project_with(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Option<PathBuf>, recipe_dir: Option<&Path>) -> Result<ProjectConfig> {
     let raw: RawProject = toml::from_str(text).with_context(|| format!("invalid project config {}", file.display()))?;
     validate_project_name(&raw.project).with_context(|| format!("in {}", file.display()))?;
     validate_domain(&raw.domain).with_context(|| format!("in {}", file.display()))?;
@@ -268,11 +276,6 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
     let idle = parse_duration(raw.idle.as_deref().unwrap_or("30m")).with_context(|| format!("in {}", file.display()))?;
     let mut procs = BTreeMap::new();
     for (name, p) in raw.procs {
-        if let Some(port) = &p.port {
-            if !raw.ports.contains_key(port) {
-                bail!("{}: proc {name:?} uses port {port:?} which is not in [ports]", file.display());
-            }
-        }
         procs.insert(name, ProcSpec { run: p.run, port: p.port, mise: p.mise, cwd: p.cwd });
     }
     let requested: Vec<String> = match raw.preset {
@@ -300,7 +303,7 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
     let checkout = if requested.iter().any(|r| r == "auto") { checkout(&repo) } else { None };
     let (presets, disk_items, stores) = presets::resolve(&requested, checkout.as_deref(), &items, &stores)
         .with_context(|| format!("in {}", file.display()))?;
-    Ok(ProjectConfig {
+    let mut cfg = ProjectConfig {
         project: raw.project,
         repo,
         presets,
@@ -316,7 +319,41 @@ fn parse_project_in(text: &str, file: &Path, checkout: impl FnOnce(&Path) -> Opt
         ports: raw.ports.into_keys().collect(),
         env: raw.env,
         procs,
-    })
+    };
+    merge_recipes(&mut cfg, &raw.recipes, file, recipe_dir)?;
+    for (name, p) in &cfg.procs {
+        if let Some(port) = &p.port {
+            if !cfg.ports.contains(port) {
+                bail!("{}: proc {name:?} uses port {port:?} which is not in [ports]", file.display());
+            }
+        }
+    }
+    Ok(cfg)
+}
+
+/// Merge the named recipes into `cfg`: their ports, env and procs fill in what the project does not
+/// say itself (a key written in the project always wins; with two recipes the first one listed wins).
+/// The generation-time variables are filled from the main worktree, once per load.
+fn merge_recipes(cfg: &mut ProjectConfig, names: &[String], file: &Path, recipe_dir: Option<&Path>) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let main = worktree::main_dir(cfg);
+    for r in recipes::resolve(names, file, &main, &cfg.project, recipe_dir)? {
+        for port in r.ports.into_keys() {
+            if !cfg.ports.contains(&port) {
+                cfg.ports.push(port);
+            }
+        }
+        for (k, v) in r.env {
+            cfg.env.entry(k).or_insert(v);
+        }
+        for (name, p) in r.procs {
+            cfg.procs.entry(name).or_insert(ProcSpec { run: p.run, port: p.port, mise: false, cwd: p.cwd });
+        }
+    }
+    cfg.ports.sort();
+    Ok(())
 }
 
 pub fn load_project(path: &Path) -> Result<ProjectConfig> {
@@ -579,6 +616,98 @@ run = "bun worker {{literal}}"
 
     fn map(v: &[(&str, &str)]) -> BTreeMap<String, String> {
         v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// A project whose main worktree is `<tmp>/<tag>/main` (files given), plus a user recipe dir.
+    fn recipe_fixture(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("setu-cfg-recipes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main = base.join("app/main");
+        for (f, c) in files {
+            let p = main.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, c).unwrap();
+        }
+        std::fs::create_dir_all(base.join("recipes")).unwrap();
+        (base.clone(), base.join("recipes"))
+    }
+
+    fn recipe_cfg(base: &Path, user: &Path, extra_top: &str, extra: &str) -> Result<ProjectConfig> {
+        let text = format!("project = \"app\"\nrepo = \"{}/app.git\"\ndomain = \"q.local\"\n{extra_top}\n[ports]\nweb = {{}}\n{extra}", base.display());
+        parse_project_with(&text, Path::new("app.toml"), |_| None, Some(user))
+    }
+
+    #[test]
+    fn recipes_are_merged_into_the_project_at_load() {
+        let (base, user) = recipe_fixture("merge", &[("bun.lock", ""), ("apps/app/package.json", r#"{"dependencies":{"inngest":"3"}}"#), ("trigger.config.ts", "")]);
+        let c = recipe_cfg(&base, &user, "recipes = [\"trigger\", \"inngest\", \"nx\"]", "[procs.web]\nrun = \"x\"\nport = \"web\"\n").unwrap();
+        assert_eq!(c.procs.keys().map(String::as_str).collect::<Vec<_>>(), ["inngest", "trigger", "web"]);
+        assert!(c.ports.contains(&"inngest".to_string()) && c.ports.contains(&"web".to_string()));
+        assert_eq!(c.env["NX_DAEMON"], "false");
+        assert_eq!(c.env["TRIGGER_DEV_BRANCH"], "{run}", "run-time variables stay for run time");
+        let t = &c.procs["trigger"].run;
+        assert!(t.contains("exec bunx") && t.contains("{worktree}/apps/app/.env.local"), "{t}");
+        assert!(!t.contains("{app_dir}") && !t.contains("{pm"), "{t}");
+        assert_eq!(c.procs["trigger"].cwd.as_deref(), Some(""), "the config sits at the root of the main worktree");
+        assert!(c.procs["inngest"].run.contains("{port.inngest}"), "{}", c.procs["inngest"].run);
+        // A project without recipes is untouched.
+        let plain = recipe_cfg(&base, &user, "", "[procs.web]\nrun = \"x\"\nport = \"web\"\n").unwrap();
+        assert_eq!(plain.procs.len(), 1);
+        assert!(plain.env.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn keys_written_in_the_project_win_over_the_recipe() {
+        let (base, user) = recipe_fixture("override", &[("trigger.config.ts", "")]);
+        let c = recipe_cfg(
+            &base,
+            &user,
+            "recipes = [\"trigger\", \"nx\"]",
+            "\n[env]\nNX_DAEMON = \"true\"\n\n[procs.trigger]\nrun = \"my own worker\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.procs["trigger"].run, "my own worker");
+        assert_eq!(c.procs["trigger"].cwd, None, "the whole proc is replaced, not merged field by field");
+        assert_eq!(c.env["NX_DAEMON"], "true");
+        assert_eq!(c.env["TRIGGER_DEV_BRANCH"], "{run}", "other recipe keys still apply");
+        // a port the project already declares is not duplicated
+        std::fs::write(user.join("p.toml"), "name = \"p\"\n[detect]\nany_of = [{ file = \"x\" }]\n[ports]\nweb = {}\nside = {}\n[procs.p]\nrun = \"go\"\nport = \"side\"\n").unwrap();
+        let c = recipe_cfg(&base, &user, "recipes = [\"p\"]", "").unwrap();
+        assert_eq!(c.ports, ["side", "web"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unknown_recipe_is_a_config_error_naming_the_file_and_the_choices() {
+        let (base, user) = recipe_fixture("unknown", &[]);
+        let e = format!("{:#}", recipe_cfg(&base, &user, "recipes = [\"nope\"]", "").unwrap_err());
+        assert!(e.contains("app.toml") && e.contains("unknown recipe \"nope\"") && e.contains("available recipes:") && e.contains("trigger") && e.contains("nx"), "{e}");
+        // a user recipe is available by name, and overrides a shipped one
+        std::fs::write(user.join("mine.toml"), "name = \"nx\"\n[detect]\nany_of = [{ file = \"nx.json\" }]\n[env]\nNX_DAEMON = \"mine\"\n").unwrap();
+        std::fs::write(user.join("extra.toml"), "name = \"extra\"\n[detect]\nany_of = [{ file = \"e\" }]\n[env]\nE = \"1\"\n").unwrap();
+        let c = recipe_cfg(&base, &user, "recipes = [\"nx\", \"extra\"]", "").unwrap();
+        assert_eq!((c.env["NX_DAEMON"].as_str(), c.env["E"].as_str()), ("mine", "1"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_dir_pm_and_dir_come_from_the_main_worktree() {
+        let (base, user) = recipe_fixture("vars", &[("pnpm-lock.yaml", ""), ("apps/app/x", ""), ("apps/web/convex/schema.ts", "")]);
+        let c = recipe_cfg(&base, &user, "recipes = [\"convex\", \"trigger\"]", "").unwrap();
+        assert_eq!(c.procs["convex"].run, "pnpm exec convex dev");
+        assert_eq!(c.procs["convex"].cwd.as_deref(), Some("apps/web"), "{{dir}} is where the recipe's detect rule matched");
+        assert!(c.procs["trigger"].run.contains("{worktree}/apps/app/.env.local"), "apps/<project> exists");
+        let _ = std::fs::remove_dir_all(&base);
+        // No apps/<project> folder and no lockfile: `.` and npm. No main worktree at all: the same, with an empty {dir}.
+        let (base, user) = recipe_fixture("vars2", &[("package.json", "{}")]);
+        let c = recipe_cfg(&base, &user, "recipes = [\"convex\", \"trigger\"]", "").unwrap();
+        assert_eq!(c.procs["convex"].run, "npx convex dev");
+        assert!(c.procs["trigger"].run.contains("{worktree}/./.env.local"));
+        let _ = std::fs::remove_dir_all(&base);
+        let gone = std::env::temp_dir().join(format!("setu-cfg-recipes-nomain-{}", std::process::id()));
+        let c = recipe_cfg(&gone, &user, "recipes = [\"convex\"]", "").unwrap();
+        assert_eq!(c.procs["convex"].run, "npx convex dev");
     }
 
     #[test]

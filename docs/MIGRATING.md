@@ -11,14 +11,15 @@ This is for anyone still running the old JavaScript Setu (the one that lives in 
 | The dashboard | The web portal on `localhost:2999` | The Setu app, and `setu ls` in a terminal. |
 | AI tools (MCP) | An HTTP server at `localhost:2999/mcp` | `setu mcp`, started by each tool. Claude Code, Codex, Cursor, Claude Desktop, Gemini and any project-level `.mcp.json` that named the old server are repointed for you. |
 | The `setu` command | A link in `~/.bun/bin` to the JavaScript CLI | The new binary. `setu cd` keeps working if your `~/.zshrc` still has the `setu()` function. |
-| Trigger.dev, Inngest, Convex | Started by the portal | Declared in your project config. `setu migrate` and `setu import-v1` write those entries for you. |
+| Trigger.dev, Inngest, Convex | Started by the portal | Declared through recipes: `setu import-v1` writes a `recipes = ["trigger", ...]` line in your project config, and Setu merges the recipes' ports, env and procs in when it loads it (`setu recipes ls`). |
 
 Your worktrees do not move. Nothing inside them is changed, and the shared `.env.local` files stay exactly as they are.
 
 New things you can use right away:
 
 - `setu restart [run]` stops a run and starts it again. It also works on a run that was started outside Setu (shown as "running, external").
-- `setu x trigger-dev` runs the Trigger.dev worker with the CLI version your worktree pins, and only passes `--branch` when the installed Trigger.dev SDK supports dev branches. Generated project configs already use it.
+- `setu recipes ls` and `setu recipes show <name>` list the recipes your configs can name. Each is a TOML file that says how to detect a stack and which ports, env and procs to add; put your own in `~/.config/setu/recipes/` (a file with a shipped recipe's name replaces it). The Trigger.dev worker's version-follow and `--branch` logic is now the shell command in the `trigger` recipe.
+- `setu x trigger-dev` is gone. If a hand-written config still has `run = "setu x trigger-dev ..."`, `setu doctor` flags it; replace the proc with `recipes = ["trigger"]` (a top-level line) and delete the old `[procs.trigger]` block.
 
 ## The steps
 

@@ -7,4 +7,5 @@ LIB=/Library/Developer/CommandLineTools/Library/Developer/usr/lib
 # shellcheck source=swift-sdk.sh
 . "$(dirname "$0")/swift-sdk.sh"
 cd "$(dirname "$0")/../apps/setu-swift"
-exec swift test ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} -Xswiftc -F -Xswiftc "$FW" -Xlinker -F -Xlinker "$FW" -Xlinker -rpath -Xlinker "$FW" -Xlinker -rpath -Xlinker "$LIB" "$@"
+PLUGINS=/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
+exec swift test ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} -Xswiftc -plugin-path -Xswiftc "$PLUGINS" -Xswiftc -F -Xswiftc "$FW" -Xlinker -F -Xlinker "$FW" -Xlinker -rpath -Xlinker "$FW" -Xlinker -rpath -Xlinker "$LIB" "$@"

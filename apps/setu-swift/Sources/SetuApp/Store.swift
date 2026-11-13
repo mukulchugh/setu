@@ -304,8 +304,13 @@ struct Refusal: Identifiable {
     var id: String { run }
 }
 
-/// `setu` inside the bundle, next to the executable, or on PATH.
+/// The installed `setu` (Homebrew, then ~/.local/bin, so the app always matches the running
+/// daemon), else one inside the bundle or next to the executable (dev builds), else PATH.
 func setuURL() -> URL {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    for path in ["/opt/homebrew/opt/setu/bin/setu", "/usr/local/opt/setu/bin/setu", "\(home)/.local/bin/setu"] {
+        if FileManager.default.isExecutableFile(atPath: path) { return URL(fileURLWithPath: path) }
+    }
     if let exe = Bundle.main.executableURL {
         let dir = exe.deletingLastPathComponent()
         let bundled = dir.appendingPathComponent("../Resources/bin/setu").standardized
