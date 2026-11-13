@@ -1,0 +1,51 @@
+name = "trigger"
+description = "Trigger.dev dev worker. The CLI version follows the worktree's pinned SDK (^ and ~ stripped); --branch is passed only where the installed core supports dev branches."
+replaces = ["trigger-dev"]
+
+[detect]
+any_of = [{ file = "trigger.config.*" }, { file = "apps/*/trigger.config.*" }, { dependency = "@trigger.dev/sdk" }]
+
+[env]
+TRIGGER_DEV_BRANCH = "{run}"
+TRIGGER_PREVIEW_BRANCH = "{run}"
+
+[procs.trigger]
+cwd = "{dir}"
+run = '''
+if [ ! -f package.json ]; then
+  echo "[setu] no package.json in $PWD: the worker must run from the directory that pins the SDK" >&2
+  exit 1
+fi
+spec=$(sed -n 's/.*"@trigger\.dev\/sdk"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -n 1)
+if [ -z "$spec" ]; then
+  echo "[setu] no @trigger.dev/sdk version pinned in $PWD/package.json: the Trigger.dev CLI must match the worktree's SDK, so there is nothing to run" >&2
+  exit 1
+fi
+ver=$(printf '%s' "$spec" | sed 's/^[~^=v[:space:]]*//')
+case "$ver" in
+  [0-9]*) ;;
+  *) echo "[setu] @trigger.dev/sdk is pinned as \"$spec\" in $PWD/package.json, which is not a version number; pin an exact version (for example 4.4.6)" >&2; exit 1 ;;
+esac
+if ! command -v bunx >/dev/null 2>&1; then
+  echo "[setu] could not run bunx; install Bun, or put bunx on PATH" >&2
+  exit 1
+fi
+supported=0
+for p in node_modules/@trigger.dev/core/dist/esm/v3/apiClientManager/index.js node_modules/@trigger.dev/core/dist/commonjs/v3/apiClientManager/index.js; do
+  if [ -f "$p" ] && grep -q TRIGGER_DEV_BRANCH "$p"; then supported=1; fi
+done
+branch=$TRIGGER_DEV_BRANCH
+[ -n "$branch" ] || branch=$TRIGGER_PREVIEW_BRANCH
+[ -n "$branch" ] || branch=$SETU_RUN
+set -- "trigger.dev@$ver" dev --max-concurrent-runs 2
+if [ "$supported" = 0 ]; then
+  echo "[setu] @trigger.dev/sdk $ver has no dev-branch support; sharing the default dev environment" >&2
+elif [ -n "$branch" ]; then
+  set -- "$@" --branch "$branch"
+else
+  echo "[setu] no run name in TRIGGER_DEV_BRANCH or SETU_RUN; sharing the default dev environment" >&2
+fi
+envfile="{worktree}/{app_dir}/.env.local"
+if [ -f "$envfile" ]; then set -- "$@" --env-file "$envfile"; fi
+exec bunx "$@"
+'''

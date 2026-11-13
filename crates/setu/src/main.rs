@@ -2,6 +2,7 @@
 //! Slice 1 plan: docs/slices/01-run-and-route.md
 
 mod activity;
+mod app;
 mod autoremove;
 mod api;
 mod claims;
@@ -28,10 +29,10 @@ mod ports;
 mod presets;
 mod procinfo;
 mod proxy;
+mod recipes;
 mod setup;
 mod state;
 mod supervisor;
-mod trigger;
 mod upstream;
 mod worktree;
 

@@ -52,7 +52,7 @@ pub async fn spawn_proc(spec: &RunSpec, proc: &ResolvedProc, exits: ExitTx) -> a
             env.insert("PATH".into(), p);
         }
     }
-    // `setu` itself must resolve inside procs (the generated Trigger.dev proc runs `setu x trigger-dev`),
+    // `setu` itself must resolve inside procs (a proc may call back into it),
     // even when the dir it was installed to is not on the captured login PATH. Appended, so it never shadows anything.
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf)) {
         let base = env.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();

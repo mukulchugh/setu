@@ -1,0 +1,8 @@
+name = "nx"
+description = "Nx's daemon is shared between checkouts and gets confused by worktrees; turn it off."
+
+[detect]
+any_of = [{ file = "nx.json" }, { dependency = "nx" }]
+
+[env]
+NX_DAEMON = "false"

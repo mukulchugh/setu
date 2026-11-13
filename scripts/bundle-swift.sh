@@ -10,18 +10,33 @@ VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/crates/setu/Cargo.toml" 
 
 # shellcheck source=swift-sdk.sh
 . "$ROOT/scripts/swift-sdk.sh"
+# SETU_APP_UNIVERSAL=1: one app for Apple silicon and Intel (release builds).
+# SETU_APP_NO_CLI=1: don't bundle a `setu` binary (Homebrew installs the CLI; the app uses it).
 cd "$ROOT/apps/setu-swift"
-swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"}
-SWIFT_BIN="$(swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} --show-bin-path)/SetuApp"
-
-cd "$ROOT"
-cargo build --release -p setu
-RS_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/setu"
+if [ "${SETU_APP_UNIVERSAL:-}" = 1 ]; then
+  SLICES=()
+  for triple in arm64-apple-macosx26.0 x86_64-apple-macosx26.0; do
+    # A separate scratch dir per architecture: they would otherwise share one output folder.
+    scratch=".build-universal/${triple%%-*}"
+    swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} --triple "$triple" --scratch-path "$scratch"
+    SLICES+=("$(swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} --triple "$triple" --scratch-path "$scratch" --show-bin-path)/SetuApp")
+  done
+  SWIFT_BIN="$(mktemp -d)/SetuApp"
+  lipo -create "${SLICES[@]}" -output "$SWIFT_BIN"
+else
+  swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"}
+  SWIFT_BIN="$(swift build -c release ${SWIFT_SDK_ARGS[@]+"${SWIFT_SDK_ARGS[@]}"} --show-bin-path)/SetuApp"
+fi
 
 rm -rf "${APP:?}"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/SetuApp"
-cp "$RS_BIN" "$APP/Contents/Resources/bin/setu"
+if [ "${SETU_APP_NO_CLI:-}" != 1 ]; then
+  cd "$ROOT"
+  cargo build --release -p setu
+  mkdir -p "$APP/Contents/Resources/bin"
+  cp "${CARGO_TARGET_DIR:-$ROOT/target}/release/setu" "$APP/Contents/Resources/bin/setu"
+fi
 # App icon from the brand kit (brand/icon/Setu.iconset, made from brand/icon/setu-icon-1024.png).
 ICONSET="$ROOT/brand/icon/Setu.iconset"
 if [ -d "$ICONSET" ]; then
@@ -49,7 +64,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # Inside-out: inner binaries first, then the bundle.
-codesign --force --sign - "$APP/Contents/Resources/bin/setu"
+[ -f "$APP/Contents/Resources/bin/setu" ] && codesign --force --sign - "$APP/Contents/Resources/bin/setu"
 codesign --force --sign - "$APP/Contents/MacOS/SetuApp"
 codesign --force --sign - "$APP"
 codesign -v --strict "$APP"

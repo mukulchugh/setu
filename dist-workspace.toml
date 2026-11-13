@@ -18,3 +18,6 @@ tap = "mukulchugh/homebrew-tap"
 formula = "setu"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# Setu.app (built by scripts/release.sh via bundle-swift.sh) ships in each archive;
+# Homebrew puts it in share/setu and `setu app` installs it into ~/Applications.
+include = ["target-swift/Setu.app"]

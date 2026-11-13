@@ -5,7 +5,7 @@
 //! Writes go through the daemon (`import.adopt`); the CLI writes only project config files and the
 //! append-only ledger.
 
-use crate::{config, globalcfg, naming, paths, procinfo};
+use crate::{config, globalcfg, naming, paths, procinfo, recipes};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,26 +295,14 @@ pub fn infer_dev(root: &Path) -> Option<Inferred> {
     None
 }
 
-/// What the repo needs besides its web server: the sidecars v1 ran per worktree (Inngest, Trigger.dev,
-/// Convex) and the env v1's `.envrc` used to provide. v1 kept none of this on disk (its sidecar
-/// state lived in the portal's memory), so it is read from the repo itself.
+/// What the repo needs besides its web server (sidecars, env), as the recipes that matched it,
+/// plus the env files the old Setu linked from main into every worktree (`[worktree] link`).
+/// Nothing here names a tool: what each recipe adds lives in its `recipes/*.toml`.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Stack {
-    /// There is a package.json (a JS/TS app).
-    pub js: bool,
-    /// `@workos-inc/authkit-nextjs` is a dependency: older code needs the redirect URI set.
-    pub workos: bool,
-    pub nx: bool,
-    /// Directory (relative to the worktree, "" for the root) the Trigger.dev worker runs in.
-    pub trigger: Option<String>,
-    /// Extra `--env-file` for the Trigger.dev worker (the v1 `apps/<repo>/.env.local` convention).
-    pub trigger_env_file: Option<String>,
-    pub inngest: bool,
-    /// Directory the Convex dev server runs in.
-    pub convex: Option<String>,
-    /// Package manager, for the Convex command.
+    /// Package manager (`bun`, `pnpm`, `yarn`, `npm`; empty counts as `npm`), for `{pm}` and `{pm_exec}` in recipes.
     pub pm: &'static str,
-    /// Env files the old Setu linked from main into every worktree (`[worktree] link`).
+    pub recipes: Vec<recipes::Matched>,
     pub links: Vec<String>,
 }
 
@@ -355,69 +343,8 @@ pub fn detect_shared_links(main: &Path, others: &[&Path]) -> Vec<String> {
         .collect()
 }
 
-fn package_deps(dir: &Path) -> Option<BTreeSet<String>> {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).ok()?).ok()?;
-    let mut out = BTreeSet::new();
-    for k in ["dependencies", "devDependencies"] {
-        if let Some(o) = v.get(k).and_then(Value::as_object) {
-            out.extend(o.keys().cloned());
-        }
-    }
-    Some(out)
-}
-
-pub fn detect_stack(root: &Path, app: &str) -> Stack {
-    let has = |f: &str| root.join(f).exists();
-    let pm = if has("bun.lock") || has("bun.lockb") {
-        "bun"
-    } else if has("pnpm-lock.yaml") {
-        "pnpm"
-    } else if has("yarn.lock") {
-        "yarn"
-    } else {
-        "npm"
-    };
-    let mut st = Stack { js: has("package.json"), nx: has("nx.json"), pm, ..Default::default() };
-    // Where to look: the root, the v1 convention apps/<repo>, then the other apps one level down.
-    let mut dirs: Vec<String> = vec![String::new(), format!("apps/{app}")];
-    if let Ok(rd) = std::fs::read_dir(root.join("apps")) {
-        let mut more: Vec<String> = rd.filter_map(Result::ok).filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().to_str().map(|n| format!("apps/{n}"))).collect();
-        more.sort();
-        dirs.extend(more.into_iter().take(20));
-    }
-    dirs.dedup();
-    let mut sdk_at: Option<String> = None;
-    for rel in &dirs {
-        let d = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
-        if !d.is_dir() {
-            continue;
-        }
-        if let Some(deps) = package_deps(&d) {
-            st.nx |= deps.contains("nx");
-            st.workos |= deps.contains("@workos-inc/authkit-nextjs");
-            st.inngest |= deps.contains("inngest");
-            if deps.contains("convex") && st.convex.is_none() {
-                st.convex = Some(rel.clone());
-            }
-            if deps.contains("@trigger.dev/sdk") && sdk_at.is_none() {
-                sdk_at = Some(rel.clone());
-            }
-        }
-        if st.trigger.is_none() && ["ts", "js", "mjs", "cjs", "mts"].iter().any(|e| d.join(format!("trigger.config.{e}")).exists()) {
-            st.trigger = Some(rel.clone());
-        }
-        if st.convex.is_none() && d.join("convex").is_dir() {
-            st.convex = Some(rel.clone());
-        }
-    }
-    // The pinned SDK without a config file still means Trigger is in use.
-    if st.trigger.is_none() {
-        st.trigger = sdk_at;
-    }
-    if st.trigger.as_deref() == Some("") && root.join("apps").join(app).is_dir() {
-        st.trigger_env_file = Some(format!("apps/{app}/.env.local"));
-    }
-    st
+pub fn detect_stack(root: &Path, app: &str) -> Result<Stack> {
+    Ok(Stack { pm: recipes::package_manager(root), recipes: recipes::detect(root, app, &recipes::load()?), links: vec![] })
 }
 
 /// The generated project config. `None` gives the commented placeholder.
@@ -438,36 +365,12 @@ pub fn generate_config(project: &str, repo_display: &str, domain: &str, inferred
         let list: Vec<String> = aliases.iter().map(|a| format!("\"{a}\"")).collect();
         t.push_str(&format!("# The v1 URL of the main worktree keeps working.\naliases = [{}]\n", list.join(", ")));
     }
+    if !stack.recipes.is_empty() {
+        let mut names: Vec<String> = stack.recipes.iter().map(|m| format!("\"{}\"", m.recipe.name)).collect();
+        names.sort();
+        t.push_str(&format!("# What this repo needs besides its web server (sidecars, env) comes from these recipes: `setu recipes show <name>`.\n# Anything you write below overrides the recipe's value.\nrecipes = [{}]\n", names.join(", ")));
+    }
     t.push_str("preset  = \"auto\"\nidle    = \"30m\"\n\n[ports]\nweb = {}\n");
-    if stack.inngest {
-        t.push_str("inngest = {}\n# Inngest dev also opens a connect gateway and two gRPC ports; lease them so worktrees never collide.\ninngest_gw = {}\ninngest_gw_grpc = {}\ninngest_exec_grpc = {}\n");
-    }
-    // The env v1's .envrc wrote, plus what v1's portal gave its sidecars.
-    let mut env: Vec<(&str, &str)> = Vec::new();
-    if stack.js {
-        env.push(("NEXT_PUBLIC_APP_BASE_URL", "{url}"));
-    }
-    if stack.workos {
-        env.push(("NEXT_PUBLIC_WORKOS_REDIRECT_URI", "{url}/authentication/callback"));
-    }
-    if stack.nx {
-        env.push(("NX_DAEMON", "false"));
-    }
-    if stack.inngest {
-        env.push(("INNGEST_DEV", "1"));
-        env.push(("INNGEST_BASE_URL", "http://127.0.0.1:{port.inngest}"));
-    }
-    if stack.trigger.is_some() {
-        env.push(("TRIGGER_DEV_BRANCH", "{run}"));
-        env.push(("TRIGGER_PREVIEW_BRANCH", "{run}"));
-    }
-    if !env.is_empty() {
-        t.push_str("\n[env]\n");
-        let w = env.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-        for (k, v) in env {
-            t.push_str(&format!("{k:<w$} = \"{v}\"\n"));
-        }
-    }
     if !stack.links.is_empty() {
         let list: Vec<String> = stack.links.iter().map(|l| format!("\"{l}\"")).collect();
         t.push_str(&format!("\n# Shared env files, symlinked from the main worktree into every worktree (as the old Setu did).\n[worktree]\nlink = [{}]\n", list.join(", ")));
@@ -476,34 +379,6 @@ pub fn generate_config(project: &str, repo_display: &str, domain: &str, inferred
     match inferred {
         Some(i) => t.push_str(&format!("[procs.web]\nrun  = \"{}\"\nport = \"web\"\n", i.run)),
         None => t.push_str("# [procs.web]\n# run  = \"<your dev command; it must listen on $PORT>\"\n# port = \"web\"\n"),
-    }
-    if stack.inngest {
-        t.push_str("\n# Inngest dev server (`brew install inngest/tap/inngest`; the binary is `inngest`), on its own port.\n");
-        t.push_str("[procs.inngest]\nrun = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery --connect-gateway-port {port.inngest_gw} --connect-gateway-grpc-port {port.inngest_gw_grpc} --connect-executor-grpc-port {port.inngest_exec_grpc}\"\n");
-    }
-    if let Some(dir) = &stack.trigger {
-        t.push_str("\n# The Trigger.dev CLI version follows the worktree's pinned SDK; --branch only where supported.\n");
-        let mut run = "setu x trigger-dev --max-concurrent-runs 2".to_string();
-        if let Some(f) = &stack.trigger_env_file {
-            run.push_str(&format!(" --env-file {f}"));
-        }
-        t.push_str(&format!("[procs.trigger]\nrun = \"{run}\"\n"));
-        if !dir.is_empty() {
-            t.push_str(&format!("cwd = \"{dir}\"\n"));
-        }
-    }
-    if let Some(dir) = &stack.convex {
-        let run = match stack.pm {
-            "bun" => "bunx convex dev",
-            "pnpm" => "pnpm exec convex dev",
-            "yarn" => "yarn convex dev",
-            _ => "npx convex dev",
-        };
-        t.push_str("\n# Convex dev server (a watch process against your Convex dev deployment).\n");
-        t.push_str(&format!("[procs.convex]\nrun = \"{run}\"\n"));
-        if !dir.is_empty() {
-            t.push_str(&format!("cwd = \"{dir}\"\n"));
-        }
     }
     (t, state)
 }
@@ -584,7 +459,10 @@ pub fn plan(v1: &V1, registered: &Registered, port_is_free: &dyn Fn(u16) -> bool
                     plan.notes.push(format!("{name}: the v1 host {alias} is not a valid DNS name, so the main URL changes to {}", url_for(&name, "main", &v1.zone, proxy_port)));
                 }
                 let aliases: Vec<String> = if alias_ok { vec![alias] } else { vec![] };
-                let mut stack = main.map(|m| detect_stack(&m.path, &v1name)).unwrap_or_default();
+                let mut stack = match main {
+                    Some(m) => detect_stack(&m.path, &v1name)?,
+                    None => Stack::default(),
+                };
                 if let Some(m) = main {
                     let others: Vec<&Path> = entries.iter().filter(usable).filter(|e| e.path != m.path).map(|e| e.path.as_path()).collect();
                     stack.links = detect_shared_links(&m.path, &others);
@@ -815,10 +693,16 @@ mod tests {
         }
     }
 
+    fn names(st: &Stack) -> Vec<&str> {
+        st.recipes.iter().map(|m| m.recipe.name.as_str()).collect()
+    }
+
     #[test]
-    fn a_trigger_inngest_workos_nx_repo_gets_the_complete_config() {
-        let d = std::env::temp_dir().join(format!("setu-stack-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn a_full_stack_repo_gets_the_complete_config() {
+        let base = std::env::temp_dir().join(format!("setu-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The generated config points at <base>/quivly-app.git, so its main worktree is <base>/quivly-app/main.
+        let d = base.join("quivly-app/main");
         write_all(
             &d,
             &[
@@ -827,59 +711,69 @@ mod tests {
                 ("nx.json", "{}"),
                 ("trigger.config.ts", "export default {}"),
                 ("apps/quivly-app/package.json", r#"{"dependencies":{"inngest":"3","@workos-inc/authkit-nextjs":"2","next":"16"}}"#),
+                ("apps/quivly-app/.env.local", "X=1\n"),
             ],
         );
-        let st = detect_stack(&d, "quivly-app");
-        assert_eq!(
-            st,
-            Stack { js: true, workos: true, nx: true, trigger: Some(String::new()), trigger_env_file: Some("apps/quivly-app/.env.local".into()), inngest: true, convex: None, pm: "bun", links: vec![] }
-        );
+        let st = detect_stack(&d, "quivly-app").unwrap();
+        assert_eq!(st.pm, "bun");
+        assert_eq!(names(&st), ["inngest", "next-env", "nx", "trigger", "workos-authkit"]);
         let inf = infer_dev(&d);
-        let (t, state) = generate_config("quivly-app", "~/workspace/quivly-app.git", "quivly.local", inf.as_ref(), &[], &st);
+        let repo = format!("{}/quivly-app.git", base.display());
+        let (t, state) = generate_config("quivly-app", &repo, "quivly.local", inf.as_ref(), &[], &st);
         assert_eq!(state, Cfg::Generated);
-        let squeezed = t.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n");
-        for want in [
-            "inngest = {}",
-            "NEXT_PUBLIC_APP_BASE_URL = \"{url}\"",
-            "NEXT_PUBLIC_WORKOS_REDIRECT_URI = \"{url}/authentication/callback\"",
-            "NX_DAEMON = \"false\"",
-            "INNGEST_DEV = \"1\"",
-            "INNGEST_BASE_URL = \"http://127.0.0.1:{port.inngest}\"",
-            "TRIGGER_DEV_BRANCH = \"{run}\"",
-            "TRIGGER_PREVIEW_BRANCH = \"{run}\"",
-            "run = \"bun run dev\"",
-            "run = \"inngest dev -p {port.inngest} -u http://127.0.0.1:{port.web}/api/inngest --no-discovery --connect-gateway-port {port.inngest_gw} --connect-gateway-grpc-port {port.inngest_gw_grpc} --connect-executor-grpc-port {port.inngest_exec_grpc}\"",
-            "inngest_gw = {}",
-            "run = \"setu x trigger-dev --max-concurrent-runs 2 --env-file apps/quivly-app/.env.local\"",
-        ] {
-            assert!(squeezed.contains(want), "missing {want:?} in:\n{t}");
+        // The recipes are named, not pasted in.
+        assert!(t.contains("\nrecipes = [\"inngest\", \"next-env\", \"nx\", \"trigger\", \"workos-authkit\"]\n"), "{t}");
+        for pasted in ["[procs.trigger]", "[procs.inngest]", "[env]", "inngest_gw", "exec bunx", "NX_DAEMON"] {
+            assert!(!t.contains(pasted), "{pasted} must come from the recipe, not the config:\n{t}");
         }
-        assert!(!t.contains("[procs.convex]"));
-        let cfg = config::parse_project(&t, Path::new("quivly-app.toml")).unwrap();
-        let run = config::resolve_run(&cfg, Path::new("/w"), "feat-x", &BTreeMap::from([("web".to_string(), 4001u16), ("inngest".to_string(), 4002u16), ("inngest_gw".to_string(), 4003u16), ("inngest_gw_grpc".to_string(), 4004u16), ("inngest_exec_grpc".to_string(), 4005u16)]), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert!(t.contains("run  = \"bun run dev\""), "{t}");
+        // Loaded, it merges to what the old inlined text gave: same procs, ports and env.
+        let cfg = config::parse_project_with(&t, Path::new("quivly-app.toml"), |_| None, None).unwrap();
+        assert_eq!(cfg.procs.keys().map(String::as_str).collect::<Vec<_>>(), ["inngest", "trigger", "web"]);
+        assert_eq!(cfg.ports, ["inngest", "inngest_exec_grpc", "inngest_gw", "inngest_gw_grpc", "web"]);
+        for m in &st.recipes {
+            for (k, v) in &m.recipe.env {
+                assert_eq!(cfg.env[k], recipes::fill(v, m, st.pm), "env {k}");
+            }
+            for (n, p) in &m.recipe.procs {
+                assert_eq!(cfg.procs[n].run, recipes::fill(&p.run, m, st.pm), "proc {n}");
+                assert_eq!(cfg.procs[n].cwd.as_deref().filter(|c| !c.is_empty()), p.cwd.as_deref().map(|c| recipes::fill(c, m, st.pm)).as_deref().filter(|c| !c.is_empty()), "cwd {n}");
+            }
+        }
+        let ports = BTreeMap::from([("web".to_string(), 4001u16), ("inngest".to_string(), 4002u16), ("inngest_gw".to_string(), 4003u16), ("inngest_gw_grpc".to_string(), 4004u16), ("inngest_exec_grpc".to_string(), 4005u16)]);
+        let run = config::resolve_run(&cfg, Path::new("/w"), "feat-x", &ports, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(run.env["TRIGGER_DEV_BRANCH"], "feat-x");
+        assert_eq!(run.env["NX_DAEMON"], "false");
         assert_eq!(run.env["INNGEST_BASE_URL"], "http://127.0.0.1:4002");
         assert_eq!(run.env["NEXT_PUBLIC_WORKOS_REDIRECT_URI"], format!("{}/authentication/callback", run.env["NEXT_PUBLIC_APP_BASE_URL"]));
-        let _ = std::fs::remove_dir_all(&d);
+        let trigger = run.procs.iter().find(|p| p.name == "trigger").unwrap();
+        assert!(trigger.command.contains("envfile=\"/w/apps/quivly-app/.env.local\""), "the worktree path is filled in at run time: {}", trigger.command);
+        assert!(trigger.command.contains("exec bunx \"$@\""));
+        assert_eq!(trigger.cwd, Path::new("/w/."));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn a_plain_app_and_a_convex_app_get_only_what_they_use() {
-        let d = std::env::temp_dir().join(format!("setu-stack2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let base = std::env::temp_dir().join(format!("setu-stack2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let d = base.join("plain/main");
+        let repo = format!("{}/plain.git", base.display());
         write_all(&d, &[("package.json", r#"{"scripts":{"dev":"vite"},"dependencies":{"react":"1"}}"#)]);
-        let st = detect_stack(&d, "plain");
-        assert_eq!(st, Stack { js: true, pm: "npm", ..Default::default() });
-        let (t, _) = generate_config("plain", "~/workspace/plain.git", "q.local", infer_dev(&d).as_ref(), &[], &st);
-        assert!(t.contains("NEXT_PUBLIC_APP_BASE_URL") && !t.contains("WORKOS") && !t.contains("NX_DAEMON") && !t.contains("INNGEST") && !t.contains("TRIGGER") && !t.contains("[procs.trigger]") && !t.contains("[procs.convex]"), "{t}");
+        let st = detect_stack(&d, "plain").unwrap();
+        assert_eq!((st.pm, names(&st)), ("npm", vec!["next-env"]));
+        let (t, _) = generate_config("plain", &repo, "q.local", infer_dev(&d).as_ref(), &[], &st);
+        assert!(t.contains("recipes = [\"next-env\"]") && !t.contains("WORKOS") && !t.contains("NX_DAEMON") && !t.contains("INNGEST") && !t.contains("trigger") && !t.contains("convex"), "{t}");
         assert!(t.contains("--port {port.web} --strictPort"), "vite keeps its explicit port flag: {t}");
         write_all(&d, &[("apps/web/package.json", r#"{"dependencies":{"convex":"1"}}"#), ("pnpm-lock.yaml", "")]);
-        let st = detect_stack(&d, "plain");
-        assert_eq!(st.convex.as_deref(), Some("apps/web"));
-        let (t, _) = generate_config("plain", "~/workspace/plain.git", "q.local", None, &[], &st);
-        assert!(t.contains("[procs.convex]\nrun = \"pnpm exec convex dev\"\ncwd = \"apps/web\""), "{t}");
-        config::parse_project(&t, Path::new("p.toml")).unwrap();
-        let _ = std::fs::remove_dir_all(&d);
+        let st = detect_stack(&d, "plain").unwrap();
+        assert_eq!(names(&st), ["convex", "next-env"]);
+        let (t, _) = generate_config("plain", &repo, "q.local", None, &[], &st);
+        assert!(t.contains("recipes = [\"convex\", \"next-env\"]") && !t.contains("[procs.convex]"), "{t}");
+        let cfg = config::parse_project_with(&t, Path::new("p.toml"), |_| None, None).unwrap();
+        assert_eq!(cfg.procs["convex"].run, "pnpm exec convex dev");
+        assert_eq!(cfg.procs["convex"].cwd.as_deref(), Some("apps/web"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

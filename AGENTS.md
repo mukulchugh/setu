@@ -4,6 +4,7 @@
 - **macOS app:** `apps/setu-swift` (SwiftUI, a thin client over the daemon socket).
 - **Design and evidence:** `docs/slices/`.
 - **Old JS Setu:** tagged `v1-final`.
+- **Recipes:** `crates/setu/recipes/*.toml`. Setu's Rust code names no third-party dev tool (a test enforces it); what a stack needs (ports, env, procs, detection) is a recipe. Adding one is adding a file. Users override by name in `<config dir>/recipes/`. Project configs name recipes (`recipes = [...]`) and `config.rs` merges them at load (project keys win); `import-v1` writes the line, it does not paste the recipe. `setu app` (`src/app.rs`) installs the bundled Setu.app into `~/Applications`.
 
 ## Build and test
 - `cargo test`: unit and integration. It must stay at zero warnings.
