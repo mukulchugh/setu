@@ -18,8 +18,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum Scope {
     Global,
     Project(String),
+    /// A named set of variables for one project (`staging`, `dev`). A worktree picks one with the
+    /// plain variable `SETU_PROFILE` in its own layer; it sits between the project and worktree layers.
+    Profile(String, String),
     Worktree(RunId),
 }
+
+/// The worktree-layer variable that selects a profile.
+pub const PROFILE_VAR: &str = "SETU_PROFILE";
 
 impl Scope {
     /// Refuse names that could alias another scope's files or escape the env directory: the
@@ -28,6 +34,14 @@ impl Scope {
         match self {
             Scope::Global => Ok(()),
             Scope::Project(p) => crate::config::validate_project_name(p),
+            Scope::Profile(p, name) => {
+                crate::config::validate_project_name(p)?;
+                let ok = !name.is_empty() && !name.starts_with('.') && !name.ends_with(".secrets") && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                if !ok {
+                    bail!("profile name {name:?} must be letters, digits, '-', '_' or '.', not start with '.' and not end in .secrets");
+                }
+                Ok(())
+            }
             Scope::Worktree(id) => {
                 crate::config::validate_project_name(&id.project)?;
                 let ok = !id.run.is_empty()
@@ -46,6 +60,11 @@ impl Scope {
         match self {
             Scope::Global => (dir.join("global.toml"), dir.join("global.secrets.toml")),
             Scope::Project(p) => (dir.join(format!("{p}.toml")), dir.join(format!("{p}.secrets.toml"))),
+            // Run names never start with '.', so `.profiles` cannot collide with a worktree's files.
+            Scope::Profile(p, name) => {
+                let d = dir.join(p).join(".profiles");
+                (d.join(format!("{name}.toml")), d.join(format!("{name}.secrets.toml")))
+            }
             Scope::Worktree(id) => {
                 let d = dir.join(&id.project);
                 (d.join(format!("{}.toml", id.run)), d.join(format!("{}.secrets.toml", id.run)))
@@ -57,6 +76,7 @@ impl Scope {
         match self {
             Scope::Global => "global",
             Scope::Project(_) => "project",
+            Scope::Profile(..) => "profile",
             Scope::Worktree(_) => "worktree",
         }
         .to_string()
@@ -66,6 +86,7 @@ impl Scope {
         match self {
             Scope::Global => None,
             Scope::Project(p) => Some(p.clone()),
+            Scope::Profile(p, name) => Some(format!("{p}/{name}")),
             Scope::Worktree(id) => Some(format!("{}/{}", id.project, id.run)),
         }
     }
@@ -1046,5 +1067,19 @@ pub(crate) mod tests {
         let r = import(&sc, "A_SECRET=1\nB_SECRET=long-enough\nFINE=1\n", false, false).unwrap();
         assert!(r.problems.is_empty(), "{:?}", r.problems);
         assert_eq!(r.secrets, vec!["B_SECRET".to_string()]);
+    }
+
+    #[test]
+    fn profile_files_live_apart_from_worktree_files_and_names_are_checked() {
+        let _sb = sandbox();
+        let prof = Scope::Profile("p".into(), "staging".into());
+        let wt = Scope::Worktree(RunId { project: "p".into(), run: "staging".into() });
+        assert_ne!(prof.paths().0, wt.paths().0);
+        assert!(prof.paths().0.to_string_lossy().contains("/.profiles/"));
+        assert_eq!((prof.label(), prof.target()), ("profile".to_string(), Some("p/staging".to_string())));
+        for bad in ["", ".hidden", "a/b", "x.secrets", "../x", "sp ace"] {
+            assert!(Scope::Profile("p".into(), bad.into()).validate().is_err(), "{bad:?}");
+        }
+        assert!(Scope::Profile("p".into(), "dev-2_x.y".into()).validate().is_ok());
     }
 }

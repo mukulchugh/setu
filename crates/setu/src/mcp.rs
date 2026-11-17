@@ -95,8 +95,8 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 fn scope_props() -> Value {
     json!({
-        "scope": { "type": "string", "enum": ["global", "project", "worktree"], "description": "Which env layer. Later layers win: global < project < worktree." },
-        "target": { "type": "string", "description": "Project name for scope=project, run (project/run or unique run name) for scope=worktree. Omit for global." }
+        "scope": { "type": "string", "enum": ["global", "project", "profile", "worktree"], "description": "Which env layer. Later layers win: global < project < profile < worktree. A worktree uses a profile when its worktree layer sets SETU_PROFILE to the profile name." },
+        "target": { "type": "string", "description": "Project name for scope=project, project/profile for scope=profile, run (project/run or unique run name) for scope=worktree. Omit for global." }
     })
 }
 

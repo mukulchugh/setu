@@ -171,14 +171,46 @@ impl Inner {
 struct Layers {
     global: BTreeMap<String, String>,
     project: Vec<env::Var>,
+    /// The profile the worktree selects with `SETU_PROFILE`, if any.
+    profile: Vec<env::Var>,
     worktree: Vec<env::Var>,
 }
 
+impl Layers {
+    /// The project layer with the profile's variables on top: what sits below the worktree layer.
+    fn project_and_profile(&self) -> Vec<env::Var> {
+        let mut merged: BTreeMap<&str, &env::Var> = self.project.iter().map(|v| (v.name.as_str(), v)).collect();
+        for v in &self.profile {
+            merged.insert(v.name.as_str(), v);
+        }
+        merged.into_values().map(|v| env::Var { name: v.name.clone(), value: v.value.clone(), secret: v.secret }).collect()
+    }
+}
+
+/// The profile a worktree layer selects, checked to exist: a run never starts quietly without
+/// the env it asked for.
+fn selected_profile(project: &str, worktree: &[env::Var]) -> Result<Option<env::Scope>> {
+    let Some(v) = worktree.iter().find(|v| v.name == env::PROFILE_VAR) else { return Ok(None) };
+    let scope = env::Scope::Profile(project.to_string(), v.value.clone());
+    scope.validate()?;
+    let (plain, secrets) = scope.paths();
+    if !plain.exists() && !secrets.exists() {
+        bail!("this worktree uses env profile {:?}, which has no variables. Create it with `setu env set profile {project}/{} NAME=value`, or stop using it with `setu env use <run> none`", v.value, v.value);
+    }
+    Ok(Some(scope))
+}
+
 fn read_layers(project: &str, id: &RunId) -> Result<Layers> {
+    let worktree = env::read_layer(&env::Scope::Worktree(id.clone()))?;
+    let profile = match selected_profile(project, &worktree)? {
+        Some(scope) => env::read_layer(&scope)?,
+        None => vec![],
+    };
     Ok(Layers {
         global: env::layer_map(&env::Scope::Global)?,
         project: env::read_layer(&env::Scope::Project(project.to_string()))?,
-        worktree: env::read_layer(&env::Scope::Worktree(id.clone()))?,
+        profile,
+        worktree,
     })
 }
 
@@ -194,18 +226,19 @@ fn build_spec_with(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut
     let k = key(&id);
     let lease = ports::lease(leases, &k, &cfg.ports, ports::port_free)?;
     leases.insert(k, lease.clone());
-    // Layers: global < project config [env] < project layer < worktree layer < computed.
+    // Layers: global < project config [env] < project layer < profile < worktree layer < computed.
     // Plain layer values may use {templates}; secret values are literal data and are never
     // rendered, so braces in a secret survive and cannot leak through a template error (review #10).
     let mut layered = cfg.clone();
-    for v in layers.project.iter().filter(|v| !v.secret) {
+    let below_worktree = layers.project_and_profile();
+    for v in below_worktree.iter().filter(|v| !v.secret) {
         layered.env.insert(v.name.clone(), v.value.clone());
     }
     let worktree_plain: BTreeMap<String, String> = layers.worktree.iter().filter(|v| !v.secret).map(|v| (v.name.clone(), v.value.clone())).collect();
     let mut spec = config::resolve_run(&layered, worktree, run, &lease, &layers.global, &worktree_plain)?;
     let web = spec.web_port;
     let is_computed = |name: &str| matches!(name, "SETU_PROJECT" | "SETU_RUN" | "SETU_URL") || (name == "PORT" && web.is_some());
-    for v in layers.project.iter().filter(|v| v.secret) {
+    for v in below_worktree.iter().filter(|v| v.secret) {
         if !layers.worktree.iter().any(|w| w.name == v.name) && !is_computed(&v.name) {
             spec.env.insert(v.name.clone(), v.value.clone());
         }
@@ -1314,11 +1347,19 @@ impl Daemon {
                 self.lock().config(p)?;
                 Ok(env::Scope::Project(p.to_string()))
             }
+            "profile" => {
+                let t = target.ok_or_else(|| anyhow!("profile scope needs <project>/<profile>"))?;
+                let (p, name) = t.split_once('/').ok_or_else(|| anyhow!("profile scope needs <project>/<profile>, got {t:?}"))?;
+                self.lock().config(p)?;
+                let scope = env::Scope::Profile(p.to_string(), name.to_string());
+                scope.validate()?;
+                Ok(scope)
+            }
             "worktree" => {
                 let k = self.resolve(target.ok_or_else(|| anyhow!("worktree scope needs a run"))?)?;
                 Ok(env::Scope::Worktree(self.lock().state.runs[&k].spec.id.clone()))
             }
-            _ => bail!("scope must be global, project or worktree"),
+            _ => bail!("scope must be global, project, profile or worktree"),
         }
     }
 
@@ -1343,11 +1384,18 @@ impl Daemon {
         let spec = build_spec(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases)?;
         let layers: Vec<(&str, BTreeMap<String, String>, std::collections::BTreeSet<String>)> = {
             let mut out = Vec::new();
+            let wt_scope = env::Scope::Worktree(spec.id.clone());
+            let profile = selected_profile(&cfg.project, &env::read_layer(&wt_scope)?)?;
             for (label, scope) in [
-                ("global", env::Scope::Global),
-                ("project", env::Scope::Project(cfg.project.clone())),
-                ("worktree", env::Scope::Worktree(spec.id.clone())),
+                ("global", Some(env::Scope::Global)),
+                ("project", Some(env::Scope::Project(cfg.project.clone()))),
+                ("profile", profile),
+                ("worktree", Some(wt_scope)),
             ] {
+                let Some(scope) = scope else {
+                    out.push((label, BTreeMap::new(), Default::default()));
+                    continue;
+                };
                 let vars = env::read_layer(&scope)?;
                 let secrets = vars.iter().filter(|v| v.secret).map(|v| v.name.clone()).collect();
                 out.push((label, vars.into_iter().map(|v| (v.name, v.value)).collect(), secrets));
@@ -1384,6 +1432,13 @@ impl Daemon {
     }
 
     pub fn env_set(&self, actor: &str, client: Option<&str>, scope: &env::Scope, name: &str, value: &str, secret: Option<bool>) -> Result<Value> {
+        // Selecting a profile: it must exist now, and the selection is a plain value.
+        if let (env::Scope::Worktree(id), true) = (scope, name == env::PROFILE_VAR) {
+            if secret == Some(true) {
+                bail!("{} is a plain value: it names a profile", env::PROFILE_VAR);
+            }
+            selected_profile(&id.project, &[env::Var { name: name.to_string(), value: value.to_string(), secret: false }])?;
+        }
         let stored_secret = env::write_var(scope, name, value, secret)?;
         env::audit(actor, "set", scope, Some(name), Some(with_client(json!({ "secret": stored_secret }), client)));
         Ok(json!({ "name": name, "secret": stored_secret, "applies": "on the next start of each affected run" }))
@@ -1476,7 +1531,8 @@ impl Daemon {
         let spec = build_spec_with(&cfg, &rec.spec.worktree, &id.run, &mut leases, &layers)?;
         let mut out: Vec<(String, String)> = Vec::new();
         let mut flagged: std::collections::BTreeSet<String> = Default::default();
-        for v in layers.project.iter().chain(layers.worktree.iter()).filter(|v| v.secret) {
+        // Every layer's secrets, overridden or not: switching profiles must not unmask older log lines.
+        for v in layers.project.iter().chain(layers.profile.iter()).chain(layers.worktree.iter()).filter(|v| v.secret) {
             flagged.insert(v.name.clone());
             out.push((v.name.clone(), v.value.clone()));
         }
@@ -2085,6 +2141,7 @@ fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
         "external": r.procs.iter().any(supervisor::is_external),
         "status": status,
         "pinned": r.pinned,
+        "profile": env::get_value(&env::Scope::Worktree(r.spec.id.clone()), env::PROFILE_VAR).ok().flatten(),
         "ram_bytes": ram,
         "ports": r.spec.ports,
         "worktree": r.spec.worktree,
@@ -2780,6 +2837,47 @@ mod tests {
         std::fs::write(&p, t).unwrap();
         f.d.env_effective("r").unwrap();
         assert!(env::redaction_history().unwrap().iter().any(|(n, v)| n == "API_TOKEN" && v == "first-config-token"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worktree_runs_with_its_selected_profile() {
+        let f = fixture(&[], "");
+        let id = f.d.lock().state.runs[&f.k].spec.id.clone();
+        let wt = env::Scope::Worktree(id);
+        let project = env::Scope::Project("tp".into());
+        let staging = env::Scope::Profile("tp".into(), "staging".into());
+        env::write_var(&project, "API_URL", "http://local", Some(false)).unwrap();
+        env::write_var(&project, "MODE", "dev", Some(false)).unwrap();
+        env::write_var(&staging, "API_URL", "https://staging", Some(false)).unwrap();
+        env::write_var(&staging, "STAGING_API_KEY", "sk-staging-0123456789abcdef", Some(true)).unwrap();
+        let get = |f: &Fx, n: &str| -> Option<(String, String)> {
+            let eff = f.d.env_effective("r").unwrap();
+            eff["vars"].as_array().unwrap().iter().find(|v| v["name"] == n).map(|v| (v["source"].as_str().unwrap().to_string(), v["preview"].as_str().unwrap_or("").to_string()))
+        };
+        // no profile selected: the project's values, nothing from the profile
+        assert_eq!(get(&f, "API_URL").unwrap().1, "http://local");
+        assert!(get(&f, "STAGING_API_KEY").is_none());
+        assert!(f.d.list()[0]["profile"].is_null());
+        // selected: the profile beats the project, and what it does not set stays
+        env::write_var(&wt, env::PROFILE_VAR, "staging", Some(false)).unwrap();
+        assert_eq!(get(&f, "API_URL").unwrap(), ("profile".to_string(), "https://staging".to_string()));
+        assert_eq!(get(&f, "MODE").unwrap().1, "dev");
+        assert_eq!(get(&f, "STAGING_API_KEY").unwrap().0, "profile");
+        assert_eq!(f.d.list()[0]["profile"], "staging");
+        // the worktree's own value beats the profile
+        env::write_var(&wt, "API_URL", "http://mine", Some(false)).unwrap();
+        assert_eq!(get(&f, "API_URL").unwrap(), ("worktree".to_string(), "http://mine".to_string()));
+        // a profile secret is redacted in logs
+        assert!(f.d.redaction_set(&f.k).unwrap().iter().any(|(n, v)| n == "STAGING_API_KEY" && v == "sk-staging-0123456789abcdef"));
+        // selecting a profile that does not exist is refused up front
+        assert!(f.d.env_set("cli", None, &wt, env::PROFILE_VAR, "prod", None).is_err());
+        assert!(f.d.env_set("cli", None, &wt, env::PROFILE_VAR, "staging", Some(true)).is_err(), "never a secret");
+        assert!(f.d.env_set("cli", None, &wt, env::PROFILE_VAR, "staging", None).is_ok());
+        // and if its files go away later, the run fails loudly instead of starting with the wrong env
+        env::write_var(&wt, env::PROFILE_VAR, "prod", Some(false)).unwrap();
+        assert!(f.d.env_effective("r").unwrap_err().to_string().contains("\"prod\""));
+        assert!(f.d.env_scope("profile", Some("tp/../x")).is_err());
+        assert!(f.d.env_scope("profile", Some("nope/staging")).is_err(), "unknown project");
     }
 
     #[tokio::test(flavor = "current_thread")]
