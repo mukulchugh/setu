@@ -172,16 +172,15 @@ pub fn run(inp: DoctorInputs, sys: &dyn Sys) -> Vec<Check> {
         }
     }
 
-    for pc in &inp.projects {
-        for st in &pc.stores {
-            let Some(min) = st.warn_below else { continue };
-            let size = crate::disk_measure::measure(&st.path).logical;
-            let name = format!("store {}/{}", pc.project, st.name);
-            if size < min {
-                out.push(bad(name, format!("{}, below {} (looks emptied; the next install re-downloads everything)", crate::disk::human_bytes(size), crate::disk::human_bytes(min)), format!("warm it by installing dependencies once, e.g. in {}", st.path.display())));
-            } else {
-                out.push(ok(name, crate::disk::human_bytes(size)));
-            }
+    let mut sizes: std::collections::HashMap<std::path::PathBuf, u64> = Default::default();
+    for (projects, st) in crate::disk::unique_stores(&inp.projects) {
+        let Some(min) = st.warn_below else { continue };
+        let size = *sizes.entry(st.path.clone()).or_insert_with(|| crate::disk_measure::measure(&st.path).logical);
+        let name = format!("store {}/{}", projects.join(","), st.name);
+        if size < min {
+            out.push(bad(name, format!("{}, below {} (looks emptied; the next install re-downloads everything)", crate::disk::human_bytes(size), crate::disk::human_bytes(min)), format!("warm it by installing dependencies once, e.g. in {}", st.path.display())));
+        } else {
+            out.push(ok(name, crate::disk::human_bytes(size)));
         }
     }
     out
@@ -376,5 +375,20 @@ mod tests {
         assert!(!find(&cs, "small").ok);
         assert!(find(&cs, "fine").ok);
         assert!(!cs.iter().any(|c| c.name.contains("unwatched")));
+    }
+
+    #[test]
+    fn a_store_shared_by_projects_is_checked_once() {
+        let d = tmpdir("shared-store");
+        std::fs::write(d.join("f"), vec![0u8; 100]).unwrap();
+        let st = |w| vec![DiskStore { name: "bun-cache".into(), path: d.clone(), warn_below: Some(w) }];
+        let (mut a, mut b) = (project(&[], "a.test", st(10)), project(&[], "b.test", st(1000)));
+        a.project = "a".into();
+        b.project = "b".into();
+        let cs = run(inputs(Some("/usr/bin".into()), vec![a, b]), &FakeSys { resolving: vec![] });
+        let checks: Vec<_> = cs.iter().filter(|c| c.name.contains("bun-cache")).collect();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].name, "store a,b/bun-cache");
+        assert!(!checks[0].ok, "the strictest threshold (1000) applies");
     }
 }

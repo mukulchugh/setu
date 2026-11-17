@@ -48,6 +48,9 @@ pub struct Daemon {
     life: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Dependency installs running at once, daemon-wide (a burst of on-demand starts must not fork 20 installs).
     install_slots: Arc<tokio::sync::Semaphore>,
+    /// Store path -> (measured at, logical bytes). A shared store holds hundreds of thousands of
+    /// files and changes slowly, so `disk.report` reuses a measurement for `STORE_TTL`.
+    store_sizes: Arc<Mutex<HashMap<std::path::PathBuf, (u64, u64)>>>,
     /// Test hook: make `persist_durable` fail.
     #[cfg(test)]
     fail_persist: std::sync::atomic::AtomicBool,
@@ -215,6 +218,9 @@ fn build_spec_with(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut
     Ok(spec)
 }
 
+/// How long `disk.report` reuses a shared store's size.
+const STORE_TTL: u64 = 600;
+
 /// Most dependency installs that run at the same time.
 const MAX_CONCURRENT_INSTALLS: usize = 2;
 
@@ -243,6 +249,7 @@ impl Daemon {
             ar_lock: Mutex::new(()),
             life: Mutex::new(HashMap::new()),
             install_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS)),
+            store_sizes: Arc::default(),
             #[cfg(test)]
             fail_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1498,34 +1505,49 @@ impl Daemon {
     pub async fn disk_report(&self, measure_deps: bool) -> Result<Value> {
         let (configs, runs) = self.snapshot();
         let db = self.db.clone();
+        let cache = self.store_sizes.clone();
         tokio::task::spawn_blocking(move || {
             let policy = disk::Policy { measure: true, measure_deps, include_unmanaged: false };
             let now = disk::now_secs();
-            let mut worktrees = Vec::new();
-            let mut stores = Vec::new();
-            let mut free = 0;
-            for (cfg, wt) in all_worktrees(&db, &configs, &runs) {
-                free = disk::free_bytes(&wt.worktree);
-                let items = disk::candidates(&cfg, &wt, policy, now);
-                if items.is_empty() {
-                    continue;
+            let uniq = disk::unique_stores(&configs);
+            std::thread::scope(|s| {
+                // Stores are measured alongside the worktrees, each path once, cached for STORE_TTL.
+                let stores = s.spawn(|| {
+                    uniq.iter()
+                        .map(|(projects, st)| {
+                            let hit = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&st.path).copied();
+                            let logical = match hit {
+                                Some((at, bytes)) if now.saturating_sub(at) < STORE_TTL => bytes,
+                                _ => {
+                                    let bytes = disk_measure::measure(&st.path).logical;
+                                    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(st.path.clone(), (now, bytes));
+                                    bytes
+                                }
+                            };
+                            let low = st.warn_below.is_some_and(|w| logical < w);
+                            json!({ "project": projects.join(", "), "name": st.name, "path": st.path, "logical": logical, "low": low })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let mut worktrees = Vec::new();
+                let mut free = 0;
+                for (cfg, wt) in all_worktrees(&db, &configs, &runs) {
+                    free = disk::free_bytes(&wt.worktree);
+                    let items = disk::candidates(&cfg, &wt, policy, now);
+                    if items.is_empty() {
+                        continue;
+                    }
+                    worktrees.push(json!({
+                        "run": format!("{}/{}", wt.project, wt.run),
+                        "worktree": wt.worktree,
+                        "status": wt.status,
+                        "stopped_at": wt.stopped_at,
+                        "items": items,
+                    }));
                 }
-                worktrees.push(json!({
-                    "run": format!("{}/{}", wt.project, wt.run),
-                    "worktree": wt.worktree,
-                    "status": wt.status,
-                    "stopped_at": wt.stopped_at,
-                    "items": items,
-                }));
-            }
-            for cfg in &configs {
-                for st in &cfg.stores {
-                    let size = disk_measure::measure(&st.path);
-                    let low = st.warn_below.is_some_and(|w| size.logical < w);
-                    stores.push(json!({ "project": cfg.project, "name": st.name, "path": st.path, "logical": size.logical, "low": low }));
-                }
-            }
-            Ok(json!({ "free_bytes": free, "worktrees": worktrees, "stores": stores }))
+                let stores = stores.join().map_err(|_| anyhow!("measuring the shared stores panicked"))?;
+                Ok(json!({ "free_bytes": free, "worktrees": worktrees, "stores": stores }))
+            })
         })
         .await?
     }
@@ -2467,6 +2489,29 @@ mod tests {
 
     fn status(f: &Fx) -> RunStatus {
         f.d.lock().state.runs[&f.k].status
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_report_measures_a_shared_store_once_and_reuses_it() {
+        let sb = sandbox();
+        let store = sb.dir.join("bun-store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("a"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir_all(paths::projects_dir()).unwrap();
+        for p in ["a", "b"] {
+            let toml = format!("project = \"{p}\"\nrepo = \"/nonexistent/{p}.git\"\ndomain = \"{p}.local\"\npreset = []\n[[disk.store]]\nname = \"bun-cache\"\npath = '{}'\n", store.display());
+            std::fs::write(paths::projects_dir().join(format!("{p}.toml")), toml).unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let d = Daemon::new(tx).unwrap();
+        let r = d.disk_report(false).await.unwrap();
+        let stores = r["stores"].as_array().unwrap();
+        assert_eq!(stores.len(), 1, "one row per store, not per project: {stores:?}");
+        assert_eq!((stores[0]["project"].as_str(), stores[0]["logical"].as_u64()), (Some("a, b"), Some(100)));
+        // Within STORE_TTL the size comes from the cache, not a new walk.
+        std::fs::write(store.join("b"), vec![0u8; 50]).unwrap();
+        assert_eq!(d.disk_report(false).await.unwrap()["stores"][0]["logical"].as_u64(), Some(100));
+        drop(sb);
     }
 
     #[test]
