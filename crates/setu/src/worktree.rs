@@ -203,6 +203,100 @@ fn is_registered(repo: &Path, wt: &Path) -> Result<bool> {
     Ok(worktree_entries(repo)?.iter().any(|(p, _)| canon(p) == want))
 }
 
+/// Does `git worktree list` mark this checkout as locked?
+fn is_locked(repo: &Path, wt: &Path) -> Result<bool> {
+    let want = canon(wt);
+    let out = git_ok(repo, &["worktree", "list", "--porcelain"])?.text();
+    Ok(out.split("\n\n").any(|block| {
+        let mut lines = block.lines();
+        let here = lines.next().and_then(|l| l.strip_prefix("worktree ")).is_some_and(|p| canon(Path::new(p)) == want);
+        here && block.lines().any(|l| l == "locked" || l.starts_with("locked "))
+    }))
+}
+
+/// Where removed checkouts wait for deletion: `<project dir>/.setu-trash`, on the same volume as
+/// the worktrees so that moving one there is a rename.
+pub const TRASH_DIR: &str = ".setu-trash";
+
+fn trash_root(repo: &Path) -> PathBuf {
+    canon(&naming::project_dir(repo)).join(TRASH_DIR)
+}
+
+/// A real directory, not a symlink. The trash and its entries are never followed through links.
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// Move the checkout into the project's trash. `None` means "use `git worktree remove`": the path
+/// is a symlink, another worktree is nested inside it, the trash is not a real directory, or the
+/// rename failed (another volume, a name clash).
+fn move_to_trash(repo: &Path, wt: &Path, id: &str) -> Option<PathBuf> {
+    if !is_real_dir(wt) {
+        return None;
+    }
+    let src = canon(wt);
+    let nested = worktree_entries(repo).ok()?.iter().any(|(p, _)| {
+        let p = canon(p);
+        p != src && p.starts_with(&src)
+    });
+    if nested {
+        return None;
+    }
+    let root = trash_root(repo);
+    if !root.exists() {
+        std::fs::create_dir(&root).ok()?;
+    }
+    if !is_real_dir(&root) {
+        return None;
+    }
+    let dest = root.join(format!("{}-{id}", src.file_name()?.to_string_lossy()));
+    std::fs::rename(&src, &dest).ok()?;
+    Some(dest)
+}
+
+/// Delete everything in the project's trash, one entry at a time. Only direct children that are
+/// real directories and not registered worktrees are deleted; symlinks are left alone. Returns
+/// how many entries were deleted.
+pub fn sweep_trash(repo: &Path) -> usize {
+    let root = trash_root(repo);
+    if !is_real_dir(&root) {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return 0 };
+    let mut n = 0;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !e.file_type().is_ok_and(|t| t.is_dir()) || is_registered(repo, &p).unwrap_or(true) {
+            continue;
+        }
+        // std's remove_dir_all never follows symlinks inside the tree.
+        if std::fs::remove_dir_all(&p).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Ask the single background sweeper to empty a project's trash. One thread for the whole
+/// process, so a burst of removals deletes one tree at a time instead of all at once.
+pub fn request_sweep(repo: &Path) {
+    use std::sync::{mpsc, Mutex, OnceLock};
+    static SWEEPER: OnceLock<Mutex<mpsc::Sender<PathBuf>>> = OnceLock::new();
+    let tx = SWEEPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        std::thread::Builder::new()
+            .name("setu-trash".into())
+            .spawn(move || {
+                for repo in rx {
+                    sweep_trash(&repo);
+                }
+            })
+            .expect("spawn the trash sweeper");
+        Mutex::new(tx)
+    });
+    let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(repo.to_path_buf());
+}
+
 /// Base for `new`: explicit `from`, else `[worktree] base`, else origin/staging if it exists,
 /// else origin/<default branch>. The result must resolve to a commit.
 pub fn resolve_base(repo: &Path, cfg: &WorktreeCfg, from: Option<&str>) -> Result<String> {
@@ -770,6 +864,9 @@ pub struct OpRecord {
     /// with tracked files deleted; a retry treats deletions-only as the half-finished removal.
     #[serde(default)]
     pub delete_started: bool,
+    /// Where the checkout was moved for background deletion, when the fast path was taken.
+    #[serde(default)]
+    pub trashed: Option<PathBuf>,
 }
 
 fn check_key(key: &str) -> Result<()> {
@@ -897,6 +994,9 @@ pub struct RmOutcome {
     pub branch: Option<String>,
     /// True when the record already said removed.
     pub already: bool,
+    /// The checkout was moved to the project's trash; its space is freed in the background.
+    #[serde(default)]
+    pub freeing_in_background: bool,
 }
 
 /// A guard refusal: the reasons, nothing destructive done.
@@ -929,7 +1029,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
     let existing = load_op(ctx.db, &key)?;
     let mut rec = match existing {
         Some(r) if r.step == Step::Done => {
-            return Ok(RmOutcome { run: key, removed: true, archive: r.archive, archived_files: r.archived_files, branch: r.branch, already: true });
+            return Ok(RmOutcome { run: key, removed: true, archive: r.archive, archived_files: r.archived_files, branch: r.branch, already: true, freeing_in_background: false });
         }
         Some(r) => {
             if ctx.worktree.exists() && canon(&r.worktree) != canon(ctx.worktree) {
@@ -971,6 +1071,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 last_error: None,
                 backup_ref: None,
                 delete_started: false,
+                trashed: None,
             };
             save_op(ctx.db, &rec)?;
             rec
@@ -995,7 +1096,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
             }
         }
     }
-    Ok(RmOutcome { run: key, removed: true, archive: rec.archive, archived_files: rec.archived_files, branch: rec.branch, already: false })
+    Ok(RmOutcome { run: key, removed: true, freeing_in_background: rec.trashed.is_some(), archive: rec.archive, archived_files: rec.archived_files, branch: rec.branch, already: false })
 }
 
 /// Run one step and record the next. Leaving `Guards` re-checks the claim table in the same
@@ -1110,24 +1211,43 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 if ctx.force {
                     backup_dirty(ctx, rec)?;
                 }
-                let wt_s = wt.to_string_lossy().into_owned();
-                let mut args = vec!["worktree", "remove"];
-                if ctx.force || half_deleted {
-                    args.push("--force");
+                // `prune` skips locked entries, so a lock must refuse before the checkout moves.
+                if is_locked(ctx.repo, wt)? {
+                    bail!("the worktree is locked. Run `git worktree unlock {}` if the lock is stale, then retry", wt.display());
                 }
-                args.extend(["--", &wt_s]);
                 if !rec.delete_started {
                     rec.delete_started = true;
                     save_op(ctx.db, rec)?;
                 }
-                git(ctx.repo, &args, GIT_REMOVE).map_err(|e| match &e {
-                    ExecError::Unknown(_) => anyhow!("git worktree remove finished with an unknown result ({e}); the record is kept, retry to continue"),
-                    ExecError::Failed { stderr, .. } if stderr.contains("locked") => anyhow!("git worktree remove refused: the worktree is locked ({}). Run `git worktree unlock {}` if the lock is stale, then retry", stderr.trim(), wt.display()),
-                    ExecError::Failed { stderr, .. } if stderr.contains("submodule") => anyhow!("git worktree remove refused: it contains submodules ({}). Deinitialise them (`git submodule deinit --all`) after saving any local commits, then retry", stderr.trim()),
-                    _ => anyhow!("git worktree remove: {e}"),
-                })?;
+                // Fast path: a rename into the project's trash (same volume) takes milliseconds;
+                // `git worktree remove` deletes ~300k files in place and takes minutes. The files
+                // are deleted later by the one background sweeper.
+                if let Some(dest) = move_to_trash(ctx.repo, wt, &rec.id) {
+                    rec.trashed = Some(dest);
+                    save_op(ctx.db, rec)?;
+                } else {
+                    let wt_s = wt.to_string_lossy().into_owned();
+                    let mut args = vec!["worktree", "remove"];
+                    if ctx.force || half_deleted {
+                        args.push("--force");
+                    }
+                    args.extend(["--", &wt_s]);
+                    git(ctx.repo, &args, GIT_REMOVE).map_err(|e| match &e {
+                        ExecError::Unknown(_) => anyhow!("git worktree remove finished with an unknown result ({e}); the record is kept, retry to continue"),
+                        ExecError::Failed { stderr, .. } if stderr.contains("locked") => anyhow!("git worktree remove refused: the worktree is locked ({}). Run `git worktree unlock {}` if the lock is stale, then retry", stderr.trim(), wt.display()),
+                        ExecError::Failed { stderr, .. } if stderr.contains("submodule") => anyhow!("git worktree remove refused: it contains submodules ({}). Deinitialise them (`git submodule deinit --all`) after saving any local commits, then retry", stderr.trim()),
+                        _ => anyhow!("git worktree remove: {e}"),
+                    })?;
+                }
             }
             git(ctx.repo, &["worktree", "prune"], GIT_QUICK).map_err(|e| anyhow!("git worktree prune: {e}"))?;
+            // Never drop state while git still lists the checkout, at its old place or in the trash.
+            if is_registered(ctx.repo, &rec.worktree)? || rec.trashed.as_deref().is_some_and(|t| is_registered(ctx.repo, t).unwrap_or(true)) {
+                bail!("git still lists {} after `git worktree prune`; the record is kept, retry to continue", rec.worktree.display());
+            }
+            if rec.trashed.is_some() {
+                request_sweep(ctx.repo);
+            }
             // Nested branch names leave empty parent folders behind.
             let pdir = canon(&naming::project_dir(ctx.repo));
             let mut parent = rec.worktree.parent();
@@ -1765,7 +1885,7 @@ pub(crate) mod tests {
         assert!(f.pdir.join("feat/e").exists());
         // a pending removal blocks new
         let key = "app/feat-f";
-        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None, backup_ref: None, delete_started: false };
+        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None, backup_ref: None, delete_started: false, trashed: None };
         save_op(&f.ops, &rec).unwrap();
         assert!(pending_removal(&f.ops, key));
         assert!(run(&f, "feat/f", &BTreeSet::new()).unwrap_err().to_string().contains("pending"));
@@ -1980,6 +2100,90 @@ pub(crate) mod tests {
         let e = do_rm(&f, "feat-n", &p, false, &Host::default()).unwrap_err();
         assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "dirty"), "{e}");
         assert!(p.exists());
+    }
+
+    fn trash_entries(f: &Fx) -> Vec<PathBuf> {
+        fs::read_dir(trash_root(&f.repo)).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn rm_moves_the_checkout_to_the_trash_and_the_sweeper_deletes_it() {
+        let f = fx("rmtrash");
+        let o = new_wt(&f, "feat/t");
+        fs::write(o.path.join("local.db"), "irreplaceable").unwrap();
+        let out = do_rm(&f, "feat-t", &o.path, false, &Host::default()).unwrap();
+        assert!(out.removed && out.freeing_in_background && !o.path.exists());
+        assert!(!is_registered(&f.repo, &o.path).unwrap());
+        // the branch is free again, and restore brings the worktree and its archived files back
+        let r = restore(&f.cfg, "feat-t", &f.ops, &f.archives).unwrap();
+        assert_eq!(fs::read_to_string(r.path.join("local.db")).unwrap(), "irreplaceable");
+        // whatever the background sweeper has not deleted yet, a sweep finishes
+        sweep_trash(&f.repo);
+        assert!(trash_entries(&f).is_empty(), "{:?}", trash_entries(&f));
+    }
+
+    #[test]
+    fn a_locked_worktree_is_refused_and_left_in_place() {
+        let f = fx("rmlocked");
+        let o = new_wt(&f, "feat/l");
+        g(&f.repo, &["worktree", "lock", o.path.to_str().unwrap()]);
+        let e = do_rm(&f, "feat-l", &o.path, false, &Host::default()).unwrap_err();
+        assert!(e.to_string().contains("locked"), "{e}");
+        assert!(o.path.exists() && is_registered(&f.repo, &o.path).unwrap());
+        assert!(trash_entries(&f).is_empty());
+    }
+
+    #[test]
+    fn a_crash_between_the_move_and_prune_completes_on_retry() {
+        let f = fx("rmmoved");
+        let o = new_wt(&f, "feat/m");
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Archive);
+        assert!(do_rm(&f, "feat-m", &o.path, false, &crashy).is_err());
+        // the move happened, then the process died before `git worktree prune`
+        let rec = load_op(&f.ops, "app/feat-m").unwrap().unwrap();
+        assert!(move_to_trash(&f.repo, &o.path, &rec.id).is_some());
+        let out = do_rm(&f, "feat-m", &o.path, false, &Host::default()).unwrap();
+        assert!(out.removed && !is_registered(&f.repo, &o.path).unwrap());
+        assert!(!pending_removal(&f.ops, "app/feat-m"));
+    }
+
+    #[test]
+    fn without_a_usable_trash_rm_falls_back_to_git_worktree_remove() {
+        let f = fx("rmnotrash");
+        let o = new_wt(&f, "feat/x");
+        fs::write(trash_root(&f.repo), "not a directory").unwrap();
+        let out = do_rm(&f, "feat-x", &o.path, false, &Host::default()).unwrap();
+        assert!(out.removed && !out.freeing_in_background && !o.path.exists());
+        assert!(trash_root(&f.repo).is_file(), "left alone");
+    }
+
+    #[test]
+    fn a_half_deleted_checkout_also_resumes_on_the_fallback_path() {
+        let f = fx("rmhalffallback");
+        let p = half_deleted(&f, "feat-hf", "feat/hf", true);
+        fs::write(trash_root(&f.repo), "not a directory").unwrap();
+        let out = do_rm(&f, "feat-hf", &p, false, &Host::default()).unwrap();
+        assert!(out.removed && !out.freeing_in_background && !p.exists());
+    }
+
+    #[test]
+    fn the_sweeper_never_follows_links() {
+        use std::os::unix::fs::symlink;
+        let f = fx("rmsweeplinks");
+        let outside = f.root.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join("keep/file"), "k").unwrap();
+        // a symlinked trash root is not swept at all
+        symlink(&outside, trash_root(&f.repo)).unwrap();
+        assert_eq!(sweep_trash(&f.repo), 0);
+        fs::remove_file(trash_root(&f.repo)).unwrap();
+        // inside a real trash, a symlinked entry is left alone; a real directory is deleted
+        fs::create_dir_all(trash_root(&f.repo).join("old-checkout/sub")).unwrap();
+        symlink(outside.join("keep"), trash_root(&f.repo).join("link")).unwrap();
+        assert_eq!(sweep_trash(&f.repo), 1);
+        assert!(outside.join("keep/file").exists());
+        assert!(fs::symlink_metadata(trash_root(&f.repo).join("link")).is_ok());
     }
 
     #[test]

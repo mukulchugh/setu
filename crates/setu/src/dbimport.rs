@@ -274,6 +274,7 @@ mod tests {
             last_error: Some("boom".into()),
             backup_ref: None,
             delete_started: false,
+            trashed: None,
         };
         fs::write(st.join("worktrees/app/feat-b.json"), serde_json::to_vec(&op).unwrap()).unwrap();
         let mut ar = AutoState::default();
