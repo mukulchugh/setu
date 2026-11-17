@@ -21,7 +21,8 @@ setu: run every worktree's app and workers at its own local URL
   setu disk [--deps] [--json]     what each worktree's declared items really cost
   setu disk clean [--apply] [--include-unmanaged]
                                      delete regenerable items of stopped runs past policy
-  setu env ls <scope> [target]    scope: global | project <name> | worktree <run>
+  setu env ls <scope> [target]    scope: global | project <name> | profile <project>/<name> | worktree <run>
+  setu env use <run> <profile>    run a worktree with a project's named profile (`none` to stop)
   setu env effective [run]        every var a run gets, and which layer it comes from
   setu env set <scope> [target] NAME=value [--secret|--plain]
   setu env set <scope> [target] NAME --secret      type the value hidden
@@ -410,7 +411,7 @@ async fn ls_cmd(args: &[String]) -> Result<()> {
             r["run"].as_str().unwrap_or("?"),
             r["status"].as_str().unwrap_or("?"),
             mb,
-            if r["pinned"].as_bool() == Some(true) { " pinned" } else { "" },
+            format!("{}{}", if r["pinned"].as_bool() == Some(true) { " pinned" } else { "" }, r["profile"].as_str().map(|p| format!(" [{p}]")).unwrap_or_default()),
             format!("{}{}", r["url"].as_str().unwrap_or(""), match r["aliases"].as_array().map_or(0, Vec::len) {
                 0 => String::new(),
                 n => format!(" +{n}"),
@@ -459,9 +460,28 @@ async fn logs(args: &[String]) -> Result<()> {
 }
 
 async fn env(args: &[String]) -> Result<()> {
-    let action = args.first().map(String::as_str).ok_or_else(|| anyhow!("env needs ls, effective, set, unset, import or reveal"))?;
+    let action = args.first().map(String::as_str).ok_or_else(|| anyhow!("env needs ls, effective, use, set, unset, import or reveal"))?;
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+    if action == "use" {
+        // `setu env use <run> <profile|none>`: the worktree layer's SETU_PROFILE selects the profile.
+        let (run, profile) = match pos.as_slice() {
+            [run, profile] => (run.to_string(), profile.to_string()),
+            _ => bail!("usage: setu env use <run> <profile|none>"),
+        };
+        let mut req = json!({ "scope": "worktree", "target": run, "name": crate::env::PROFILE_VAR });
+        if profile == "none" {
+            api::call(with_cmd("env.unset", req)).await?;
+            println!("{run} uses no env profile; applies the next time it starts");
+            return Ok(());
+        }
+        // The daemon refuses a profile that has no values yet.
+        req["value"] = json!(profile);
+        req["secret"] = json!(false);
+        api::call(with_cmd("env.set", req)).await?;
+        println!("{run} now uses env profile {profile}; applies the next time it starts (`setu restart {run}`)");
+        return Ok(());
+    }
     if action == "effective" {
         let run = match pos.first() {
             Some(r) => r.to_string(),
@@ -555,7 +575,7 @@ async fn env(args: &[String]) -> Result<()> {
             println!("{}", out["value"].as_str().unwrap_or(""));
             Ok(())
         }
-        _ => bail!("env needs ls, effective, set, unset, import or reveal"),
+        _ => bail!("env needs ls, effective, use, set, unset, import or reveal"),
     }
 }
 

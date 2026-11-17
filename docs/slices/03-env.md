@@ -3,10 +3,11 @@
 Research: `02-env-research.md`.
 
 ## What you get
-- **Three layers you edit**, merged in this order:
+- **Layers you edit**, merged in this order:
   1. global (every project and worktree)
   2. project
-  3. worktree
+  3. profile: a named set per project (`staging`, `dev`), used by a worktree whose own layer sets `SETU_PROFILE` (`setu env use <run> <profile>`). Stored at `env/<project>/.profiles/<name>.toml`; run names never start with a dot, so the files cannot collide with a worktree's. A selected profile with no values is an error, never a silent fallback. Its secrets are redacted from logs like any other layer's, even when overridden.
+  4. worktree
 
   Each layer holds plain values and secrets. Setu's computed values (`PORT`, `SETU_URL` and the rest) always win.
 - **Secrets are stored apart from plain values.** Each layer has a sibling secrets file, mode 0600, in a 0700 directory. A name is treated as a secret when either:

@@ -152,7 +152,7 @@ pub struct RunSpec {
     /// `http://<host>:<PROXY_PORT>`
     pub url: String,
     pub ports: BTreeMap<String, u16>,
-    /// Final env after all layers and templates (global < project < worktree < computed).
+    /// Final env after all layers and templates (global < project < profile < worktree < computed).
     pub env: BTreeMap<String, String>,
     pub procs: Vec<ResolvedProc>,
     /// Port of the proc that receives proxied traffic.

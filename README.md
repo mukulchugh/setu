@@ -231,8 +231,11 @@ Env comes in layers. Later layers win:
 1. **Global:** `setu env set global NAME=value`
 2. **Project config `[env]`,** with recipes merged in
 3. **Project:** `setu env set project myapp NAME=value`
-4. **Worktree:** `setu env set worktree myapp/feat-login NAME=value`
-5. **Computed:** `PORT`, `SETU_*`
+4. **Profile,** if the worktree uses one: `setu env set profile myapp/staging NAME=value`
+5. **Worktree:** `setu env set worktree myapp/feat-login NAME=value`
+6. **Computed:** `PORT`, `SETU_*`
+
+A profile is a named set of values for one project, such as `staging` or `dev`. A worktree picks one with `setu env use myapp/feat-login staging` (`none` to stop); `setu ls` shows it in brackets. A run whose profile has no values refuses to start rather than run with the wrong env. Values Setu injects take precedence over the same names in an app's own `.env` files when the app's loader keeps existing process env (Next.js does).
 
 ```bash
 setu env effective feat-login                      # every var a run gets, and which layer it came from
