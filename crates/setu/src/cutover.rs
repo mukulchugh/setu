@@ -639,6 +639,7 @@ mod tests {
 
     #[test]
     fn generated_configs_parse() {
+        let _sb = crate::env::tests::sandbox(); // recipes come from SETU_HOME, never the user's config
         for inf in [Some(Inferred { run: "bun run dev".into(), how: "x".into() }), None] {
             let (t, _) = generate_config("p", "~/workspace/p.git", "quivly.local", inf.as_ref(), &[], &Stack::default());
             config::parse_project(&t, Path::new("p.toml")).unwrap();
@@ -647,6 +648,7 @@ mod tests {
 
     #[test]
     fn shared_env_links_from_main_are_detected_and_declared() {
+        let _sb = crate::env::tests::sandbox(); // recipes come from SETU_HOME, never the user's config
         let d = std::env::temp_dir().join(format!("setu-links-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let main = d.join("main");
@@ -699,6 +701,7 @@ mod tests {
 
     #[test]
     fn a_full_stack_repo_gets_the_complete_config() {
+        let _sb = crate::env::tests::sandbox(); // recipes come from SETU_HOME, never the user's config
         let base = std::env::temp_dir().join(format!("setu-stack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         // The generated config points at <base>/quivly-app.git, so its main worktree is <base>/quivly-app/main.
@@ -755,6 +758,7 @@ mod tests {
 
     #[test]
     fn a_plain_app_and_a_convex_app_get_only_what_they_use() {
+        let _sb = crate::env::tests::sandbox(); // recipes come from SETU_HOME, never the user's config
         let base = std::env::temp_dir().join(format!("setu-stack2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let d = base.join("plain/main");

@@ -216,7 +216,8 @@ pub struct RunRecord {
     pub procs: Vec<ProcRecord>,
     /// Last error or crash note, if any.
     pub note: Option<String>,
-    /// Unix seconds when Setu last saw this run stop. Disk policies age from this, never from mtimes.
+    /// Unix seconds when Setu last saw this run stopped: when it stopped, or when Setu first
+    /// registered it (see `state::stamp_unknown_ages`). Disk policies age from this, never from mtimes.
     #[serde(default)]
     pub stopped_at: Option<u64>,
     /// Hash of the env the running procs were started with (for "restart to apply env changes").

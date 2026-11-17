@@ -34,6 +34,22 @@ pub fn load(db: &Db) -> Result<State> {
     db.with(load_conn)
 }
 
+/// Give every idle run Setu has no event time for (registered or adopted but never started by
+/// Setu) a `stopped_at` of `now`: the moment Setu saw it stopped. Without it, disk clean and
+/// auto-removal treat its age as unknown and keep it forever; with it, age counts from now,
+/// never backwards and never from mtimes. Returns how many runs were stamped.
+pub fn stamp_unknown_ages(state: &mut State, now: u64) -> usize {
+    let mut n = 0;
+    for r in state.runs.values_mut() {
+        let idle = !matches!(r.status, RunStatus::Starting | RunStatus::Running | RunStatus::Stopping);
+        if idle && r.stopped_at.is_none() && r.last_started_at.is_none() && r.last_request_at.is_none() {
+            r.stopped_at = Some(now);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn load_conn(c: &Conn) -> Result<State> {
     let mut st = State::default();
     let rows = c.query(
@@ -148,6 +164,25 @@ mod tests {
         s.runs.insert("p/r".into(), RunRecord { spec, status: RunStatus::Running, pinned: true, procs: vec![], note: None, stopped_at: None, env_hash: Some(u64::MAX), last_started_at: None, last_request_at: None, custom_aliases: vec![] });
         s.leases.insert("p/r".into(), BTreeMap::from([("web".to_string(), 4001u16)]));
         s
+    }
+
+    #[test]
+    fn stamp_unknown_ages_only_touches_idle_runs_with_no_event() {
+        let mut s = sample();
+        let base = s.runs["p/r"].clone();
+        let with = |status, stopped_at, last_started_at, last_request_at| RunRecord { status, stopped_at, last_started_at, last_request_at, ..base.clone() };
+        s.runs.insert("p/never-ran".into(), with(RunStatus::Stopped, None, None, None));
+        s.runs.insert("p/setup-failed".into(), with(RunStatus::SetupFailed, None, None, None));
+        s.runs.insert("p/started-once".into(), with(RunStatus::Stopped, None, Some(5), None));
+        s.runs.insert("p/stopped".into(), with(RunStatus::Stopped, Some(9), None, None));
+        // "p/r" is Running with no event: live, so it is left alone.
+        assert_eq!(stamp_unknown_ages(&mut s, 1000), 2);
+        assert_eq!(s.runs["p/never-ran"].stopped_at, Some(1000));
+        assert_eq!(s.runs["p/setup-failed"].stopped_at, Some(1000));
+        assert_eq!(s.runs["p/started-once"].stopped_at, None, "has a start time already");
+        assert_eq!(s.runs["p/stopped"].stopped_at, Some(9), "never moved");
+        assert_eq!(s.runs["p/r"].stopped_at, None, "running");
+        assert_eq!(stamp_unknown_ages(&mut s, 2000), 0, "idempotent: age never resets");
     }
 
     #[test]

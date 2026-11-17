@@ -3,8 +3,9 @@
 //! The one rule that shapes everything here (V1-REVIEW D1): **unknown means keep**. A worktree's
 //! idle age comes only from Setu's own recorded event times (last start, last stop, last proxied
 //! request). If none was ever recorded, or anything needed cannot be read, the worktree is not
-//! eligible; an unknown age is never read as zero or as infinity. Worktrees Setu never ran are
-//! never touched.
+//! eligible; an unknown age is never read as zero or as infinity. A run Setu registers but never
+//! starts gets its stop time when Setu first sees it (`state::stamp_unknown_ages`), so its age
+//! counts from that moment, never from earlier.
 //!
 //! Two phases: an eligible worktree first becomes a *candidate* (visible in `ls`), and is removed
 //! only when it is still eligible after the grace period and not pinned. Any failing check
