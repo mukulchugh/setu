@@ -3,7 +3,7 @@
 //! immediately before each delete.
 
 use crate::disk_measure::{self, Size};
-use crate::model::{DiskItem, DiskKind, ProjectConfig, RunStatus};
+use crate::model::{DiskItem, DiskKind, DiskStore, ProjectConfig, RunStatus};
 use crate::presets;
 use crate::procinfo;
 use anyhow::{bail, Result};
@@ -340,6 +340,25 @@ pub fn human_secs(s: u64) -> String {
         s if s >= 60 => format!("{}m", s / 60),
         s => format!("{s}s"),
     }
+}
+
+/// Each distinct store (path and name) once, with every project that declares it. Projects usually share
+/// one store (the bun cache), and walking a large one takes tens of seconds, so callers must not
+/// measure it once per project. `warn_below` is the largest any project asked for.
+pub fn unique_stores(configs: &[ProjectConfig]) -> Vec<(Vec<String>, DiskStore)> {
+    let mut out: Vec<(Vec<String>, DiskStore)> = Vec::new();
+    for cfg in configs {
+        for st in &cfg.stores {
+            match out.iter_mut().find(|(_, s)| s.path == st.path && s.name == st.name) {
+                Some((projects, s)) => {
+                    projects.push(cfg.project.clone());
+                    s.warn_below = s.warn_below.max(st.warn_below);
+                }
+                None => out.push((vec![cfg.project.clone()], st.clone())),
+            }
+        }
+    }
+    out
 }
 
 pub fn human_bytes(b: u64) -> String {

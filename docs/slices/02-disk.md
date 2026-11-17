@@ -10,7 +10,7 @@ Research behind this slice:
   - what each declared item really costs on disk: logical size, plus clone-aware "frees if deleted" bytes;
   - the run's status and how long ago it stopped;
   - the volume's free space;
-  - a health line for each shared package store. A cold or emptied store is the expensive case: 2.7 GiB to re-download for quivly-app.
+  - a health line for each shared package store. A cold or emptied store is the expensive case: 2.7 GiB to re-download for quivly-app. Each store is listed once with every project that declares it, measured alongside the worktrees, and its size is reused for 10 minutes: a 476k-file bun cache takes about 26 s to walk, and measuring it once per project made the report take 8 minutes.
 - **`setu disk clean`** is a dry run by default. With `--apply` it deletes only declared, regenerable, git-ignored caches and outputs, in stopped runs, after their age policy has passed. Every deletion is written to an audit log.
 - **The daemon cleans automatically** on the same rules, hourly, for runs it manages. It only ever deletes what `disk clean` would list.
 - **Nothing is stack-specific in code.** Ecosystem knowledge lives in preset TOML files, with a `[detect]` section matching marker files. Presets only fill defaults, and the project config can override or disable any of them.
