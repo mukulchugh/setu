@@ -22,12 +22,25 @@ Sources to port from (proven behaviour, not to copy blindly):
   1. stop the run;
   2. check the guards;
   3. archive irreplaceable ignored files;
-  4. `git worktree remove`;
+  4. move the checkout into `<project dir>/.setu-trash` and `git worktree prune` (fallback: `git worktree remove`);
   5. drop state;
   6. release the port lease;
   7. write a marker.
 
-  The branch is always kept, and a retry resumes from the recorded step. Step 4 deletes files in place (up to 15 minutes for a large `node_modules`). If it is interrupted, the checkout is left with tracked files deleted; the retry accepts a tree whose only changes are those deletions, and still refuses any edit or new file.
+  The branch is always kept, and a retry resumes from the recorded step.
+
+  **Step 4, measured.** A checkout with a 336k-file `node_modules` on an idle Mac:
+
+  | Option | Time until `rm` returns | Notes |
+  |---|---|---|
+  | `git worktree remove` (the old step 4) | 37 s idle, over 120 s under load | deletes in place; an interrupted run leaves a half-deleted tree |
+  | delete declared deps first, then `git worktree remove` | not measured; same work | the same files are deleted before returning |
+  | parallel delete, then `git worktree remove` | not measured; still blocking | more disk contention while agents work |
+  | **rename into a same-volume trash, then `git worktree prune`** | **0.09 s** | the delete (29 s) runs in the background |
+
+  Setu takes the rename path. A lock refuses before the move, because `prune` skips locked entries. The move is skipped (and `git worktree remove` used) when the path is a symlink, another worktree is nested inside it, the trash is not a real directory, or the rename fails (another volume). After `prune`, state is dropped only when git no longer lists the checkout at its old or its trash path. One background thread per daemon empties the trash, one tree at a time, deleting only direct children that are real directories and not registered worktrees; it never follows symlinks. The daemon also sweeps every project's trash at startup, so a delete cut short by a restart finishes. Space is freed a minute or two after `rm` returns; the CLI says so.
+
+  If the fallback `git worktree remove` is interrupted, the checkout is left with tracked files deleted; the retry accepts a tree whose only changes are those deletions, and still refuses any edit or new file.
 - **`setu restore <run>`:** recreate the worktree from its kept branch and put back the archived files.
 
 ### Writer claims (agents coordinate edits)

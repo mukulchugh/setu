@@ -230,6 +230,10 @@ impl Daemon {
         let db = db::global().context("the state database could not be opened or imported; refusing to start")?;
         let mut state = state::load(&db).context("the state database is unreadable; refusing to start")?;
         let stamped = state::stamp_unknown_ages(&mut state, crate::disk::now_secs());
+        // Finish deleting checkouts a previous daemon moved to a trash but did not get to delete.
+        for cfg in &configs {
+            worktree::request_sweep(&cfg.repo);
+        }
         let d = Self::with_parts(configs, state, db, exits);
         if stamped > 0 {
             d.persist();

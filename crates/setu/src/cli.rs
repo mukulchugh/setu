@@ -296,6 +296,9 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
                 println!("{} removed; branch {} kept", out["run"].as_str().unwrap_or("?"), out["branch"].as_str().unwrap_or("(detached)"));
             }
             print_dropped_aliases(&out);
+            if out["freeing_in_background"].as_bool() == Some(true) {
+                println!("  its files are being deleted in the background; the space frees up over the next minute or two");
+            }
             if let Some(a) = out["archive"].as_str() {
                 println!("  {} ignored file(s) archived to {a}; `setu restore {}` brings them back", out["archived_files"].as_u64().unwrap_or(0), out["run"].as_str().unwrap_or(""));
             }
