@@ -222,8 +222,13 @@ impl Daemon {
     pub fn new(exits: ExitTx) -> Result<Arc<Self>> {
         let configs = config::load_all()?;
         let db = db::global().context("the state database could not be opened or imported; refusing to start")?;
-        let state = state::load(&db).context("the state database is unreadable; refusing to start")?;
-        Ok(Self::with_parts(configs, state, db, exits))
+        let mut state = state::load(&db).context("the state database is unreadable; refusing to start")?;
+        let stamped = state::stamp_unknown_ages(&mut state, crate::disk::now_secs());
+        let d = Self::with_parts(configs, state, db, exits);
+        if stamped > 0 {
+            d.persist();
+        }
+        Ok(d)
     }
 
     fn with_parts(configs: Vec<ProjectConfig>, state: State, db: Arc<Db>, exits: ExitTx) -> Arc<Self> {
@@ -546,7 +551,9 @@ impl Daemon {
             pinned: false,
             procs: vec![],
             note: None,
-            stopped_at: None,
+            // A new run is stopped when Setu first sees it; recording that gives disk clean and
+            // auto-removal an age to work from even if Setu never starts it.
+            stopped_at: Some(crate::disk::now_secs()),
             env_hash: None,
             last_started_at: None,
             last_request_at: None,
@@ -2460,6 +2467,15 @@ mod tests {
 
     fn status(f: &Fx) -> RunStatus {
         f.d.lock().state.runs[&f.k].status
+    }
+
+    #[test]
+    fn a_registered_run_has_an_age_before_it_ever_starts() {
+        let before = crate::disk::now_secs();
+        let f = fixture(&[], "");
+        let r = f.d.lock().state.runs[&f.k].clone();
+        assert_eq!(r.last_started_at, None);
+        assert!(r.stopped_at.is_some_and(|t| t >= before), "disk clean and auto-removal need an age: {r:?}");
     }
 
     fn recorded(f: &Fx) -> usize {

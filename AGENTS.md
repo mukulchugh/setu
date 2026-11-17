@@ -8,6 +8,7 @@
 - **One-command install:** `brew install mukulchugh/tap/setu && setu`. Bare `setu` and any daemon command run the first-run setup (`src/onboard.rs`, over `setup.rs`'s plan/apply and `app.rs`); `doctor`, `mcp`, `migrate`, `setup --dry-run|--undo`, `recipes`, `path`, `app` and `import-v1` (without `--apply`) never auto-install (`needs_daemon` in `cli.rs`). Upgrades: the daemon re-executes via launchd when its Homebrew binary is replaced (`src/selfupdate.rs`, exit code 75, so the plist's `KeepAlive` `SuccessfulExit=false` restarts it) and updates `~/Applications/Setu.app` when the app is not running (`app::auto_update`). Tests use `SETU_MAINTENANCE_SECS`, `SETU_RESTART_WATCH` and `SETU_APP_SOURCE`; `crates/setu/e2e/onecmd-e2e.sh` covers the flow.
 
 ## Build and test
+- One worktree per lane: `setu new setu <branch> --from origin/main`. Build in that worktree's own `target/`, which the rust-cargo preset cleans a week after the lane goes idle. Never point `CARGO_TARGET_DIR` at a shared checkout; per-lane dirs there are invisible to Setu and once grew to 38 GB.
 - `cargo test`: unit and integration. It must stay at zero warnings.
 - `crates/setu/e2e/*-e2e.sh <binary>`: each script runs in its own HOME and SETU_HOME, on non-80 ports.
 - `scripts/test-cutover-sandbox.sh <binary>`: `setu migrate` run and rollback in a fake home.

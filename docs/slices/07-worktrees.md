@@ -27,7 +27,7 @@ Sources to port from (proven behaviour, not to copy blindly):
   6. release the port lease;
   7. write a marker.
 
-  The branch is always kept, and a retry resumes from the recorded step.
+  The branch is always kept, and a retry resumes from the recorded step. Step 4 deletes files in place (up to 15 minutes for a large `node_modules`). If it is interrupted, the checkout is left with tracked files deleted; the retry accepts a tree whose only changes are those deletions, and still refuses any edit or new file.
 - **`setu restore <run>`:** recreate the worktree from its kept branch and put back the archived files.
 
 ### Writer claims (agents coordinate edits)
@@ -40,7 +40,7 @@ Sources to port from (proven behaviour, not to copy blindly):
 - **Setu.app:** a claim badge per run, showing who holds it.
 
 ### Auto-removal, robust (opt-in)
-1. **Unknown means keep.** Age comes only from Setu's own event times: last stop, last proxied request, last start. Any missing input, git error or timeout skips the worktree.
+1. **Unknown means keep.** Age comes only from Setu's own event times: last stop, last proxied request, last start. A run Setu never started counts as stopped from when Setu first saw it. Any missing input, git error or timeout skips the worktree.
 2. **Proven safe, re-checked right before deleting:**
    - not `main`;
    - clean, including untracked files;

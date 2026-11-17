@@ -59,7 +59,7 @@ Presets are additive, and a project can stack several of them.
 2. **The path resolves inside the worktree.** `realpath` is checked against the worktree's realpath. A symlinked candidate, or one with a symlinked ancestor inside the worktree, is skipped. Setu never follows symlinks.
 3. **Git ignores the path.** `git check-ignore` must match it, and no tracked file may be under it.
 4. **The path is declared** by a preset or by the project config.
-5. **Age comes from Setu's own record of when the run stopped.** A new `stopped_at` field is added to the run record. A worktree Setu never ran has no stop time, so auto-clean skips it. `disk clean --include-unmanaged` can act on those, but only with `--apply` and only for items whose policy allows it.
+5. **Age comes from Setu's own record of when the run stopped.** A new `stopped_at` field is added to the run record. A run Setu registers or adopts but never starts gets a stop time when Setu first sees it (at registration, or at daemon start for runs from older versions), so its age counts from then, never from mtimes. `disk clean --include-unmanaged` can act on those, but only with `--apply` and only for items whose policy allows it.
 6. **Dry-run is the default.** `--apply` deletes, and appends `{ts, run, path, bytes_freed_estimate}` to `~/Library/Logs/Setu/disk-audit.jsonl`.
 
 ## Measuring

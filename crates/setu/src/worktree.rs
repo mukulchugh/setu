@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const GIT_QUICK: Duration = Duration::from_secs(30);
 const GIT_SLOW: Duration = Duration::from_secs(120);
+/// `git worktree remove` deletes every file in place; a JS checkout has about 300k of them.
+const GIT_REMOVE: Duration = Duration::from_secs(900);
 const TAR_TIMEOUT: Duration = Duration::from_secs(600);
 const STEP_TIMEOUT: Duration = Duration::from_secs(1800);
 /// After a command exits, how long its output pipes may stay open (a background child can hold them).
@@ -764,6 +766,10 @@ pub struct OpRecord {
     /// `--force` saved the dirty changes here (`refs/setu-backup/<branch>`) before removing.
     #[serde(default)]
     pub backup_ref: Option<String>,
+    /// Set right before `git worktree remove` runs. If that is interrupted, the checkout is left
+    /// with tracked files deleted; a retry treats deletions-only as the half-finished removal.
+    #[serde(default)]
+    pub delete_started: bool,
 }
 
 fn check_key(key: &str) -> Result<()> {
@@ -964,6 +970,7 @@ pub fn rm(ctx: &RmCtx) -> Result<RmOutcome> {
                 finished: None,
                 last_error: None,
                 backup_ref: None,
+                delete_started: false,
             };
             save_op(ctx.db, &rec)?;
             rec
@@ -1086,7 +1093,15 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 if rec.branch.is_some() && now_branch != rec.branch {
                     bail!("{} is on {:?} but the removal was planned for {:?}; refusing to delete a different checkout", wt.display(), now_branch, rec.branch);
                 }
-                let mut reasons = guards_with_proof(ctx, collect_facts_opt(wt, facts_ctx(ctx, false), false), false, rec.head.as_deref());
+                let mut facts = collect_facts_opt(wt, facts_ctx(ctx, false), false);
+                // An interrupted `git worktree remove` leaves tracked files deleted. They are still in
+                // HEAD (which the unpushed guard protects), so they are not work to keep; anything
+                // else (an edit, a new file) still refuses.
+                let half_deleted = rec.delete_started && matches!(&facts.dirty, Fact::Known(v) if !v.is_empty() && v.iter().all(|l| l.starts_with(" D ")));
+                if half_deleted {
+                    facts.dirty = Fact::Known(vec![]);
+                }
+                let mut reasons = guards_with_proof(ctx, facts, false, rec.head.as_deref());
                 reasons.extend(submodule_reasons(wt));
                 if !reasons.is_empty() {
                     return Err(Refused(reasons).into());
@@ -1097,11 +1112,15 @@ fn run_step(ctx: &RmCtx, rec: &mut OpRecord) -> Result<Step> {
                 }
                 let wt_s = wt.to_string_lossy().into_owned();
                 let mut args = vec!["worktree", "remove"];
-                if ctx.force {
+                if ctx.force || half_deleted {
                     args.push("--force");
                 }
                 args.extend(["--", &wt_s]);
-                git(ctx.repo, &args, GIT_SLOW).map_err(|e| match &e {
+                if !rec.delete_started {
+                    rec.delete_started = true;
+                    save_op(ctx.db, rec)?;
+                }
+                git(ctx.repo, &args, GIT_REMOVE).map_err(|e| match &e {
                     ExecError::Unknown(_) => anyhow!("git worktree remove finished with an unknown result ({e}); the record is kept, retry to continue"),
                     ExecError::Failed { stderr, .. } if stderr.contains("locked") => anyhow!("git worktree remove refused: the worktree is locked ({}). Run `git worktree unlock {}` if the lock is stale, then retry", stderr.trim(), wt.display()),
                     ExecError::Failed { stderr, .. } if stderr.contains("submodule") => anyhow!("git worktree remove refused: it contains submodules ({}). Deinitialise them (`git submodule deinit --all`) after saving any local commits, then retry", stderr.trim()),
@@ -1746,7 +1765,7 @@ pub(crate) mod tests {
         assert!(f.pdir.join("feat/e").exists());
         // a pending removal blocks new
         let key = "app/feat-f";
-        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None, backup_ref: None };
+        let rec = OpRecord { version: 1, id: "x".into(), project: "app".into(), run: "feat-f".into(), worktree: f.pdir.join("feat/f"), branch: None, head: None, step: Step::Archive, archive: None, archived_files: 0, started: 0, updated: 0, finished: None, last_error: None, backup_ref: None, delete_started: false };
         save_op(&f.ops, &rec).unwrap();
         assert!(pending_removal(&f.ops, key));
         assert!(run(&f, "feat/f", &BTreeSet::new()).unwrap_err().to_string().contains("pending"));
@@ -1917,6 +1936,50 @@ pub(crate) mod tests {
         let tars: Vec<_> = fs::read_dir(archive.parent().unwrap()).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "tar")).collect();
         assert_eq!(tars.len(), 1, "exactly one archive");
         assert!(!pending_removal(&f.ops, "app/feat-c1"));
+    }
+
+    /// A crash after the archive step, then the record marked as if `git worktree remove` had
+    /// started (and timed out), with one tracked file already gone.
+    fn half_deleted(f: &Fx, name: &str, branch: &str, started: bool) -> PathBuf {
+        let o = new_wt(f, branch);
+        let crashy = Host::default();
+        *crashy.fail_after.lock().unwrap() = Some(Step::Archive);
+        assert!(do_rm(f, name, &o.path, false, &crashy).is_err());
+        let key = format!("app/{name}");
+        let mut rec = load_op(&f.ops, &key).unwrap().unwrap();
+        rec.delete_started = started;
+        save_op(&f.ops, &rec).unwrap();
+        let tracked = g(&o.path, &["ls-files"]);
+        fs::remove_file(o.path.join(tracked.lines().next().unwrap())).unwrap();
+        o.path
+    }
+
+    #[test]
+    fn a_removal_interrupted_mid_delete_resumes_without_force() {
+        let f = fx("rmhalf");
+        let p = half_deleted(&f, "feat-h", "feat/h", true);
+        let out = do_rm(&f, "feat-h", &p, false, &Host::default()).unwrap();
+        assert!(out.removed && !p.exists());
+        assert!(!pending_removal(&f.ops, "app/feat-h"));
+    }
+
+    #[test]
+    fn a_half_deleted_checkout_with_real_changes_is_still_refused() {
+        let f = fx("rmhalfdirty");
+        let p = half_deleted(&f, "feat-d", "feat/d", true);
+        fs::write(p.join("new-work.txt"), "keep me").unwrap();
+        let e = do_rm(&f, "feat-d", &p, false, &Host::default()).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "dirty"), "{e}");
+        assert!(p.join("new-work.txt").exists());
+    }
+
+    #[test]
+    fn deleted_tracked_files_block_removal_when_no_delete_was_started() {
+        let f = fx("rmnodelete");
+        let p = half_deleted(&f, "feat-n", "feat/n", false);
+        let e = do_rm(&f, "feat-n", &p, false, &Host::default()).unwrap_err();
+        assert!(e.downcast_ref::<Refused>().unwrap().0.iter().any(|r| r.code == "dirty"), "{e}");
+        assert!(p.exists());
     }
 
     #[test]
