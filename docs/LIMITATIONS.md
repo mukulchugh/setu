@@ -21,3 +21,17 @@ Append-only log of limits found in real use. Each entry: what happened, the caus
 - A worktree that ran the dev server adds about 2.6 GB of unique `.next` output.
 
 **Fix tracked in:** `docs/slices/11-disk-at-scale.md`.
+
+## 2026-11-18: `setu rm` answers "already removed" for a recreated worktree
+
+**What happened:** a worktree removed earlier was created again for the same branch and run name (`quivly-app/codex-linked-commitment-sync`). `setu rm` then answered "was already removed" and did nothing, although the folder existed, `git worktree list` showed it at a live HEAD, and `setu ls` showed the run.
+
+**Likely cause:** the removal record from the first `rm` is matched by run name, without checking whether the worktree on disk is the same one (path, creation time, HEAD). A recreated worktree inherits the old record.
+
+**Fix tracked in:** not yet planned; slice 11 auto-archive (C) must key removal state to the worktree instance, not only the run name.
+
+## 2026-11-18: "merged" by ancestry removes brand-new worktrees
+
+**What happened:** a cleanup that called a worktree merged when its HEAD was contained in the base branch removed worktrees a lane had created minutes earlier: a fresh branch with no commits is always contained in its base.
+
+**Rule for any Setu auto-archive (slice 11, C):** a worktree is merged only when its branch has its own merged pull request and no open one, and it is never a candidate while its folder or HEAD commit is younger than 6 hours.
