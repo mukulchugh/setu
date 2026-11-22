@@ -53,6 +53,10 @@ setu: run every worktree's app and workers at its own local URL
   setu autoremove [--dry-run]     evaluate auto-removal now (needs [auto_remove] enabled) and print every decision
   setu history [run] [--kind env|worktree|disk|autoremove] [--limit N] [--json]
                                      recent audit events, newest first (names only, never values)
+  setu start [run] <proc> [--as name]
+                                     start one proc of a run that is up (for `autostart = false` procs)
+  setu stop [run] <proc> [--as name]
+                                     stop one proc and leave the run up (the web proc: use `setu down`)
   setu restart [run]              stop a run and start it again (also takes over a running external one)
   setu migrate [plan|run --yes|rollback]
                                      move from the old JS Setu (v1): plan is read-only, run needs --yes
@@ -179,6 +183,23 @@ async fn dispatch(args: Vec<String>) -> Result<()> {
             }
             let run = api::call(with_cmd("down", req)).await?;
             println!("{} stopped", run["run"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Some(c @ ("start" | "stop")) => {
+            let (rest, holder) = extract_as(&args[1..])?;
+            // One name is the proc (the run is the worktree we stand in); two are run then proc.
+            let (run, proc) = match rest.as_slice() {
+                [p] => (None, p),
+                [r, p] => (Some(r), p),
+                _ => bail!("usage: setu {c} [run] <proc>"),
+            };
+            let mut req = target(run)?;
+            req["proc"] = json!(proc);
+            if let Some(h) = holder {
+                req["holder"] = json!(h);
+            }
+            let out = api::call(with_cmd(if c == "start" { "proc.start" } else { "proc.stop" }, req)).await?;
+            println!("{proc} {} in {}", if c == "start" { "started" } else { "stopped" }, out["run"].as_str().unwrap_or("?"));
             Ok(())
         }
         Some("restart") => {
@@ -418,6 +439,12 @@ async fn ls_cmd(args: &[String]) -> Result<()> {
             }),
             r["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default(),
         );
+        for p in r["proc_states"].as_array().into_iter().flatten().filter(|p| p["state"] == "off") {
+            println!("    {}: off (on-demand; `setu start {} {}`)", p["name"].as_str().unwrap_or("?"), r["run"].as_str().unwrap_or("<run>"), p["name"].as_str().unwrap_or("<proc>"));
+        }
+        for p in r["proc_states"].as_array().into_iter().flatten().filter(|p| p["state"] == "exited") {
+            println!("    {}: exited; `setu logs {} {}`", p["name"].as_str().unwrap_or("?"), r["run"].as_str().unwrap_or("<run>"), p["name"].as_str().unwrap_or("<proc>"));
+        }
         if let Some(h) = r["claim"]["holder"].as_str() {
             println!("    claimed by {h}{}", if r["claim"]["stale"].as_bool() == Some(true) { " (stale)" } else { "" });
         }
@@ -437,6 +464,17 @@ async fn logs(args: &[String]) -> Result<()> {
     let key = api::call(with_cmd("resolve", target(rest.first().copied())?)).await?;
     let key = key.as_str().ok_or_else(|| anyhow!("no run"))?.to_string();
     let dir = paths::logs_dir().join(&key);
+    // An on-demand proc that never ran has no log file: the daemon says it is off.
+    if let Some(proc) = rest.get(1) {
+        if !dir.join(format!("{proc}.log")).exists() {
+            if let Ok(out) = api::call(json!({ "cmd": "logs", "run": key, "proc": proc, "lines": 1 })).await {
+                if out["off"] == true {
+                    println!("{}", out["text"].as_str().unwrap_or(""));
+                    return Ok(());
+                }
+            }
+        }
+    }
     let files: Vec<String> = match rest.get(1) {
         Some(proc) => vec![dir.join(format!("{proc}.log")).display().to_string()],
         None => std::fs::read_dir(&dir)
@@ -775,7 +813,7 @@ fn with_real_ctx<R>(f: impl FnOnce(&mut crate::onboard::Ctx) -> R) -> Result<R> 
 /// word, `import-v1` without `--apply`) never installs or starts anything.
 fn needs_daemon(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("up" | "down" | "restart" | "pin" | "unpin" | "ls" | "alias" | "new" | "history" | "autoremove" | "adopt" | "rm" | "retry-setup" | "forget" | "restore" | "claim" | "release" | "claims" | "disk" | "env") => true,
+        Some("up" | "down" | "start" | "stop" | "restart" | "pin" | "unpin" | "ls" | "alias" | "new" | "history" | "autoremove" | "adopt" | "rm" | "retry-setup" | "forget" | "restore" | "claim" | "release" | "claims" | "disk" | "env") => true,
         Some("import-v1") => args.iter().any(|a| a == "--apply"),
         _ => false,
     }
@@ -1060,7 +1098,7 @@ mod tests {
 
     #[test]
     fn only_daemon_commands_set_up_or_start_the_daemon() {
-        for c in ["ls", "up", "down", "restart", "new", "adopt", "rm", "env", "disk", "claims", "history"] {
+        for c in ["ls", "up", "down", "start", "stop", "restart", "new", "adopt", "rm", "env", "disk", "claims", "history"] {
             assert!(needs_daemon(&args(&[c])), "{c}");
         }
         // the exceptions: never auto-setup

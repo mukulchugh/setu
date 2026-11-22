@@ -44,6 +44,13 @@ pub struct RecipeProc {
     pub run: String,
     pub port: Option<String>,
     pub cwd: Option<String>,
+    /// `false` makes the proc on-demand (see `ProcSpec::autostart`).
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

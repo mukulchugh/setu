@@ -225,7 +225,7 @@ mod tests {
     fn project(procs: &[(&str, &str, bool)], domain: &str, stores: Vec<DiskStore>) -> ProjectConfig {
         let mut map = BTreeMap::new();
         for (n, run, mise) in procs {
-            map.insert(n.to_string(), ProcSpec { run: run.to_string(), port: None, mise: *mise, cwd: None });
+            map.insert(n.to_string(), ProcSpec { run: run.to_string(), port: None, mise: *mise, cwd: None, autostart: true });
         }
         ProjectConfig {
             project: "p".into(),

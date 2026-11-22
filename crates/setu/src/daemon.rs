@@ -813,7 +813,9 @@ impl Daemon {
             }
         }
         self.activity.touch(&spec.id);
-        for proc in &spec.procs {
+        // On-demand procs (autostart = false) keep their env and ports but do not run until
+        // `setu start <run> <proc>`; readiness below only ever waits on the web port.
+        for proc in spec.procs.iter().filter(|p| p.autostart) {
             if self.generation(k) != gen {
                 return self.cancel_start(k).await;
             }
@@ -867,8 +869,10 @@ impl Daemon {
                 Some(p) => supervisor::wait_port(&spec.id, p, START_TIMEOUT).await,
                 None => true,
             };
+            // A sidecar that exited meanwhile leaves `procs` (see `on_exit`), so the pid set may only have
+            // shrunk. Stale means a stop happened since (`gens` moved) or a pid this start did not spawn exists.
             let current: Vec<i32> = me.lock().state.runs.get(&k2).map(|r| r.procs.iter().map(|p| p.pid).collect()).unwrap_or_default();
-            if current != generation {
+            if me.generation(&k2) != gen || !current.iter().all(|p| generation.contains(p)) {
                 return;
             }
             me.set(&k2, |r| {
@@ -1013,6 +1017,83 @@ impl Daemon {
             self.activity.forget(&id);
         }
         result
+    }
+
+    /// Start one proc of a run that is already up: the way to run an on-demand proc
+    /// (`autostart = false`), or to bring back a worker that was stopped or crashed.
+    pub async fn start_proc(self: &Arc<Self>, k: &str, name: &str) -> Result<()> {
+        let life = self.life_lock(k);
+        let _life = life.lock().await;
+        let (spec, proc, gen) = {
+            let inner = self.lock();
+            let r = inner.state.runs.get(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            if !matches!(r.status, RunStatus::Running | RunStatus::Starting) {
+                bail!("{k} is not running (status {}); start the run first with `setu start {k}`", serde_json::to_value(r.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default());
+            }
+            if r.procs.iter().any(supervisor::is_external) {
+                bail!("{k} is a server Setu adopted, not one it started, so it cannot start single procs; restart the run first");
+            }
+            let proc = r.spec.procs.iter().find(|p| p.name == name).cloned().ok_or_else(|| anyhow!("{k} has no proc {name:?} (procs: {})", r.spec.procs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+            if r.procs.iter().any(|p| p.name == name && supervisor::unresolved(p)) {
+                bail!("{name} is already running in {k}");
+            }
+            (r.spec.clone(), proc, inner.gens.get(k).copied().unwrap_or(0))
+        };
+        let rec = supervisor::spawn_proc(&spec, &proc, self.exits.clone()).await?;
+        let pushed = {
+            let mut inner = self.lock();
+            if inner.gens.get(k).copied().unwrap_or(0) != gen {
+                false
+            } else {
+                if let Some(r) = inner.state.runs.get_mut(k) {
+                    r.procs.retain(|p| p.name != name);
+                    r.procs.push(rec.clone());
+                }
+                true
+            }
+        };
+        if !pushed {
+            let _ = supervisor::stop_procs(std::slice::from_ref(&rec), STOP_GRACE).await;
+            bail!("{k} was stopped while {name} was starting");
+        }
+        if let Err(e) = self.persist_durable().await {
+            let _ = supervisor::stop_procs(std::slice::from_ref(&rec), STOP_GRACE).await;
+            self.set(k, |r| r.procs.retain(|p| p.pid != rec.pid));
+            return Err(e.context(format!("could not save the process record for {name}; it was stopped")));
+        }
+        self.activity.touch(&spec.id);
+        Ok(())
+    }
+
+    /// Stop one proc of a run, leaving the run up. The web proc is the run itself: stop the run instead.
+    pub async fn stop_proc(self: &Arc<Self>, k: &str, name: &str) -> Result<()> {
+        let life = self.life_lock(k);
+        let _life = life.lock().await;
+        let taken = {
+            let mut inner = self.lock();
+            let r = inner.state.runs.get_mut(k).ok_or_else(|| anyhow!("unknown run {k}"))?;
+            let Some(p) = r.spec.procs.iter().find(|p| p.name == name) else {
+                bail!("{k} has no proc {name:?} (procs: {})", r.spec.procs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+            };
+            if p.port.is_some() && p.port == r.spec.web_port {
+                bail!("{name} serves {k}; stop the whole run with `setu down {k}`");
+            }
+            if r.procs.iter().any(supervisor::is_external) {
+                bail!("{k} is a server Setu adopted, not one it started, so it cannot stop single procs");
+            }
+            // Forgotten before the signal, so its exit is not reported as a crash.
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut r.procs).into_iter().partition(|p| p.name == name);
+            r.procs = rest;
+            mine
+        };
+        self.persist();
+        let res = supervisor::stop_procs(&taken, STOP_GRACE).await;
+        let left = retained_after_stop(&taken, res.is_err(), &supervisor::unresolved);
+        if !left.is_empty() {
+            self.set(k, |r| r.procs.extend(left.clone()));
+        }
+        self.persist();
+        res
     }
 
     /// A proc exited on its own.
@@ -1169,7 +1250,9 @@ impl Daemon {
             let web_name = r.spec.procs.iter().find(|p| p.port.is_some() && p.port == r.spec.web_port).map(|p| p.name.clone());
             let web_dead = match &web_name {
                 Some(n) => !r.procs.iter().any(|p| &p.name == n && supervisor::owned_and_alive(p)),
-                None => !r.procs.iter().any(supervisor::owned_and_alive),
+                // Without a web proc the run lives while an autostart proc does; a run whose procs are
+                // all on-demand has nothing that must stay alive.
+                None => r.spec.procs.iter().any(|p| p.autostart) && !r.procs.iter().any(supervisor::owned_and_alive),
             };
             if web_dead {
                 let _ = self.stop(&k, RunStatus::Crashed).await;
@@ -1499,6 +1582,13 @@ impl Daemon {
                 .unwrap_or_default(),
         };
         names.sort();
+        // An on-demand proc that never ran has no log: say it is off instead of failing.
+        if let Some(p) = proc {
+            let off = self.lock().state.runs.get(&k).is_some_and(|r| r.spec.procs.iter().any(|x| x.name == p && !x.autostart) && !r.procs.iter().any(|x| x.name == p));
+            if off && !dir.join(format!("{p}.log")).exists() {
+                return Ok(json!({ "run": k, "lines": 0, "text": format!("{p} is off (on-demand); start it with `setu start {k} {p}`"), "off": true }));
+            }
+        }
         if names.is_empty() {
             bail!("no logs yet for {k}");
         }
@@ -2125,6 +2215,27 @@ fn alias_sources(r: &RunRecord) -> Vec<(String, &'static str)> {
     r.spec.aliases.iter().map(|a| (a.clone(), "config")).chain(r.custom_aliases.iter().map(|a| (a.clone(), "custom"))).collect()
 }
 
+/// Each configured proc with how it stands: `running`, `off` (on-demand and not started), `exited`
+/// (it ran and is gone while the run is up) or `stopped` (the run is down).
+fn proc_states(r: &RunRecord) -> Vec<Value> {
+    let up = matches!(r.status, RunStatus::Running | RunStatus::Starting);
+    r.spec
+        .procs
+        .iter()
+        .map(|p| {
+            let live = r.procs.iter().any(|x| x.name == p.name && supervisor::unresolved(x));
+            let state = match (live, p.autostart, up) {
+                (true, ..) => "running",
+                (false, false, _) => "off",
+                (false, true, true) if r.status == RunStatus::Starting => "starting",
+                (false, true, true) => "exited",
+                (false, true, false) => "stopped",
+            };
+            json!({ "name": p.name, "state": state, "autostart": p.autostart })
+        })
+        .collect()
+}
+
 fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
     let ram = if r.procs.is_empty() { 0 } else { supervisor::run_footprint(&r.procs) };
     // A project with no procs has no URL to open: its status is `no-server` and the note says what to add.
@@ -2146,6 +2257,7 @@ fn run_json(db: &Db, k: &str, r: &RunRecord, no_server: bool) -> Value {
         "ports": r.spec.ports,
         "worktree": r.spec.worktree,
         "procs": r.procs.iter().map(|p| json!({"name": p.name, "pid": p.pid})).collect::<Vec<_>>(),
+        "proc_states": proc_states(r),
         "note": note,
         "claim": claim_json(db, k),
     })
@@ -2531,12 +2643,17 @@ mod tests {
     /// A daemon over a sandboxed SETU_HOME with one project `tp` whose procs are `procs` (name -> command)
     /// and one registered run `tp/r`.
     fn fixture(procs: &[(String, String)], extra: &str) -> Fx {
-        let sb = sandbox();
-        let mut toml = String::from("project = \"tp\"\nrepo = \"/nonexistent/tp.git\"\ndomain = \"tp.local\"\n");
-        toml.push_str(extra);
+        let mut toml = String::from(extra);
         for (n, c) in procs {
             toml.push_str(&format!("[procs.{n}]\nrun = '{c}'\n"));
         }
+        fixture_toml(&toml)
+    }
+
+    /// Like `fixture`, from the project config text after the three required keys.
+    fn fixture_toml(body: &str) -> Fx {
+        let sb = sandbox();
+        let toml = format!("project = \"tp\"\nrepo = \"/nonexistent/tp.git\"\ndomain = \"tp.local\"\n{body}");
         std::fs::create_dir_all(paths::projects_dir()).unwrap();
         std::fs::write(paths::projects_dir().join("tp.toml"), toml).unwrap();
         let wt = sb.dir.join("wt/r");
@@ -3914,5 +4031,104 @@ while True:
         assert_eq!(f.d.describe(&f.k).unwrap()["status"], "running");
         f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
         pkill("sleep 300703");
+    }
+
+    /// A web proc serving `port.web` with python's static server, plus the given extra procs.
+    fn web_and(extra_procs: &str) -> Fx {
+        web_and_after(0, extra_procs)
+    }
+
+    fn web_and_after(delay_secs: u32, extra_procs: &str) -> Fx {
+        fixture_toml(&format!("[ports.web]\n[procs.web]\nrun = 'sleep {delay_secs}; exec python3 -m http.server {{port.web}} --bind 127.0.0.1'\nport = \"web\"\n{extra_procs}"))
+    }
+
+    async fn wait_status(f: &Fx, want: RunStatus) {
+        for _ in 0..300 {
+            if status(f) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("run never reached {want:?}; is {:?} ({:?})", status(f), f.d.lock().state.runs[&f.k].note);
+    }
+
+    fn proc_state(f: &Fx, name: &str) -> String {
+        let v = f.d.describe(&f.k).unwrap();
+        v["proc_states"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()["state"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worker_that_crashes_at_startup_does_not_block_the_web_proc() {
+        // The worker exits (code 1) while the run is still waiting for the web port. on_exit drops it
+        // from the run's procs; the readiness waiter used to read that as "a newer incarnation" and give
+        // up, leaving the run `starting` (and the proxy answering 503) for good.
+        // The web proc opens its port only after a second, so the worker is gone before readiness.
+        let mut f = web_and_after(1, "[procs.worker]\nrun = 'sleep 0.3; exit 1'\n");
+        f.d.start(&f.k).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), f.rx.recv()).await.unwrap().unwrap();
+        assert_eq!(ev.proc, "worker");
+        f.d.on_exit(ev).await;
+        wait_status(&f, RunStatus::Running).await;
+        let host = "r.tp.local";
+        assert!(matches!(f.d.lookup(host), Lookup::Up { .. }), "the domain is served");
+        let v = f.d.describe(&f.k).unwrap();
+        assert!(v["note"].as_str().unwrap().contains("worker exited (code 1)"), "{v}");
+        assert_eq!(proc_state(&f, "worker"), "exited");
+        assert_eq!(proc_state(&f, "web"), "running");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_skips_on_demand_procs_and_start_proc_and_stop_proc_run_them() {
+        let f = web_and("[procs.worker]\nrun = 'exec sleep 300811'\nautostart = false\n");
+        // not up yet: refused with a clear message
+        let e = f.d.start_proc(&f.k, "worker").await.unwrap_err();
+        assert!(e.to_string().contains("start the run first"), "{e:#}");
+        assert_eq!(proc_state(&f, "worker"), "off");
+        f.d.start(&f.k).await.unwrap();
+        wait_status(&f, RunStatus::Running).await;
+        assert!(!pgrep("sleep 300811"), "an on-demand proc does not start with the run");
+        assert_eq!(recorded(&f), 1);
+        assert_eq!(proc_state(&f, "worker"), "off");
+        // its env and port are still part of the run
+        assert!(f.d.lock().state.runs[&f.k].spec.procs.iter().any(|p| p.name == "worker" && !p.autostart));
+        // a sweep does not treat the missing worker as a crash
+        f.d.sweep().await;
+        assert_eq!(status(&f), RunStatus::Running);
+        f.d.start_proc(&f.k, "worker").await.unwrap();
+        assert!(pgrep("sleep 300811"));
+        assert_eq!(proc_state(&f, "worker"), "running");
+        let e = f.d.start_proc(&f.k, "worker").await.unwrap_err();
+        assert!(e.to_string().contains("already running"), "{e:#}");
+        let e = f.d.start_proc(&f.k, "nope").await.unwrap_err();
+        assert!(e.to_string().contains("no proc"), "{e:#}");
+        f.d.stop_proc(&f.k, "worker").await.unwrap();
+        assert!(!still_running("sleep 300811").await);
+        assert_eq!(proc_state(&f, "worker"), "off");
+        assert_eq!(status(&f), RunStatus::Running, "stopping a worker leaves the run up");
+        assert_eq!(f.d.lock().state.runs[&f.k].note, None, "a deliberate stop is not a crash");
+        let e = f.d.stop_proc(&f.k, "web").await.unwrap_err();
+        assert!(e.to_string().contains("setu down"), "{e:#}");
+        // a started on-demand proc goes down with the run, and a restart does not bring it back
+        f.d.start_proc(&f.k, "worker").await.unwrap();
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        assert!(!still_running("sleep 300811").await);
+        f.d.start(&f.k).await.unwrap();
+        assert!(!pgrep("sleep 300811"));
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
+        pkill("sleep 300811");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_whose_procs_are_all_on_demand_stays_up_and_logs_say_off() {
+        let f = fixture_toml("[procs.a]\nrun = 'exec sleep 300812'\nautostart = false\n");
+        f.d.start(&f.k).await.unwrap();
+        wait_status(&f, RunStatus::Running).await;
+        f.d.sweep().await;
+        assert_eq!(status(&f), RunStatus::Running, "nothing must stay alive, so nothing is dead");
+        let l = f.d.logs(&f.k, Some("a"), 10).unwrap();
+        assert_eq!(l["off"], true);
+        assert!(l["text"].as_str().unwrap().contains("is off"), "{l}");
+        f.d.stop(&f.k, RunStatus::Stopped).await.unwrap();
     }
 }

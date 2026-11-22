@@ -119,11 +119,13 @@ struct RawPort {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProc {
-    run: String,
+    /// Required, except for a proc that only sets `autostart` to override a recipe's proc.
+    run: Option<String>,
     port: Option<String>,
     #[serde(default)]
     mise: bool,
     cwd: Option<String>,
+    autostart: Option<bool>,
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration> {
@@ -275,8 +277,18 @@ pub(crate) fn parse_project_with(text: &str, file: &Path, checkout: impl FnOnce(
     }
     let idle = parse_duration(raw.idle.as_deref().unwrap_or("30m")).with_context(|| format!("in {}", file.display()))?;
     let mut procs = BTreeMap::new();
+    // `[procs.x] autostart = ...` without `run` flips the flag of the proc a recipe supplies.
+    let mut flags: BTreeMap<String, bool> = BTreeMap::new();
     for (name, p) in raw.procs {
-        procs.insert(name, ProcSpec { run: p.run, port: p.port, mise: p.mise, cwd: p.cwd });
+        match (p.run, p.autostart) {
+            (Some(run), a) => {
+                procs.insert(name, ProcSpec { run, port: p.port, mise: p.mise, cwd: p.cwd, autostart: a.unwrap_or(true) });
+            }
+            (None, Some(a)) if p.port.is_none() && !p.mise && p.cwd.is_none() => {
+                flags.insert(name, a);
+            }
+            (None, _) => bail!("{}: proc {name:?} needs `run` (only `autostart` may stand alone, to override a recipe's proc)", file.display()),
+        }
     }
     let requested: Vec<String> = match raw.preset {
         None => vec!["auto".into()],
@@ -321,6 +333,15 @@ pub(crate) fn parse_project_with(text: &str, file: &Path, checkout: impl FnOnce(
         procs,
     };
     merge_recipes(&mut cfg, &raw.recipes, file, recipe_dir)?;
+    for (name, a) in flags {
+        match cfg.procs.get_mut(&name) {
+            Some(p) => p.autostart = a,
+            None => bail!("{}: proc {name:?} has no `run` and no recipe in `recipes` supplies it", file.display()),
+        }
+    }
+    if let Some((name, _)) = cfg.web_proc().filter(|(_, p)| !p.autostart) {
+        bail!("{}: proc {name:?} serves the run's domain, so it cannot have autostart = false", file.display());
+    }
     for (name, p) in &cfg.procs {
         if let Some(port) = &p.port {
             if !cfg.ports.contains(port) {
@@ -349,7 +370,7 @@ fn merge_recipes(cfg: &mut ProjectConfig, names: &[String], file: &Path, recipe_
             cfg.env.entry(k).or_insert(v);
         }
         for (name, p) in r.procs {
-            cfg.procs.entry(name).or_insert(ProcSpec { run: p.run, port: p.port, mise: false, cwd: p.cwd });
+            cfg.procs.entry(name).or_insert(ProcSpec { run: p.run, port: p.port, mise: false, cwd: p.cwd, autostart: p.autostart });
         }
     }
     cfg.ports.sort();
@@ -566,6 +587,7 @@ pub fn resolve_run(
             cwd: worktree.join(p.cwd.as_deref().unwrap_or(".")),
             port: p.port.as_ref().and_then(|n| leased.get(n).copied()),
             log_path: paths::logs_dir().join(&cfg.project).join(run).join(format!("{name}.log")),
+            autostart: p.autostart,
         });
     }
     Ok(RunSpec {
@@ -654,6 +676,45 @@ run = "bun worker {{literal}}"
         let plain = recipe_cfg(&base, &user, "", "[procs.web]\nrun = \"x\"\nport = \"web\"\n").unwrap();
         assert_eq!(plain.procs.len(), 1);
         assert!(plain.env.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn autostart_defaults_to_true_and_a_project_can_turn_off_only_that_on_a_recipe_proc() {
+        let (base, user) = recipe_fixture("autostart", &[("trigger.config.ts", ""), ("bun.lock", "")]);
+        // Only `autostart` is restated: the recipe still supplies run and cwd.
+        let c = recipe_cfg(&base, &user, "recipes = [\"trigger\", \"nx\"]", "[procs.web]\nrun = \"x\"\nport = \"web\"\n\n[procs.trigger]\nautostart = false\n").unwrap();
+        assert!(!c.procs["trigger"].autostart);
+        assert!(c.procs["trigger"].run.contains("exec bunx"), "run comes from the recipe");
+        assert_eq!(c.procs["trigger"].cwd.as_deref(), Some(""));
+        assert!(c.procs["web"].autostart, "the default is to start with the run");
+        // and it can also be turned off with a full proc of the project's own
+        let own = recipe_cfg(&base, &user, "", "[procs.web]\nrun = \"x\"\nport = \"web\"\n[procs.w]\nrun = \"y\"\nautostart = false\n").unwrap();
+        assert!(!own.procs["w"].autostart);
+        // a recipe may ship an on-demand proc itself; the project can turn it back on
+        std::fs::write(user.join("od.toml"), "name = \"od\"\n[detect]\nany_of = [{ file = \"x\" }]\n[procs.od]\nrun = \"go\"\nautostart = false\n").unwrap();
+        let c = recipe_cfg(&base, &user, "recipes = [\"od\"]", "[procs.web]\nrun = \"x\"\nport = \"web\"\n").unwrap();
+        assert!(!c.procs["od"].autostart);
+        let c = recipe_cfg(&base, &user, "recipes = [\"od\"]", "[procs.web]\nrun = \"x\"\nport = \"web\"\n[procs.od]\nautostart = true\n").unwrap();
+        assert!(c.procs["od"].autostart);
+        // the resolved run carries the flag
+        let spec = resolve_run(&recipe_cfg(&base, &user, "recipes = [\"trigger\"]", "[procs.web]\nrun = \"x\"\nport = \"web\"\n[procs.trigger]\nautostart = false\n").unwrap(), Path::new("/wt/r"), "r", &BTreeMap::from([("web".to_string(), 4100u16)]), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert_eq!(spec.procs.iter().map(|p| (p.name.as_str(), p.autostart)).collect::<Vec<_>>(), [("trigger", false), ("web", true)]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn autostart_alone_needs_a_recipe_proc_and_the_web_proc_must_autostart() {
+        let (base, user) = recipe_fixture("autostart-bad", &[("trigger.config.ts", "")]);
+        let web = "[procs.web]\nrun = \"x\"\nport = \"web\"\n";
+        let e = recipe_cfg(&base, &user, "", &format!("{web}[procs.ghost]\nautostart = false\n")).unwrap_err().to_string();
+        assert!(e.contains("\"ghost\"") && e.contains("no recipe"), "{e}");
+        let e = recipe_cfg(&base, &user, "recipes = [\"trigger\"]", &format!("{web}[procs.trigger]\ncwd = \"a\"\n")).unwrap_err().to_string();
+        assert!(e.contains("needs `run`"), "{e}");
+        let e = recipe_cfg(&base, &user, "", &format!("{web}[procs.nothing]\n")).unwrap_err().to_string();
+        assert!(e.contains("needs `run`"), "{e}");
+        let e = recipe_cfg(&base, &user, "", "[procs.web]\nrun = \"x\"\nport = \"web\"\nautostart = false\n").unwrap_err().to_string();
+        assert!(e.contains("serves the run's domain"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
