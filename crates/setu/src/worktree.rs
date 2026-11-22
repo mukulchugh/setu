@@ -254,7 +254,7 @@ fn move_to_trash(repo: &Path, wt: &Path, id: &str) -> Option<PathBuf> {
     Some(dest)
 }
 
-/// Delete everything in the project's trash, one entry at a time. Only direct children that are
+/// Delete everything in the project's trash, a few entries at a time. Only direct children that are
 /// real directories and not registered worktrees are deleted; symlinks are left alone. Returns
 /// how many entries were deleted.
 pub fn sweep_trash(repo: &Path) -> usize {
@@ -263,22 +263,35 @@ pub fn sweep_trash(repo: &Path) -> usize {
         return 0;
     }
     let Ok(rd) = std::fs::read_dir(&root) else { return 0 };
-    let mut n = 0;
-    for e in rd.flatten() {
-        let p = e.path();
-        if !e.file_type().is_ok_and(|t| t.is_dir()) || is_registered(repo, &p).unwrap_or(true) {
-            continue;
+    let queue: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|p| !is_registered(repo, p).unwrap_or(true))
+        .collect();
+    // A few trees at once: deleting is mostly waiting on the file system, so a bulk removal frees
+    // its space several times sooner, while a cap keeps the disk usable for running work.
+    let next = std::sync::Mutex::new(queue.into_iter());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..TRASH_DELETERS {
+            s.spawn(|| loop {
+                let Some(p) = next.lock().unwrap_or_else(|e| e.into_inner()).next() else { break };
+                // std's remove_dir_all never follows symlinks inside the tree.
+                if std::fs::remove_dir_all(&p).is_ok() {
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
-        // std's remove_dir_all never follows symlinks inside the tree.
-        if std::fs::remove_dir_all(&p).is_ok() {
-            n += 1;
-        }
-    }
-    n
+    });
+    done.into_inner()
 }
 
-/// Ask the single background sweeper to empty a project's trash. One thread for the whole
-/// process, so a burst of removals deletes one tree at a time instead of all at once.
+/// How many trash trees one sweep deletes at the same time.
+const TRASH_DELETERS: usize = 4;
+
+/// Ask the single background sweeper to empty a project's trash. One sweeper for the whole
+/// process, so sweeps never overlap; each deletes up to `TRASH_DELETERS` trees at once.
 pub fn request_sweep(repo: &Path) {
     use std::sync::{mpsc, Mutex, OnceLock};
     static SWEEPER: OnceLock<Mutex<mpsc::Sender<PathBuf>>> = OnceLock::new();
@@ -2165,6 +2178,18 @@ pub(crate) mod tests {
         fs::write(trash_root(&f.repo), "not a directory").unwrap();
         let out = do_rm(&f, "feat-hf", &p, false, &Host::default()).unwrap();
         assert!(out.removed && !out.freeing_in_background && !p.exists());
+    }
+
+    #[test]
+    fn a_sweep_deletes_every_tree_even_with_more_trees_than_deleters() {
+        let f = fx("rmsweepmany");
+        let n = TRASH_DELETERS * 2 + 1;
+        for i in 0..n {
+            fs::create_dir_all(trash_root(&f.repo).join(format!("old-{i}/deep/er"))).unwrap();
+            fs::write(trash_root(&f.repo).join(format!("old-{i}/deep/er/file")), "x").unwrap();
+        }
+        assert_eq!(sweep_trash(&f.repo), n);
+        assert!(trash_entries(&f).is_empty());
     }
 
     #[test]
