@@ -75,6 +75,50 @@ pub fn restart_code(w: Option<&Watch>) -> Option<i32> {
     w.filter(|w| w.changed()).map(|_| RESTART_EXIT_CODE)
 }
 
+// ---------------------------------------------------------------- self-upgrade
+
+/// Homebrew's `brew` for a daemon started from `<prefix>/opt/setu/bin/setu`. `None` for any other
+/// path: only a Homebrew install upgrades itself, never a dev build or a hand-run binary.
+pub fn brew_for(watched: &Path) -> Option<PathBuf> {
+    let prefix = watched.to_str()?.strip_suffix("/opt/setu/bin/setu")?;
+    (!prefix.is_empty()).then(|| Path::new(prefix).join("bin/brew"))
+}
+
+/// Is a check due? `last` is the previous attempt (unix seconds), successful or not.
+pub fn upgrade_due(last: Option<u64>, now: u64, every: u64) -> bool {
+    last.is_none_or(|t| now.saturating_sub(t) >= every)
+}
+
+/// Where the last attempt's time is kept, so restarts and crash loops never re-run it early.
+fn stamp_path() -> PathBuf {
+    crate::paths::state_dir().join("last-upgrade-check")
+}
+
+pub fn last_check() -> Option<u64> {
+    std::fs::read_to_string(stamp_path()).ok()?.trim().parse().ok()
+}
+
+pub fn record_check(now: u64) {
+    let p = stamp_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, now.to_string());
+}
+
+/// Blocking: `brew update`, then `brew upgrade setu`. Returns brew's last output line. When the
+/// binary changes, the maintenance tick sees it and restarts the daemon onto it.
+pub fn upgrade_via(brew: &Path) -> anyhow::Result<String> {
+    let run = |args: &[&str]| {
+        let mut c = std::process::Command::new(brew);
+        c.args(args).env("HOMEBREW_NO_ENV_HINTS", "1").env("HOMEBREW_NO_INSTALL_CLEANUP", "1");
+        crate::worktree::exec(c, Duration::from_secs(600)).map_err(|e| anyhow::anyhow!("brew {}: {e}", args.join(" ")))
+    };
+    run(&["update", "--quiet"])?;
+    let out = run(&["upgrade", "setu"])?;
+    Ok(out.text().lines().last().unwrap_or("").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +178,21 @@ mod tests {
         assert_ne!(RESTART_EXIT_CODE, 0);
         let plist = crate::setup::plist(Path::new("/b/setu"), "/usr/bin", Path::new("/l"));
         assert!(plist.contains("<key>SuccessfulExit</key>\n\t\t<false/>"));
+    }
+
+    #[test]
+    fn only_a_homebrew_install_finds_brew() {
+        assert_eq!(brew_for(Path::new("/opt/homebrew/opt/setu/bin/setu")), Some(PathBuf::from("/opt/homebrew/bin/brew")));
+        assert_eq!(brew_for(Path::new("/usr/local/opt/setu/bin/setu")), Some(PathBuf::from("/usr/local/bin/brew")));
+        assert_eq!(brew_for(Path::new("/Users/me/setu/target/debug/setu")), None);
+        assert_eq!(brew_for(Path::new("/opt/setu/bin/setu")), None, "no prefix");
+    }
+
+    #[test]
+    fn a_check_is_due_once_per_interval() {
+        assert!(upgrade_due(None, 100, 86_400));
+        assert!(!upgrade_due(Some(100), 100 + 86_399, 86_400));
+        assert!(upgrade_due(Some(100), 100 + 86_400, 86_400));
+        assert!(!upgrade_due(Some(500), 100, 86_400), "a clock that went back never triggers early");
     }
 }

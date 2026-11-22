@@ -2538,6 +2538,10 @@ pub async fn run() -> Result<i32> {
         eprintln!("setu daemon: watching {} for an upgrade", w.path().display());
     }
     let maint_every = crate::selfupdate::maintenance_every();
+    // Self-upgrade: only a daemon Homebrew started (the watched opt link), never a sandbox.
+    let brew = watch.as_ref().and_then(|w| crate::selfupdate::brew_for(w.path())).filter(|_| std::env::var_os("SETU_HOME").is_none());
+    let upgrading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = std::time::Instant::now();
     let mut maint = tokio::time::interval_at(tokio::time::Instant::now() + maint_every, maint_every);
     let mut exit_code = 0;
 
@@ -2573,6 +2577,29 @@ pub async fn run() -> Result<i32> {
             _ = maint.tick() => {
                 if app_pending.load(std::sync::atomic::Ordering::SeqCst) {
                     app_pending.store(update_app(false).await, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Not before 10 minutes of uptime (a restart loop never hammers brew), at most once per
+                // `[update] every` (the last attempt is kept on disk), one at a time.
+                if let (Some(brew), false) = (brew.clone(), upgrading.load(std::sync::atomic::Ordering::SeqCst)) {
+                    let cfg = globalcfg::GlobalConfig::load().unwrap_or_default();
+                    let every = config::parse_duration(&cfg.update.every).map(|d| d.as_secs()).unwrap_or(86_400);
+                    let now = crate::disk::now_secs();
+                    if cfg.update.auto && started.elapsed() >= Duration::from_secs(600) && crate::selfupdate::upgrade_due(crate::selfupdate::last_check(), now, every) {
+                        crate::selfupdate::record_check(now);
+                        upgrading.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let flag = upgrading.clone();
+                        tokio::task::spawn_blocking(move || {
+                            match crate::selfupdate::upgrade_via(&brew) {
+                                Ok(last) => eprintln!("setu daemon: auto-update checked ({last})"),
+                                Err(e) => eprintln!("setu daemon: auto-update failed: {e:#}"),
+                            }
+                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                }
+                // Never restart while brew is still upgrading: it would be killed with the daemon.
+                if upgrading.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
                 }
                 if let Some(code) = crate::selfupdate::restart_code(watch.as_ref()) {
                     eprintln!("setu daemon: the setu binary was replaced; restarting to run the new version");
