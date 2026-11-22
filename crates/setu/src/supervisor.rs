@@ -529,6 +529,7 @@ mod tests {
             cwd: dir.to_path_buf(),
             port,
             log_path: dir.join("logs").join("web.log"),
+            autostart: true,
         };
         let mut env = BTreeMap::new();
         env.insert("FOO".to_string(), "bar".to_string());

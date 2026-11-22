@@ -156,7 +156,7 @@ mod tests {
             url: "http://r.p.local:7777".into(),
             ports: BTreeMap::from([("web".to_string(), 4001u16)]),
             env: BTreeMap::from([("TOKEN".to_string(), "CANARY-STATE-SECRET".to_string())]),
-            procs: vec![ResolvedProc { name: "web".into(), command: "serve --key CANARY-STATE-SECRET".into(), cwd: "/w".into(), port: Some(4001), log_path: "/l/web.log".into() }],
+            procs: vec![ResolvedProc { name: "web".into(), command: "serve --key CANARY-STATE-SECRET".into(), cwd: "/w".into(), port: Some(4001), log_path: "/l/web.log".into(), autostart: true }],
             web_port: Some(4001),
             idle: Duration::from_secs(60),
             aliases: vec![],

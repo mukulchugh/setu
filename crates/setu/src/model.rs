@@ -115,6 +115,9 @@ pub struct ProcSpec {
     pub mise: bool,
     /// Working directory relative to the worktree root (default ".").
     pub cwd: Option<String>,
+    /// Start with the run (default). `false` makes the proc on-demand: its env is still
+    /// allocated and injected, but it runs only after `setu start <run> <proc>`.
+    pub autostart: bool,
 }
 
 impl ProjectConfig {
@@ -171,6 +174,13 @@ pub struct ResolvedProc {
     pub cwd: PathBuf,
     pub port: Option<u16>,
     pub log_path: PathBuf,
+    /// False for an on-demand proc: `start` skips it; `setu start <run> <proc>` runs it.
+    #[serde(default = "yes")]
+    pub autostart: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A process Setu started. `pgid == pid` because every proc leads its own session.

@@ -127,6 +127,7 @@ port = "web"
 run  = "bun run worker --port {port.worker}"
 cwd  = "apps/worker"                      # relative to the worktree
 mise = false                              # true: run through `mise exec`
+autostart = true                          # false: on-demand, see On-demand workers (default true)
 
 [worktree]
 base     = "origin/staging"               # base for `setu new` (default: origin/staging, else the default branch)
@@ -178,6 +179,26 @@ Shipped recipes:
 | `workos-authkit` | `NEXT_PUBLIC_WORKOS_REDIRECT_URI = {url}/authentication/callback`, so sign-in returns to the right worktree. |
 | `nx` | `NX_DAEMON = false`; Nx's shared daemon gets confused by worktrees. |
 | `next-env` | `NEXT_PUBLIC_APP_BASE_URL = {url}`. |
+
+### On-demand workers
+
+A proc with `autostart = false` keeps its ports and env (so the web app can still reach it) but does not start with the run. Start it when you need it:
+
+```toml
+recipes = ["inngest", "next-env", "nx", "trigger", "workos-authkit"]
+
+[procs.trigger]                           # no `run`: the recipe supplies it, only the flag changes
+autostart = false
+[procs.inngest]
+autostart = false
+```
+
+```bash
+setu start trigger         # in a worktree; or: setu start <run> trigger
+setu stop trigger          # stops that proc only, the run stays up
+```
+
+`setu ls` shows an off proc as `off`, and `setu logs <run> trigger` says so instead of failing. Starting a proc of a run that is not up is an error: start the run first. `setu restart` and on-demand starts from the browser do not start these procs. The proc that serves the URL (`port = "web"`) cannot be on-demand. A worker that crashes is reported in `setu ls` but never blocks the URL: the run is up once its web proc answers.
 
 ```bash
 setu recipes ls            # shipped and your own
@@ -314,6 +335,7 @@ In Cursor's `~/.cursor/mcp.json`: `"setu": { "command": "setu", "args": ["mcp"] 
 | `setu ls [--json]` | Every run: status, real memory, URL, notes |
 | `setu up [path]` | Start the run for a worktree (default: the current directory) |
 | `setu down [run]` | Stop a run |
+| `setu start [run] <proc>` / `stop [run] <proc>` | Start or stop one proc of a run that is up (on-demand workers) |
 | `setu restart [run]` | Stop and start; also takes over a dev server started outside Setu |
 | `setu logs [run] [proc] [-f]` | Show or follow logs |
 | `setu pin` / `unpin [run]` | Keep a run up, or let idle stop it again |

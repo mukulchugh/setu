@@ -80,6 +80,17 @@ pub(crate) async fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value> {
             d.start(&k).await?;
             d.describe_async(&k).await
         }
+        "proc.start" | "proc.stop" => {
+            let k = target(d, req)?;
+            let proc = s(req, "proc").ok_or_else(|| anyhow!("{cmd} needs a proc"))?;
+            check_holder(d, &k, s(req, "holder")).await?;
+            if cmd == "proc.start" {
+                d.start_proc(&k, proc).await?;
+            } else {
+                d.stop_proc(&k, proc).await?;
+            }
+            d.describe_async(&k).await
+        }
         "restart" => {
             let k = target(d, req)?;
             d.require_server(&k).await?;

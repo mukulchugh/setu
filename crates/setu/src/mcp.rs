@@ -123,6 +123,13 @@ pub fn tools() -> Vec<Value> {
             &[],
         ),
         tool("run_stop", "Stop a run and all its processes. Refused while another holder has a live claim on it.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }), &["run"]),
+        tool(
+            "run_proc_start",
+            "Start one proc of a run that is already up, e.g. an on-demand worker (a proc with autostart = false, shown as state off in run_list proc_states). Errors if the run is not running.",
+            json!({ "run": run.clone(), "proc": { "type": "string", "description": "Proc name, e.g. worker." }, "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }),
+            &["run", "proc"],
+        ),
+        tool("run_proc_stop", "Stop one proc of a run and leave the run up. The web proc cannot be stopped this way; use run_stop.", json!({ "run": run.clone(), "proc": { "type": "string", "description": "Proc name, e.g. worker." }, "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }), &["run", "proc"]),
         tool("run_restart", "Stop then start a run. Use after env changes (see stale_env in run_list). Refused while another holder has a live claim on it.", json!({ "run": run.clone(), "holder": { "type": "string", "description": "Your claim name, if you hold the claim." } }), &["run"]),
         tool(
             "run_logs",
@@ -250,6 +257,10 @@ async fn call_tool(name: &str, args: &Value, client: Option<&str>) -> Result<Val
             _ => bail!("give `path` (a worktree) or `run` (a registered run)"),
         },
         "run_stop" => daemon(json!({ "cmd": "down", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
+        "run_proc_start" | "run_proc_stop" => {
+            let cmd = if name == "run_proc_start" { "proc.start" } else { "proc.stop" };
+            daemon(json!({ "cmd": cmd, "run": need(args, "run")?, "proc": need(args, "proc")?, "holder": holder(args, client) }), client, true).await
+        }
         "run_restart" => daemon(json!({ "cmd": "restart", "run": need(args, "run")?, "holder": holder(args, client) }), client, true).await,
         "worktree_new" => {
             let mut req = json!({ "cmd": "worktree.new", "project": need(args, "project")?, "branch": need(args, "branch")?, "start": args.get("start").and_then(Value::as_bool).unwrap_or(false) });
@@ -336,7 +347,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_object_schema() {
         let list = tools();
-        assert_eq!(list.len(), 23);
+        assert_eq!(list.len(), 25);
         for t in &list {
             let name = t["name"].as_str().unwrap();
             assert!(!t["description"].as_str().unwrap().is_empty(), "{name}");
@@ -377,7 +388,7 @@ mod tests {
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle(&note, &mut client).await.is_none());
         let l = handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &mut client).await.unwrap();
-        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 25);
         let bad = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "env_reveal" } }), &mut client).await.unwrap();
         assert_eq!(bad["error"]["code"], -32602);
     }

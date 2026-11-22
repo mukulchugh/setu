@@ -9,7 +9,7 @@ Research: `02-env-research.md`, MCP section.
 
 | Group | Tools |
 |---|---|
-| Runs | `run_list`, `run_start {path \| run}`, `run_stop {run}`, `run_restart {run}`, `run_logs {run, proc?, lines? ≤ 500}`, `run_url {run}` |
+| Runs | `run_list`, `run_start {path \| run}`, `run_stop {run}`, `run_restart {run}`, `run_proc_start {run, proc}`, `run_proc_stop {run, proc}`, `run_logs {run, proc?, lines? ≤ 500}`, `run_url {run}` |
 | Env | `env_list {scope, target?}`, `env_effective {run}`, `env_set {scope, target?, name, value?, secret?}`, `env_unset`, `env_import {scope, target?, path, preview?}` |
 | Disk | `disk_report`, `disk_clean {apply?}` |
 
