@@ -28,11 +28,28 @@ pub struct GlobalConfig {
     /// `launchctl kickstart` leaves dev servers running, and the next daemon adopts them.
     /// Servers Setu only took over (external) are never stopped by a daemon exit.
     pub stop_runs_on_exit: bool,
+    /// `[update]`: keep a Homebrew-installed Setu up to date by itself.
+    pub update: UpdateCfg,
 }
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        GlobalConfig { proxy_port: None, path: None, path_captured_at: None, dns_port: 15353, auto_remove: AutoRemoveCfg::default(), stop_runs_on_exit: false }
+        GlobalConfig { proxy_port: None, path: None, path_captured_at: None, dns_port: 15353, auto_remove: AutoRemoveCfg::default(), stop_runs_on_exit: false, update: UpdateCfg::default() }
+    }
+}
+
+/// `[update]` in `config.toml`. On by default: once per `every`, a daemon started by Homebrew runs
+/// `brew update` and `brew upgrade setu`, then restarts onto the new binary as after a manual upgrade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateCfg {
+    pub auto: bool,
+    pub every: String,
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        UpdateCfg { auto: true, every: "24h".into() }
     }
 }
 

@@ -68,3 +68,16 @@ Research: `05-install-research.md`.
   - `setu-rs setup` itself. Installing a LaunchAgent is blocked for the agent as persistence, so Mukul runs it.
   - Publishing. It needs a public repo or a public releases repo, plus a `mukulchugh/homebrew-tap` repo and a `HOMEBREW_TAP_TOKEN` secret.
 - **Follow-ups:** a crate README for the tarball (it currently ships the repo root README), and a formula caveat pointing to `setu-rs setup`.
+
+## Automatic upgrades
+
+A Homebrew-installed daemon upgrades itself once a day (`[update] auto`, `every`, on by default). It runs `<prefix>/bin/brew update --quiet` then `brew upgrade setu`, found from the opt link it was started from; a dev build, a hand-run binary or a sandbox (`SETU_HOME`) never does. The first attempt waits for 10 minutes of uptime, the last attempt's time is kept in `last-upgrade-check` in the state dir so restarts and crash loops never retry early, and only one runs at a time. The daemon does not restart while brew is still running; once it finishes, the existing binary watch restarts onto the new version.
+
+Options ranked before building:
+
+| Option | Fit | Cost |
+|---|---|---|
+| **`brew update` + `brew upgrade setu` daily** (chosen) | the same source that installs Setu decides; no version parsing; reuses the binary watch | `brew update` refreshes every tap, 10 to 30 s in the background |
+| GitHub releases API through `curl`, then `brew upgrade` | fast check | JSON and version parsing; a release is visible before the tap formula is updated |
+| `gh release view` | simple | needs a signed-in `gh` |
+| an HTTPS client crate | self-contained | a TLS dependency tree in a 1 MB binary |
