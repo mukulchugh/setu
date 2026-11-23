@@ -221,6 +221,47 @@ fn build_spec(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTre
     build_spec_with(cfg, worktree, run, leases, &layers)
 }
 
+/// How many idle runs give back their ports at once when the range is full.
+const RECLAIM_BATCH: usize = 20;
+
+/// `build_spec_with`, and when every port is taken, reclaim the leases of the longest-idle stopped
+/// runs (never `keep`, never a run that is up or has processes) and try once more. A reclaimed run
+/// gets ports again the next time it starts; its URL is by name, so it does not change.
+fn build_spec_reclaiming(inner: &Inner, cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>, layers: &Layers) -> Result<RunSpec> {
+    match build_spec_with(cfg, worktree, run, leases, layers) {
+        Err(e) if e.downcast_ref::<ports::PortsExhausted>().is_some() => {
+            let keep = format!("{}/{run}", cfg.project);
+            let freed = reclaim_idle_leases(&inner.state.runs, leases, &keep, RECLAIM_BATCH);
+            if freed.is_empty() {
+                return Err(e.context("every run holding ports is up; stop one, or `setu rm` a worktree you no longer need"));
+            }
+            eprintln!("setu: the port range was full; reclaimed the ports of {} idle runs: {}", freed.len(), freed.join(", "));
+            build_spec_with(cfg, worktree, run, leases, layers)
+        }
+        r => r,
+    }
+}
+
+/// Drop the leases of up to `max` idle runs, longest idle first (no recorded event counts as
+/// oldest). Returns the run keys whose ports were freed.
+fn reclaim_idle_leases(runs: &BTreeMap<String, RunRecord>, leases: &mut BTreeMap<String, BTreeMap<String, u16>>, keep: &str, max: usize) -> Vec<String> {
+    let mut idle: Vec<(Option<u64>, String)> = leases
+        .keys()
+        .filter(|k| k.as_str() != keep)
+        .filter_map(|k| {
+            let r = runs.get(k)?;
+            let resting = matches!(r.status, RunStatus::Stopped | RunStatus::Crashed | RunStatus::SetupFailed) && r.procs.is_empty();
+            resting.then(|| (autoremove::Events::from_record(r).last(), k.clone()))
+        })
+        .collect();
+    idle.sort();
+    let freed: Vec<String> = idle.into_iter().take(max).map(|(_, k)| k).collect();
+    for k in &freed {
+        leases.remove(k);
+    }
+    freed
+}
+
 fn build_spec_with(cfg: &ProjectConfig, worktree: &Path, run: &str, leases: &mut BTreeMap<String, BTreeMap<String, u16>>, layers: &Layers) -> Result<RunSpec> {
     let id = RunId { project: cfg.project.clone(), run: run.to_string() };
     let k = key(&id);
@@ -574,7 +615,7 @@ impl Daemon {
                 seeded = Some(false);
             }
         }
-        let spec = build_spec_with(cfg, worktree, run, &mut leases, &layers)?;
+        let spec = build_spec_reclaiming(&inner, cfg, worktree, run, &mut leases, &layers)?;
         inner.state.leases = leases;
         let k = key(&spec.id);
         for host in std::iter::once(&spec.host).chain(spec.aliases.iter()) {
@@ -748,7 +789,7 @@ impl Daemon {
                 bail!("{} already has {} runs up (max_running); stop one first", cfg.project, cfg.max_running);
             }
             let mut leases = inner.state.leases.clone();
-            let spec = build_spec_with(&cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases, &layers)?;
+            let spec = build_spec_reclaiming(&inner, &cfg, &rec.spec.worktree, &rec.spec.id.run, &mut leases, &layers)?;
             inner.state.leases = leases;
             let gen = inner.gens.get(k).copied().unwrap_or(0);
             if let Some(r) = inner.state.runs.get_mut(k) {
@@ -2717,6 +2758,57 @@ mod tests {
         std::fs::write(store.join("b"), vec![0u8; 50]).unwrap();
         assert_eq!(d.disk_report(false).await.unwrap()["stores"][0]["logical"].as_u64(), Some(100));
         drop(sb);
+    }
+
+    fn rec_for(run: &str, status: RunStatus, last: Option<u64>, procs: bool) -> RunRecord {
+        let spec = RunSpec {
+            id: RunId { project: "p".into(), run: run.into() },
+            worktree: "/w".into(),
+            host: "x".into(),
+            url: "http://x".into(),
+            ports: BTreeMap::new(),
+            env: BTreeMap::new(),
+            procs: vec![],
+            web_port: None,
+            idle: Duration::from_secs(60),
+            aliases: vec![],
+        };
+        let procs = if procs { vec![crate::model::ProcRecord { name: "web".into(), pid: 1, start_time: 1, escaped: vec![], members: vec![] }] } else { vec![] };
+        RunRecord { spec, status, pinned: false, procs, note: None, stopped_at: last, env_hash: None, last_started_at: None, last_request_at: None, custom_aliases: vec![] }
+    }
+
+    #[test]
+    fn a_full_port_range_reclaims_the_longest_idle_stopped_runs_only() {
+        let mut runs = BTreeMap::new();
+        let mut leases = BTreeMap::new();
+        for (run, status, last, procs) in [
+            ("old", RunStatus::Stopped, Some(10), false),
+            ("never", RunStatus::Stopped, None, false),
+            ("recent", RunStatus::Stopped, Some(99), false),
+            ("crashed", RunStatus::Crashed, Some(20), false),
+            ("up", RunStatus::Running, Some(1), true),
+            ("stopped-but-procs", RunStatus::Stopped, Some(1), true),
+            ("me", RunStatus::Stopped, Some(1), false),
+        ] {
+            runs.insert(format!("p/{run}"), rec_for(run, status, last, procs));
+            leases.insert(format!("p/{run}"), BTreeMap::from([("web".to_string(), 4000u16)]));
+        }
+        let freed = reclaim_idle_leases(&runs, &mut leases, "p/me", 3);
+        assert_eq!(freed, ["p/never", "p/old", "p/crashed"], "longest idle first; no event counts as oldest");
+        for k in ["p/recent", "p/up", "p/stopped-but-procs", "p/me"] {
+            assert!(leases.contains_key(k), "{k} keeps its ports");
+        }
+        // the next reclaim takes what is left, and then nothing more
+        assert_eq!(reclaim_idle_leases(&runs, &mut leases, "p/me", 10), ["p/recent"]);
+        let freed = reclaim_idle_leases(&runs, &mut leases, "p/me", 10);
+        assert!(freed.is_empty(), "running, busy and kept runs are never reclaimed: {freed:?}");
+    }
+
+    #[test]
+    fn an_exhausted_range_is_recognisable_through_context() {
+        let e = ports::lease(&BTreeMap::new(), "p/a", &["web".to_string()], |_| false).unwrap_err().context("starting p/a");
+        assert!(e.downcast_ref::<ports::PortsExhausted>().is_some());
+        assert!(format!("{e:#}").contains("no free port left"));
     }
 
     #[test]
