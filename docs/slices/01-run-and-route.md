@@ -113,7 +113,7 @@ run = "bunx trigger.dev@4.8.3 dev --max-concurrent-runs 2 --branch {run} --env-f
 **Ports**
 - Leased from 4000-4999, above v1's 3000-3999 and outside its 8288-9287.
 - A lease is first-free from a hash of the run name. Before use, Setu checks the port actually binds and that no unknown process is listening on it.
-- Leases are stored in state and reused on the next start.
+- Leases are stored in state and reused on the next start, including by stopped runs. When the range is full, starting or registering a run reclaims the leases of up to 20 idle runs (stopped, crashed or failed setup, with no processes; longest idle first) and tries once more. A reclaimed run gets ports again when it next starts; its URL is by name and does not change. Running runs and the run being started never lose theirs.
 
 **Runs**
 - Starting a run starts every proc in its own process group.

@@ -3,7 +3,7 @@
 
 use crate::model::PORT_RANGE;
 use crate::naming::fnv1a;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
@@ -27,6 +27,19 @@ fn port_free_v4(port: u16) -> bool {
     }
     TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
+
+/// Every port in `PORT_RANGE` is leased or busy. The daemon answers it by reclaiming leases of
+/// long-idle stopped runs and trying once more.
+#[derive(Debug)]
+pub struct PortsExhausted(pub String);
+
+impl std::fmt::Display for PortsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no free port left in {:?} for {}", PORT_RANGE, self.0)
+    }
+}
+
+impl std::error::Error for PortsExhausted {}
 
 pub fn lease(
     leases: &BTreeMap<String, BTreeMap<String, u16>>,
@@ -57,7 +70,7 @@ pub fn lease(
                 break;
             }
         }
-        let Some(p) = found else { bail!("no free port left in {:?} for {run_key}/{name}", PORT_RANGE) };
+        let Some(p) = found else { return Err(PortsExhausted(format!("{run_key}/{name}")).into()) };
         taken.insert(p);
         result.insert(name.clone(), p);
     }
